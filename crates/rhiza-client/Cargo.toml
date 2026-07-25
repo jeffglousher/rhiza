@@ -15,9 +15,9 @@ sql = ["dep:rhiza-sql"]
 
 [dependencies]
 reqwest.workspace = true
-rhiza-core = { version = "0.1.0", path = "../rhiza-core" }
-rhiza-node = { version = "0.1.0", path = "../rhiza-node" }
-rhiza-sql = { version = "0.1.0", path = "../rhiza-sql", optional = true }
+rhiza-core = { version = "0.2.0", path = "../rhiza-core" }
+rhiza-node = { version = "0.2.0", path = "../rhiza-node" }
+rhiza-sql = { version = "0.2.0", path = "../rhiza-sql", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

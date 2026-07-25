@@ -2558,6 +2558,7 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
             "slot {} was not reconstructable: {inspection:?}",
             entry.index
         );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 }
 
