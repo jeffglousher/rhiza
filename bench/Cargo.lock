@@ -1964,10 +1964,15 @@ dependencies = [
 name = "rhizadb"
 version = "0.2.0"
 dependencies = [
+ "axum",
+ "rhiza-archive",
  "rhiza-core",
+ "rhiza-log",
  "rhiza-node",
  "rhiza-quepaxa",
  "rhiza-sql",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
