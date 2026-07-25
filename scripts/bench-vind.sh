@@ -1136,6 +1136,7 @@ peer_tokens="$(for _ in 1 2 3; do openssl rand -hex 24; done | jq -Rsc 'split("\
 k create secret generic rhiza-auth --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" \
   --from-literal=tail-token="$tail_token" >/dev/null
+k apply -f deploy/k8s/rhiza-client-services.yaml >/dev/null
 sed -e "s|__RUSTFS_IMAGE__|$rustfs_image|g" -e "s|__AWS_CLI_IMAGE__|$aws_image|g" \
   deploy/k8s/rustfs-e2e.yaml > "$rendered_rustfs"
 yq eval '.' "$rendered_rustfs" >/dev/null

@@ -217,12 +217,14 @@ make_bundle 1 "$target/config-c1.json"
 make_bundle 2 "$target/config-c2-draft.json"
 name_c1="rhiza-${profile}-c1"
 name_c2="rhiza-${profile}-c2"
+client_service="rhiza-${profile}-client"
 jq -e '[.members[].token] | unique | length == 3' \
   "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
 jq -se '(.[0].members | map(.token)) == (.[1].members | map(.token))' \
   "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
 k create secret generic "${name_c1}-bundle" --from-file=config.json="$target/config-c1.json" \
   --dry-run=client -o yaml | yq eval '.immutable = true' - | k create -f - >/dev/null
+k apply -f deploy/k8s/rhiza-client-services.yaml >/dev/null
 
 export RHIZA_IMAGE="$image" RHIZA_KUBE_CONTEXT="$context" RHIZA_K8S_NAMESPACE="$namespace"
 export RHIZA_CLUSTER_ID="$logical_cluster_id" RHIZA_RECOVERY_GENERATION=1
@@ -307,7 +309,7 @@ matrix_service_http() {
     -e 's|__PATH__|/|g' \
     -e 's|__AUTH_SECRET__|rhiza-auth|g' \
     deploy/k8s/rhiza-admin-job.yaml > "$manifest"
-  export RHIZA_E2E_HTTP_SERVICE="${matrix_http_target:-$name_c1-client}"
+  export RHIZA_E2E_HTTP_SERVICE="${matrix_http_target:-$client_service}"
   matrix_last_http_target="$RHIZA_E2E_HTTP_SERVICE"
   matrix_last_http_raw="$raw_response"
   export RHIZA_E2E_HTTP_PATH="$path" RHIZA_E2E_HTTP_BODY="$body"
@@ -405,7 +407,7 @@ matrix_expect_f2_read_barrier_timeout() {
   survivor_ready="$(k get pod "$survivor" \
     -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')" || return 1
   [ "$survivor_ready" = True ] || return 1
-  endpoint_count="$(k get endpoints "$name_c1-client" -o json |
+  endpoint_count="$(k get endpoints "$client_service" -o json |
     jq --arg survivor "$survivor" '
       [.subsets[]?.addresses[]?] as $addresses |
       if ($addresses | length) == 1 and $addresses[0].targetRef.name == $survivor
@@ -451,7 +453,7 @@ matrix_expect_zero_endpoint_transport_failure() {
   local path="$1" body="$2" endpoint_count exit_code attempt
   endpoint_count=-1
   for ((attempt=1; attempt<=15; attempt++)); do
-    endpoint_count="$(k get endpoints "$name_c1-client" -o json |
+    endpoint_count="$(k get endpoints "$client_service" -o json |
       jq '[.subsets[]?.addresses[]?] | length')" || return 1
     [ "$endpoint_count" != 0 ] || break
     sleep 1
@@ -1159,25 +1161,23 @@ done
 jq -e '.anchor.format_version == 2 and .anchor.configuration_state.phase == "active"' \
   "$generation_compact" >/dev/null
 
-echo "== restart successor container in place and rejoin preserved PVC state =="
+echo "== recreate one successor Pod and rejoin from the target checkpoint =="
 restart_pod="${name_c2}-1"
 restart_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
-restart_count="$(k get pod "$restart_pod" \
-  -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-k exec "$restart_pod" -- /bin/sh -ec 'kill -TERM 1' >/dev/null 2>&1 || true
-for ((attempt=1; attempt<=120; attempt++)); do
-  current_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
-  [ "$current_uid" = "$restart_uid" ] || die "successor Pod was recreated during container restart"
-  current_count="$(k get pod "$restart_pod" \
-    -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-  ready="$(k get pod "$restart_pod" \
-    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
-  if [ "$current_count" -gt "$restart_count" ] && [ "$ready" = True ]; then
-    break
-  fi
-  [ "$attempt" -lt 120 ] || die "successor container did not rejoin with preserved state"
+# shellcheck disable=SC2016
+k exec "$restart_pod" -- /bin/sh -ec 'printf marker > "$1"' sh "$marker"
+k delete pod "$restart_pod" --wait=true >/dev/null
+restart_deadline=$((SECONDS + recovery_timeout))
+until k get pod "$restart_pod" -o json 2>/dev/null |
+  jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null; do
+  [ "$SECONDS" -lt "$restart_deadline" ] ||
+    die "successor Pod did not become Ready after emptyDir recreation"
   sleep 1
 done
+current_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
+[ "$current_uid" != "$restart_uid" ] || die "successor Pod was not recreated"
+k exec "$restart_pod" -- test ! -e "$marker" ||
+  die "successor Pod retained deleted emptyDir data"
 retry_read_value "$restart_pod" suffix replayed
 
 scripts/k8s-object-job.sh 2 "$successor" roll-checkpoint \
@@ -1223,7 +1223,7 @@ if [ "$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0].metad
   [ "$recovery_matrix" != 1 ] || matrix_emit_summary failed rustfs_uid_changed
   die "RustFS changed during the restore lifecycle"
 fi
-[ "$(k get persistentvolumeclaims -o json | jq '.items | length')" = 3 ] ||
-  die "successor prestage must retain one PVC per successor Pod"
+[ -z "$(k get persistentvolumeclaims -o name)" ] ||
+  die "successor lifecycle must remain zero-PVC"
 [ "$recovery_matrix" != 1 ] || matrix_emit_summary passed
-echo "vind RustFS emptyDir recovery, PVC prestage, V2 compact, 3->3 replacement, and exact-hash GC passed"
+echo "vind RustFS emptyDir recovery, zero-PVC prestage, V2 compact, 3->3 replacement, and exact-hash GC passed"

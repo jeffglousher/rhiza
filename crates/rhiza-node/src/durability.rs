@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
+const SYNC_COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
@@ -445,6 +446,7 @@ pub struct CheckpointCoordinator {
     publisher: CheckpointPublisher,
     mode: DurabilityMode,
     state: Mutex<CoordinatorState>,
+    successor_baseline_required: AtomicBool,
     publication_attempts: AtomicU64,
 }
 
@@ -528,6 +530,7 @@ impl CheckpointCoordinator {
                 pending_lag: None,
                 health: DurabilityHealth::Available,
             }),
+            successor_baseline_required: AtomicBool::new(false),
             publication_attempts: AtomicU64::new(0),
         })
     }
@@ -575,6 +578,9 @@ impl CheckpointCoordinator {
     }
 
     pub fn write_allowed(&self) -> Result<(), DurabilityError> {
+        if self.successor_baseline_required.load(Ordering::Acquire) {
+            return Err(DurabilityError::Unavailable);
+        }
         if matches!(self.mode, DurabilityMode::Sync)
             && self.health() == DurabilityHealth::Unavailable
         {
@@ -598,6 +604,159 @@ impl CheckpointCoordinator {
             });
         }
         Ok(())
+    }
+
+    /// Prevents writes until a successor runtime has established its own checkpoint baseline.
+    #[doc(hidden)]
+    pub fn require_successor_checkpoint_baseline(&self) {
+        self.successor_baseline_required
+            .store(true, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn successor_checkpoint_baseline_required(&self) -> bool {
+        self.successor_baseline_required.load(Ordering::Acquire)
+    }
+
+    /// Publishes the first target-configuration snapshot after the exact Activate entry.
+    ///
+    /// A live successor inherits a compacted predecessor qlog, so an empty target archive cannot
+    /// flush the missing prefix as ordinary segments. The first target checkpoint is therefore an
+    /// active snapshot rooted at the successor's Activate entry. Until this succeeds,
+    /// [`Self::write_allowed`] remains closed for every durability mode.
+    #[doc(hidden)]
+    pub async fn establish_successor_checkpoint_baseline(
+        &self,
+        runtime: &NodeRuntime,
+        predecessor_stop: LogAnchor,
+    ) -> Result<RecoveryAnchor, DurabilityError> {
+        let (snapshot, _fence) = {
+            let _commit = runtime.commit.lock().map_err(|_| {
+                DurabilityError::SnapshotVerification("commit mutex is poisoned".into())
+            })?;
+            runtime
+                .ensure_ready()
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            let configuration = runtime
+                .configuration_state()
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            if !configuration.is_active() {
+                return Err(DurabilityError::SnapshotVerification(
+                    "successor checkpoint baseline requires the active target configuration".into(),
+                ));
+            }
+            let stop_entry = runtime
+                .config
+                .predecessor_stop_entry
+                .as_ref()
+                .filter(|entry| {
+                    LogAnchor::new(entry.index, entry.hash) == predecessor_stop
+                        && entry.recompute_hash() == entry.hash
+                })
+                .ok_or_else(|| {
+                    DurabilityError::SnapshotVerification(
+                        "successor checkpoint baseline Stop binding changed".into(),
+                    )
+                })?;
+            let stopped = runtime
+                .config
+                .log_initial_configuration
+                .validate_entry(stop_entry)
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            let root = runtime
+                .log_root_unlocked()
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            let expected_activation_index =
+                predecessor_stop.index().checked_add(1).ok_or_else(|| {
+                    DurabilityError::SnapshotVerification(
+                        "successor Activate index cannot advance".into(),
+                    )
+                })?;
+            if root.index() != expected_activation_index {
+                return Err(DurabilityError::SnapshotVerification(
+                    "successor checkpoint baseline is not rooted at the Activate entry".into(),
+                ));
+            }
+            let activation = runtime
+                .log_store
+                .read(root.index())?
+                .filter(|entry| {
+                    entry.hash == root.hash() && entry.prev_hash == predecessor_stop.hash()
+                })
+                .ok_or_else(|| {
+                    DurabilityError::SnapshotVerification(
+                        "successor checkpoint baseline Activate entry is unavailable".into(),
+                    )
+                })?;
+            let activated = stopped
+                .validate_entry(&activation)
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            if activated != configuration {
+                return Err(DurabilityError::SnapshotVerification(
+                    "successor Activate entry does not produce the active target configuration"
+                        .into(),
+                ));
+            }
+            if runtime.checkpointing.swap(true, Ordering::AcqRel) {
+                return Err(DurabilityError::SnapshotVerification(
+                    "checkpoint transition is already in progress".into(),
+                ));
+            }
+            let fence = CheckpointFence(&runtime.checkpointing);
+            let (target, target_hash) = runtime
+                .ensure_materialized_tip()
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            if target != root.index() || target_hash != root.hash() {
+                return Err(DurabilityError::SnapshotVerification(
+                    "materialized successor state does not match the Activate entry".into(),
+                ));
+            }
+            let snapshot =
+                create_runtime_checkpoint_snapshot(runtime, target, target_hash, &configuration)?;
+            (snapshot, fence)
+        };
+
+        let expected_tip = CheckpointTip::new(
+            snapshot.anchor.compacted().index(),
+            snapshot.anchor.compacted().hash(),
+        );
+        let durable_tip = self.durable_tip();
+        if durable_tip == CheckpointTip::new(0, LogHash::ZERO) {
+            self.publisher
+                .publish_initial_checkpoint_snapshot(
+                    snapshot.anchor.clone(),
+                    &snapshot.archive_bytes,
+                )
+                .await?;
+        } else if durable_tip != expected_tip {
+            return Err(DurabilityError::SnapshotVerification(
+                "target checkpoint namespace conflicts with the successor baseline".into(),
+            ));
+        }
+        let restored = self.store.restore_checkpoint_state().await?;
+        let published = restored.snapshot().ok_or_else(|| {
+            DurabilityError::SnapshotVerification(
+                "successor checkpoint baseline has no snapshot".into(),
+            )
+        })?;
+        if published.anchor() != &snapshot.anchor || published.bytes() != snapshot.archive_bytes {
+            return Err(DurabilityError::SnapshotVerification(
+                "successor checkpoint baseline read-back differs from the active runtime".into(),
+            ));
+        }
+        {
+            let _commit = runtime.commit.lock().map_err(|_| {
+                DurabilityError::SnapshotVerification("commit mutex is poisoned".into())
+            })?;
+            runtime.log_store.compact_prefix(&snapshot.anchor)?;
+            runtime
+                .compact_embedded_log_before(snapshot.anchor.compacted().index())
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+        }
+        self.mark_durable(expected_tip);
+        self.successor_baseline_required
+            .store(false, Ordering::Release);
+        Ok(snapshot.anchor)
     }
 
     pub async fn flush_runtime(
@@ -763,10 +922,15 @@ impl CheckpointCoordinator {
                 "read-back anchor or snapshot bytes differ".into(),
             ));
         }
-        runtime.log_store.compact_prefix(&anchor)?;
-        runtime
-            .compact_embedded_log_before(anchor.compacted().index())
-            .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+        {
+            let _commit = runtime.commit.lock().map_err(|_| {
+                DurabilityError::SnapshotVerification("commit mutex is poisoned".into())
+            })?;
+            runtime.log_store.compact_prefix(&anchor)?;
+            runtime
+                .compact_embedded_log_before(anchor.compacted().index())
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+        }
         self.mark_durable(CheckpointTip::new(
             anchor.compacted().index(),
             anchor.compacted().hash(),
@@ -783,7 +947,7 @@ impl CheckpointCoordinator {
         F: Future<Output = ()> + Send,
     {
         let cadence = match self.mode {
-            DurabilityMode::Sync => return Ok(()),
+            DurabilityMode::Sync => SYNC_COMPACTION_POLL_INTERVAL,
             DurabilityMode::Bounded { max_lag } => {
                 let half = max_lag / 2;
                 half.min(Duration::from_secs(1))
@@ -795,9 +959,20 @@ impl CheckpointCoordinator {
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
                 () = tokio::time::sleep(cadence) => {
-                    match self.flush_runtime(&runtime, LogIndex::MAX).await {
-                        Ok(_) | Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {}
-                        Err(error) => return Err(error),
+                    if !matches!(self.mode, DurabilityMode::Sync) {
+                        match self.flush_runtime(&runtime, LogIndex::MAX).await {
+                            Ok(_) | Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if self.publisher.compaction_recommended().await {
+                        match self.checkpoint_compact(&runtime).await {
+                            Ok(_) => {}
+                            Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
+                                let _ = self.publisher.reload().await;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
             }

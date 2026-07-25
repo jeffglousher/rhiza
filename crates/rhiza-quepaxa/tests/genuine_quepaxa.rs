@@ -2259,7 +2259,7 @@ fn record_broadcast_returns_typed_rejection_when_quorum_is_impossible() {
 }
 
 #[test]
-fn consensus_drop_does_not_wait_for_a_blocked_minority_rpc() {
+fn consensus_drop_joins_a_blocked_minority_rpc_before_returning() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let started = Arc::new((Mutex::new(false), Condvar::new()));
@@ -2312,14 +2312,18 @@ fn consensus_drop_does_not_wait_for_a_blocked_minority_rpc() {
         dropped_sender.send(()).unwrap();
     });
     drop_started_receiver.recv().unwrap();
-    dropped_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
+    assert_eq!(
+        dropped_receiver.recv_timeout(Duration::from_millis(10)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
 
     let (release_lock, release_condition) = &*release;
     *release_lock.lock().unwrap() = true;
     release_condition.notify_all();
 
+    dropped_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
     drop_thread.join().unwrap();
 }
 

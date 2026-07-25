@@ -13,6 +13,8 @@ yq eval '.' deploy/k8s/*.yaml >/dev/null
 
 client_service=deploy/k8s/rhiza-client-services.yaml
 [ "$(yq eval-all '[select(.kind == "Service")] | length' "$client_service")" = 1 ]
+grep -Fq 'k apply -f deploy/k8s/rhiza-client-services.yaml' scripts/e2e-vind-rustfs.sh
+grep -Fq 'k apply -f deploy/k8s/rhiza-client-services.yaml' scripts/bench-vind.sh
 yq eval -e '
   .kind == "Service" and
   .metadata.name == "rhiza-sql-client" and
@@ -93,8 +95,9 @@ for replicas in 3 7; do
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${profile}-${id}.yaml")" = "$replicas" ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.podManagementPolicy' "$tmp/config-${profile}-${id}.yaml")" = Parallel ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.updateStrategy.type' "$tmp/config-${profile}-${id}.yaml")" = OnDelete ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.volumeClaimTemplates[0].metadata.name' "$tmp/config-${profile}-${id}.yaml")" = data ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers[0].name' "$tmp/config-${profile}-${id}.yaml")" = prestage ]
+  [ "$(yq eval 'select(.kind == "StatefulSet") | has("volumeClaimTemplates")' "$tmp/config-${profile}-${id}.yaml")" = false ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | .emptyDir.sizeLimit' "$tmp/config-${profile}-${id}.yaml")" = 20Gi ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers // "absent"' "$tmp/config-${profile}-${id}.yaml")" = absent ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.selector.matchLabels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.metadata.labels["rhiza.dev/member-role"]' "$tmp/config-${profile}-${id}.yaml")" = learner ]
@@ -121,15 +124,15 @@ for replicas in 3 7; do
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].image' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}:dev" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_DATA_DIR") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/var/lib/rhiza/${profile}" ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/transition/config.json" ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/prestage/config.json" ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers[0].env[] | select(.name == "RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/source/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/prestage/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/source/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/transition/config.json" ]
+  yq eval -e 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].args[0] | contains("exec rhiza prestage serve")' "$tmp/config-${profile}-${id}.yaml" >/dev/null
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_TAIL_TOKEN") | .valueFrom.secretKeyRef.key' "$tmp/config-${profile}-${id}.yaml")" = tail-token ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.cpu' "$tmp/config-${profile}-${id}.yaml")" = 250m ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.memory' "$tmp/config-${profile}-${id}.yaml")" = 512Mi ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.cpu' "$tmp/config-${profile}-${id}.yaml")" = 2 ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.memory' "$tmp/config-${profile}-${id}.yaml")" = 2Gi ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.volumeClaimTemplates[0].spec.resources.requests.storage' "$tmp/config-${profile}-${id}.yaml")" = 20Gi ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[] |
     select(.name == "RHIZA_S3_ALLOW_HTTP") | .value' \
@@ -1335,9 +1338,9 @@ successor_apply_line="$(grep -n '"${k\[@\]}" apply -f "$successor_yaml"' \
   scripts/replace-k8s-config.sh | cut -d: -f1)"
 successor_running_line="$(grep -n 'successor learner Pods did not reach Running' \
   scripts/replace-k8s-config.sh | cut -d: -f1)"
-successor_prestage_line="$(grep -n 'successor learner admin status prerequisite' \
+successor_prestage_line="$(grep -n 'successor quorum did not reach pre-Stop readiness' \
   scripts/replace-k8s-config.sh | cut -d: -f1)"
-successor_active_line="$(grep -n 'not every successor node reached Active(S+1)' \
+successor_active_line="$(grep -n 'not every successor node auto-activated to Active(S+1)' \
   scripts/replace-k8s-config.sh | cut -d: -f1)"
 # shellcheck disable=SC2016
 voter_promotion_line="$(grep -n 'patch statefulset "$new_name"' \
@@ -1357,11 +1360,11 @@ old_zero_pods_line="$(grep -nF -- '-o name)" ]' \
 cutover_success_line="$(grep -n 'GC is now permitted' \
   scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$prestage_secret_line" -lt "$successor_apply_line" ]
-[ "$successor_apply_line" -lt "$stop_post_line" ]
+[ "$successor_apply_line" -lt "$successor_prestage_line" ]
+[ "$successor_prestage_line" -lt "$stop_post_line" ]
 [ "$stop_post_line" -lt "$durable_secret_line" ]
 [ "$durable_secret_line" -lt "$successor_running_line" ]
-[ "$successor_running_line" -lt "$successor_prestage_line" ]
-[ "$successor_prestage_line" -lt "$successor_active_line" ]
+[ "$successor_running_line" -lt "$successor_active_line" ]
 [ "$successor_active_line" -lt "$voter_promotion_line" ]
 [ "$voter_promotion_line" -lt "$predecessor_seal_line" ]
 [ "$predecessor_seal_line" -lt "$endpoint_slice_line" ]
@@ -1414,9 +1417,11 @@ if grep -Eq 'rhiza-c[0-9]' scripts/e2e-vind-rustfs.sh; then
   echo "vind E2E retained an unscoped rhiza-cN resource name" >&2
   exit 1
 fi
-grep -Fq "kill -TERM 1" scripts/e2e-vind-rustfs.sh
-grep -Fq "containerStatuses[0].restartCount" scripts/e2e-vind-rustfs.sh
-grep -Fq "current_uid\" = \"\$restart_uid" scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'k delete pod "$restart_pod" --wait=true' scripts/e2e-vind-rustfs.sh
+grep -Fq 'successor Pod retained deleted emptyDir data' scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'current_uid" != "$restart_uid' scripts/e2e-vind-rustfs.sh
 grep -Fq 'capture_failure_diagnostics || true' scripts/e2e-vind-rustfs.sh
 grep -Fq 'failure-diagnostics' scripts/e2e-vind-rustfs.sh
 # shellcheck disable=SC2016

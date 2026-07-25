@@ -103,9 +103,11 @@ Its three file-backed recorders share one process and data directory, so it is
 for local development and consumer integration—not a highly available or
 remote-facing deployment.
 
-For local development, `local_file_backed` creates a fixed three-recorder
-configuration below one root directory. All recorders share the process and
-failure domain, so this configuration is not highly available:
+An embedding application chooses the ownership model explicitly. For
+local-only writes, `local_file_backed` creates a fixed three-recorder
+configuration below one root directory and opens no peer listener or membership
+workflow. All recorders share the process and failure domain, so this mode is
+durable but not highly available:
 
 ```rust,no_run
 use rhizadb::{EmbeddedConfig, ExecutionProfile, Rhiza, ReadConsistency};
@@ -135,12 +137,13 @@ those traits or using the broader transport vocabulary still requires direct
 dependencies on `rhiza-quepaxa` and `rhiza-node`. Normal local consumers should
 use `local_file_backed`.
 
-Highly available embedded consumers bind the Recorder and service listeners,
-build a `HaServeConfig`, and pass it to `PreparedHaStartup::start`. The returned
-`HaNode` owns both ingress servers, recovery, background workers, and ordered
-durability-aware shutdown. `ready()` waits for the active, writable node and
-returns a cloneable `RhizaHandle` for application requests; `monitor()` reports
-terminal server or worker failures.
+For Hiqlite-style clustered ownership, the embedding application binds the
+Recorder and service listeners, builds `HaServeConfig`, and starts either a
+normal `HaNode` or a live `HaSuccessorNode`. These public owners manage
+preparation, both ingress servers, recovery, checkpoint coordination,
+readiness, background workers, and ordered durability-aware shutdown. The
+application supplies transport clients and process shutdown; the CLI is only
+one adapter over this API.
 
 ```rust,no_run
 use std::{future::Future, sync::Arc};
@@ -162,17 +165,13 @@ async fn run_ha_node(
     let service_listener = TcpListener::bind("127.0.0.1:7002")
         .await
         .map_err(|error| error.to_string())?;
-    let prepared = startup.prepare().await.map_err(|error| error.to_string())?;
-    let node = prepared
-        .start(HaServeConfig::new(
-            recorder_listener,
-            service_listener,
-            HaRecorderTransport::Http,
-            recorders,
-            log_peers,
-        ))
-        .await
-        .map_err(|error| error.to_string())?;
+    let node = startup.start(HaServeConfig::new(
+        recorder_listener,
+        service_listener,
+        HaRecorderTransport::Http,
+        recorders,
+        log_peers,
+    ));
 
     tokio::pin!(shutdown);
     let observed = tokio::select! {
@@ -214,32 +213,20 @@ log-peer clients, and its process shutdown signal. Dropping `HaNode` requests
 best-effort shutdown but cannot report cleanup failures, so planned shutdown
 must always await `HaNode::shutdown`.
 
-Membership replacement can move bulk restore out of the Stop fence through the
-public successor-prestage boundary. `HaSuccessorPrestageConfig::prepare`
-restores an Active(S) checkpoint into a detached store without opening a
-runtime, Recorder, proposer, or client endpoint. The predecessor enables its
-certified-tail route with `HaServeConfig::with_tail_token` and a separate
-configuration-bound credential; the successor repeatedly uses `tail_request`
-and `apply_page` until Stop(S).
-`PublishedHaSuccessorPrestage::finalize` accepts only the exact bound Stop,
-requires identical durable and applied anchors, adopts the staged files without
-copying the checkpoint again, and returns the normal `PreparedHaStartup`.
-Starting that value still reports `HaNodeStatus::AwaitingActivation`;
-activation remains the first S+1 proposal. Kubernetes successor init
-containers now run this facade through `rhiza prestage serve`: they restore and
-tail before Stop, observe the projected bound transition bundle, finalize the
-exact Stop, and only then let the normal `rhiza serve` container start.
+Membership replacement moves restore and catch-up out of the Stop fence through
+`HaSuccessorPrestageConfig::start_live`. The returned `HaSuccessorNode` keeps
+the same process and prebound listeners from learner catch-up through active
+service. It exposes liveness immediately and readiness only after the learner
+matches the observed predecessor tip. After the application supplies one exact
+`HaPredecessor`, the owner tails through that bound Stop, atomically adopts the
+stage, starts the target runtime on the retained listener, proposes Activate,
+and establishes the target checkpoint baseline before admitting writes.
+`HaCertifiedTailSource` is the only transport boundary; retry cadence, proof
+validation, Stop matching, activation, and shutdown remain facade-owned.
 
 `execute_sql` and `query` expose typed SQL, `RETURNING`, consistency, and
 persistent idempotency. HTTP routes and workspace tooling are secondary
 adapters over the same SQL node service contracts.
-
-### v0.2.0 migration
-
-v0.2.0 is a breaking clean-install release. It removes the former Rust
-constructors and legacy persistence decoders. Do not attempt mixed-version
-rolling recovery: stop the old deployment, create a clean data root, and start
-all recovering members on v0.2.0.
 
 ## Kubernetes Deployment
 
@@ -458,12 +445,13 @@ steps are documented in
 
 ## Storage Model
 
-Successor StatefulSets provision a `ReadWriteOnce` PVC for `/var/lib/rhiza`.
-Prestage and normal successor serving use the same claim, so publishing the
-detached stage and starting the main container does not recopy the checkpoint.
-Ordinary same-configuration manifests retain `emptyDir` and recover from the
-object-store authority. The successor PVC is a restart and cutover-performance
-cache, not a substitute for independent, strong-CAS production object storage.
+All StatefulSets, including prestaged successors, use bounded `emptyDir`
+storage. Before predecessor scale-down, a recreated successor rebuilds its
+detached stage from the predecessor checkpoint and certified tail. Predecessors
+remain available until the first Active successor checkpoint is independently
+verified. After that checkpoint, ordinary rejoin restores the target
+configuration from object-store authority. No Kubernetes PVC is part of the HA
+correctness or performance contract.
 The local vind RustFS Deployment also uses `emptyDir`; it simulates S3
 compatibility but is not production durability evidence.
 
@@ -560,11 +548,11 @@ automatically; only deploy mutually compatible binaries and verify them one
 ordinal at a time under a separate upgrade procedure.
 
 The node-bound local identity marker is
-`.rhiza-checkpoint-identity-v2.json`; its format version is `2` and includes
+`.rhiza-checkpoint-identity.json`; it includes
 the exact node identity as well as the cluster, profile, epoch, configuration,
 and recovery generation.
 
-Interrupted checkpoint replacement uses `.rhiza-restore-v2.json`, bound to the
+Interrupted checkpoint replacement uses `.rhiza-restore.json`, bound to the
 same identity plus the exact checkpoint index and hash. Other local
 restore-intent artifacts fail without replacing local state.
 
@@ -578,35 +566,33 @@ state is never included in that quarantine.
 
 ## Stop And Replace
 
-Membership replacement is intentionally stop-the-world. There is no mixed
-rolling transition between configurations. Client writes are unavailable from
-Stop(S) until every successor reports Active(S+1). The bounded operator flow is:
+Membership replacement still has a logical QuePaxa Stop(S) → Activate(S+1)
+barrier, but bulk restore, tail catch-up, target archive initialization, and
+listener startup happen before Stop. The remaining write gap contains only the
+exact Stop tail, local adoption, runtime opening, Activate, and first target
+checkpoint publication. The bounded operator flow is:
 
 1. Prepare a successor draft with config ID S+1 and 3 through 7 members.
-2. Create the successor PVCs and learner-labeled Pods before Stop. Their init
-   containers restore Active(S), continuously consume authenticated certified
-   tail pages, and expose no client or Recorder service.
+2. Create learner-labeled successor Pods before Stop. Their main process runs
+   `rhiza prestage serve`, restores Active(S), continuously consumes
+   authenticated certified tail pages, and reports Ready only when caught up.
+   The facade pre-initializes the target archive namespace at this stage.
 3. Call old live admin `membership/stop`, poll every old node to exact
    `Stopped(S)`, and bind the returned Stop proof into an immutable transition
-   Secret. The projected Secret lets each init container finalize only after
-   its durable and applied anchors equal the exact Stop.
-4. Let the normal successor containers start from the same PVC and use the
-   config-scoped headless admin path to require
-   `awaiting_activation` (or an idempotently resumed `active` state). Learners
-   intentionally need not pass client readiness. If that direct learner admin
-   status path is unavailable, the workflow fails closed rather than treating
-   Pod phase as activation proof. Require every successor to report
-   `awaiting_activation`, activate S+1 once, and poll every node until it
-   reports exact `Active(S+1)`.
+   Secret. The same process tails to the exact Stop, adopts its staged state,
+   starts the target runtime on the retained sockets, auto-activates only from
+   that Stop capability, and publishes the first Active(S+1) checkpoint.
+4. Poll every successor until it reports exact `Active(S+1)`. There is no
+   init-to-main restart and no separate operator activation request.
 5. Promote exact Active successor Pods to voter, relabel the stopped
    predecessor Pods as sealed, and require the stable client Service
    EndpointSlices to contain exactly the Ready successor Pod UIDs.
 6. Publish and inspect the first Active(S+1) checkpoint. Only after that proof
    scale the sealed predecessor StatefulSet to zero and permit GC.
 
-The temporary coexistence is safe because successor init containers have no
-runtime, proposer, Recorder, or client endpoint, while predecessor Pods cannot
-write after exact `Stopped(S)`. Keeping those sealed Pods until the first
+The temporary coexistence is safe because pre-Stop successors are recovery-only
+learners and cannot propose or accept writes, while predecessor Pods cannot
+write after exact `Stopped(S)`. Keeping sealed predecessors until the first
 Active(S+1) checkpoint preserves rollback evidence without admitting them to
 the stable voter-only client Service.
 
@@ -670,7 +656,7 @@ scripts/e2e-vind-rustfs.sh
 
 It creates a fresh namespace and RustFS bucket, boots config 1 on `emptyDir`,
 writes snapshot and suffix data, compacts to checkpoint V2, performs a 3-to-3
-PVC-prestaged stop-and-replace, proves recovery by successful reads, then
+zero-PVC prestaged stop-and-replace, proves recovery by successful reads, then
 plans, inspects, and applies old-object GC with exact
 hash confirmation after stopping publishers and observing lease expiry. It
 restarts the three nodes and verifies the retained generation afterward.

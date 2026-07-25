@@ -1,6 +1,13 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
+    time::{Duration, Instant},
+};
 
-use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+use rhiza_archive::{CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore};
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::ExecutionProfile;
 use rhiza_core::{ConfigurationState, LogHash};
@@ -13,11 +20,15 @@ use rhiza_node::{
     rehydrate_recorder_after_checkpoint, restore_checkpoint_to_fresh_data_dir,
     restore_checkpoint_to_fresh_data_dir_for_node, CheckpointCoordinator, DurabilityError,
     DurabilityHealth, DurabilityMode, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
+    StartupIoContext,
 };
 #[cfg(feature = "graph")]
 use rhiza_node::{GraphCommandV1, GraphValueV1};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
+use rhiza_quepaxa::{
+    DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
+    RecordSummary, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
+};
 use rhiza_sql::SqliteStateMachine;
 
 #[test]
@@ -151,7 +162,7 @@ fn recorder_rehydration_restores_command_bytes_before_installing_decision_proof(
     )
     .unwrap();
 
-    rehydrate_recorder_after_checkpoint(&runtime, &recorder, 0).unwrap();
+    rehydrate_recorder_after_checkpoint(&runtime, &recorder, 0, &StartupIoContext::new()).unwrap();
 
     let entry = runtime
         .log_store()
@@ -163,6 +174,205 @@ fn recorder_rehydration_restores_command_bytes_before_installing_decision_proof(
         recorder.fetch_command(command.hash()).unwrap(),
         Some(command)
     );
+}
+
+#[test]
+fn cancelled_recorder_rehydration_is_joined_without_late_persistence() {
+    let root = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (started, entered) = mpsc::sync_channel(3);
+    let recorders = membership
+        .members()
+        .iter()
+        .map(|node_id| {
+            let recorder = RecorderFileStore::new_with_membership(
+                root.path().join("recorders").join(node_id),
+                node_id.clone(),
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            (
+                node_id.clone(),
+                Box::new(BlockingRehydrateRecorder {
+                    recorder,
+                    blocked: Arc::clone(&blocked),
+                    started: started.clone(),
+                    gate: Arc::clone(&gate),
+                }) as Box<dyn RecorderRpc>,
+            )
+        })
+        .collect();
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorders,
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(
+        NodeRuntime::open(
+            NodeConfig::new(
+                "rhiza:sql:cluster-a",
+                "node-1",
+                root.path().join("node"),
+                1,
+                1,
+                [
+                    PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
+                    PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
+                    PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
+                ],
+                "client-token",
+            )
+            .unwrap(),
+            consensus,
+            &[],
+        )
+        .unwrap(),
+    );
+    let committed = runtime.write("request-1", "alpha", "one").unwrap();
+    assert!(runtime
+        .consensus()
+        .finish_pending_rpcs(Duration::from_secs(1)));
+    let recorder = RecorderFileStore::new_with_membership(
+        root.path().join("fresh-recorder"),
+        "node-1",
+        "rhiza:sql:cluster-a",
+        1,
+        1,
+        membership,
+    )
+    .unwrap();
+    blocked.store(true, Ordering::Release);
+    let startup = StartupIoContext::new();
+    let attempt_startup = startup.clone();
+    let attempt_runtime = Arc::clone(&runtime);
+    let attempt_recorder = recorder.clone();
+    let attempt = std::thread::spawn(move || {
+        rehydrate_recorder_after_checkpoint(
+            &attempt_runtime,
+            &attempt_recorder,
+            0,
+            &attempt_startup,
+        )
+    });
+
+    entered.recv().unwrap();
+    startup.cancel(Instant::now() + Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !attempt.is_finished(),
+        "rehydration must retain an admitted recorder inspection"
+    );
+    let (released, changed) = &*gate;
+    *released.lock().unwrap() = true;
+    changed.notify_all();
+
+    let error = attempt.join().unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("startup cancelled during recorder rehydration decision inspection"),
+        "{error}"
+    );
+    let entry = runtime
+        .log_store()
+        .read(committed.applied_index)
+        .unwrap()
+        .unwrap();
+    let command = rhiza_core::StoredCommand::new(entry.entry_type, entry.payload);
+    assert_eq!(recorder.fetch_command(command.hash()).unwrap(), None);
+}
+
+struct BlockingRehydrateRecorder {
+    recorder: RecorderFileStore,
+    blocked: Arc<AtomicBool>,
+    started: mpsc::SyncSender<()>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RecorderRpc for BlockingRehydrateRecorder {
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        self.recorder.recorder_id()
+    }
+
+    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+        self.recorder.record(request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.recorder.install_decision_proof(proof, membership)
+    }
+
+    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        self.recorder.inspect_decision_proof(slot)
+    }
+
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        if self.blocked.load(Ordering::Acquire) {
+            self.started.send(()).unwrap();
+            let (released, changed) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+        }
+        self.recorder.inspect_record_summary(slot)
+    }
+
+    fn supports_context_read_fence(&self) -> bool {
+        self.recorder.supports_context_read_fence()
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        self.recorder.observe_read_fence(request)
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: rhiza_core::StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.recorder.store_command_for(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        )
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        self.recorder
+            .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+    }
 }
 
 #[tokio::test]
@@ -476,7 +686,7 @@ async fn background_checkpoint_recovers_after_transient_storage_failure() {
 }
 
 #[tokio::test]
-async fn bounded_background_flushes_at_half_lag_and_sync_does_not_flush() {
+async fn bounded_background_flushes_at_half_lag_and_sync_only_compacts() {
     let root = tempfile::tempdir().unwrap();
     let bounded_archive = initialized_checkpoint(&root.path().join("bounded-archive")).await;
     let bounded = Arc::new(
@@ -528,7 +738,7 @@ async fn bounded_background_flushes_at_half_lag_and_sync_does_not_flush() {
     let sync_runtime = Arc::new(runtime(root.path().join("sync-node")));
     let committed = sync_runtime.write("request-1", "alpha", "one").unwrap();
     sync.note_committed(committed.applied_index);
-    sync.run_background(sync_runtime, std::future::pending())
+    sync.run_background(sync_runtime, tokio::time::sleep(Duration::from_millis(10)))
         .await
         .unwrap();
     assert_eq!(
@@ -542,6 +752,75 @@ async fn bounded_background_flushes_at_half_lag_and_sync_does_not_flush() {
             .index(),
         0
     );
+}
+
+#[tokio::test]
+async fn sync_background_compacts_at_the_publisher_segment_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("sync-compact-archive")).await;
+    let coordinator = Arc::new(
+        CheckpointCoordinator::open_with_holder_and_options(
+            archive.clone(),
+            DurabilityMode::Sync,
+            "sync-compact",
+            CheckpointPublisherOptions::default().with_compaction_segment_limit(2),
+        )
+        .await
+        .unwrap(),
+    );
+    let runtime = Arc::new(runtime(root.path().join("sync-compact-node")));
+    for index in 1..=2 {
+        let committed = runtime
+            .write(
+                &format!("request-{index}"),
+                &format!("key-{index}"),
+                "value",
+            )
+            .unwrap();
+        coordinator.note_committed(committed.applied_index);
+        coordinator
+            .flush_runtime(&runtime, committed.applied_index)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .segments()
+            .len(),
+        2
+    );
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(coordinator.run_background(runtime, async move {
+        if !*shutdown_rx.borrow() {
+            let _ = shutdown_rx.changed().await;
+        }
+    }));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if archive
+                .load_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest()
+                .segments()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown_tx.send(true).unwrap();
+    worker.await.unwrap().unwrap();
 }
 
 #[tokio::test]
