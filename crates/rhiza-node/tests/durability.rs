@@ -682,11 +682,12 @@ async fn restore_preserves_an_existing_empty_data_directory() {
 }
 
 #[tokio::test]
-async fn unbound_legacy_restore_intent_fails_without_mutation() {
+async fn unsupported_restore_intent_fails_without_mutating_nonfresh_data() {
     let root = tempfile::tempdir().unwrap();
     let archive = initialized_checkpoint(&root.path().join("archive")).await;
     let data_dir = root.path().join("mounted-data");
     std::fs::create_dir_all(data_dir.join("consensus/partial")).unwrap();
+    std::fs::write(data_dir.join("consensus/partial/sentinel"), b"preserve").unwrap();
     std::fs::create_dir(data_dir.join(".restore-stage-old")).unwrap();
     std::fs::write(
         data_dir.join(".rhiza-restore-v1"),
@@ -694,15 +695,19 @@ async fn unbound_legacy_restore_intent_fails_without_mutation() {
     )
     .unwrap();
 
-    let before = std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap();
-    assert!(restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
+    let intent_before = std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap();
+    let error = restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(error.to_string().contains("unsupported"));
     assert_eq!(
         std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap(),
-        before
+        intent_before
     );
-    assert!(data_dir.join("consensus/partial").is_dir());
+    assert_eq!(
+        std::fs::read(data_dir.join("consensus/partial/sentinel")).unwrap(),
+        b"preserve"
+    );
     assert!(data_dir.join(".restore-stage-old").is_dir());
 }
 
@@ -994,18 +999,14 @@ async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activ
         .await
         .unwrap();
     let data_dir = root.path().join("successor");
-    let stopped = ConfigurationState::stopped(
-        1,
-        source.configuration_state().unwrap().digest(),
-        LogAnchor::new(stop.entry.index, stop.entry.hash),
-    );
+    let stopped = source.configuration_state().unwrap().clone();
     let config = NodeConfig::new_with_configuration(
         "rhiza:sql:cluster-a",
         "node-1",
         data_dir.clone(),
         1,
         successor.clone(),
-        stopped,
+        stopped.clone(),
         successor_peers(),
         "client-token",
     )
@@ -1177,11 +1178,7 @@ async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activ
         root.path().join("wrong"),
         1,
         Membership::new(["other-1", "other-2", "other-3"]).unwrap(),
-        ConfigurationState::stopped(
-            1,
-            successor.digest(),
-            LogAnchor::new(stop.entry.index, stop.entry.hash),
-        ),
+        stopped.clone(),
         [
             PeerConfig::new("other-1", "http://other-1", "token-1").unwrap(),
             PeerConfig::new("other-2", "http://other-2", "token-2").unwrap(),

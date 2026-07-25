@@ -42,7 +42,7 @@ use crate::{Materializer, NodeConfig, NodeRuntime};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore-v2.json";
-const LEGACY_RESTORE_INTENT_FILE: &str = ".rhiza-restore-v1";
+const RESTORE_INTENT_PREFIX: &str = ".rhiza-restore-";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
@@ -189,7 +189,6 @@ pub enum DurabilityHealth {
 pub enum CheckpointRestoreState {
     None,
     IdentityBoundV2,
-    LegacyV1,
 }
 
 impl DurabilityMode {
@@ -850,7 +849,7 @@ fn engine_recovery_anchor(
     let size_bytes = u64::try_from(archive_bytes.len()).map_err(|_| {
         DurabilityError::SnapshotVerification("snapshot envelope size exceeds u64".into())
     })?;
-    Ok(RecoveryAnchor::new_with_configuration(
+    Ok(RecoveryAnchor::new(
         runtime.config().cluster_id(),
         runtime.config().epoch(),
         configuration.clone(),
@@ -860,8 +859,8 @@ fn engine_recovery_anchor(
             format!("snapshot-{applied_index:020}"),
             LogHash::digest(&[archive_bytes]),
             size_bytes,
-        )
-        .with_executor_fingerprint(materializer_fingerprint),
+            materializer_fingerprint,
+        ),
     ))
 }
 
@@ -912,8 +911,7 @@ pub async fn restore_checkpoint_to_fresh_data_dir(
     store: ObjectArchiveStore,
     data_dir: impl AsRef<Path>,
 ) -> Result<CheckpointTip, DurabilityError> {
-    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None, false)
-        .await
+    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None).await
 }
 
 pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
@@ -931,7 +929,6 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
         data_dir.as_ref(),
         Some(target_node_id),
         None,
-        false,
     )
     .await
 }
@@ -942,7 +939,6 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
     target_node_id: &str,
     marker_name: &str,
     marker_contents: &[u8],
-    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
@@ -955,7 +951,6 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
         data_dir.as_ref(),
         Some(target_node_id),
         Some((marker_name, marker_contents)),
-        resume_legacy_v1_intent,
     )
     .await
 }
@@ -1009,43 +1004,15 @@ pub fn checkpoint_restore_in_progress(
     node_id: &str,
     execution_profile: ExecutionProfile,
     checkpoint_root: LogAnchor,
-    legacy_v1_authorized_by_exact_marker: bool,
 ) -> Result<CheckpointRestoreState, DurabilityError> {
     let data_dir = data_dir.as_ref();
-    let legacy = data_dir.join(LEGACY_RESTORE_INTENT_FILE);
+    reject_unsupported_restore_intent_artifacts(data_dir)?;
     let intent = data_dir.join(RESTORE_INTENT_FILE);
-    let legacy_metadata = match fs::symlink_metadata(&legacy) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
     let metadata = match fs::symlink_metadata(&intent) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if legacy_metadata.is_some() && metadata.is_some() {
-        return Err(DurabilityError::SnapshotVerification(
-            "both legacy and identity-bound checkpoint restore intents exist".into(),
-        ));
-    }
-    if let Some(metadata) = legacy_metadata {
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || read_bounded_regular_file(&legacy, 4096)?.as_deref()
-                != Some(b"rhiza restore in progress\n")
-        {
-            return Err(DurabilityError::SnapshotVerification(
-                "legacy local checkpoint restore intent is invalid".into(),
-            ));
-        }
-        if !legacy_v1_authorized_by_exact_marker {
-            return Err(DurabilityError::SnapshotVerification(
-                "legacy local checkpoint restore intent requires an exact node-bound v2 identity marker".into(),
-            ));
-        }
-        return Ok(CheckpointRestoreState::LegacyV1);
-    }
     let Some(metadata) = metadata else {
         return Ok(CheckpointRestoreState::None);
     };
@@ -1093,7 +1060,6 @@ pub fn validate_local_recovery_view(
         target_node_id,
         execution_profile,
         checkpoint_root,
-        false,
     )? != CheckpointRestoreState::None
     {
         return Err(DurabilityError::SnapshotVerification(
@@ -1195,7 +1161,6 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
     execution_profile: ExecutionProfile,
     marker_name: &str,
     marker_contents: &[u8],
-    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
@@ -1226,11 +1191,14 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
         execution_profile,
         checkpoint_root,
     ));
+    checkpoint_restore_in_progress(
+        data_dir,
+        &identity,
+        target_node_id,
+        execution_profile,
+        checkpoint_root,
+    )?;
     cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
-    if resume_legacy_v1_intent {
-        fs::remove_file(data_dir.join(LEGACY_RESTORE_INTENT_FILE))?;
-        sync_directory(data_dir)?;
-    }
     publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
     install_restored_checkpoint(
         &identity,
@@ -1251,7 +1219,6 @@ async fn restore_checkpoint_to_fresh_data_dir_with_target(
     data_dir: &Path,
     target_node_id: Option<&str>,
     completion_marker: Option<(&str, &[u8])>,
-    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     let identity = store.checkpoint_identity()?.clone();
     store
@@ -1269,12 +1236,7 @@ async fn restore_checkpoint_to_fresh_data_dir_with_target(
         profile,
         checkpoint_root,
     ));
-    prepare_fresh_restore_data_dir(
-        data_dir,
-        completion_marker.map(|(name, _)| name),
-        &intent,
-        resume_legacy_v1_intent,
-    )?;
+    prepare_fresh_restore_data_dir(data_dir, completion_marker.map(|(name, _)| name), &intent)?;
     publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
     install_restored_checkpoint(
         &identity,
@@ -1534,7 +1496,7 @@ fn validate_anchor_fingerprint(
     anchor: &RecoveryAnchor,
     expected: LogHash,
 ) -> Result<(), DurabilityError> {
-    if anchor.executor_fingerprint() != Some(expected) {
+    if anchor.executor_fingerprint() != expected {
         return Err(DurabilityError::SnapshotVerification(
             "snapshot executor fingerprint does not match this binary".into(),
         ));
@@ -1580,16 +1542,18 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
             "successor startup requires transition provenance".into(),
         )
     })?;
-    let stop = LogAnchor::new(transition.stop_entry().index, transition.stop_entry().hash);
-    let expected_stopped = ConfigurationState::stopped(
-        transition.predecessor().config_id(),
-        transition.successor().predecessor_config_digest(),
-        stop,
-    );
     let expected_initial = ConfigurationState::active(
         transition.predecessor().config_id(),
         transition.successor().predecessor_config_digest(),
     );
+    let expected_stopped = expected_initial
+        .clone()
+        .validate_entry(transition.stop_entry())
+        .map_err(|_| {
+            DurabilityError::SnapshotVerification(
+                "successor transition Stop entry is not a valid bound configuration change".into(),
+            )
+        })?;
     if identity.cluster_id() != config.cluster_id()
         || identity.epoch() != config.epoch()
         || identity.config_id() != transition.successor().config_id()
@@ -2317,42 +2281,19 @@ fn prepare_fresh_restore_data_dir(
     data_dir: &Path,
     completion_marker_name: Option<&str>,
     expected_intent: &[u8],
-    resume_legacy_v1_intent: bool,
 ) -> Result<(), DurabilityError> {
     if !path_has_state(data_dir)? {
         return Ok(());
     }
 
-    let legacy_intent = data_dir.join(LEGACY_RESTORE_INTENT_FILE);
+    reject_unsupported_restore_intent_artifacts(data_dir)?;
     let intent = data_dir.join(RESTORE_INTENT_FILE);
-    let legacy_metadata = match fs::symlink_metadata(&legacy_intent) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
     let intent_metadata = match fs::symlink_metadata(&intent) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if legacy_metadata.is_some() && intent_metadata.is_some() {
-        return Err(DurabilityError::SnapshotVerification(
-            "both legacy and identity-bound checkpoint restore intents exist".into(),
-        ));
-    }
-    let (active_intent, recovery_identity) = if let Some(metadata) = legacy_metadata {
-        if !resume_legacy_v1_intent
-            || metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || read_bounded_regular_file(&legacy_intent, 4096)?.as_deref()
-                != Some(b"rhiza restore in progress\n")
-        {
-            return Err(DurabilityError::SnapshotVerification(
-                "legacy local checkpoint restore intent requires an exact node-bound v2 identity marker".into(),
-            ));
-        }
-        (&legacy_intent, None)
-    } else if let Some(metadata) = intent_metadata {
+    let (active_intent, recovery_identity) = if let Some(metadata) = intent_metadata {
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || read_bounded_regular_file(&intent, 4096)?.as_deref() != Some(expected_intent)
@@ -2436,6 +2377,24 @@ fn prepare_fresh_restore_data_dir(
     }
     fs::remove_file(active_intent)?;
     sync_directory(data_dir)?;
+    Ok(())
+}
+
+fn reject_unsupported_restore_intent_artifacts(data_dir: &Path) -> Result<(), DurabilityError> {
+    let entries = match fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(RESTORE_INTENT_PREFIX) && name != RESTORE_INTENT_FILE {
+            return Err(DurabilityError::SnapshotVerification(
+                "unsupported local checkpoint restore artifact".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2616,7 +2575,7 @@ mod tests {
         std::fs::create_dir_all(staging.join("sqlite")).unwrap();
 
         assert!(matches!(
-            super::prepare_fresh_restore_data_dir(root.path(), None, &intent, false),
+            super::prepare_fresh_restore_data_dir(root.path(), None, &intent),
             Err(DurabilityError::DataDirNotFresh(_))
         ));
         assert!(staging.join("sqlite").is_dir());
@@ -3034,7 +2993,6 @@ mod tests {
             ExecutionProfile::Kv,
             "identity.json",
             b"identity-fixture",
-            false,
         )
         .await
         .unwrap();
@@ -3055,7 +3013,6 @@ mod tests {
             ExecutionProfile::Kv,
             "identity.json",
             b"identity-fixture",
-            false,
         )
         .await
         .unwrap();

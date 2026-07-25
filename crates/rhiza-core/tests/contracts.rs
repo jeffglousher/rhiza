@@ -1,7 +1,7 @@
 use rhiza_core::{
     canonical_membership_digest, ConfigChange, ConfigurationState, EntryId, EntryType, LogAnchor,
-    LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity, SnapshotManifest, StoredCommand,
-    SuccessorDescriptor, RECOVERY_ANCHOR_FORMAT_VERSION,
+    LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity, SnapshotManifest, StopBinding,
+    StoredCommand, SuccessorDescriptor, RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 
 fn config_entry(index: u64, config_id: u64, prev_hash: LogHash, change: ConfigChange) -> LogEntry {
@@ -188,12 +188,13 @@ fn stored_command_hash_binds_entry_type_and_payload() {
 fn snapshot_manifest_id_uses_zero_padded_snapshot_index() {
     let manifest = SnapshotManifest::new(
         "cluster-a",
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         7,
         104_200,
         LogHash::from_bytes([9; 32]),
         14,
         "node-2",
+        LogHash::from_bytes([6; 32]),
     );
 
     assert_eq!(manifest.snapshot_id(), "snapshot-000000000104200");
@@ -204,12 +205,13 @@ fn snapshot_manifest_id_uses_zero_padded_snapshot_index() {
 fn snapshot_manifest_round_trips_all_snapshot_identity_as_json() {
     let manifest = SnapshotManifest::new(
         "cluster-a",
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         7,
         104_200,
         LogHash::from_bytes([9; 32]),
         14,
         "node-2",
+        LogHash::from_bytes([6; 32]),
     );
 
     let json = serde_json::to_value(&manifest).unwrap();
@@ -239,26 +241,25 @@ fn snapshot_manifest_round_trips_a_known_executor_fingerprint() {
     let executor_fingerprint = LogHash::from_bytes([6; 32]);
     let manifest = SnapshotManifest::new(
         "cluster-a",
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         7,
         104_200,
         LogHash::from_bytes([9; 32]),
         14,
         "node-2",
-    )
-    .with_executor_fingerprint(executor_fingerprint);
+        executor_fingerprint,
+    );
 
     let json = serde_json::to_value(&manifest).unwrap();
     assert_eq!(json["executor_fingerprint"], serde_json::json!(vec![6; 32]));
 
     let decoded: SnapshotManifest = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, manifest);
-    assert_eq!(decoded.executor_fingerprint(), Some(executor_fingerprint));
-    assert!(!decoded.is_legacy_executor_fingerprint());
+    assert_eq!(decoded.executor_fingerprint(), executor_fingerprint);
 }
 
 #[test]
-fn legacy_snapshot_manifest_decodes_without_an_executor_fingerprint() {
+fn snapshot_manifest_rejects_missing_canonical_fields() {
     let legacy = serde_json::json!({
         "snapshot_id": "snapshot-000000000104200",
         "cluster_id": "cluster-a",
@@ -275,13 +276,7 @@ fn legacy_snapshot_manifest_decodes_without_an_executor_fingerprint() {
         "created_by": "node-2",
     });
 
-    let decoded: SnapshotManifest = serde_json::from_value(legacy).unwrap();
-    assert_eq!(decoded.executor_fingerprint(), None);
-    assert!(decoded.is_legacy_executor_fingerprint());
-    assert!(serde_json::to_value(decoded)
-        .unwrap()
-        .get("executor_fingerprint")
-        .is_none());
+    assert!(serde_json::from_value::<SnapshotManifest>(legacy).is_err());
 }
 
 #[test]
@@ -290,15 +285,15 @@ fn recovery_anchor_round_trips_versioned_log_and_snapshot_identity() {
     let anchor = RecoveryAnchor::new(
         "cluster-a",
         7,
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         4,
         LogAnchor::new(104_200, LogHash::from_bytes([8; 32])),
         SnapshotIdentity::new(
             "snapshot-000000000104200",
             LogHash::from_bytes([9; 32]),
             8192,
-        )
-        .with_executor_fingerprint(executor_fingerprint),
+            executor_fingerprint,
+        ),
     );
 
     let json = serde_json::to_value(&anchor).unwrap();
@@ -329,11 +324,11 @@ fn recovery_anchor_round_trips_versioned_log_and_snapshot_identity() {
     assert_eq!(decoded.snapshot().snapshot_id(), "snapshot-000000000104200");
     assert_eq!(decoded.snapshot().digest(), LogHash::from_bytes([9; 32]));
     assert_eq!(decoded.snapshot().size_bytes(), 8192);
-    assert_eq!(decoded.executor_fingerprint(), Some(executor_fingerprint));
+    assert_eq!(decoded.executor_fingerprint(), executor_fingerprint);
 }
 
 #[test]
-fn legacy_recovery_anchor_decodes_without_an_executor_fingerprint() {
+fn recovery_anchor_rejects_missing_canonical_fields_and_legacy_version() {
     let legacy = serde_json::json!({
         "format_version": RECOVERY_ANCHOR_FORMAT_VERSION,
         "cluster_id": "cluster-a",
@@ -356,9 +351,12 @@ fn legacy_recovery_anchor_decodes_without_an_executor_fingerprint() {
         },
     });
 
-    let decoded: RecoveryAnchor = serde_json::from_value(legacy).unwrap();
-    assert_eq!(decoded.executor_fingerprint(), None);
-    assert!(decoded.snapshot().is_legacy_executor_fingerprint());
+    assert!(serde_json::from_value::<RecoveryAnchor>(legacy.clone()).is_err());
+
+    let mut legacy_version = legacy;
+    legacy_version["snapshot"]["executor_fingerprint"] = serde_json::json!(vec![6; 32]);
+    legacy_version["format_version"] = 1.into();
+    assert!(serde_json::from_value::<RecoveryAnchor>(legacy_version).is_err());
 }
 
 #[test]
@@ -632,7 +630,12 @@ fn configuration_state_accepts_only_exact_stop_then_successor_activation() {
     );
     assert_eq!(
         stopped,
-        ConfigurationState::stopped(4, old_digest, LogAnchor::new(10, stop.hash))
+        ConfigurationState::stopped(
+            4,
+            old_digest,
+            LogAnchor::new(10, stop.hash),
+            StopBinding::Unbound,
+        )
     );
 
     let activation = config_entry(
@@ -744,13 +747,14 @@ fn configuration_state_rejects_malformed_or_misbound_transitions() {
 }
 
 #[test]
-fn recovery_anchor_v2_preserves_configuration_state_and_reads_v1_as_active() {
+fn recovery_anchor_v2_preserves_configuration_state_and_rejects_missing_state() {
     let stopped = ConfigurationState::stopped(
         4,
         LogHash::from_bytes([4; 32]),
         LogAnchor::new(10, LogHash::from_bytes([5; 32])),
+        StopBinding::Unbound,
     );
-    let anchor = RecoveryAnchor::new_with_configuration(
+    let anchor = RecoveryAnchor::new(
         "cluster-a",
         7,
         stopped.clone(),
@@ -760,28 +764,23 @@ fn recovery_anchor_v2_preserves_configuration_state_and_reads_v1_as_active() {
             "snapshot-000000000000010",
             LogHash::from_bytes([9; 32]),
             8192,
+            LogHash::from_bytes([6; 32]),
         ),
     );
     let json = serde_json::to_value(&anchor).unwrap();
     assert_eq!(anchor.configuration_state(), &stopped);
     assert_eq!(json["configuration_state"]["phase"], "stopped");
 
-    let mut v1 = json;
-    v1["format_version"] = 1.into();
-    v1.as_object_mut().unwrap().remove("configuration_state");
-    let decoded: RecoveryAnchor = serde_json::from_value(v1).unwrap();
-    assert_eq!(
-        decoded.configuration_state(),
-        &ConfigurationState::active(4, LogHash::ZERO)
-    );
-    assert_eq!(
-        serde_json::from_value::<RecoveryAnchor>(serde_json::to_value(&decoded).unwrap()).unwrap(),
-        decoded
-    );
+    let mut missing_state = json;
+    missing_state
+        .as_object_mut()
+        .unwrap()
+        .remove("configuration_state");
+    assert!(serde_json::from_value::<RecoveryAnchor>(missing_state).is_err());
 }
 
 #[test]
-fn stopped_state_with_missing_binding_decodes_but_rejects_all_activation() {
+fn stopped_state_rejects_missing_binding() {
     let legacy = serde_json::json!({
         "phase": "stopped",
         "config_id": 4,
@@ -792,25 +791,5 @@ fn stopped_state_with_missing_binding_decodes_but_rejects_all_activation() {
         }
     });
 
-    let decoded: ConfigurationState = serde_json::from_value(legacy).unwrap();
-    let stop_hash = LogHash::from_bytes([5; 32]);
-    let successor = ConfigChange::bound_stop(
-        "cluster-a",
-        4,
-        LogHash::from_bytes([4; 32]),
-        5,
-        vec!["r1".into(), "r2".into(), "r3".into()],
-    )
-    .unwrap();
-    let stop_command_hash = successor.to_stored_command().hash();
-    let successor = successor.successor().unwrap().clone();
-
-    for activation in [
-        ConfigChange::activation_barrier(5, successor.digest(), 10, stop_hash),
-        ConfigChange::bound_activation_barrier(successor, 10, stop_hash, stop_command_hash),
-    ] {
-        assert!(decoded
-            .validate_entry(&config_entry(11, 5, stop_hash, activation))
-            .is_err());
-    }
+    assert!(serde_json::from_value::<ConfigurationState>(legacy).is_err());
 }

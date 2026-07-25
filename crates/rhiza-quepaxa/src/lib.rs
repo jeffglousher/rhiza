@@ -98,10 +98,6 @@ pub enum Error {
     InvalidFixedMembershipSize,
     InvalidRecoveredTip,
     Io(String),
-    MigrationRequired {
-        format: &'static str,
-        version: u16,
-    },
     NoQuorum,
     ProposeFailed,
     RandomnessUnavailable(String),
@@ -135,9 +131,6 @@ impl fmt::Display for Error {
             }
             Self::InvalidRecoveredTip => write!(f, "recovered qlog next index must be positive"),
             Self::Io(message) => write!(f, "QuePaxa io failed: {message}"),
-            Self::MigrationRequired { format, version } => {
-                write!(f, "QuePaxa {format} version {version} requires migration")
-            }
             Self::NoQuorum => write!(f, "QuePaxa quorum was not reached"),
             Self::ProposeFailed => write!(f, "QuePaxa propose failed"),
             Self::RandomnessUnavailable(message) => {
@@ -861,33 +854,6 @@ pub enum RecorderRequest {
         config_digest: LogHash,
         slot: Slot,
     },
-    /// Legacy transport envelope; active protocol code uses `RecorderRpc::record`.
-    Observe {
-        cluster_id: ClusterId,
-        epoch: Epoch,
-        config_id: ConfigId,
-        config_digest: LogHash,
-        slot: Slot,
-        ballot: Ballot,
-    },
-    /// Legacy transport envelope; active protocol code uses `RecorderRpc::record`.
-    Converge {
-        cluster_id: ClusterId,
-        epoch: Epoch,
-        config_id: ConfigId,
-        config_digest: LogHash,
-        slot: Slot,
-        ballot: Ballot,
-        value: AcceptedValue,
-    },
-    Decide {
-        cluster_id: ClusterId,
-        epoch: Epoch,
-        config_id: ConfigId,
-        config_digest: LogHash,
-        slot: Slot,
-        decision: DecisionCertificate,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -1049,9 +1015,6 @@ impl RecorderSlotState {
                 config_digest,
                 slot,
             } => self.inspect(cluster_id, epoch, config_id, config_digest, slot),
-            RecorderRequest::Observe { .. }
-            | RecorderRequest::Converge { .. }
-            | RecorderRequest::Decide { .. } => Err(RejectReason::InvalidRequest),
             RecorderRequest::Identity
             | RecorderRequest::StoreCommand { .. }
             | RecorderRequest::FetchCommand { .. } => Err(RejectReason::InvalidRequest),
@@ -1440,15 +1403,7 @@ impl RecorderFileStore {
             }
             (None, None) => {}
         }
-        let name = ".recorder.lock";
-        let path = root.join(name);
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| Error::Decode(format!("recorder is missing {name}")))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(Error::Decode(format!(
-                "recorder {name} must be a regular file"
-            )));
-        }
+        validate_current_recorder_layout(root)?;
         let configuration = decode_configuration_state(&read_regular_file_bounded(
             &root.join("configuration.rec"),
             MAX_CONFIGURATION_BYTES,
@@ -1509,8 +1464,14 @@ impl RecorderFileStore {
         epoch: Epoch,
         config_id: ConfigId,
     ) -> Result<Self> {
-        let (store, existing_format) =
-            Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
+        let root = root.into();
+        let existing_format = current_recorder_layout(&root)?;
+        let (store, _) = Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
+        if current_recorder_layout(&store.root)? != existing_format {
+            return Err(Error::Decode(
+                "recorder layout changed while opening".into(),
+            ));
+        }
         store.open_or_initialize_recorded_head(existing_format)?;
         store.open_or_replay_wal()?;
         Ok(store)
@@ -1524,34 +1485,26 @@ impl RecorderFileStore {
         config_id: ConfigId,
     ) -> Result<(Self, bool)> {
         let root = root.into();
-        let head_exists = root.join("recorded-head.rec").exists();
-        let legacy_files_exist = if root.exists() && !head_exists {
-            fs::read_dir(&root)
-                .map_err(|err| Error::Io(err.to_string()))?
-                .filter_map(std::result::Result::ok)
-                .any(|entry| {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    name == "configuration.rec"
-                        || name.starts_with("slot-")
-                        || name.starts_with("command-")
-                })
-        } else {
-            false
-        };
-        let existing_format = head_exists || legacy_files_exist;
         let recorder_id = recorder_id.into();
         if recorder_id.is_empty() {
             return Err(Error::EmptyRecorderIdentity);
         }
-        fs::create_dir_all(&root).map_err(|err| Error::Io(err.to_string()))?;
-        let root_lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(root.join(".recorder.lock"))
-            .map_err(|err| Error::Io(err.to_string()))?;
+        prepare_fresh_recorder_root(&root)?;
+        if current_recorder_layout(&root)? {
+            return Self::open_existing_root(
+                root,
+                recorder_id,
+                cluster_id.into(),
+                epoch,
+                config_id,
+            );
+        }
+        let root_lock = open_or_create_fresh_root_lock(&root)?;
+        if current_recorder_layout(&root)? {
+            return Err(Error::Decode(
+                "recorder layout changed while opening".into(),
+            ));
+        }
         match root_lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
@@ -1579,7 +1532,7 @@ impl RecorderFileStore {
                 _root_lock: Arc::new(root_lock),
                 sync: Arc::new(Mutex::new(())),
             },
-            existing_format,
+            false,
         ))
     }
 
@@ -1614,23 +1567,6 @@ impl RecorderFileStore {
             }
             Err(fs::TryLockError::Error(error)) => return Err(Error::Io(error.to_string())),
         }
-        let head_exists = fs::symlink_metadata(root.join("recorded-head.rec"))
-            .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
-            .unwrap_or(false);
-        let legacy_files_exist = if !head_exists {
-            fs::read_dir(&root)
-                .map_err(|error| Error::Io(error.to_string()))?
-                .filter_map(std::result::Result::ok)
-                .any(|entry| {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    name == "configuration.rec"
-                        || name.starts_with("slot-")
-                        || name.starts_with("command-")
-                })
-        } else {
-            false
-        };
         Ok((
             Self {
                 root,
@@ -1651,7 +1587,7 @@ impl RecorderFileStore {
                 _root_lock: Arc::new(root_lock),
                 sync: Arc::new(Mutex::new(())),
             },
-            head_exists || legacy_files_exist,
+            true,
         ))
     }
 
@@ -1705,32 +1641,35 @@ impl RecorderFileStore {
         membership: Membership,
         existing_only: bool,
     ) -> Result<Self> {
-        let (mut store, existing_format) = if existing_only {
+        let preflight = Self::preflight_existing_with_membership_outcome(
+            &root,
+            &cluster_id,
+            epoch,
+            config_id,
+            &membership,
+        )?;
+        if existing_only && preflight == RecorderPreflight::Missing {
+            return Err(Error::Decode(
+                "recorder root is missing durable state".into(),
+            ));
+        }
+        let existing_format = preflight != RecorderPreflight::Missing;
+        let (mut store, _) = if existing_format {
             Self::open_existing_root(root, recorder_id, cluster_id, epoch, config_id)?
         } else {
             Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?
         };
-        // Preflight is advisory until this process owns the recorder lock. Re-run the same
-        // bounded, no-follow validation under that lock before an intent can rewrite authority
-        // files, so a path replacement after startup classification cannot authorize mutation.
-        match Self::preflight_existing_with_membership_outcome(
+        let revalidated = Self::preflight_existing_with_membership_outcome(
             &store.root,
             &store.cluster_id,
             store.epoch,
             config_id,
             &membership,
-        ) {
-            Ok(RecorderPreflight::Missing) if existing_only => {
-                return Err(Error::Decode(
-                    "recorder root is missing durable state".into(),
-                ))
-            }
-            Ok(_) => {}
-            // A pre-manifest recorder is legacy state. Preserve the established migration error
-            // below; it cannot reach intent recovery because it has no complete authority set.
-            Err(Error::Decode(message))
-                if existing_format && message.starts_with("recorder is missing ") => {}
-            Err(error) => return Err(error),
+        )?;
+        if revalidated != preflight {
+            return Err(Error::Decode(
+                "recorder layout changed while opening".into(),
+            ));
         }
         store.recover_configuration_head_intent()?;
         let configured = match read_regular_file_bounded(
@@ -1740,12 +1679,6 @@ impl RecorderFileStore {
         ) {
             Ok(bytes) => decode_configuration_state(&bytes)?,
             Err(Error::Decode(message)) if message == "recorder is missing configuration.rec" => {
-                if existing_format {
-                    return Err(Error::MigrationRequired {
-                        format: "recorder durable head",
-                        version: 2,
-                    });
-                }
                 let configured =
                     ConfigurationState::initial(config_id, membership.digest(), Some(membership));
                 store.commit_configuration_head_unlocked(
@@ -1967,14 +1900,6 @@ impl RecorderFileStore {
     }
 
     pub fn apply(&self, request: RecorderRequest) -> Result<RecorderReply> {
-        if matches!(
-            request,
-            RecorderRequest::Observe { .. }
-                | RecorderRequest::Converge { .. }
-                | RecorderRequest::Decide { .. }
-        ) {
-            return Err(Error::Rejected(RejectReason::InvalidRequest));
-        }
         if !matches!(request, RecorderRequest::Identity) {
             self.validate_request_context(&request)?;
         }
@@ -2038,43 +1963,11 @@ impl RecorderFileStore {
                 self.recover_intent()?;
                 self.validate_request_context(&request)?;
                 let configuration = self.configuration_state()?;
-                let change = match &request {
-                    RecorderRequest::Converge { value, .. } => {
-                        self.change_for_value_unlocked(value)?
-                    }
-                    RecorderRequest::Decide { decision, .. } => {
-                        if let Some(membership) = configuration.membership.as_ref() {
-                            decision
-                                .validate_for(configuration.config_id, membership)
-                                .map_err(Error::Rejected)?;
-                        }
-                        self.change_for_value_unlocked(&decision.value)?
-                    }
-                    _ => None,
-                };
-                if !configuration.activated
-                    && change.is_none()
-                    && matches!(
-                        &request,
-                        RecorderRequest::Converge { .. } | RecorderRequest::Decide { .. }
-                    )
-                {
-                    return Err(Error::Rejected(RejectReason::ActivationRequired));
-                }
-                self.validate_slot_gate(&configuration, slot, change.as_ref())?;
-                match &request {
-                    RecorderRequest::Converge { value, .. } => {
-                        self.validate_value_unlocked(slot, value)?;
-                    }
-                    RecorderRequest::Decide { decision, .. } => {
-                        self.validate_value_unlocked(slot, &decision.value)?;
-                    }
-                    _ => {}
-                }
+                self.validate_slot_gate(&configuration, slot, None)?;
                 let mut state = self.load_unlocked(slot, request_digest)?;
                 let mut reply = state.apply(request).map_err(Error::Rejected)?;
                 let next_configuration =
-                    self.transition_after_apply(&configuration, &state, change.as_ref(), None)?;
+                    self.transition_after_apply(&configuration, &state, None, None)?;
                 if should_save || next_configuration != configuration {
                     self.persist_state_transition_unlocked(
                         &state,
@@ -2370,10 +2263,7 @@ impl RecorderFileStore {
             }
             Err(Error::Decode(message)) if message == "recorder is missing recorded-head.rec" => {
                 if existing_format {
-                    return Err(Error::MigrationRequired {
-                        format: "recorder durable head",
-                        version: 2,
-                    });
+                    return Err(noncurrent_recorder_layout_error());
                 }
                 let head = RecordedHeadProvenance::Empty;
                 let wal_checkpoint = WalCheckpoint::default();
@@ -5541,10 +5431,7 @@ impl Consensus for ThreeNodeConsensus {
 
 fn request_slot(request: &RecorderRequest) -> Option<Slot> {
     match request {
-        RecorderRequest::Inspect { slot, .. }
-        | RecorderRequest::Observe { slot, .. }
-        | RecorderRequest::Converge { slot, .. }
-        | RecorderRequest::Decide { slot, .. } => Some(*slot),
+        RecorderRequest::Inspect { slot, .. } => Some(*slot),
         RecorderRequest::Identity
         | RecorderRequest::StoreCommand { .. }
         | RecorderRequest::FetchCommand { .. } => None,
@@ -5568,27 +5455,6 @@ fn request_context(request: &RecorderRequest) -> Option<(&ClusterId, Epoch, Conf
             ..
         }
         | RecorderRequest::Inspect {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Observe {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Converge {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Decide {
             cluster_id,
             epoch,
             config_id,
@@ -5646,12 +5512,8 @@ fn decode_configuration_state(bytes: &[u8]) -> Result<ConfigurationState> {
         return Err(Error::Decode("configuration digest mismatch".into()));
     }
     let mut cursor = 4;
-    let version = read_u16(body, &mut cursor)?;
-    if version != CONFIGURATION_STATE_VERSION {
-        return Err(Error::MigrationRequired {
-            format: "QCON",
-            version,
-        });
+    if read_u16(body, &mut cursor)? != CONFIGURATION_STATE_VERSION {
+        return Err(noncurrent_recorder_layout_error());
     }
     let config_id = read_u64(body, &mut cursor)?;
     let config_digest = read_hash(body, &mut cursor)?;
@@ -5804,12 +5666,8 @@ fn decode_recorder_state(bytes: &[u8]) -> Result<RecorderSlotState> {
         return Err(Error::Decode("recorder digest mismatch".into()));
     }
     let mut cursor = 4;
-    let version = read_u16(body, &mut cursor)?;
-    if version != RECORDER_STATE_VERSION {
-        return Err(Error::MigrationRequired {
-            format: "QREC",
-            version,
-        });
+    if read_u16(body, &mut cursor)? != RECORDER_STATE_VERSION {
+        return Err(noncurrent_recorder_layout_error());
     }
     let slot = read_u64(body, &mut cursor)?;
     let epoch = read_u64(body, &mut cursor)?;
@@ -6522,6 +6380,73 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File> {
         .map_err(|error| Error::Io(error.to_string()))
 }
 
+fn prepare_fresh_recorder_root(root: &Path) -> Result<()> {
+    if let Some(parent) = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_real_directory_if_missing(parent)?;
+    }
+    match fs::create_dir(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(Error::Io(error.to_string())),
+    }
+    ensure_real_directory(root, "recorder root")
+}
+
+fn create_real_directory_if_missing(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => return ensure_real_directory(path, "recorder root parent"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::Io(error.to_string())),
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_real_directory_if_missing(parent)?;
+    }
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(Error::Io(error.to_string())),
+    }
+    ensure_real_directory(path, "recorder root parent")
+}
+
+fn ensure_real_directory(path: &Path, name: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Decode(format!("{name} must be a real directory")));
+    }
+    Ok(())
+}
+
+fn open_or_create_fresh_root_lock(root: &Path) -> Result<fs::File> {
+    let path = root.join(".recorder.lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    options.custom_flags(O_NOFOLLOW_FLAG);
+    match options.open(&path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_existing_root_lock(&path)
+        }
+        Err(error) => Err(Error::Io(error.to_string())),
+    }
+}
+
 fn open_existing_root_lock(path: &Path) -> Result<fs::File> {
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -6580,6 +6505,53 @@ fn same_opened_file(opened: &fs::Metadata, linked: &fs::Metadata) -> bool {
     opened.file_type() == linked.file_type()
         && opened.len() == linked.len()
         && opened.modified().ok() == linked.modified().ok()
+}
+
+fn current_recorder_layout(root: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Error::Io(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Decode(
+            "recorder root must be a real directory".into(),
+        ));
+    }
+    let entries = fs::read_dir(root)
+        .map_err(|error| Error::Io(error.to_string()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    if entries.is_empty()
+        || entries
+            .iter()
+            .all(|entry| entry.file_name() == ".recorder.lock")
+    {
+        return Ok(false);
+    }
+    validate_current_recorder_layout(root)?;
+    Ok(true)
+}
+
+fn noncurrent_recorder_layout_error() -> Error {
+    Error::Decode("recorder directory is not a current durable layout".into())
+}
+
+fn validate_current_recorder_layout(root: &Path) -> Result<()> {
+    for name in [
+        ".recorder.lock",
+        "configuration.rec",
+        "recorded-head.rec",
+        "recorder.wal",
+    ] {
+        let metadata = fs::symlink_metadata(root.join(name)).ok();
+        if !metadata
+            .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+        {
+            return Err(noncurrent_recorder_layout_error());
+        }
+    }
+    Ok(())
 }
 
 fn read_preflight_intent(root: &Path, name: &str, maximum: usize) -> Result<Option<Vec<u8>>> {
@@ -6963,10 +6935,7 @@ fn decode_recorded_head(
     }
     let mut version_cursor = RECORDED_HEAD_MAGIC.len();
     if read_u16(bytes, &mut version_cursor)? != RECORDED_HEAD_VERSION {
-        return Err(Error::MigrationRequired {
-            format: "recorder durable head",
-            version: RECORDED_HEAD_VERSION,
-        });
+        return Err(noncurrent_recorder_layout_error());
     }
     if bytes.len() < 32 {
         return Err(Error::Decode("truncated recorder durable head".into()));
@@ -9225,6 +9194,37 @@ mod tests {
         assert_eq!(directory_files(target.path()), before);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fresh_open_rejects_a_symlinked_parent_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let root = parent.path().join("linked-parent").join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        std::fs::write(target.path().join("sentinel"), b"untouched").unwrap();
+        let before = directory_files(target.path());
+        symlink(target.path(), parent.path().join("linked-parent")).unwrap();
+
+        assert!(
+            RecorderFileStore::new_with_membership(&root, "n1", "cluster", 1, 1, membership,)
+                .is_err()
+        );
+        assert!(
+            std::fs::symlink_metadata(parent.path().join("linked-parent"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!target
+            .path()
+            .join("recorder")
+            .join(".recorder.lock")
+            .exists());
+        assert_eq!(directory_files(target.path()), before);
+    }
+
     #[test]
     fn wal_fails_closed_on_interior_corruption() {
         let root = tempfile::tempdir().unwrap();
@@ -9420,9 +9420,7 @@ mod tests {
     fn fresh_initialization_recovers_when_configuration_was_published_before_head() {
         let root = tempfile::tempdir().unwrap();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-        let (store, existing_format) =
-            RecorderFileStore::open_root(root.path(), "n1", "cluster", 1, 1).unwrap();
-        assert!(!existing_format);
+        let (store, _) = RecorderFileStore::open_root(root.path(), "n1", "cluster", 1, 1).unwrap();
         let configuration =
             ConfigurationState::initial(1, membership.digest(), Some(membership.clone()));
         store

@@ -92,7 +92,6 @@ impl ErrorClassification {
 }
 
 pub const RECOVERY_ANCHOR_FORMAT_VERSION: u32 = 2;
-pub const RECOVERY_ANCHOR_V1_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LogHash([u8; 32]);
@@ -159,11 +158,9 @@ impl LogAnchor {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StopBinding {
-    #[default]
-    Unknown,
     Unbound,
     Bound {
         successor: SuccessorDescriptor,
@@ -182,7 +179,6 @@ pub enum ConfigurationState {
         config_id: ConfigId,
         digest: LogHash,
         stop: LogAnchor,
-        #[serde(default)]
         binding: StopBinding,
     },
 }
@@ -192,12 +188,17 @@ impl ConfigurationState {
         Self::Active { config_id, digest }
     }
 
-    pub const fn stopped(config_id: ConfigId, digest: LogHash, stop: LogAnchor) -> Self {
+    pub const fn stopped(
+        config_id: ConfigId,
+        digest: LogHash,
+        stop: LogAnchor,
+        binding: StopBinding,
+    ) -> Self {
         Self::Stopped {
             config_id,
             digest,
             stop,
-            binding: StopBinding::Unbound,
+            binding,
         }
     }
 
@@ -252,6 +253,7 @@ impl ConfigurationState {
                     *config_id,
                     config_digest,
                     LogAnchor::new(entry.index, entry.hash),
+                    StopBinding::Unbound,
                 ))
             }
             (Self::Active { config_id, digest }, Some(ConfigChange::BoundStop { successor }))
@@ -366,23 +368,22 @@ pub struct SnapshotIdentity {
     snapshot_id: String,
     digest: LogHash,
     size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_fingerprint: Option<LogHash>,
+    executor_fingerprint: LogHash,
 }
 
 impl SnapshotIdentity {
-    pub fn new(snapshot_id: impl Into<String>, digest: LogHash, size_bytes: u64) -> Self {
+    pub fn new(
+        snapshot_id: impl Into<String>,
+        digest: LogHash,
+        size_bytes: u64,
+        executor_fingerprint: LogHash,
+    ) -> Self {
         Self {
             snapshot_id: snapshot_id.into(),
             digest,
             size_bytes,
-            executor_fingerprint: None,
+            executor_fingerprint,
         }
-    }
-
-    pub fn with_executor_fingerprint(mut self, executor_fingerprint: LogHash) -> Self {
-        self.executor_fingerprint = Some(executor_fingerprint);
-        self
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -397,12 +398,8 @@ impl SnapshotIdentity {
         self.size_bytes
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.executor_fingerprint
-    }
-
-    pub const fn is_legacy_executor_fingerprint(&self) -> bool {
-        self.executor_fingerprint.is_none()
     }
 }
 
@@ -423,26 +420,6 @@ impl RecoveryAnchor {
     pub fn new(
         cluster_id: impl Into<ClusterId>,
         epoch: Epoch,
-        config_id: ConfigId,
-        recovery_generation: u64,
-        compacted: LogAnchor,
-        snapshot: SnapshotIdentity,
-    ) -> Self {
-        Self {
-            format_version: RECOVERY_ANCHOR_FORMAT_VERSION,
-            cluster_id: cluster_id.into(),
-            epoch,
-            config_id,
-            configuration_state: ConfigurationState::active(config_id, LogHash::ZERO),
-            recovery_generation,
-            compacted,
-            snapshot,
-        }
-    }
-
-    pub fn new_with_configuration(
-        cluster_id: impl Into<ClusterId>,
-        epoch: Epoch,
         configuration_state: ConfigurationState,
         recovery_generation: u64,
         compacted: LogAnchor,
@@ -454,26 +431,6 @@ impl RecoveryAnchor {
             epoch,
             config_id: configuration_state.config_id(),
             configuration_state,
-            recovery_generation,
-            compacted,
-            snapshot,
-        }
-    }
-
-    pub fn from_v1(
-        cluster_id: impl Into<ClusterId>,
-        epoch: Epoch,
-        config_id: ConfigId,
-        recovery_generation: u64,
-        compacted: LogAnchor,
-        snapshot: SnapshotIdentity,
-    ) -> Self {
-        Self {
-            format_version: RECOVERY_ANCHOR_V1_FORMAT_VERSION,
-            cluster_id: cluster_id.into(),
-            epoch,
-            config_id,
-            configuration_state: ConfigurationState::active(config_id, LogHash::ZERO),
             recovery_generation,
             compacted,
             snapshot,
@@ -512,7 +469,7 @@ impl RecoveryAnchor {
         &self.snapshot
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.snapshot.executor_fingerprint()
     }
 }
@@ -529,40 +486,26 @@ impl<'de> serde::Deserialize<'de> for RecoveryAnchor {
             cluster_id: ClusterId,
             epoch: Epoch,
             config_id: ConfigId,
-            #[serde(default)]
-            configuration_state: Option<ConfigurationState>,
+            configuration_state: ConfigurationState,
             recovery_generation: u64,
             compacted: LogAnchor,
             snapshot: SnapshotIdentity,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let configuration_state = match (wire.format_version, wire.configuration_state) {
-            (RECOVERY_ANCHOR_V1_FORMAT_VERSION, None) => {
-                ConfigurationState::active(wire.config_id, LogHash::ZERO)
-            }
-            (RECOVERY_ANCHOR_V1_FORMAT_VERSION, Some(state))
-                if state == ConfigurationState::active(wire.config_id, LogHash::ZERO) =>
-            {
-                state
-            }
-            (RECOVERY_ANCHOR_FORMAT_VERSION, Some(state))
-                if state.config_id() == wire.config_id =>
-            {
-                state
-            }
-            _ => {
-                return Err(serde::de::Error::custom(
-                    "invalid recovery anchor configuration state",
-                ))
-            }
-        };
+        if wire.format_version != RECOVERY_ANCHOR_FORMAT_VERSION
+            || wire.configuration_state.config_id() != wire.config_id
+        {
+            return Err(serde::de::Error::custom(
+                "invalid recovery anchor configuration state",
+            ));
+        }
         Ok(Self {
             format_version: wire.format_version,
             cluster_id: wire.cluster_id,
             epoch: wire.epoch,
             config_id: wire.config_id,
-            configuration_state,
+            configuration_state: wire.configuration_state,
             recovery_generation: wire.recovery_generation,
             compacted: wire.compacted,
             snapshot: wire.snapshot,
@@ -1467,35 +1410,12 @@ pub struct SnapshotManifest {
     applied_hash: LogHash,
     schema_version: u64,
     created_by: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_fingerprint: Option<LogHash>,
+    executor_fingerprint: LogHash,
 }
 
 impl SnapshotManifest {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cluster_id: impl Into<ClusterId>,
-        config_id: ConfigId,
-        epoch: Epoch,
-        index: LogIndex,
-        applied_hash: LogHash,
-        schema_version: u64,
-        created_by: impl Into<NodeId>,
-    ) -> Self {
-        Self {
-            snapshot_id: format!("snapshot-{index:015}"),
-            cluster_id: cluster_id.into(),
-            config_id,
-            configuration_state: ConfigurationState::active(config_id, LogHash::ZERO),
-            epoch,
-            index,
-            applied_hash,
-            schema_version,
-            created_by: created_by.into(),
-            executor_fingerprint: None,
-        }
-    }
-
-    pub fn new_with_configuration(
         cluster_id: impl Into<ClusterId>,
         configuration_state: ConfigurationState,
         epoch: Epoch,
@@ -1503,6 +1423,7 @@ impl SnapshotManifest {
         applied_hash: LogHash,
         schema_version: u64,
         created_by: impl Into<NodeId>,
+        executor_fingerprint: LogHash,
     ) -> Self {
         Self {
             snapshot_id: format!("snapshot-{index:015}"),
@@ -1514,13 +1435,8 @@ impl SnapshotManifest {
             applied_hash,
             schema_version,
             created_by: created_by.into(),
-            executor_fingerprint: None,
+            executor_fingerprint,
         }
-    }
-
-    pub fn with_executor_fingerprint(mut self, executor_fingerprint: LogHash) -> Self {
-        self.executor_fingerprint = Some(executor_fingerprint);
-        self
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -1563,12 +1479,8 @@ impl SnapshotManifest {
         self.applied_hash
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.executor_fingerprint
-    }
-
-    pub const fn is_legacy_executor_fingerprint(&self) -> bool {
-        self.executor_fingerprint.is_none()
     }
 }
 
@@ -1583,22 +1495,17 @@ impl<'de> serde::Deserialize<'de> for SnapshotManifest {
             snapshot_id: String,
             cluster_id: ClusterId,
             config_id: ConfigId,
-            #[serde(default)]
-            configuration_state: Option<ConfigurationState>,
+            configuration_state: ConfigurationState,
             epoch: Epoch,
             index: LogIndex,
             applied_hash: LogHash,
             schema_version: u64,
             created_by: NodeId,
-            #[serde(default)]
-            executor_fingerprint: Option<LogHash>,
+            executor_fingerprint: LogHash,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let configuration_state = wire
-            .configuration_state
-            .unwrap_or_else(|| ConfigurationState::active(wire.config_id, LogHash::ZERO));
-        if configuration_state.config_id() != wire.config_id {
+        if wire.configuration_state.config_id() != wire.config_id {
             return Err(serde::de::Error::custom(
                 "snapshot configuration state does not match config_id",
             ));
@@ -1607,7 +1514,7 @@ impl<'de> serde::Deserialize<'de> for SnapshotManifest {
             snapshot_id: wire.snapshot_id,
             cluster_id: wire.cluster_id,
             config_id: wire.config_id,
-            configuration_state,
+            configuration_state: wire.configuration_state,
             epoch: wire.epoch,
             index: wire.index,
             applied_hash: wire.applied_hash,

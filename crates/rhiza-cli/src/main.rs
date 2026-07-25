@@ -2237,19 +2237,15 @@ fn parse_configuration_bundle(json: &str) -> Result<ConfigurationBundle, String>
         .predecessor
         .map(|predecessor| parse_predecessor(document.config_id, &membership, predecessor))
         .transpose()?;
-    let configuration_state = predecessor
-        .as_ref()
-        .map(|predecessor| {
-            ConfigurationState::stopped(
-                predecessor.stop.entry.config_id,
-                predecessor.membership.digest(),
-                rhiza_core::LogAnchor::new(
-                    predecessor.stop.entry.index,
-                    predecessor.stop.entry.hash,
-                ),
-            )
-        })
-        .unwrap_or_else(|| ConfigurationState::active(document.config_id, membership.digest()));
+    let configuration_state = match predecessor.as_ref() {
+        Some(predecessor) => ConfigurationState::active(
+            predecessor.stop.entry.config_id,
+            predecessor.membership.digest(),
+        )
+        .validate_entry(&predecessor.stop.entry)
+        .map_err(|error| format!("invalid predecessor stop entry: {error}"))?,
+        None => ConfigurationState::active(document.config_id, membership.digest()),
+    };
     Ok(ConfigurationBundle {
         config_id: document.config_id,
         peers,
@@ -4478,7 +4474,6 @@ async fn prepare_remote_startup_with_membership(
                     node_id,
                     LOCAL_CHECKPOINT_IDENTITY_FILE,
                     &marker,
-                    false,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -4527,7 +4522,6 @@ async fn prepare_remote_startup_with_membership(
                 node_id,
                 execution_profile,
                 checkpoint_root,
-                exact_marker_exists,
             )
             .map_err(|error| error.to_string())?;
             // A normal nonfresh rejoin is fenced by the exact node-bound marker. The only
@@ -4561,8 +4555,6 @@ async fn prepare_remote_startup_with_membership(
                         node_id,
                         LOCAL_CHECKPOINT_IDENTITY_FILE,
                         &marker,
-                        restore_state
-                            == rhiza_node::durability::CheckpointRestoreState::LegacyV1,
                     )
                     .await
                 } else {
@@ -4573,8 +4565,6 @@ async fn prepare_remote_startup_with_membership(
                         execution_profile,
                         LOCAL_CHECKPOINT_IDENTITY_FILE,
                         &marker,
-                        restore_state
-                            == rhiza_node::durability::CheckpointRestoreState::LegacyV1,
                     )
                     .await
                 }
@@ -4622,7 +4612,6 @@ async fn prepare_remote_startup_with_membership(
                     execution_profile,
                     LOCAL_CHECKPOINT_IDENTITY_FILE,
                     &marker,
-                    false,
                 )
                 .await
                 .map_err(|restore_error| {
@@ -4668,31 +4657,26 @@ async fn prepare_remote_startup_with_membership(
                 checkpoint.manifest().tip().index(),
                 checkpoint.manifest().tip().hash(),
             );
-            let exact_marker_exists =
-                match fs::symlink_metadata(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)) {
-                    Ok(_) => {
-                        read_and_validate_local_checkpoint_identity_marker(
-                            data_dir,
-                            execution_profile,
-                            identity,
-                            node_id,
-                        )?;
-                        true
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                    Err(error) => {
-                        return Err(format!(
-                            "cannot inspect local checkpoint identity marker: {error}"
-                        ))
-                    }
-                };
+            match fs::symlink_metadata(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)) {
+                Ok(_) => read_and_validate_local_checkpoint_identity_marker(
+                    data_dir,
+                    execution_profile,
+                    identity,
+                    node_id,
+                )?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect local checkpoint identity marker: {error}"
+                    ))
+                }
+            }
             let restore_state = rhiza_node::durability::checkpoint_restore_in_progress(
                 data_dir,
                 identity,
                 node_id,
                 execution_profile,
                 checkpoint_root,
-                exact_marker_exists,
             )
             .map_err(|error| error.to_string())?;
             if restore_state == rhiza_node::durability::CheckpointRestoreState::None
@@ -4708,7 +4692,6 @@ async fn prepare_remote_startup_with_membership(
                 node_id,
                 LOCAL_CHECKPOINT_IDENTITY_FILE,
                 &marker,
-                restore_state == rhiza_node::durability::CheckpointRestoreState::LegacyV1,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -5495,7 +5478,10 @@ mod tests {
     #[cfg(feature = "sql")]
     use rhiza_quepaxa::{RecordRequest, RecordSummary};
     #[cfg(feature = "sql")]
-    use rhiza_sql::{encode_sql_command, SqlBatchMember, SqlCommand, SqliteStateMachine};
+    use rhiza_sql::{
+        encode_sql_command, sql_executor_fingerprint, SqlBatchMember, SqlCommand,
+        SqliteStateMachine,
+    };
 
     use super::*;
 
@@ -7289,7 +7275,7 @@ mod tests {
                     .unwrap();
                 let payload = preparation
                     .effect
-                    .expect("successful checkpoint fixture batch produces one QWAL v2 effect");
+                    .expect("successful checkpoint fixture batch produces one QWAL v3 effect");
                 let hash = LogEntry::calculate_hash(
                     "rhiza:sql:cluster-a",
                     index,
@@ -7917,13 +7903,17 @@ mod tests {
                 RecoveryAnchor::new(
                     "rhiza:sql:cluster-a",
                     1,
-                    1,
+                    ConfigurationState::active(
+                        1,
+                        LogHash::digest(&[b"cli-roll-checkpoint-test-config"]),
+                    ),
                     1,
                     LogAnchor::new(2, committed[1].hash),
                     SnapshotIdentity::new(
                         "cli-roll-snapshot",
                         LogHash::digest(&[bytes]),
                         bytes.len() as u64,
+                        sql_executor_fingerprint().unwrap(),
                     ),
                 ),
                 bytes,
@@ -8048,40 +8038,36 @@ mod tests {
             .publish_checkpoint_snapshot(recovery.anchor().clone(), recovery.db_bytes())
             .await
             .unwrap();
-        let interrupted_rejoin_dir = root.path().join("interrupted-rejoin");
-        std::fs::create_dir_all(interrupted_rejoin_dir.join("sqlite")).unwrap();
+        let unsupported_restore_intent_dir = root.path().join("unsupported-restore-intent");
+        std::fs::create_dir_all(unsupported_restore_intent_dir.join("sqlite")).unwrap();
         write_local_checkpoint_identity_marker(
-            &interrupted_rejoin_dir,
+            &unsupported_restore_intent_dir,
             ExecutionProfile::Sqlite,
             archive.checkpoint_identity().unwrap(),
             "node-1",
         )
         .unwrap();
         std::fs::write(
-            interrupted_rejoin_dir.join(".rhiza-restore-v1"),
+            unsupported_restore_intent_dir.join(".rhiza-restore-v1"),
             b"rhiza restore in progress\n",
         )
         .unwrap();
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &interrupted_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
-                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert!(interrupted_rejoin_dir
-            .join(LOCAL_CHECKPOINT_IDENTITY_FILE)
-            .is_file());
-        assert!(!interrupted_rejoin_dir.join(".rhiza-restore-v1").exists());
-        assert!(!interrupted_rejoin_dir
-            .join(".rhiza-restore-v2.json")
-            .exists());
+        let unsupported_restore_intent_before =
+            directory_file_bytes(&unsupported_restore_intent_dir);
+        assert!(prepare_remote_startup(
+            StartupMode::Rejoin,
+            &archive,
+            &unsupported_restore_intent_dir,
+            "node-1",
+            ExecutionProfile::Sqlite,
+        )
+        .await
+        .unwrap_err()
+        .contains("unsupported"));
+        assert_eq!(
+            directory_file_bytes(&unsupported_restore_intent_dir),
+            unsupported_restore_intent_before
+        );
         let fresh_bootstrap_dir = root.path().join("fresh-bootstrap-nonempty");
         assert!(prepare_remote_startup(
             StartupMode::Bootstrap,
@@ -8469,8 +8455,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            ambiguous_intent.join(".rhiza-restore-v1"),
-            b"rhiza restore in progress\n",
+            ambiguous_intent.join(".rhiza-restore-unknown"),
+            b"unsupported restore intent",
         )
         .unwrap();
         let ambiguous_before = directory_file_bytes(&ambiguous_intent);
@@ -8483,7 +8469,7 @@ mod tests {
         )
         .await
         .unwrap_err()
-        .contains("both legacy and identity-bound"));
+        .contains("unsupported"));
         assert_eq!(directory_file_bytes(&ambiguous_intent), ambiguous_before);
 
         let mismatch = root.path().join("mismatch");

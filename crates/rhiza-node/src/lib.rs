@@ -8506,9 +8506,11 @@ impl NodeRuntime {
             || manifest.cluster_id() != anchor.cluster_id()
             || manifest.epoch() != anchor.epoch()
             || manifest.config_id() != anchor.config_id()
+            || manifest.configuration_state() != anchor.configuration_state()
             || manifest.index() != anchor.compacted().index()
             || manifest.applied_hash() != anchor.compacted().hash()
             || manifest.snapshot_id() != anchor.snapshot().snapshot_id()
+            || manifest.executor_fingerprint() != anchor.snapshot().executor_fingerprint()
             || publication_digest != anchor.snapshot().digest()
             || publication.size_bytes() != anchor.snapshot().size_bytes()
             || LogHash::digest(&[snapshot.db_bytes()]) != anchor.snapshot().digest()
@@ -9382,8 +9384,8 @@ mod tests {
     use axum::http::HeaderValue;
 
     use rhiza_core::{
-        Command, CommandKind, EntryType, ErrorCategory, ErrorClassification, ExecutionProfile,
-        LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
+        Command, CommandKind, ConfigurationState, EntryType, ErrorCategory, ErrorClassification,
+        ExecutionProfile, LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
@@ -9534,10 +9536,15 @@ mod tests {
         let snapshot = RecoveryAnchor::new(
             "cluster",
             1,
-            1,
+            ConfigurationState::active(1, LogHash::digest(&[b"node-error-test-config"])),
             1,
             LogAnchor::new(1, LogHash::ZERO),
-            SnapshotIdentity::new("snapshot", LogHash::ZERO, 0),
+            SnapshotIdentity::new(
+                "snapshot",
+                LogHash::digest(&[b"node-error-test-snapshot"]),
+                0,
+                rhiza_sql::sql_executor_fingerprint().unwrap(),
+            ),
         );
         let cases = vec![
             (

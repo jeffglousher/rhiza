@@ -4,7 +4,7 @@ use rhiza_archive::{
 };
 use rhiza_core::{
     canonical_membership_digest, ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry,
-    LogHash, RecoveryAnchor, Snapshot, SnapshotIdentity, SnapshotManifest,
+    LogHash, RecoveryAnchor, Snapshot, SnapshotIdentity, SnapshotManifest, StopBinding,
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore, SegmentFile};
 use rhiza_obj_store::{Error as ObjStoreError, ObjStore, ObjStoreConfig};
@@ -463,7 +463,7 @@ async fn restored_entries_rebuild_an_empty_file_log_store() {
 }
 
 #[tokio::test]
-async fn v1_genesis_manifest_migrates_without_losing_segments() {
+async fn v1_manifest_is_rejected_without_overwriting_it() {
     let (_dir, store, archive) = local_checkpoint(checkpoint_identity());
     let published = archive
         .publish_committed(&entries(1, 2, LogHash::ZERO))
@@ -471,7 +471,6 @@ async fn v1_genesis_manifest_migrates_without_losing_segments() {
         .unwrap();
     let mut v1 = serde_json::to_value(published.manifest()).unwrap();
     v1["format_version"] = 1.into();
-    v1.as_object_mut().unwrap().remove("base");
     store
         .put(
             &archive.checkpoint_manifest_key().unwrap(),
@@ -480,14 +479,32 @@ async fn v1_genesis_manifest_migrates_without_losing_segments() {
         .await
         .unwrap();
 
-    let loaded = archive.load_checkpoint().await.unwrap().unwrap();
-    assert_eq!(loaded.manifest().base(), &CheckpointBase::Genesis);
-    assert_eq!(loaded.manifest().segments().len(), 1);
-
-    let migrated = archive.initialize_checkpoint().await.unwrap();
-    assert_eq!(migrated.manifest().format_version(), 2);
-    assert_eq!(migrated.manifest().segments(), loaded.manifest().segments());
-    assert_eq!(archive.restore_checkpoint().await.unwrap().len(), 2);
+    let key = archive.checkpoint_manifest_key().unwrap();
+    let before = store.get(&key).await.unwrap();
+    assert!(matches!(
+        archive.load_checkpoint().await,
+        Err(Error::UnsupportedFormatVersion {
+            object: "checkpoint manifest",
+            version: 1,
+        })
+    ));
+    assert!(matches!(
+        archive.initialize_checkpoint().await,
+        Err(Error::UnsupportedFormatVersion {
+            object: "checkpoint manifest",
+            version: 1,
+        })
+    ));
+    assert!(matches!(
+        archive
+            .publish_committed(&entries(3, 3, LogHash::from_bytes([1; 32])))
+            .await,
+        Err(Error::UnsupportedFormatVersion {
+            object: "checkpoint manifest",
+            version: 1,
+        })
+    ));
+    assert_eq!(store.get(&key).await.unwrap(), before);
 }
 
 #[tokio::test]
@@ -512,7 +529,11 @@ async fn snapshot_base_restores_snapshot_and_exact_tail() {
     assert!(snapshot_key.contains(
         "rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003/generation-00000000000000000004/snapshots/00000000000000000002-"
     ));
-    assert!(snapshot_key.ends_with(&format!("-{}.snapshot", LogHash::digest(&[bytes]).to_hex())));
+    assert!(snapshot_key.ends_with(&format!(
+        "-{}-{}.snapshot",
+        LogHash::digest(&[bytes]).to_hex(),
+        anchor.executor_fingerprint().to_hex(),
+    )));
     assert_eq!(advanced.manifest().segments().len(), 1);
     assert_eq!(advanced.manifest().segments()[0].start_index(), 3);
 
@@ -534,8 +555,13 @@ async fn format2_snapshot_anchor_round_trips_configuration_state() {
     archive.publish_committed(&committed).await.unwrap();
     let bytes = b"snapshot-at-stop";
     let compacted = LogAnchor::new(1, committed[0].hash);
-    let configuration = ConfigurationState::stopped(3, LogHash::from_bytes([7; 32]), compacted);
-    let anchor = RecoveryAnchor::new_with_configuration(
+    let configuration = ConfigurationState::stopped(
+        3,
+        LogHash::from_bytes([7; 32]),
+        compacted,
+        StopBinding::Unbound,
+    );
+    let anchor = RecoveryAnchor::new(
         "cluster-a",
         7,
         configuration.clone(),
@@ -545,6 +571,7 @@ async fn format2_snapshot_anchor_round_trips_configuration_state() {
             "snapshot-stop",
             LogHash::digest(&[bytes]),
             bytes.len() as u64,
+            LogHash::from_bytes([6; 32]),
         ),
     );
 
@@ -582,7 +609,7 @@ async fn checkpoint_snapshot_round_trip_preserves_executor_fingerprint() {
     archive.publish_committed(&committed).await.unwrap();
     let bytes = b"fingerprinted-checkpoint";
     let executor_fingerprint = LogHash::from_bytes([6; 32]);
-    let anchor = recovery_anchor_with_executor_fingerprint(
+    let anchor = recovery_anchor_for_fingerprint(
         1,
         committed[0].hash,
         bytes,
@@ -595,7 +622,7 @@ async fn checkpoint_snapshot_round_trip_preserves_executor_fingerprint() {
         .await
         .unwrap();
     let base = published.manifest().base().snapshot().unwrap();
-    assert_eq!(base.executor_fingerprint(), Some(executor_fingerprint));
+    assert_eq!(base.executor_fingerprint(), executor_fingerprint);
     assert!(base
         .object_key()
         .ends_with(&format!("-{}.snapshot", executor_fingerprint.to_hex())));
@@ -604,7 +631,7 @@ async fn checkpoint_snapshot_round_trip_preserves_executor_fingerprint() {
     assert_eq!(restored.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(
         restored.snapshot().unwrap().anchor().executor_fingerprint(),
-        Some(executor_fingerprint)
+        executor_fingerprint
     );
 }
 
@@ -620,7 +647,7 @@ async fn stopped_v2_checkpoint_forks_only_to_its_bound_successor() {
     let stopped = ConfigurationState::active(3, predecessor_digest())
         .validate_entry(&stop)
         .unwrap();
-    let anchor = RecoveryAnchor::new_with_configuration(
+    let anchor = RecoveryAnchor::new(
         "cluster-a",
         7,
         stopped.clone(),
@@ -630,6 +657,7 @@ async fn stopped_v2_checkpoint_forks_only_to_its_bound_successor() {
             "snapshot-bound-stop",
             LogHash::digest(&[bytes]),
             bytes.len() as u64,
+            LogHash::from_bytes([6; 32]),
         ),
     );
     source
@@ -870,7 +898,7 @@ async fn checkpoint_snapshot_rejects_executor_fingerprint_mismatch_and_tamper() 
     archive.publish_committed(&committed).await.unwrap();
     let published = archive
         .publish_checkpoint_snapshot(
-            recovery_anchor_with_executor_fingerprint(
+            recovery_anchor_for_fingerprint(
                 1,
                 committed[0].hash,
                 b"snapshot",
@@ -1030,13 +1058,8 @@ async fn archive_manifest_round_trips_and_updates_with_compare_and_swap() {
 async fn archive_manifest_round_trip_preserves_executor_fingerprint() {
     let (_dir, _store, archive) = local_archive();
     let executor_fingerprint = LogHash::from_bytes([6; 32]);
-    let snapshot = snapshot_with_executor_fingerprint(
-        "cluster-a",
-        3,
-        10,
-        b"snapshot-bytes",
-        executor_fingerprint,
-    );
+    let snapshot =
+        snapshot_for_fingerprint("cluster-a", 3, 10, b"snapshot-bytes", executor_fingerprint);
     let record = archive.publish_snapshot(&snapshot).await.unwrap();
     assert!(record
         .object_key()
@@ -1055,7 +1078,7 @@ async fn archive_manifest_round_trip_preserves_executor_fingerprint() {
             .unwrap()
             .manifest()
             .executor_fingerprint(),
-        Some(executor_fingerprint)
+        executor_fingerprint
     );
 }
 
@@ -1092,7 +1115,10 @@ async fn snapshot_publication_derives_identity_only_from_the_manifest() {
 
     assert_eq!(record.manifest(), source_snapshot.manifest());
     assert_eq!(record.snapshot_index(), 42);
-    assert_eq!(record.object_key(), "rhiza/cluster-a/archive/snapshots/epoch-00000000000000000007/snapshot-00000000000000000042.snapshot");
+    assert_eq!(
+        record.object_key(),
+        "rhiza/cluster-a/archive/snapshots/epoch-00000000000000000007/snapshot-00000000000000000042-0606060606060606060606060606060606060606060606060606060606060606.snapshot"
+    );
 
     let json = serde_json::to_value(&record).unwrap();
     assert_eq!(json["manifest"]["cluster_id"], "cluster-a");
@@ -1124,7 +1150,7 @@ async fn snapshot_publication_derives_identity_only_from_the_manifest() {
 #[tokio::test]
 async fn snapshot_download_rejects_tampered_record_identity() {
     let (_dir, store, archive) = local_archive();
-    let snapshot = snapshot_with_executor_fingerprint(
+    let snapshot = snapshot_for_fingerprint(
         "cluster-a",
         7,
         42,
@@ -1235,12 +1261,21 @@ fn entries_for(
 
 fn snapshot(cluster_id: &str, epoch: u64, index: u64, bytes: &[u8]) -> Snapshot {
     Snapshot::new(
-        SnapshotManifest::new(cluster_id, 1, epoch, index, LogHash::ZERO, 1, "node-1"),
+        SnapshotManifest::new(
+            cluster_id,
+            ConfigurationState::active(1, LogHash::ZERO),
+            epoch,
+            index,
+            LogHash::ZERO,
+            1,
+            "node-1",
+            LogHash::from_bytes([6; 32]),
+        ),
         bytes.to_vec(),
     )
 }
 
-fn snapshot_with_executor_fingerprint(
+fn snapshot_for_fingerprint(
     cluster_id: &str,
     epoch: u64,
     index: u64,
@@ -1248,8 +1283,16 @@ fn snapshot_with_executor_fingerprint(
     executor_fingerprint: LogHash,
 ) -> Snapshot {
     Snapshot::new(
-        SnapshotManifest::new(cluster_id, 1, epoch, index, LogHash::ZERO, 1, "node-1")
-            .with_executor_fingerprint(executor_fingerprint),
+        SnapshotManifest::new(
+            cluster_id,
+            ConfigurationState::active(1, LogHash::ZERO),
+            epoch,
+            index,
+            LogHash::ZERO,
+            1,
+            "node-1",
+            executor_fingerprint,
+        ),
         bytes.to_vec(),
     )
 }
@@ -1258,14 +1301,19 @@ fn recovery_anchor(index: u64, hash: LogHash, bytes: &[u8], snapshot_id: &str) -
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         4,
         LogAnchor::new(index, hash),
-        SnapshotIdentity::new(snapshot_id, LogHash::digest(&[bytes]), bytes.len() as u64),
+        SnapshotIdentity::new(
+            snapshot_id,
+            LogHash::digest(&[bytes]),
+            bytes.len() as u64,
+            LogHash::from_bytes([6; 32]),
+        ),
     )
 }
 
-fn recovery_anchor_with_executor_fingerprint(
+fn recovery_anchor_for_fingerprint(
     index: u64,
     hash: LogHash,
     bytes: &[u8],
@@ -1275,11 +1323,15 @@ fn recovery_anchor_with_executor_fingerprint(
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         4,
         LogAnchor::new(index, hash),
-        SnapshotIdentity::new(snapshot_id, LogHash::digest(&[bytes]), bytes.len() as u64)
-            .with_executor_fingerprint(executor_fingerprint),
+        SnapshotIdentity::new(
+            snapshot_id,
+            LogHash::digest(&[bytes]),
+            bytes.len() as u64,
+            executor_fingerprint,
+        ),
     )
 }
 

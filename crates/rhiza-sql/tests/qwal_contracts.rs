@@ -1,11 +1,12 @@
-use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot};
+use rhiza_core::{
+    ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot, StopBinding,
+};
 use rhiza_sql::{
     decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
     restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, SqlBatchMember,
     SqlCommand, SqlCommandResult, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES,
     QWAL_V3_MAGIC,
 };
-use rusqlite::Connection;
 
 fn entry(index: u64, prev_hash: LogHash, payload: &[u8]) -> LogEntry {
     LogEntry {
@@ -417,6 +418,7 @@ fn existing_qwal_pair_opens_when_supplied_configuration_is_ahead() {
             1,
             initial.digest(),
             LogAnchor::new(1, LogHash::digest(&[b"stop"])),
+            StopBinding::Unbound,
         ),
     )
     .unwrap();
@@ -861,22 +863,6 @@ fn modern_sqlite_schema_and_dml_features_keep_exact_page_replay() {
         [[SqlValue::Text("allowed".into())]]
     );
     for denied in [
-        command(
-            "legacy-meta-create",
-            &["CREATE TABLE __rhiza_meta(value TEXT)"],
-        ),
-        command(
-            "legacy-requests-create",
-            &["CREATE TABLE __rhiza_requests(value TEXT)"],
-        ),
-        command(
-            "legacy-meta-rename",
-            &["ALTER TABLE __rhiza_user_table RENAME TO __rhiza_meta"],
-        ),
-        command(
-            "legacy-requests-rename",
-            &["ALTER TABLE __rhiza_user_table RENAME TO __rhiza_requests"],
-        ),
         command("schema-version-write", &["PRAGMA schema_version = 99"]),
         command("optimize-invalid", &["PRAGMA optimize = 'garbage'"]),
         command("incremental-vacuum-write", &["PRAGMA incremental_vacuum"]),
@@ -1325,22 +1311,61 @@ fn qwal_only_apply_rejects_legacy_qsql_and_qefx_payloads() {
 }
 
 #[test]
-fn existing_legacy_database_requires_snapshot_bootstrap_instead_of_auto_upgrade() {
+fn current_qwal_database_reopens_with_application_tables() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("legacy.sqlite");
-    let connection = Connection::open(&path).unwrap();
-    connection
-        .execute_batch("CREATE TABLE __rhiza_meta(key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+    let path = dir.path().join("current.sqlite");
+    let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let tables = command(
+        "application-tables",
+        &[
+            "CREATE TABLE __rhiza_meta(value TEXT NOT NULL)",
+            "CREATE TABLE __rhiza_requests(value TEXT NOT NULL)",
+            "INSERT INTO __rhiza_meta VALUES ('meta')",
+            "INSERT INTO __rhiza_requests VALUES ('request')",
+        ],
+    );
+    let (_, effect) = prepared_qwal(&database, &tables, 0, LogHash::ZERO);
+    database
+        .apply_entry(&entry(1, LogHash::ZERO, &effect))
         .unwrap();
-    connection
-        .execute(
-            "INSERT INTO __rhiza_meta(key, value) VALUES ('node_id', 'legacy-node')",
-            [],
-        )
-        .unwrap();
-    drop(connection);
+    drop(database);
 
-    assert!(SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).is_err());
+    let reopened = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    assert_eq!(
+        query(&reopened, "SELECT value FROM __rhiza_meta"),
+        [[SqlValue::Text("meta".into())]]
+    );
+    assert_eq!(
+        query(&reopened, "SELECT value FROM __rhiza_requests"),
+        [[SqlValue::Text("request".into())]]
+    );
+}
+
+#[test]
+fn incomplete_database_control_pairs_fail_without_mutating_either_file() {
+    for (name, database, control) in [
+        ("database-only", Some(b"database".as_slice()), None),
+        ("control-only", None, Some(b"control".as_slice())),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let control_path = path.with_extension("sqlite.control");
+        if let Some(bytes) = database {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        if let Some(bytes) = control {
+            std::fs::write(&control_path, bytes).unwrap();
+        }
+        let before_database = std::fs::read(&path).ok();
+        let before_control = std::fs::read(&control_path).ok();
+
+        assert!(
+            SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).is_err(),
+            "{name}"
+        );
+        assert_eq!(std::fs::read(&path).ok(), before_database, "{name}");
+        assert_eq!(std::fs::read(&control_path).ok(), before_control, "{name}");
+    }
 }
 
 #[test]
