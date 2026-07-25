@@ -1600,7 +1600,7 @@ fn hedged_proposer_finishes_another_proposers_exact_h_quorum() {
 fn hedged_proposer_installs_an_adopted_config_change_on_a_quorum() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let config_command = ConfigChange::stop(
+    let config_command = ConfigChange::bound_stop(
         "cluster",
         1,
         membership.digest(),
@@ -2558,6 +2558,7 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
             "slot {} was not reconstructable: {inspection:?}",
             entry.index
         );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 }
 

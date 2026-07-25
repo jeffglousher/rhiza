@@ -10,7 +10,7 @@ use std::{
 
 use rhiza_core::{
     ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor,
-    SnapshotIdentity, SuccessorDescriptor, RECOVERY_ANCHOR_FORMAT_VERSION,
+    SnapshotIdentity, StopBinding, SuccessorDescriptor, RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 
 pub const QLOG_MAGIC: [u8; 4] = *b"QLOG";
@@ -76,12 +76,10 @@ impl fmt::Display for Error {
             Self::InvalidIndexRange { start, end } => {
                 write!(f, "invalid index range: start {start} is after end {end}")
             }
-            Self::CompactionUnsupported => {
-                write!(
-                    f,
-                    "prefix compaction is unsupported by the canonical qlog format"
-                )
-            }
+            Self::CompactionUnsupported => write!(
+                f,
+                "prefix compaction is unsupported by the canonical qlog format"
+            ),
             Self::CompactionAboveTip { target, tip } => {
                 write!(f, "compaction target {target} is above log tip {tip:?}")
             }
@@ -200,20 +198,6 @@ pub fn decode_segment_for_cluster(bytes: &[u8], cluster_id: &str) -> Result<Vec<
         entries.push(entry);
         offset = next_offset;
     }
-}
-
-pub fn decode_segment_for_cluster_with_configuration(
-    bytes: &[u8],
-    cluster_id: &str,
-    mut configuration: ConfigurationState,
-) -> Result<(Vec<LogEntry>, ConfigurationState)> {
-    let entries = decode_segment_for_cluster(bytes, cluster_id)?;
-    for entry in &entries {
-        configuration = configuration
-            .validate_entry(entry)
-            .map_err(|error| Error::Decode(error.to_string()))?;
-    }
-    Ok((entries, configuration))
 }
 
 pub fn write_segment_file(dir: impl Into<PathBuf>, entries: &[LogEntry]) -> Result<PathBuf> {
@@ -1105,12 +1089,9 @@ fn scan_closed_segments(
             }
         }
         for entry in &entries {
-            configuration_state = configuration_state.validate_entry(entry).map_err(|err| {
-                Error::Decode(format!(
-                    "{err} at qlog entry {} from configuration {configuration_state:?}",
-                    entry.index
-                ))
-            })?;
+            configuration_state = configuration_state
+                .validate_entry(entry)
+                .map_err(|err| Error::Decode(err.to_string()))?;
         }
         segments.push(ClosedSegment { entries });
     }
@@ -1195,12 +1176,9 @@ fn scan_open_segment(
         }
     }
     for entry in &entries {
-        configuration_state = configuration_state.validate_entry(entry).map_err(|err| {
-            Error::Decode(format!(
-                "{err} at qlog entry {} from configuration {configuration_state:?}",
-                entry.index
-            ))
-        })?;
+        configuration_state = configuration_state
+            .validate_entry(entry)
+            .map_err(|err| Error::Decode(err.to_string()))?;
     }
     let file = fs::OpenOptions::new()
         .append(true)
@@ -1775,16 +1753,24 @@ fn encode_configuration_state(out: &mut Vec<u8>, state: &ConfigurationState) -> 
         ConfigurationState::Stopped {
             digest,
             stop,
-            successor,
-            stop_command_hash,
+            binding,
             ..
         } => {
             out.push(2);
             out.extend_from_slice(digest.as_bytes());
             put_u64(out, stop.index());
             out.extend_from_slice(stop.hash().as_bytes());
-            encode_successor_descriptor(out, successor)?;
-            out.extend_from_slice(stop_command_hash.as_bytes());
+            match binding {
+                StopBinding::Unbound => out.push(1),
+                StopBinding::Bound {
+                    successor,
+                    stop_command_hash,
+                } => {
+                    out.push(2);
+                    encode_successor_descriptor(out, successor)?;
+                    out.extend_from_slice(stop_command_hash.as_bytes());
+                }
+            }
         }
     }
     Ok(())
@@ -1807,14 +1793,12 @@ fn decode_configuration_state(
         2 => {
             let stop_index = read_state_u64(bytes, cursor, end)?;
             let stop_hash = read_state_hash(bytes, cursor, end)?;
-            let successor = decode_successor_descriptor(bytes, cursor, end)?;
-            let stop_command_hash = read_state_hash(bytes, cursor, end)?;
+            let binding = decode_stop_binding(bytes, cursor, end)?;
             Ok(ConfigurationState::Stopped {
                 config_id,
                 digest,
                 stop: LogAnchor::new(stop_index, stop_hash),
-                successor,
-                stop_command_hash,
+                binding,
             })
         }
         _ => Err(Error::Decode(
@@ -1836,35 +1820,51 @@ fn encode_successor_descriptor(out: &mut Vec<u8>, successor: &SuccessorDescripto
     Ok(())
 }
 
-fn decode_successor_descriptor(
-    bytes: &[u8],
-    cursor: &mut usize,
-    end: usize,
-) -> Result<SuccessorDescriptor> {
-    let cluster_id = read_string(bytes, cursor, end, "successor cluster_id")?;
-    let predecessor_config_id = read_state_u64(bytes, cursor, end)?;
-    let predecessor_config_digest = read_state_hash(bytes, cursor, end)?;
-    let successor_config_id = read_state_u64(bytes, cursor, end)?;
-    let encoded_digest = read_state_hash(bytes, cursor, end)?;
-    let member_count = usize::from(read_state_u16(bytes, cursor, end)?);
-    let mut members = Vec::with_capacity(member_count);
-    for _ in 0..member_count {
-        members.push(read_string(bytes, cursor, end, "successor member")?);
+fn decode_stop_binding(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<StopBinding> {
+    let kind = read_state_u8(bytes, cursor, end)?;
+    match kind {
+        1 => Ok(StopBinding::Unbound),
+        2 => {
+            let cluster_id = read_string(bytes, cursor, end, "successor cluster_id")?;
+            let predecessor_config_id = read_state_u64(bytes, cursor, end)?;
+            let predecessor_config_digest = read_state_hash(bytes, cursor, end)?;
+            let successor_config_id = read_state_u64(bytes, cursor, end)?;
+            let encoded_digest = read_state_hash(bytes, cursor, end)?;
+            let member_count = usize::from(read_state_u16(bytes, cursor, end)?);
+            let mut members = Vec::with_capacity(member_count);
+            for _ in 0..member_count {
+                members.push(read_string(bytes, cursor, end, "successor member")?);
+            }
+            let successor = SuccessorDescriptor::new(
+                cluster_id,
+                predecessor_config_id,
+                predecessor_config_digest,
+                successor_config_id,
+                members,
+            )
+            .map_err(|_| Error::Decode("invalid recovery anchor successor descriptor".into()))?;
+            if successor.digest() != encoded_digest {
+                return Err(Error::Decode(
+                    "recovery anchor successor digest mismatch".into(),
+                ));
+            }
+            let stop_command_hash = read_state_hash(bytes, cursor, end)?;
+            Ok(StopBinding::Bound {
+                successor,
+                stop_command_hash,
+            })
+        }
+        _ => Err(Error::Decode("invalid recovery anchor stop binding".into())),
     }
-    let successor = SuccessorDescriptor::new(
-        cluster_id,
-        predecessor_config_id,
-        predecessor_config_digest,
-        successor_config_id,
-        members,
-    )
-    .map_err(|_| Error::Decode("invalid recovery anchor successor descriptor".into()))?;
-    if successor.digest() != encoded_digest {
-        return Err(Error::Decode(
-            "recovery anchor successor digest mismatch".into(),
-        ));
-    }
-    Ok(successor)
+}
+
+fn read_state_u8(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u8> {
+    let value = *bytes
+        .get(*cursor)
+        .filter(|_| *cursor < end)
+        .ok_or_else(|| Error::Decode("short recovery anchor configuration state".into()))?;
+    *cursor += 1;
+    Ok(value)
 }
 
 fn read_state_u16(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u16> {

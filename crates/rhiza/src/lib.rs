@@ -539,6 +539,12 @@ impl Drop for Rhiza {
 }
 
 impl RhizaHandle {
+    pub(crate) fn close_admission(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            close_inner(&inner);
+        }
+    }
+
     pub async fn put(
         &self,
         request_id: &str,

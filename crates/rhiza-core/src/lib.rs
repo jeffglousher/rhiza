@@ -159,6 +159,16 @@ impl LogAnchor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StopBinding {
+    Unbound,
+    Bound {
+        successor: SuccessorDescriptor,
+        stop_command_hash: LogHash,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConfigurationState {
     Active {
@@ -169,8 +179,7 @@ pub enum ConfigurationState {
         config_id: ConfigId,
         digest: LogHash,
         stop: LogAnchor,
-        successor: SuccessorDescriptor,
-        stop_command_hash: LogHash,
+        binding: StopBinding,
     },
 }
 
@@ -183,15 +192,13 @@ impl ConfigurationState {
         config_id: ConfigId,
         digest: LogHash,
         stop: LogAnchor,
-        successor: SuccessorDescriptor,
-        stop_command_hash: LogHash,
+        binding: StopBinding,
     ) -> Self {
         Self::Stopped {
             config_id,
             digest,
             stop,
-            successor,
-            stop_command_hash,
+            binding,
         }
     }
 
@@ -232,13 +239,30 @@ impl ConfigurationState {
         };
 
         match (self, change) {
-            (Self::Active { config_id, digest }, Some(ConfigChange::Stop { successor }))
+            (
+                Self::Active { config_id, digest },
+                Some(ConfigChange::Stop {
+                    config_id: stop_config_id,
+                    config_digest,
+                }),
+            ) if entry.config_id == *config_id
+                && stop_config_id == *config_id
+                && (*digest == LogHash::ZERO || config_digest == *digest) =>
+            {
+                Ok(Self::stopped(
+                    *config_id,
+                    config_digest,
+                    LogAnchor::new(entry.index, entry.hash),
+                    StopBinding::Unbound,
+                ))
+            }
+            (Self::Active { config_id, digest }, Some(ConfigChange::BoundStop { successor }))
                 if entry.cluster_id == successor.cluster_id
                     && entry.config_id == *config_id
                     && successor.predecessor_config_id == *config_id
                     && successor.predecessor_config_digest == *digest =>
             {
-                let stop_command_hash = (ConfigChange::Stop {
+                let stop_command_hash = (ConfigChange::BoundStop {
                     successor: successor.clone(),
                 })
                 .to_stored_command()
@@ -247,8 +271,10 @@ impl ConfigurationState {
                     config_id: *config_id,
                     digest: *digest,
                     stop: LogAnchor::new(entry.index, entry.hash),
-                    successor,
-                    stop_command_hash,
+                    binding: StopBinding::Bound {
+                        successor,
+                        stop_command_hash,
+                    },
                 })
             }
             (Self::Active { config_id, .. }, None) if entry.config_id == *config_id => {
@@ -258,12 +284,37 @@ impl ConfigurationState {
             (
                 Self::Stopped {
                     config_id: predecessor_id,
-                    digest: predecessor_digest,
                     stop,
-                    successor: authorized_successor,
-                    stop_command_hash: authorized_stop_command_hash,
+                    binding: StopBinding::Unbound,
+                    ..
                 },
                 Some(ConfigChange::ActivationBarrier {
+                    config_id,
+                    config_digest,
+                    stop_slot,
+                    prefix_hash,
+                }),
+            ) if predecessor_id.checked_add(1) == Some(config_id)
+                && entry.config_id == config_id
+                && stop.index().checked_add(1) == Some(entry.index)
+                && entry.prev_hash == stop.hash()
+                && stop_slot == stop.index()
+                && prefix_hash == stop.hash() =>
+            {
+                Ok(Self::active(config_id, config_digest))
+            }
+            (
+                Self::Stopped {
+                    config_id: predecessor_id,
+                    digest: predecessor_digest,
+                    stop,
+                    binding:
+                        StopBinding::Bound {
+                            successor: authorized_successor,
+                            stop_command_hash: authorized_stop_command_hash,
+                        },
+                },
+                Some(ConfigChange::BoundActivationBarrier {
                     successor,
                     stop_slot,
                     prefix_hash,
@@ -281,7 +332,7 @@ impl ConfigurationState {
                 // Reject a deserialized state whose cached authorization hash
                 // does not match its bound successor descriptor.
                 && *authorized_stop_command_hash
-                    == (ConfigChange::Stop {
+                    == (ConfigChange::BoundStop {
                         successor: authorized_successor.clone(),
                     })
                     .to_stored_command()
@@ -951,9 +1002,19 @@ pub fn canonical_membership_digest(members: &[NodeId]) -> Result<LogHash, Config
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigChange {
     Stop {
-        successor: SuccessorDescriptor,
+        config_id: ConfigId,
+        config_digest: LogHash,
     },
     ActivationBarrier {
+        config_id: ConfigId,
+        config_digest: LogHash,
+        stop_slot: LogIndex,
+        prefix_hash: LogHash,
+    },
+    BoundStop {
+        successor: SuccessorDescriptor,
+    },
+    BoundActivationBarrier {
         successor: SuccessorDescriptor,
         stop_slot: LogIndex,
         prefix_hash: LogHash,
@@ -962,14 +1023,35 @@ pub enum ConfigChange {
 }
 
 impl ConfigChange {
-    pub fn stop(
+    pub const fn stop(config_id: ConfigId, config_digest: LogHash) -> Self {
+        Self::Stop {
+            config_id,
+            config_digest,
+        }
+    }
+
+    pub const fn activation_barrier(
+        config_id: ConfigId,
+        config_digest: LogHash,
+        stop_slot: LogIndex,
+        prefix_hash: LogHash,
+    ) -> Self {
+        Self::ActivationBarrier {
+            config_id,
+            config_digest,
+            stop_slot,
+            prefix_hash,
+        }
+    }
+
+    pub fn bound_stop(
         cluster_id: impl Into<ClusterId>,
         predecessor_config_id: ConfigId,
         predecessor_config_digest: LogHash,
         successor_config_id: ConfigId,
         successor_members: Vec<NodeId>,
     ) -> Result<Self, ConfigChangeDecodeError> {
-        Ok(Self::Stop {
+        Ok(Self::BoundStop {
             successor: SuccessorDescriptor::new(
                 cluster_id,
                 predecessor_config_id,
@@ -980,13 +1062,13 @@ impl ConfigChange {
         })
     }
 
-    pub const fn activation_barrier(
+    pub const fn bound_activation_barrier(
         successor: SuccessorDescriptor,
         stop_slot: LogIndex,
         prefix_hash: LogHash,
         stop_command_hash: LogHash,
     ) -> Self {
-        Self::ActivationBarrier {
+        Self::BoundActivationBarrier {
             successor,
             stop_slot,
             prefix_hash,
@@ -994,9 +1076,12 @@ impl ConfigChange {
         }
     }
 
-    pub const fn successor(&self) -> &SuccessorDescriptor {
+    pub const fn successor(&self) -> Option<&SuccessorDescriptor> {
         match self {
-            Self::Stop { successor } | Self::ActivationBarrier { successor, .. } => successor,
+            Self::BoundStop { successor } | Self::BoundActivationBarrier { successor, .. } => {
+                Some(successor)
+            }
+            _ => None,
         }
     }
 
@@ -1004,17 +1089,37 @@ impl ConfigChange {
         let mut payload = Vec::with_capacity(87);
         payload.extend_from_slice(CONFIG_CHANGE_MAGIC);
         match self {
-            Self::Stop { successor } => {
+            Self::Stop {
+                config_id,
+                config_digest,
+            } => {
                 payload.push(1);
-                encode_successor(&mut payload, successor);
+                payload.extend_from_slice(&config_id.to_be_bytes());
+                payload.extend_from_slice(config_digest.as_bytes());
             }
             Self::ActivationBarrier {
+                config_id,
+                config_digest,
+                stop_slot,
+                prefix_hash,
+            } => {
+                payload.push(2);
+                payload.extend_from_slice(&config_id.to_be_bytes());
+                payload.extend_from_slice(config_digest.as_bytes());
+                payload.extend_from_slice(&stop_slot.to_be_bytes());
+                payload.extend_from_slice(prefix_hash.as_bytes());
+            }
+            Self::BoundStop { successor } => {
+                payload.push(3);
+                encode_successor(&mut payload, successor);
+            }
+            Self::BoundActivationBarrier {
                 successor,
                 stop_slot,
                 prefix_hash,
                 stop_command_hash,
             } => {
-                payload.push(2);
+                payload.push(4);
                 encode_successor(&mut payload, successor);
                 payload.extend_from_slice(&stop_slot.to_be_bytes());
                 payload.extend_from_slice(prefix_hash.as_bytes());
@@ -1040,31 +1145,54 @@ impl ConfigChange {
             return Err(ConfigChangeDecodeError);
         }
         let kind = *bytes.get(4).ok_or(ConfigChangeDecodeError)?;
-        let mut cursor = 5;
-        let successor = decode_successor(bytes, &mut cursor)?;
-        let change = match kind {
-            1 => Self::Stop { successor },
-            2 => Self::ActivationBarrier {
-                successor,
-                stop_slot: read_config_u64_at(bytes, &mut cursor)?,
-                prefix_hash: read_config_hash_at(bytes, &mut cursor)?,
-                stop_command_hash: read_config_hash_at(bytes, &mut cursor)?,
-            },
-            _ => return Err(ConfigChangeDecodeError),
-        };
-        if cursor != bytes.len() {
-            return Err(ConfigChangeDecodeError);
+        if matches!(kind, 3 | 4) {
+            let mut cursor = 5;
+            let successor = decode_successor(bytes, &mut cursor)?;
+            let change = match kind {
+                3 => Self::BoundStop { successor },
+                4 => Self::BoundActivationBarrier {
+                    successor,
+                    stop_slot: read_config_u64_at(bytes, &mut cursor)?,
+                    prefix_hash: read_config_hash_at(bytes, &mut cursor)?,
+                    stop_command_hash: read_config_hash_at(bytes, &mut cursor)?,
+                },
+                _ => return Err(ConfigChangeDecodeError),
+            };
+            if cursor != bytes.len() {
+                return Err(ConfigChangeDecodeError);
+            }
+            return Ok(change);
         }
-        Ok(change)
+        let config_id = read_config_u64(bytes, 5)?;
+        let config_digest = read_config_hash(bytes, 13)?;
+        match kind {
+            1 if bytes.len() == 45 => Ok(Self::stop(config_id, config_digest)),
+            2 if bytes.len() == 85 => Ok(Self::activation_barrier(
+                config_id,
+                config_digest,
+                read_config_u64(bytes, 45)?,
+                read_config_hash(bytes, 53)?,
+            )),
+            _ => Err(ConfigChangeDecodeError),
+        }
     }
 
     pub const fn binding(&self) -> (ConfigId, LogHash) {
         match self {
-            Self::Stop { successor } => (
+            Self::Stop {
+                config_id,
+                config_digest,
+            }
+            | Self::ActivationBarrier {
+                config_id,
+                config_digest,
+                ..
+            } => (*config_id, *config_digest),
+            Self::BoundStop { successor } => (
                 successor.predecessor_config_id,
                 successor.predecessor_config_digest,
             ),
-            Self::ActivationBarrier { successor, .. } => {
+            Self::BoundActivationBarrier { successor, .. } => {
                 (successor.config_id, successor.config_digest)
             }
         }

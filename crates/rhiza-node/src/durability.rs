@@ -22,7 +22,7 @@ use rhiza_archive::{
 use rhiza_core::SnapshotIdentity;
 use rhiza_core::{
     ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex,
-    RecoveryAnchor,
+    RecoveryAnchor, StopBinding,
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
@@ -43,8 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
-const RESTORE_INTENT_FILE: &str = ".rhiza-restore-v2.json";
-const RESTORE_INTENT_PREFIX: &str = ".rhiza-restore-";
+const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
@@ -56,7 +55,7 @@ pub(crate) const SUCCESSOR_PRESTAGE_READY_FILE: &str = ".successor-prestage.read
 const SUCCESSOR_PRESTAGE_PUBLISHED_FILE: &str = ".successor-prestage.published";
 const SUCCESSOR_PRESTAGE_FINALIZED_FILE: &str = ".successor-prestage.finalized";
 const REPAIR_ARTIFACT_OWNER_FILE: &str = ".rhiza-recovery-owner.json";
-pub const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity-v2.json";
+pub const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity.json";
 static RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -89,7 +88,6 @@ enum RepairArtifactRole {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RepairArtifactOwnership {
-    format_version: u32,
     role: RepairArtifactRole,
     name: String,
     identity: RecoveryArtifactIdentity,
@@ -1113,7 +1111,6 @@ pub fn checkpoint_restore_in_progress(
     checkpoint_root: LogAnchor,
 ) -> Result<CheckpointRestoreState, DurabilityError> {
     let data_dir = data_dir.as_ref();
-    reject_unsupported_restore_intent_artifacts(data_dir)?;
     let intent = data_dir.join(RESTORE_INTENT_FILE);
     let metadata = match fs::symlink_metadata(&intent) {
         Ok(metadata) => Some(metadata),
@@ -1854,7 +1851,7 @@ fn validate_successor_prestage_stop(
                 "successor prestage Stop entry is not a bound configuration change".into(),
             )
         })?;
-    let ConfigChange::Stop { successor } = change else {
+    let ConfigChange::BoundStop { successor } = change else {
         return Err(DurabilityError::SnapshotVerification(
             "successor prestage requires a bound Stop entry".into(),
         ));
@@ -1981,9 +1978,14 @@ pub fn adopt_finalized_successor_prestage(
                 prestage.identity.predecessor_config_id(),
                 predecessor_digest,
                 expected_stop,
-                successor.clone(),
-                rhiza_core::StoredCommand::new(stop.entry.entry_type, stop.entry.payload.clone())
+                StopBinding::Bound {
+                    successor: successor.clone(),
+                    stop_command_hash: rhiza_core::StoredCommand::new(
+                        stop.entry.entry_type,
+                        stop.entry.payload.clone(),
+                    )
                     .hash(),
+                },
             )
     {
         return Err(DurabilityError::SnapshotVerification(
@@ -2069,7 +2071,6 @@ fn write_repair_artifact_ownership(
         })?
         .to_owned();
     let contents = serde_json::to_vec(&RepairArtifactOwnership {
-        format_version: 1,
         role,
         name,
         identity: identity.clone(),
@@ -2290,8 +2291,7 @@ fn is_owned_recovery_directory(
     let Ok(ownership) = serde_json::from_slice::<RepairArtifactOwnership>(&owner_bytes) else {
         return Ok(false);
     };
-    if ownership.format_version != 1
-        || ownership.role != expected_role
+    if ownership.role != expected_role
         || ownership.identity != *expected_identity
         || path.file_name().and_then(|name| name.to_str()) != Some(ownership.name.as_str())
     {
@@ -2731,7 +2731,6 @@ fn prepare_fresh_restore_data_dir(
         return Ok(());
     }
 
-    reject_unsupported_restore_intent_artifacts(data_dir)?;
     let intent = data_dir.join(RESTORE_INTENT_FILE);
     let intent_metadata = match fs::symlink_metadata(&intent) {
         Ok(metadata) => Some(metadata),
@@ -2822,24 +2821,6 @@ fn prepare_fresh_restore_data_dir(
     }
     fs::remove_file(active_intent)?;
     sync_directory(data_dir)?;
-    Ok(())
-}
-
-fn reject_unsupported_restore_intent_artifacts(data_dir: &Path) -> Result<(), DurabilityError> {
-    let entries = match fs::read_dir(data_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let name = entry?.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(RESTORE_INTENT_PREFIX) && name != RESTORE_INTENT_FILE {
-            return Err(DurabilityError::SnapshotVerification(
-                "unsupported local checkpoint restore artifact".into(),
-            ));
-        }
-    }
     Ok(())
 }
 

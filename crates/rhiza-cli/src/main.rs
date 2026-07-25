@@ -13,7 +13,7 @@ use reqwest::{header, Method, RequestBuilder, Response};
 use rhiza_archive::{CheckpointIdentity, CheckpointTip, GcPlan, GcPolicy, ObjectArchiveStore};
 use rhiza_client::RhizaClient;
 use rhiza_core::{
-    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, StoredCommand,
+    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, StoredCommand,
 };
 use rhiza_node::{
     effective_cluster_id, install_successor_recorder, node_router,
@@ -570,8 +570,6 @@ struct RecorderTlsFiles {
 struct PredecessorConfiguration {
     membership: Membership,
     stop: StopInformation,
-    successor: rhiza_core::SuccessorDescriptor,
-    stop_command_hash: LogHash,
 }
 
 impl ConfigurationBundle {
@@ -2239,21 +2237,15 @@ fn parse_configuration_bundle(json: &str) -> Result<ConfigurationBundle, String>
         .predecessor
         .map(|predecessor| parse_predecessor(document.config_id, &membership, predecessor))
         .transpose()?;
-    let configuration_state = predecessor
-        .as_ref()
-        .map(|predecessor| {
-            ConfigurationState::stopped(
-                predecessor.stop.entry.config_id,
-                predecessor.membership.digest(),
-                rhiza_core::LogAnchor::new(
-                    predecessor.stop.entry.index,
-                    predecessor.stop.entry.hash,
-                ),
-                predecessor.successor.clone(),
-                predecessor.stop_command_hash,
-            )
-        })
-        .unwrap_or_else(|| ConfigurationState::active(document.config_id, membership.digest()));
+    let configuration_state = match predecessor.as_ref() {
+        Some(predecessor) => ConfigurationState::active(
+            predecessor.stop.entry.config_id,
+            predecessor.membership.digest(),
+        )
+        .validate_entry(&predecessor.stop.entry)
+        .map_err(|error| format!("invalid predecessor stop entry: {error}"))?,
+        None => ConfigurationState::active(document.config_id, membership.digest()),
+    };
     Ok(ConfigurationBundle {
         config_id: document.config_id,
         peers,
@@ -2285,9 +2277,11 @@ fn parse_predecessor(
         .as_ref()
         .ok_or_else(|| "predecessor Stop proof has no value".to_string())?;
     let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
-    let bound_successor = ConfigChange::recognize(&command)
-        .map_err(|_| "predecessor Stop must be bound to an exact successor".to_string())?
+    let change = ConfigChange::recognize(&command)
+        .map_err(|_| "predecessor Stop must be bound to an exact successor".to_string())?;
+    let bound_successor = change
         .successor()
+        .ok_or_else(|| "predecessor Stop must be bound to an exact successor".to_string())?
         .clone();
     let transitioned = ConfigurationState::active(entry.config_id, membership.digest())
         .validate_entry(&entry)
@@ -2306,8 +2300,6 @@ fn parse_predecessor(
     }
     Ok(PredecessorConfiguration {
         membership,
-        successor: bound_successor,
-        stop_command_hash: command.hash(),
         stop: StopInformation { entry, proof },
     })
 }
@@ -4498,7 +4490,10 @@ mod tests {
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
     use rhiza_quepaxa::AcceptedValue;
     #[cfg(feature = "sql")]
-    use rhiza_sql::{encode_sql_command, SqlBatchMember, SqlCommand, SqliteStateMachine};
+    use rhiza_sql::{
+        encode_sql_command, sql_executor_fingerprint, SqlBatchMember, SqlCommand,
+        SqliteStateMachine,
+    };
 
     use super::*;
 
@@ -5524,7 +5519,7 @@ mod tests {
         successor_members: [&str; N],
     ) -> serde_json::Value {
         let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let command = ConfigChange::stop(
+        let command = ConfigChange::bound_stop(
             "rhiza-vind",
             3,
             predecessor.digest(),
@@ -6303,7 +6298,7 @@ mod tests {
                     .unwrap();
                 let payload = preparation
                     .effect
-                    .expect("successful checkpoint fixture batch produces one QWAL v2 effect");
+                    .expect("successful checkpoint fixture batch produces one QWAL v3 effect");
                 let hash = LogEntry::calculate_hash(
                     "rhiza:sql:cluster-a",
                     index,
@@ -6466,14 +6461,17 @@ mod tests {
                 RecoveryAnchor::new(
                     "rhiza:sql:cluster-a",
                     1,
-                    ConfigurationState::active(1, LogHash::digest(&[b"membership"])),
+                    ConfigurationState::active(
+                        1,
+                        LogHash::digest(&[b"cli-roll-checkpoint-test-config"]),
+                    ),
                     1,
                     LogAnchor::new(2, committed[1].hash),
                     SnapshotIdentity::new(
                         "cli-roll-snapshot",
                         LogHash::digest(&[bytes]),
                         bytes.len() as u64,
-                        LogHash::digest(&[b"executor"]),
+                        sql_executor_fingerprint().unwrap(),
                     ),
                 ),
                 bytes,

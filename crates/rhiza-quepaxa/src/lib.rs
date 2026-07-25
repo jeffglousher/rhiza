@@ -1784,7 +1784,7 @@ impl RecorderFileStore {
                 old_membership,
             )
             .map_err(Error::Rejected)?;
-        let stop_command = ConfigChange::stop(
+        let stop_command = ConfigChange::bound_stop(
             self.cluster_id.clone(),
             current.config_id,
             current.config_digest,
@@ -2620,16 +2620,20 @@ impl RecorderFileStore {
                     stop_slot: seal.stop_slot,
                 }));
             }
-            if matches!(change, Some(ConfigChange::Stop { .. }))
-                && (slot != seal.stop_slot || seal.command_hash == LogHash::ZERO)
+            if matches!(
+                change,
+                Some(ConfigChange::Stop { .. } | ConfigChange::BoundStop { .. })
+            ) && (slot != seal.stop_slot || seal.command_hash == LogHash::ZERO)
             {
                 return Err(Error::Rejected(RejectReason::TransitionInProgress));
             }
         }
-        if matches!(change, Some(ConfigChange::Stop { .. }))
-            && configuration
-                .max_accepted_or_decided_slot
-                .is_some_and(|accepted_slot| accepted_slot > slot)
+        if matches!(
+            change,
+            Some(ConfigChange::Stop { .. } | ConfigChange::BoundStop { .. })
+        ) && configuration
+            .max_accepted_or_decided_slot
+            .is_some_and(|accepted_slot| accepted_slot > slot)
         {
             return Err(Error::Rejected(RejectReason::InvalidTransition));
         }
@@ -2638,7 +2642,7 @@ impl RecorderFileStore {
                 return Err(Error::Rejected(RejectReason::InvalidTransition));
             };
             match change {
-                Some(ConfigChange::ActivationBarrier {
+                Some(ConfigChange::BoundActivationBarrier {
                     successor,
                     stop_slot,
                     prefix_hash,
@@ -2655,19 +2659,17 @@ impl RecorderFileStore {
                 None if slot == predecessor.stop_slot + 1 => {}
                 _ => return Err(Error::Rejected(RejectReason::ActivationRequired)),
             }
-        } else if matches!(change, Some(ConfigChange::ActivationBarrier { .. })) {
+        } else if matches!(
+            change,
+            Some(
+                ConfigChange::ActivationBarrier { .. }
+                    | ConfigChange::BoundActivationBarrier { .. }
+            )
+        ) {
             return Err(Error::Rejected(RejectReason::InvalidTransition));
         }
         if let Some(change) = change {
-            let (config_id, config_digest) = match change {
-                ConfigChange::Stop { successor } => (
-                    successor.predecessor_config_id(),
-                    successor.predecessor_config_digest(),
-                ),
-                ConfigChange::ActivationBarrier { successor, .. } => {
-                    (successor.config_id(), successor.digest())
-                }
-            };
+            let (config_id, config_digest) = change.binding();
             if config_id != configuration.config_id || config_digest != configuration.config_digest
             {
                 return Err(Error::Rejected(RejectReason::WrongConfig));
@@ -2699,7 +2701,9 @@ impl RecorderFileStore {
             next.seal = None;
         }
         match change {
-            Some(ConfigChange::Stop { .. }) if applied_value.is_some() => {
+            Some(ConfigChange::Stop { .. } | ConfigChange::BoundStop { .. })
+                if applied_value.is_some() =>
+            {
                 let value = applied_value.expect("checked applied value");
                 let proposed = ConfigurationSeal {
                     stop_slot: state.slot(),
@@ -2714,7 +2718,10 @@ impl RecorderFileStore {
                     next.seal = Some(proposed);
                 }
             }
-            Some(ConfigChange::ActivationBarrier { .. }) if state.decision_proof().is_some() => {
+            Some(
+                ConfigChange::ActivationBarrier { .. }
+                | ConfigChange::BoundActivationBarrier { .. },
+            ) if state.decision_proof().is_some() => {
                 next.activated = true;
             }
             _ => {}
@@ -4014,6 +4021,14 @@ impl ThreeNodeConsensus {
         })
     }
 
+    pub fn propose_stop_at(&self, slot: Slot, prev_hash: LogHash) -> Result<LogEntry> {
+        self.propose_stored_at(
+            slot,
+            prev_hash,
+            ConfigChange::stop(self.config_id, self.config_digest).to_stored_command(),
+        )
+    }
+
     pub fn propose_stop_for_successor_at(
         &self,
         slot: Slot,
@@ -4024,7 +4039,7 @@ impl ThreeNodeConsensus {
             .config_id
             .checked_add(1)
             .ok_or(Error::Rejected(RejectReason::InvalidTransition))?;
-        let stop = ConfigChange::stop(
+        let stop = ConfigChange::bound_stop(
             self.cluster_id.clone(),
             self.config_id,
             self.config_digest,
@@ -4035,26 +4050,50 @@ impl ThreeNodeConsensus {
         self.propose_stored_at(slot, prev_hash, stop.to_stored_command())
     }
 
+    pub fn propose_activation_barrier_at(
+        &self,
+        stop_slot: Slot,
+        prefix_hash: LogHash,
+    ) -> Result<LogEntry> {
+        self.propose_stored_at(
+            stop_slot.checked_add(1).ok_or(Error::InvalidRecoveredTip)?,
+            prefix_hash,
+            ConfigChange::activation_barrier(
+                self.config_id,
+                self.config_digest,
+                stop_slot,
+                prefix_hash,
+            )
+            .to_stored_command(),
+        )
+    }
+
     pub fn propose_activation_for_stop_entry(&self, stop: &LogEntry) -> Result<LogEntry> {
         let command = StoredCommand::new(stop.entry_type, stop.payload.clone());
         let change = ConfigChange::recognize(&command)
             .map_err(|_| Error::Rejected(RejectReason::InvalidTransition))?;
-        let successor = change.successor();
-        if successor.cluster_id() != self.cluster_id
-            || successor.config_id() != self.config_id
-            || successor.digest() != self.config_digest
-            || successor.members() != self.membership.members()
-        {
-            return Err(Error::Rejected(RejectReason::InvalidTransition));
-        }
-        let successor = successor.clone();
+        let successor = change
+            .successor()
+            .filter(|successor| {
+                successor.cluster_id() == self.cluster_id
+                    && successor.config_id() == self.config_id
+                    && successor.digest() == self.config_digest
+                    && successor.members() == self.membership.members()
+            })
+            .ok_or(Error::Rejected(RejectReason::InvalidTransition))?
+            .clone();
         self.propose_stored_at(
             stop.index
                 .checked_add(1)
                 .ok_or(Error::InvalidRecoveredTip)?,
             stop.hash,
-            ConfigChange::activation_barrier(successor, stop.index, stop.hash, command.hash())
-                .to_stored_command(),
+            ConfigChange::bound_activation_barrier(
+                successor,
+                stop.index,
+                stop.hash,
+                command.hash(),
+            )
+            .to_stored_command(),
         )
     }
 
@@ -4071,7 +4110,7 @@ impl ThreeNodeConsensus {
             .value
             .as_ref()
             .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
-        let stop_change = ConfigChange::stop(
+        let bound_stop = ConfigChange::bound_stop(
             self.cluster_id.clone(),
             predecessor_config_id,
             proof_context(stop_proof).3,
@@ -4079,7 +4118,7 @@ impl ThreeNodeConsensus {
             self.membership.members().to_vec(),
         )
         .map_err(|_| Error::Rejected(RejectReason::InvalidTransition))?;
-        let stop_command = stop_change.to_stored_command();
+        let stop_command = bound_stop.to_stored_command();
         let expected = AcceptedValue::from_command(
             &self.cluster_id,
             stop_slot,
@@ -4091,11 +4130,14 @@ impl ThreeNodeConsensus {
         if &expected != value {
             return Err(Error::Rejected(RejectReason::InvalidTransition));
         }
-        let successor = stop_change.successor().clone();
+        let successor = bound_stop
+            .successor()
+            .expect("bound stop has successor")
+            .clone();
         self.propose_stored_at(
             stop_slot.checked_add(1).ok_or(Error::InvalidRecoveredTip)?,
             value.entry_hash,
-            ConfigChange::activation_barrier(
+            ConfigChange::bound_activation_barrier(
                 successor,
                 stop_slot,
                 value.entry_hash,
@@ -9477,7 +9519,7 @@ mod tests {
             })
             .collect();
         let offered = StoredCommand::new(EntryType::Command, b"offered".to_vec());
-        let transition = ConfigChange::stop(
+        let transition = ConfigChange::bound_stop(
             "cluster",
             1,
             membership.digest(),

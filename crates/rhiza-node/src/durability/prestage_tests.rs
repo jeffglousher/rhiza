@@ -8,7 +8,7 @@ use rhiza_archive::{
     CheckpointIdentity, CheckpointPublisherOptions, CheckpointTip, ObjectArchiveStore,
 };
 use rhiza_core::{
-    ConfigChange, ConfigurationState, EntryType, ExecutionProfile, LogEntry, LogHash,
+    ConfigChange, ConfigurationState, EntryType, ExecutionProfile, LogEntry, LogHash, StopBinding,
 };
 use rhiza_log::{FileLogStore, LogStore};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
@@ -423,7 +423,7 @@ async fn finalized_prestage_adopts_the_existing_successor_receipt_without_recopy
     .await
     .unwrap();
     let published = publish_successor_prestage(prestage, &data_dir).unwrap();
-    let change = ConfigChange::stop(
+    let change = ConfigChange::bound_stop(
         "rhiza:sql:cluster-a",
         4,
         predecessor_digest,
@@ -431,7 +431,7 @@ async fn finalized_prestage_adopts_the_existing_successor_receipt_without_recopy
         successor.members().to_vec(),
     )
     .unwrap();
-    let successor_descriptor = change.successor().clone();
+    let successor_descriptor = change.successor().unwrap().clone();
     let command = change.to_stored_command();
     let hash = LogEntry::calculate_hash(
         "rhiza:sql:cluster-a",
@@ -533,8 +533,10 @@ async fn finalized_prestage_adopts_the_existing_successor_receipt_without_recopy
             4,
             predecessor_digest,
             rhiza_core::LogAnchor::new(1, hash),
-            successor_descriptor,
-            command.hash(),
+            StopBinding::Bound {
+                successor: successor_descriptor,
+                stop_command_hash: command.hash(),
+            },
         ),
         [
             PeerConfig::new("node-1", "http://node-1", "peer-1").unwrap(),

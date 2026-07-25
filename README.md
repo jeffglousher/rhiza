@@ -10,18 +10,18 @@ The workspace retains SQL, graph, and KV materialization crates. The released
 runtime and product documentation cover SQL only; graph and KV are not wired
 into the SQL release surface.
 
-The initial crates.io product, `rhizadb` v0.1.0, is SQL-only and uses SQLite.
+The current crates.io product, `rhizadb` v0.2.0, is SQL-only and uses SQLite.
 Its registry dependency closure is `rhiza-core`, `rhiza-obj-store`,
 `rhiza-log`, `rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and
-`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.1.0
-features or part of the initial SQL-only supported release.
+`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.2.0
+features or part of the SQL-only supported release.
 
 ## Workspace Components
 
 The Kubernetes-independent Rust workspace currently contains:
 
 - `rhizadb`: primary embedded SQL Rust facade and lifecycle owner; part of the
-  initial registry product.
+  registry product.
 - `rhiza-core`: log, configuration, command, and snapshot domain types.
 - `rhiza-quepaxa`: recorder RPC, durable recorder state, and consensus.
 - `rhiza-log`: local binary qlog and compaction anchors.
@@ -38,7 +38,7 @@ The Kubernetes-independent Rust workspace currently contains:
 - `rhiza-testkit`: internal, non-publishable integration-test support.
 
 Only `rhiza-core`, `rhiza-obj-store`, `rhiza-log`, `rhiza-quepaxa`,
-`rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb` are in the initial
+`rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb` are in the
 crates.io release. `rhiza-graph`, `rhiza-kv`, `rhiza-client`, `rhiza-cli`,
 `rhiza-testkit`, and `examples/basic-app-server` are excluded from it.
 
@@ -58,7 +58,7 @@ see [RELEASING.md](RELEASING.md) for the registry procedure.
 
 ## Embedded Rust API
 
-The published `rhizadb` crate exposes an SQL-only embedded owner. It
+The published `rhizadb` v0.2.0 crate exposes an SQL-only embedded owner. It
 does not offer graph or KV Cargo features, re-exports, or embedded methods;
 those remain outside the initial registry product.
 
@@ -234,6 +234,13 @@ exact Stop, and only then let the normal `rhiza serve` container start.
 persistent idempotency. HTTP routes and workspace tooling are secondary
 adapters over the same SQL node service contracts.
 
+### v0.2.0 migration
+
+v0.2.0 is a breaking clean-install release. It removes the former Rust
+constructors and legacy persistence decoders. Do not attempt mixed-version
+rolling recovery: stop the old deployment, create a clean data root, and start
+all recovering members on v0.2.0.
+
 ## Kubernetes Deployment
 
 Kubernetes provides stable process identity, DNS, secrets, and orchestration;
@@ -341,7 +348,7 @@ replays the original result rather than executing the SQL again.
 
 `/v1/sql/query` accepts one read-only statement and supports `local`, applied-
 index, and quorum read-barrier consistency. QSQL v2 is only the client request
-encoding. Replication uses QWAL v2: one canonical envelope can contain 1 to 1,024
+encoding. Replication uses the QWAL v3 envelope: one canonical envelope can contain 1 to 1,024
 ordered successful receipts at one shared qlog anchor. Each public typed call is
 still bounded to 256 members and 512 KiB of aggregate canonical encoded input.
 The runtime's bounded FIFO group-commit queue can combine concurrent whole calls
@@ -362,7 +369,7 @@ that winner, rechecks stored receipts, and prepares the remaining requests from
 the new exact base. An effect that exceeds the 512 KiB command cap is retried
 with a halved prefix until it fits or one command alone is rejected. Receipt and
 request-ID duplicate validation uses pre-sized `HashSet`s in one pass rather
-than rescanning every preceding member. QWAL v2, the current generation-5
+than rescanning every preceding member. QWAL v3, the current generation-5
 control sidecar, and generation-5 `QSNP` snapshots require a clean installation:
 older files and payloads fail closed, with no migration or rolling dual decoder.
 
@@ -427,20 +434,21 @@ access, replicated-write `PRAGMA`, `ATTACH`/`DETACH`, TEMP objects, virtual
 tables, extension loading, and explicit transaction/savepoint control. Query
 and `RETURNING` responses are bounded by server row and byte limits.
 
-SQLite storage is QWAL-only. A canonical user database must be paired with its
-mandatory `.control` sidecar; legacy `__rhiza_meta` databases and old
-QSQL/QEFX/qlog histories are not upgraded, migrated, or dual-decoded. Install
-the current generation into empty data directories; same-generation `QSNP`
-restore is recovery, not an upgrade path.
+SQLite storage is QWAL-only. A canonical user database and its mandatory
+`.control` sidecar form one current-layout pair; open and recovery validate
+their shared identity and reject incomplete, mismatched, or noncurrent layouts
+before mutation. Same-generation `QSNP` restore is recovery, not a format
+conversion path.
 The recording VFS currently runs in staging shadow/audit mode, while full
 closed-file page diff remains the correctness path. Preparation computes the
 target digest during that same complete target scan. Apply-time base/target
 digest validation, file sync, owned-inode checks, atomic rename, parent-directory
 sync, and receipt/control commit remain unchanged.
 
-Recovery metadata uses QANC v3 and binds the recovery generation,
-configuration state, snapshot identity, and executor fingerprint. A mismatch
-is rejected during recovery rather than replayed best-effort.
+Recovery metadata has semantic `RecoveryAnchor` format v2, serialized in the
+binary QANC v4 envelope. It binds the recovery generation, configuration state,
+snapshot identity, and executor fingerprint; a mismatch is rejected during
+recovery rather than replayed best-effort.
 
 The message-level comparison with Hiqlite and the bounded effect-replication
 contract are documented in [`docs/hiqlite-sql-message-review.md`](docs/hiqlite-sql-message-review.md).
@@ -557,10 +565,8 @@ the exact node identity as well as the cluster, profile, epoch, configuration,
 and recovery generation.
 
 Interrupted checkpoint replacement uses `.rhiza-restore-v2.json`, bound to the
-same identity plus the exact checkpoint index and hash. The older
-`.rhiza-restore-v1` literal is resumed only when an exact, valid v2 node marker
-already authorizes that local directory; absent or conflicting markers and
-dual restore intents fail without replacing local state.
+same identity plus the exact checkpoint index and hash. Other local
+restore-intent artifacts fail without replacing local state.
 
 On steady-state `rejoin`, a missing local Recorder is rebuilt behind the
 startup gate from the verified qlog and quorum-certified peer tail before the

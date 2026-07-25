@@ -4,7 +4,7 @@ use rhiza_archive::{
 };
 use rhiza_core::{
     ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor,
-    Snapshot, SnapshotIdentity, SnapshotManifest,
+    Snapshot, SnapshotIdentity, SnapshotManifest, StopBinding,
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore, SegmentFile};
 use rhiza_obj_store::{Error as ObjStoreError, ObjStore, ObjStoreConfig};
@@ -555,7 +555,7 @@ async fn snapshot_anchor_round_trips_configuration_state() {
     archive.publish_committed(&committed).await.unwrap();
     let bytes = b"snapshot-at-stop";
     let compacted = LogAnchor::new(1, committed[0].hash);
-    let stop_change = ConfigChange::stop(
+    let stop_change = ConfigChange::bound_stop(
         "cluster-a",
         3,
         LogHash::from_bytes([7; 32]),
@@ -567,8 +567,10 @@ async fn snapshot_anchor_round_trips_configuration_state() {
         3,
         LogHash::from_bytes([7; 32]),
         compacted,
-        stop_change.successor().clone(),
-        stop_change.to_stored_command().hash(),
+        StopBinding::Bound {
+            successor: stop_change.successor().expect("bound stop").clone(),
+            stop_command_hash: stop_change.to_stored_command().hash(),
+        },
     );
     let anchor = RecoveryAnchor::new(
         "cluster-a",

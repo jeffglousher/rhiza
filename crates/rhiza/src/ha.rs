@@ -11,7 +11,8 @@ use std::{
 
 use rhiza_archive::{CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore};
 use rhiza_core::{
-    ConfigChange, ErrorClassification, ExecutionProfile, LogAnchor, LogHash, StoredCommand,
+    ConfigChange, ErrorClassification, ExecutionProfile, LogAnchor, LogHash, StopBinding,
+    StoredCommand,
 };
 use rhiza_log::LogStore;
 use rhiza_node::{
@@ -180,14 +181,22 @@ impl HaNode {
     pub async fn ready(&self) -> Result<RhizaHandle, HaNodeError> {
         let mut state = self.state.clone();
         loop {
-            let snapshot = state.borrow().clone();
+            let (shutdown, snapshot) = {
+                let shutdown_guard = self.shutdown.borrow();
+                let shutdown = *shutdown_guard;
+                let snapshot = state.borrow().clone();
+                (shutdown, snapshot)
+            };
+            if let Some(error) = snapshot.terminal_error {
+                return Err(error);
+            }
+            if shutdown.is_some() {
+                return Err(HaNodeError::Cancelled);
+            }
             if snapshot.status == HaNodeStatus::Ready {
                 return snapshot.handle.ok_or_else(|| {
                     HaNodeError::Startup(fail("ready HA node has no application handle"))
                 });
-            }
-            if let Some(error) = snapshot.terminal_error {
-                return Err(error);
             }
             if matches!(
                 snapshot.status,
@@ -204,7 +213,8 @@ impl HaNode {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.status() == HaNodeStatus::Ready
+        let shutdown_guard = self.shutdown.borrow();
+        shutdown_guard.is_none() && self.status() == HaNodeStatus::Ready
     }
 
     pub async fn monitor(&self) -> Result<(), HaNodeError> {
@@ -224,7 +234,11 @@ impl HaNode {
     }
 
     pub async fn shutdown(mut self) -> Result<(), HaNodeError> {
-        request_ha_shutdown(&self.shutdown);
+        request_ha_shutdown(&self.shutdown, || {
+            if let Some(handle) = self.state.borrow().handle.as_ref() {
+                handle.close_admission();
+            }
+        });
         let supervisor = self
             .supervisor
             .take()
@@ -240,17 +254,26 @@ impl HaNode {
 
 impl Drop for HaNode {
     fn drop(&mut self) {
-        request_ha_shutdown(&self.shutdown);
+        request_ha_shutdown(&self.shutdown, || {
+            if let Some(handle) = self.state.borrow().handle.as_ref() {
+                handle.close_admission();
+            }
+        });
     }
 }
 
-fn request_ha_shutdown(
+fn request_ha_shutdown<F>(
     shutdown: &tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
-) -> tokio::time::Instant {
+    close_admission: F,
+) -> tokio::time::Instant
+where
+    F: FnOnce(),
+{
     let requested = tokio::time::Instant::now() + HA_SERVER_SHUTDOWN_TIMEOUT;
     shutdown.send_if_modified(|deadline| {
         if deadline.is_none() {
             *deadline = Some(requested);
+            close_admission();
             true
         } else {
             false
@@ -675,6 +698,9 @@ impl HaStartupConfig {
     }
 
     pub async fn prepare(self) -> Result<PreparedHaStartup, HaStartupError> {
+        if self.predecessor.is_none() && !self.node_config.configuration_state().is_active() {
+            return Err(fail("stopped configuration requires a predecessor"));
+        }
         let identity = self.archive.checkpoint_identity().map_err(error)?.clone();
         let target_config_id = self.target_config_id()?;
         validate_archive_identity(&self.node_config, &identity, target_config_id)?;
@@ -1261,7 +1287,7 @@ async fn supervise_ha_node(
             },
             result = &mut recorder_task => {
                 let error = unexpected_server_exit(result, "recorder server");
-                let deadline = request_ha_shutdown(&shutdown);
+                let deadline = request_ha_shutdown(&shutdown, || {});
                 publish_ha_failure(&state, error.clone());
                 let cleanup = match tokio::time::timeout_at(deadline, &mut startup).await {
                     Ok(Ok(opened)) => {
@@ -1488,14 +1514,14 @@ async fn supervise_ha_node(
     };
 
     let deadline = if let Some(error) = &terminal {
-        let deadline = request_ha_shutdown(&shutdown);
+        let deadline = request_ha_shutdown(&shutdown, || handle.close_admission());
         publish_ha_failure(&state, error.clone());
         deadline
     } else {
         publish_ha_state(&state, HaNodeStatus::ShuttingDown, None, None);
         shutdown_rx
             .borrow()
-            .unwrap_or_else(|| request_ha_shutdown(&shutdown))
+            .unwrap_or_else(|| request_ha_shutdown(&shutdown, || handle.close_admission()))
     };
     let cleanup = shutdown_ha_runtime_before(
         owner,
@@ -1574,12 +1600,7 @@ async fn update_ha_readiness(
     if shutdown_guard.is_some() {
         return;
     }
-    publish_ha_state(
-        state,
-        phase,
-        (phase == HaNodeStatus::Ready).then(|| handle.clone()),
-        None,
-    );
+    publish_ha_state(state, phase, Some(handle.clone()), None);
     drop(shutdown_guard);
 }
 
@@ -1926,6 +1947,7 @@ impl RecorderRpc for HaRecorder {
         &self,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        self.require_active()?;
         self.require_visible_slot(request.slot)?;
         self.recorder.observe_read_fence(request)
     }
@@ -2317,7 +2339,7 @@ fn validate_predecessor_binding(
             "predecessor Stop does not exactly bind the target node configuration",
         ));
     }
-    let ConfigChange::Stop { successor } =
+    let ConfigChange::BoundStop { successor } =
         ConfigChange::recognize_parts(stop.entry.entry_type, &stop.entry.payload)
             .map_err(|_| fail("predecessor Stop is not a bound configuration change"))?
     else {
@@ -2346,8 +2368,10 @@ fn validate_predecessor_binding(
                 stop.entry.config_id,
                 predecessor.membership.digest(),
                 stop_anchor,
-                successor.clone(),
-                command.hash(),
+                StopBinding::Bound {
+                    successor: successor.clone(),
+                    stop_command_hash: command.hash(),
+                },
             )
     {
         return Err(fail(
@@ -3344,6 +3368,67 @@ fn path_has_state(path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantined_recorders_do_not_contribute_empty_read_fence_votes() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorders = membership
+            .members()
+            .iter()
+            .enumerate()
+            .map(|(index, node_id)| {
+                let recorder = RecorderFileStore::new_with_membership(
+                    root.path().join(node_id),
+                    node_id.clone(),
+                    "cluster-a",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap();
+                let recorder = if index == 0 {
+                    HaRecorder::active(recorder)
+                } else {
+                    HaRecorder::quarantined(recorder, LogAnchor::new(0, LogHash::ZERO))
+                };
+                (node_id.clone(), Box::new(recorder) as Box<dyn RecorderRpc>)
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster-a", "node-1", 1, 1, recorders)
+                .unwrap();
+
+        assert_eq!(
+            consensus
+                .inspect_context_read_fence_at(1, LogHash::ZERO)
+                .unwrap(),
+            rhiza_quepaxa::CertifiedDecisionInspection::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_rejects_a_ready_snapshot_after_shutdown_is_requested() {
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(None);
+        let (_state_tx, state) = tokio::sync::watch::channel(HaNodeSnapshot {
+            status: HaNodeStatus::Ready,
+            handle: Some(RhizaHandle {
+                inner: std::sync::Weak::new(),
+            }),
+            terminal_error: None,
+        });
+        let node = HaNode {
+            shutdown,
+            state,
+            supervisor: None,
+        };
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(node.ready());
+
+        request_ha_shutdown(&node.shutdown, || {});
+
+        assert!(matches!(node.ready().await, Err(HaNodeError::Cancelled)));
+    }
 
     #[tokio::test]
     async fn service_start_prefers_shutdown_when_both_signals_are_ready() {

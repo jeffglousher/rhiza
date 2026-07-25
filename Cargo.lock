@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-archive"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rhiza-core",
  "rhiza-log",
@@ -2045,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-log"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "rhiza-core",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-node"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "postcard",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-obj-store"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-quepaxa"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "proptest",
@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "rhiza-sql"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "fallible-streaming-iterator",
  "postcard",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "rhizadb"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "rhiza-archive",

@@ -6,7 +6,7 @@ use rhiza_quepaxa::{
 };
 
 fn same_membership_stop(cluster_id: &str, config_id: u64, membership: &Membership) -> ConfigChange {
-    ConfigChange::stop(
+    ConfigChange::bound_stop(
         cluster_id,
         config_id,
         membership.digest(),
@@ -75,8 +75,8 @@ fn config_change_commands_are_opaque_and_strictly_recognized() {
     assert_eq!(stop.entry_type, EntryType::ConfigChange);
     assert_eq!(ConfigChange::recognize(&stop).unwrap(), stop_change);
 
-    let activation_change = ConfigChange::activation_barrier(
-        stop_change.successor().clone(),
+    let activation_change = ConfigChange::bound_activation_barrier(
+        stop_change.successor().expect("bound stop").clone(),
         10,
         LogHash::from_bytes([9; 32]),
         stop.hash(),
@@ -323,7 +323,7 @@ fn activation_proof_reinstall_accepts_same_value_and_rejects_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     let recorder = store(&dir, "r1", 4, membership.clone());
-    let stop_change = ConfigChange::stop(
+    let stop_change = ConfigChange::bound_stop(
         "cluster-a",
         4,
         membership.digest(),
@@ -343,8 +343,8 @@ fn activation_proof_reinstall_accepts_same_value_and_rejects_conflict() {
         .install_successor_from_proof(membership.clone(), &stop_proof)
         .unwrap();
 
-    let activation = ConfigChange::activation_barrier(
-        stop_change.successor().clone(),
+    let activation = ConfigChange::bound_activation_barrier(
+        stop_change.successor().expect("bound stop").clone(),
         7,
         stop_value.entry_hash,
         stop_value.command_hash,
@@ -533,7 +533,7 @@ fn one_stop_proof_cannot_install_two_disjoint_successors() {
     let old = Membership::new(["r1", "r2", "r3"]).unwrap();
     let next_a = Membership::new(["a1", "a2", "a3"]).unwrap();
     let next_b = Membership::new(["b1", "b2", "b3"]).unwrap();
-    let stop = ConfigChange::stop("cluster-a", 4, old.digest(), 5, next_a.members().to_vec())
+    let stop = ConfigChange::bound_stop("cluster-a", 4, old.digest(), 5, next_a.members().to_vec())
         .unwrap()
         .to_stored_command();
     let value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
@@ -555,7 +555,7 @@ fn cross_cluster_stop_proof_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let old = Membership::new(["r1", "r2", "r3"]).unwrap();
     let next = Membership::new(["r1", "r2", "r3"]).unwrap();
-    let stop = ConfigChange::stop("cluster-b", 4, old.digest(), 5, next.members().to_vec())
+    let stop = ConfigChange::bound_stop("cluster-b", 4, old.digest(), 5, next.members().to_vec())
         .unwrap()
         .to_stored_command();
     let value = AcceptedValue::from_command("cluster-b", 7, 2, 4, LogHash::ZERO, &stop);
@@ -571,7 +571,7 @@ fn cross_cluster_stop_proof_is_rejected() {
 fn same_voter_successor_is_legal() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
-    let stop = ConfigChange::stop(
+    let stop = ConfigChange::bound_stop(
         "cluster-a",
         4,
         membership.digest(),

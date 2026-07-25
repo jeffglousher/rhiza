@@ -1422,18 +1422,16 @@ fn decode_embedded_log_entry(
     cluster_id: &str,
     initial_configuration: ConfigurationState,
 ) -> Result<(LogEntry, ConfigurationState)> {
-    let (entries, resulting_configuration) =
-        rhiza_log::decode_segment_for_cluster_with_configuration(
-            encoded,
-            cluster_id,
-            initial_configuration,
-        )
+    let entries = rhiza_log::decode_segment_for_cluster(encoded, cluster_id)
         .map_err(|error| Error::InvalidEntry(error.to_string()))?;
     let [entry] = entries.as_slice() else {
         return Err(Error::InvalidEntry(
             "embedded qlog value must contain exactly one entry".into(),
         ));
     };
+    let resulting_configuration = initial_configuration
+        .validate_entry(entry)
+        .map_err(|error| Error::InvalidEntry(error.to_string()))?;
     Ok((entry.clone(), resulting_configuration))
 }
 
@@ -1834,7 +1832,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sqlite.control");
         let original = identity("node-a");
-        let stop_change = rhiza_core::ConfigChange::stop(
+        let stop_change = rhiza_core::ConfigChange::bound_stop(
             original.cluster_id(),
             original.configuration_state().config_id(),
             original.configuration_state().digest(),

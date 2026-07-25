@@ -698,7 +698,11 @@ fn successor_from_entry(entry: &LogEntry) -> Result<AdminSuccessorBundle, NodeEr
     let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
     let change = ConfigChange::recognize(&command)
         .map_err(|_| NodeError::PreconditionFailed("Stop command is not successor-bound".into()))?;
-    let successor = change.successor();
+    let ConfigChange::BoundStop { successor } = change else {
+        return Err(NodeError::PreconditionFailed(
+            "Stop command is not successor-bound".into(),
+        ));
+    };
     Ok(AdminSuccessorBundle {
         config_id: successor.config_id(),
         members: successor.members().to_vec(),

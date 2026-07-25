@@ -699,7 +699,7 @@ fn startup_replays_qlog_config_change_ahead_of_sqlite_sidecar() {
         ConfigurationState::active(1, test_config_digest()),
     )
     .unwrap();
-    let command = ConfigChange::stop(
+    let command = ConfigChange::bound_stop(
         "rhiza:sql:cluster-a",
         1,
         test_config_digest(),

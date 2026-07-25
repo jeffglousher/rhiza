@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use rhiza_archive::ObjectArchiveStore;
+use rhiza_archive::{ObjectArchiveStore, SnapshotRecord};
 use rhiza_core::{ConfigurationState, LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity};
 use rhiza_log::LogStore;
 use rhiza_node::{
@@ -9,7 +9,7 @@ use rhiza_node::{
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::ThreeNodeConsensus;
-use rhiza_sql::restore_snapshot_file;
+use rhiza_sql::{restore_snapshot_file, sql_executor_fingerprint};
 
 #[tokio::test]
 async fn restart_accepts_sqlite_exactly_at_compacted_anchor() {
@@ -226,6 +226,44 @@ async fn compaction_requires_matching_remote_snapshot_publication() {
         .is_none());
 }
 
+#[tokio::test]
+async fn snapshot_publication_is_rejected_when_executor_fingerprint_differs_from_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+    let snapshot = runtime.create_recovery_snapshot().unwrap();
+    let publication = publication_with_executor_fingerprint(
+        publish(dir.path(), &snapshot).await,
+        LogHash::digest(&[b"other-executor"]),
+    );
+    let before = runtime.log_store().logical_state().unwrap().anchor;
+
+    assert!(matches!(
+        runtime.verify_snapshot_publication(&snapshot, &publication),
+        Err(NodeError::Reconciliation(_))
+    ));
+    assert_eq!(runtime.log_store().logical_state().unwrap().anchor, before);
+}
+
+#[tokio::test]
+async fn snapshot_publication_is_rejected_when_configuration_state_differs_from_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+    let snapshot = runtime.create_recovery_snapshot().unwrap();
+    let publication = publication_with_configuration_state(
+        publish(dir.path(), &snapshot).await,
+        ConfigurationState::active(1, LogHash::digest(&[b"other-configuration"])),
+    );
+    let before = runtime.log_store().logical_state().unwrap().anchor;
+
+    assert!(matches!(
+        runtime.verify_snapshot_publication(&snapshot, &publication),
+        Err(NodeError::Reconciliation(_))
+    ));
+    assert_eq!(runtime.log_store().logical_state().unwrap().anchor, before);
+}
+
 #[derive(Clone)]
 struct SnapshotPeer(RecoveryAnchor);
 
@@ -254,6 +292,24 @@ async fn publish(
         .unwrap()
 }
 
+fn publication_with_executor_fingerprint(
+    publication: SnapshotRecord,
+    executor_fingerprint: LogHash,
+) -> SnapshotRecord {
+    let mut value = serde_json::to_value(publication).unwrap();
+    value["manifest"]["executor_fingerprint"] = serde_json::to_value(executor_fingerprint).unwrap();
+    serde_json::from_value(value).unwrap()
+}
+
+fn publication_with_configuration_state(
+    publication: SnapshotRecord,
+    configuration_state: ConfigurationState,
+) -> SnapshotRecord {
+    let mut value = serde_json::to_value(publication).unwrap();
+    value["manifest"]["configuration_state"] = serde_json::to_value(configuration_state).unwrap();
+    serde_json::from_value(value).unwrap()
+}
+
 fn test_anchor(index: u64, hash: LogHash, recovery_generation: u64) -> RecoveryAnchor {
     let digest = rhiza_quepaxa::Membership::new(["node-1", "node-2", "node-3"])
         .unwrap()
@@ -268,7 +324,7 @@ fn test_anchor(index: u64, hash: LogHash, recovery_generation: u64) -> RecoveryA
             format!("snapshot-{index:015}"),
             LogHash::digest(&[b"snapshot"]),
             8,
-            rhiza_sql::sql_executor_fingerprint().unwrap(),
+            sql_executor_fingerprint().unwrap(),
         ),
     )
 }

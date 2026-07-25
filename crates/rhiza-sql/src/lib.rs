@@ -528,7 +528,6 @@ impl SqliteStateMachine {
         }
         let control = ControlStore::open_existing_unchecked(&control_path)?;
         let (page_state, pending) = validate_control_database_pair(path, &control)?;
-        reject_legacy_user_database(path)?;
         let conn = open_connection(path)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -1213,7 +1212,7 @@ impl SqliteStateMachine {
             .map(|_| ())
     }
 
-    /// Prepares one physical QWAL v2 effect for the successful subset of an
+    /// Prepares one physical QWAL v3 effect for the successful subset of an
     /// ordered SQL batch.
     ///
     /// Each member runs inside its own savepoint nested under one outer SQLite
@@ -2838,28 +2837,6 @@ fn control_sidecar_path(path: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
-fn reject_legacy_user_database(path: &Path) -> Result<()> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(sqlite_error)?;
-    let legacy: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_schema WHERE name IN ('__rhiza_meta', '__rhiza_requests') LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    if let Some(table) = legacy {
-        return Err(Error::IdentityMismatch(format!(
-            "legacy table {table} requires snapshot bootstrap into QWAL storage"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_control_database_pair(
     path: &Path,
     control: &ControlStore,
@@ -3311,7 +3288,7 @@ fn observational_pragma(name: &str, value: Option<&str>) -> bool {
 }
 
 fn reserved_name(name: &str) -> bool {
-    const TABLES: &[&str] = &["__rhiza_kv", "__rhiza_meta", "__rhiza_requests"];
+    const TABLES: &[&str] = &["__rhiza_kv"];
     reserved_table_name(name)
         || strip_ascii_prefix_ignore_case(name, "sqlite_autoindex_").is_some_and(|suffix| {
             TABLES.iter().any(|table| {
@@ -3324,7 +3301,7 @@ fn reserved_name(name: &str) -> bool {
 }
 
 fn reserved_table_name(name: &str) -> bool {
-    matches_ignore_ascii_case(name, &["__rhiza_kv", "__rhiza_meta", "__rhiza_requests"])
+    matches_ignore_ascii_case(name, &["__rhiza_kv"])
 }
 
 fn validate_reserved_schema(conn: &Connection) -> Result<()> {
@@ -3333,17 +3310,14 @@ fn validate_reserved_schema(conn: &Connection) -> Result<()> {
             "SELECT name
              FROM sqlite_schema
              WHERE
-               ((lower(name) IN ('__rhiza_meta', '__rhiza_requests')
-                 OR lower(tbl_name) IN ('__rhiza_meta', '__rhiza_requests')))
-               OR
-               ((lower(name) = '__rhiza_kv' OR lower(tbl_name) = '__rhiza_kv')
+               (lower(name) = '__rhiza_kv' OR lower(tbl_name) = '__rhiza_kv')
                 AND NOT (
                     (type = 'table' AND name = '__rhiza_kv' AND tbl_name = '__rhiza_kv')
                     OR
                     (type = 'index'
                      AND name GLOB 'sqlite_autoindex___rhiza_kv_*'
                      AND tbl_name = '__rhiza_kv')
-                ))
+                )
              LIMIT 1",
             [],
             |row| row.get(0),
@@ -3776,16 +3750,13 @@ mod query_policy_tests {
 
     #[test]
     fn reserved_name_and_vtable_content_checks_match_only_structural_sentinels() {
-        for name in [
-            "__rhiza_kv",
-            "__RHIZA_META",
-            "__rhiza_requests",
-            "sqlite_autoindex___rhiza_kv_1",
-        ] {
+        for name in ["__rhiza_kv", "sqlite_autoindex___rhiza_kv_1"] {
             assert!(reserved_name(name));
         }
         for name in [
             "__rhiza_user_table",
+            "__RHIZA_META",
+            "__rhiza_requests",
             "x__rhiza_kv",
             "sqlite_autoindex_user_1",
         ] {
@@ -3793,10 +3764,6 @@ mod query_policy_tests {
         }
         for sql in [
             "CREATE VIRTUAL TABLE x USING fts5(body, content='__rhiza_kv')",
-            "CREATE VIRTUAL TABLE x USING fts5(body, CONTENT = [__RHIZA_META])",
-            "CREATE VIRTUAL TABLE x USING fts5(body, content=__rhiza_requests)",
-            "CREATE VIRTUAL TABLE x USING fts5(body, content=\"__rhiza_meta\")",
-            "CREATE VIRTUAL TABLE x USING fts5(body, content=`__rhiza_requests`)",
             "CREATE VIRTUAL TABLE x USING fts5(prefix=(a,b), CoNtEnT /* option */ = '__rhiza_kv')",
         ] {
             assert!(virtual_table_uses_reserved_content(sql));
@@ -3805,6 +3772,8 @@ mod query_policy_tests {
             "CREATE VIRTUAL TABLE x USING fts5(__rhiza_kv)",
             "CREATE VIRTUAL TABLE x USING fts5(body, tokenize='__rhiza_kv')",
             "CREATE VIRTUAL TABLE x USING fts5(body, content='__rhiza_kv_user')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, CONTENT = [__RHIZA_META])",
+            "CREATE VIRTUAL TABLE x USING fts5(body, content=__rhiza_requests)",
             "CREATE VIRTUAL TABLE x USING fts5(body, 'content=__rhiza_kv')",
             "CREATE VIRTUAL TABLE x USING fts5(body, \"content=__rhiza_meta\")",
             "CREATE VIRTUAL TABLE x USING fts5(body, `content=__rhiza_requests`)",
@@ -4701,7 +4670,7 @@ mod query_policy_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
-        let change = rhiza_core::ConfigChange::stop(
+        let change = rhiza_core::ConfigChange::bound_stop(
             "cluster-a",
             1,
             LogHash::ZERO,

@@ -943,10 +943,9 @@ impl LearnerStore {
         }
         let change = ConfigChange::recognize_parts(stop.entry.entry_type, &stop.entry.payload)
             .map_err(|_| LearnerStoreError::InvalidStop)?;
-        if !matches!(change, ConfigChange::Stop { .. }) {
+        let ConfigChange::BoundStop { successor } = change else {
             return Err(LearnerStoreError::InvalidStop);
-        }
-        let successor = change.successor();
+        };
         if successor.cluster_id() != self.config.cluster_id
             || successor.predecessor_config_id() != self.config.config_id
             || successor.predecessor_config_digest() != self.config.membership.digest()

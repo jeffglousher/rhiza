@@ -139,7 +139,7 @@ fn normal_record_reopens_with_command_and_max_without_rewriting_configuration() 
         Some(command)
     );
 
-    let stop = ConfigChange::stop(
+    let stop = ConfigChange::bound_stop(
         CLUSTER_ID,
         CONFIG_ID,
         membership.digest(),

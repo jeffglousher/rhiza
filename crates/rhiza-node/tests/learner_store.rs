@@ -3,6 +3,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{
     Command, CommandKind, ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogHash,
+    StopBinding,
 };
 use rhiza_log::FileLogStore;
 use rhiza_node::{
@@ -123,7 +124,7 @@ async fn detached_learner_applies_only_certified_pages_and_adopts_the_exact_boun
             Command::new(CommandKind::ReadBarrier, Vec::new()),
         )
         .unwrap();
-    let stop_command = ConfigChange::stop(
+    let stop_command = ConfigChange::bound_stop(
         CLUSTER_ID,
         PREDECESSOR_CONFIG_ID,
         predecessor.digest(),
@@ -136,6 +137,7 @@ async fn detached_learner_applies_only_certified_pages_and_adopts_the_exact_boun
     let successor_descriptor = ConfigChange::recognize(&stop_command)
         .unwrap()
         .successor()
+        .unwrap()
         .clone();
     let stop_entry = consensus
         .propose_stored_at(2, noop.hash, stop_command)
@@ -202,8 +204,10 @@ async fn detached_learner_applies_only_certified_pages_and_adopts_the_exact_boun
         PREDECESSOR_CONFIG_ID,
         predecessor.digest(),
         stop_anchor,
-        successor_descriptor,
-        stop_command_hash,
+        StopBinding::Bound {
+            successor: successor_descriptor,
+            stop_command_hash,
+        },
     );
     assert_eq!(
         detached_log.configuration_state().unwrap(),

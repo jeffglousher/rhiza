@@ -1,7 +1,9 @@
 use std::{
+    future::{poll_fn, Future},
     net::SocketAddr,
     path::Path,
     sync::{mpsc, Arc, Condvar, Mutex},
+    task::Poll,
     time::Duration,
 };
 
@@ -119,6 +121,59 @@ async fn listeners() -> (Vec<TcpListener>, Vec<SocketAddr>) {
     (listeners, addresses)
 }
 
+#[tokio::test]
+async fn shutdown_request_immediately_closes_ready_handle_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = archive(&root.path().join("archive"));
+    archive.initialize_checkpoint().await.unwrap();
+    let (mut recorder_listeners, recorder_addresses) = listeners().await;
+    let (mut service_listeners, service_addresses) = listeners().await;
+    let prepared = HaStartupConfig::new(
+        node_config(
+            &root.path().join("node-1"),
+            0,
+            &recorder_addresses,
+            &service_addresses,
+        ),
+        archive,
+        DurabilityMode::Sync,
+        60_000,
+        HaStartupMode::Bootstrap,
+    )
+    .prepare()
+    .await
+    .unwrap();
+    let node = prepared
+        .start(HaServeConfig::new(
+            recorder_listeners.remove(0),
+            service_listeners.remove(0),
+            HaRecorderTransport::Http,
+            file_recorder_clients(&root.path().join("recorders")),
+            Vec::<Arc<dyn LogPeer>>::new(),
+        ))
+        .await
+        .unwrap();
+    let handle = tokio::time::timeout(HANG_GUARD, node.ready())
+        .await
+        .expect("HA node must become ready")
+        .unwrap();
+    let mut shutdown = Box::pin(node.shutdown());
+
+    let first_shutdown_poll = poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(first_shutdown_poll.is_pending());
+
+    let mut put = Box::pin(handle.put("after-shutdown-request", "key", "value"));
+    let first_put_poll = poll_fn(|context| Poll::Ready(put.as_mut().poll(context))).await;
+    let admission_closed = matches!(first_put_poll, Poll::Ready(Err(Error::Closed)));
+    drop(put);
+    shutdown.await.unwrap();
+
+    assert!(
+        admission_closed,
+        "a new operation was admitted after shutdown was requested"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_then_releases_listeners(
 ) {
@@ -129,10 +184,10 @@ async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_the
     let (mut service_listeners, service_addresses) = listeners().await;
     let mut nodes = Vec::with_capacity(3);
 
-    for node_index in 0..3 {
+    for (node_index, node_id) in NODE_IDS.iter().enumerate() {
         let prepared = HaStartupConfig::new(
             node_config(
-                &root.path().join(NODE_IDS[node_index]),
+                &root.path().join(node_id),
                 node_index,
                 &recorder_addresses,
                 &service_addresses,
@@ -397,13 +452,13 @@ async fn shutdown_bounds_a_blocked_runtime_open_and_releases_recorder_ingress() 
     release.release();
 }
 
-fn blocking_file_recorder_clients(
-    root: &Path,
-) -> (
+type BlockingRecorderClients = (
     Vec<(String, Box<dyn RecorderRpc>)>,
     mpsc::Receiver<()>,
     StartupRelease,
-) {
+);
+
+fn blocking_file_recorder_clients(root: &Path) -> BlockingRecorderClients {
     let membership = Membership::new(NODE_IDS).unwrap();
     let (started, startup_blocked) = mpsc::sync_channel(3);
     let gate = Arc::new((Mutex::new(false), Condvar::new()));

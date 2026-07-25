@@ -8324,7 +8324,7 @@ impl NodeRuntime {
         self.ensure_ready()?;
         self.ensure_writes_active()?;
         let state = self.configuration_state()?;
-        let stop_command = ConfigChange::stop(
+        let stop_command = ConfigChange::bound_stop(
             self.config.cluster_id.clone(),
             state.config_id(),
             state.digest(),
@@ -8555,9 +8555,11 @@ impl NodeRuntime {
             || manifest.cluster_id() != anchor.cluster_id()
             || manifest.epoch() != anchor.epoch()
             || manifest.config_id() != anchor.config_id()
+            || manifest.configuration_state() != anchor.configuration_state()
             || manifest.index() != anchor.compacted().index()
             || manifest.applied_hash() != anchor.compacted().hash()
             || manifest.snapshot_id() != anchor.snapshot().snapshot_id()
+            || manifest.executor_fingerprint() != anchor.snapshot().executor_fingerprint()
             || publication_digest != anchor.snapshot().digest()
             || publication.size_bytes() != anchor.snapshot().size_bytes()
             || LogHash::digest(&[snapshot.db_bytes()]) != anchor.snapshot().digest()
@@ -9586,7 +9588,7 @@ mod tests {
 
     #[cfg(feature = "sql")]
     #[tokio::test]
-    async fn node_error_http_response_preserves_v1_contract() {
+    async fn node_error_http_response_preserves_contract() {
         let snapshot = RecoveryAnchor::new(
             "cluster",
             1,
@@ -9595,7 +9597,7 @@ mod tests {
             LogAnchor::new(1, LogHash::ZERO),
             SnapshotIdentity::new(
                 "snapshot",
-                LogHash::ZERO,
+                LogHash::digest(&[b"node-error-test-snapshot"]),
                 0,
                 rhiza_sql::sql_executor_fingerprint().unwrap(),
             ),

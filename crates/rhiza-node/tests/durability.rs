@@ -680,31 +680,6 @@ async fn restore_preserves_an_existing_empty_data_directory() {
 }
 
 #[tokio::test]
-async fn unsupported_restore_artifact_fails_without_mutation() {
-    let root = tempfile::tempdir().unwrap();
-    let archive = initialized_checkpoint(&root.path().join("archive")).await;
-    let data_dir = root.path().join("mounted-data");
-    std::fs::create_dir_all(data_dir.join("consensus/partial")).unwrap();
-    std::fs::create_dir(data_dir.join(".restore-stage-foreign")).unwrap();
-    std::fs::write(
-        data_dir.join(".rhiza-restore-unsupported"),
-        b"unsupported restore artifact\n",
-    )
-    .unwrap();
-
-    let before = std::fs::read(data_dir.join(".rhiza-restore-unsupported")).unwrap();
-    assert!(restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
-        .await
-        .is_err());
-    assert_eq!(
-        std::fs::read(data_dir.join(".rhiza-restore-unsupported")).unwrap(),
-        before
-    );
-    assert!(data_dir.join("consensus/partial").is_dir());
-    assert!(data_dir.join(".restore-stage-foreign").is_dir());
-}
-
-#[tokio::test]
 async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
     let root = tempfile::tempdir().unwrap();
     let archive = initialized_checkpoint(&root.path().join("archive")).await;
@@ -719,7 +694,6 @@ async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
         .unwrap();
     let anchor = source.checkpoint_compact(&coordinator).await.unwrap();
     let local = source.log_store().logical_state().unwrap();
-    assert_eq!(anchor.format_version(), 2);
     assert_eq!(local.anchor, Some(anchor.clone()));
     assert!(source
         .log_store()

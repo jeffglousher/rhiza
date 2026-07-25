@@ -121,6 +121,79 @@ async fn ha_bootstrap_rejects_nonfresh_local_state_before_opening_a_recorder() {
 }
 
 #[tokio::test]
+async fn ha_standard_startup_rejects_bound_stopped_successor_before_creating_local_state() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = archive(&root.path().join("archive"));
+    archive.initialize_checkpoint().await.unwrap();
+    let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let successor = Membership::new(["node-4", "node-5", "node-6"]).unwrap();
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorder_clients(&root.path().join("source-recorders")),
+        )
+        .unwrap(),
+    );
+    let source =
+        NodeRuntime::open(node_config(&root.path().join("source")), consensus, &[]).unwrap();
+    let stop = source
+        .stop_current_configuration_for_successor(&successor)
+        .unwrap();
+    assert!(source
+        .consensus()
+        .finish_pending_rpcs(Duration::from_secs(1)));
+    let peers = successor
+        .members()
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| {
+            PeerConfig::new(
+                node_id,
+                format!("http://127.0.0.1:{}", 9201 + index),
+                format!("successor-peer-token-{}", index + 1),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let data_dir = root.path().join("successor");
+    let successor_config = NodeConfig::new_with_configuration(
+        "rhiza:sql:cluster-a",
+        "node-4",
+        data_dir.clone(),
+        1,
+        successor,
+        source.configuration_state().unwrap(),
+        peers,
+        "successor-client-token",
+    )
+    .unwrap()
+    .with_log_initial_configuration(ConfigurationState::active(1, predecessor.digest()))
+    .with_predecessor_stop_entry(stop.entry);
+
+    let error = HaStartupConfig::new(
+        successor_config,
+        archive,
+        DurabilityMode::Sync,
+        60_000,
+        HaStartupMode::Bootstrap,
+    )
+    .prepare()
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("stopped configuration requires a predecessor"),
+        "{error}"
+    );
+    assert!(!data_dir.exists());
+}
+
+#[tokio::test]
 async fn successor_prestage_exposes_the_exact_seed_and_target_without_opening_a_runtime() {
     let root = tempfile::tempdir().unwrap();
     let archive = archive(&root.path().join("archive"));
