@@ -15,13 +15,13 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{hash_map, BTreeMap, BTreeSet, HashMap},
+    collections::{hash_map, BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -3568,9 +3568,19 @@ impl Drop for ControlJobCancellation {
 }
 
 struct ControlWorker {
-    sender: Option<std::sync::mpsc::SyncSender<QueuedControlJob>>,
+    queue: Option<Arc<ControlQueue>>,
     handle: Option<thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
+}
+
+struct ControlQueue {
+    state: Mutex<ControlQueueState>,
+    available: Condvar,
+}
+
+struct ControlQueueState {
+    jobs: VecDeque<QueuedControlJob>,
+    closed: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3582,20 +3592,34 @@ enum ControlDispatch {
 
 impl ControlWorker {
     fn spawn(recorder: Arc<dyn RecorderRpc>) -> Result<Self> {
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<QueuedControlJob>(CONTROL_WORKER_QUEUE_CAPACITY);
+        let queue = Arc::new(ControlQueue {
+            state: Mutex::new(ControlQueueState {
+                jobs: VecDeque::with_capacity(CONTROL_WORKER_QUEUE_CAPACITY),
+                closed: false,
+            }),
+            available: Condvar::new(),
+        });
+        let worker_queue = Arc::clone(&queue);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = Arc::clone(&pending);
         let handle = thread::Builder::new()
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    job.run(recorder.as_ref());
-                    worker_pending.fetch_sub(1, Ordering::Release);
-                }
+            .spawn(move || loop {
+                let job = {
+                    let mut state = worker_queue.state.lock().unwrap();
+                    while state.jobs.is_empty() && !state.closed {
+                        state = worker_queue.available.wait(state).unwrap();
+                    }
+                    state.jobs.pop_front()
+                };
+                let Some(job) = job else {
+                    break;
+                };
+                job.run(recorder.as_ref());
+                worker_pending.fetch_sub(1, Ordering::Release);
             })
             .map_err(|error| Error::Io(error.to_string()))?;
         Ok(Self {
-            sender: Some(sender),
+            queue: Some(queue),
             handle: Some(handle),
             pending,
         })
@@ -3618,27 +3642,42 @@ impl ControlWorker {
         job: ControlJob,
         cancelled: Option<Arc<AtomicBool>>,
     ) -> ControlDispatch {
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        let job = QueuedControlJob { job, cancelled };
-        let (failed, outcome) = match &self.sender {
-            Some(sender) => match sender.try_send(job) {
-                Ok(()) => (None, ControlDispatch::Accepted),
-                Err(std::sync::mpsc::TrySendError::Full(job)) => (
-                    Some((
-                        job,
-                        Error::Io("recorder control worker queue is temporarily full".into()),
-                    )),
-                    ControlDispatch::Saturated,
-                ),
-                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
-                    (Some((job, Error::ProposeFailed)), ControlDispatch::Failed)
+        let mut queued_job = Some(QueuedControlJob { job, cancelled });
+        let (error, outcome) = match &self.queue {
+            Some(queue) => {
+                let mut state = queue.state.lock().unwrap();
+                let queued_before = state.jobs.len();
+                // A completed hedge must release queued capacity without waiting for a blocked peer.
+                state.jobs.retain(|job| {
+                    !job.cancelled
+                        .as_ref()
+                        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+                });
+                let removed = queued_before - state.jobs.len();
+                if removed != 0 {
+                    self.pending.fetch_sub(removed, Ordering::Release);
                 }
-            },
-            None => (Some((job, Error::ProposeFailed)), ControlDispatch::Failed),
+
+                if state.closed {
+                    (Some(Error::ProposeFailed), ControlDispatch::Failed)
+                } else if state.jobs.len() >= CONTROL_WORKER_QUEUE_CAPACITY {
+                    (
+                        Some(Error::Io(
+                            "recorder control worker queue is temporarily full".into(),
+                        )),
+                        ControlDispatch::Saturated,
+                    )
+                } else {
+                    self.pending.fetch_add(1, Ordering::Relaxed);
+                    state.jobs.push_back(queued_job.take().unwrap());
+                    queue.available.notify_one();
+                    (None, ControlDispatch::Accepted)
+                }
+            }
+            None => (Some(Error::ProposeFailed), ControlDispatch::Failed),
         };
-        if let Some((job, error)) = failed {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-            job.fail(error);
+        if let Some(error) = error {
+            queued_job.unwrap().fail(error);
         }
         outcome
     }
@@ -3648,7 +3687,10 @@ impl ControlWorker {
     }
 
     fn shutdown(&mut self) {
-        self.sender.take();
+        if let Some(queue) = self.queue.take() {
+            queue.state.lock().unwrap().closed = true;
+            queue.available.notify_one();
+        }
         if let Some(handle) = self.handle.take() {
             if self.pending.load(Ordering::Acquire) == 0 || handle.is_finished() {
                 let _ = handle.join();
@@ -7256,12 +7298,12 @@ mod tests {
         encode_stored_command, encode_wal_frame, last_file_sync_kind, reset_command_file_reads,
         reset_sync_counts, sync_counts, sync_wal_append, sync_wal_metadata, upsert_wal_command,
         AcceptedValue, CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus,
-        ControlDispatch, ControlJob, DecisionInspection, DecisionProof, DriveOutcome, Error,
-        FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
-        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
-        RecordedHeadProvenance, RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc,
-        RecorderSlotState, RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus,
-        ThreeNodeConsensus,
+        ControlDispatch, ControlJob, ControlJobCancellation, ControlWorker, DecisionInspection,
+        DecisionProof, DriveOutcome, Error, FileSyncKind, Membership, PrioritySource, Proposal,
+        ProposalPriority, ProposerProgress, ReadFenceObservation, ReadFenceRequest,
+        ReadFenceSlotState, RecordRequest, RecordSummary, RecordedHeadProvenance,
+        RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc, RecorderSlotState,
+        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
@@ -7501,6 +7543,58 @@ mod tests {
             }
             Ok(None)
         }
+    }
+
+    #[test]
+    fn control_worker_reclaims_a_cancelled_queued_job_for_the_next_operation() {
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let recorder = Arc::new(BlockingControlRecorder {
+            recorder_id: "n1",
+            started: started_tx,
+            release_first: Mutex::new(release_rx),
+        });
+        let worker = ControlWorker::spawn(recorder).unwrap();
+        let (result_tx, result_rx) = mpsc::sync_channel(3);
+
+        assert!(matches!(
+            worker.dispatch(ControlJob::InspectProof {
+                index: 1,
+                slot: 1,
+                result: result_tx.clone(),
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(started_rx.recv().unwrap(), 1);
+
+        let cancellation = ControlJobCancellation::new();
+        assert!(matches!(
+            worker.dispatch_cancellable(
+                ControlJob::InspectProof {
+                    index: 2,
+                    slot: 2,
+                    result: result_tx.clone(),
+                },
+                cancellation.token(),
+            ),
+            ControlDispatch::Accepted
+        ));
+        drop(cancellation);
+
+        assert!(matches!(
+            worker.dispatch(ControlJob::InspectProof {
+                index: 3,
+                slot: 3,
+                result: result_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+        assert!(started_rx.try_recv().is_err());
+        assert_eq!(result_rx.recv().unwrap().0, 1);
+        assert_eq!(result_rx.recv().unwrap().0, 3);
     }
 
     impl RecorderRpc for BlockingInspectionReadFenceRecorder {
