@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 axum = "0.8"
-rhizadb = { version = "0.1.0", path = "../../crates/rhiza" }
+rhizadb = { version = "0.2.0", path = "../../crates/rhiza" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal"] }
 

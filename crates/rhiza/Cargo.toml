@@ -1,6 +1,6 @@
 [package]
 name = "rhizadb"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,13 +11,13 @@ description = "Embeddable facade for rhiza replicated state machines"
 name = "rhizadb"
 
 [dependencies]
-rhiza-core = { version = "0.1.1", path = "../rhiza-core" }
-rhiza-node = { version = "0.1.1", path = "../rhiza-node" }
-rhiza-quepaxa = { version = "0.1.1", path = "../rhiza-quepaxa" }
-rhiza-sql = { version = "0.1.1", path = "../rhiza-sql" }
+rhiza-core = { version = "0.2.0", path = "../rhiza-core" }
+rhiza-node = { version = "0.2.0", path = "../rhiza-node" }
+rhiza-quepaxa = { version = "0.2.0", path = "../rhiza-quepaxa" }
+rhiza-sql = { version = "0.2.0", path = "../rhiza-sql" }
 tokio.workspace = true
 
 [dev-dependencies]
-rhiza-archive = { version = "0.1.1", path = "../rhiza-archive" }
-rhiza-obj-store = { version = "0.1.1", path = "../rhiza-obj-store" }
+rhiza-archive = { version = "0.2.0", path = "../rhiza-archive" }
+rhiza-obj-store = { version = "0.2.0", path = "../rhiza-obj-store" }
 tempfile.workspace = true

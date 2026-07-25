@@ -10,18 +10,18 @@ The workspace retains SQL, graph, and KV materialization crates. The released
 runtime and product documentation cover SQL only; graph and KV are not wired
 into the SQL release surface.
 
-The initial crates.io product, `rhizadb` v0.1.0, is SQL-only and uses SQLite.
+The current crates.io product, `rhizadb` v0.2.0, is SQL-only and uses SQLite.
 Its registry dependency closure is `rhiza-core`, `rhiza-obj-store`,
 `rhiza-log`, `rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and
-`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.1.0
-features or part of the initial SQL-only supported release.
+`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.2.0
+features or part of the SQL-only supported release.
 
 ## Workspace Components
 
 The Kubernetes-independent Rust workspace currently contains:
 
 - `rhizadb`: primary embedded SQL Rust facade and lifecycle owner; part of the
-  initial registry product.
+  registry product.
 - `rhiza-core`: log, configuration, command, and snapshot domain types.
 - `rhiza-quepaxa`: recorder RPC, durable recorder state, and consensus.
 - `rhiza-log`: local binary qlog and compaction anchors.
@@ -38,7 +38,7 @@ The Kubernetes-independent Rust workspace currently contains:
 - `rhiza-testkit`: internal, non-publishable integration-test support.
 
 Only `rhiza-core`, `rhiza-obj-store`, `rhiza-log`, `rhiza-quepaxa`,
-`rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb` are in the initial
+`rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb` are in the
 crates.io release. `rhiza-graph`, `rhiza-kv`, `rhiza-client`, `rhiza-cli`,
 `rhiza-testkit`, and `examples/basic-app-server` are excluded from it.
 
@@ -58,7 +58,7 @@ see [RELEASING.md](RELEASING.md) for the registry procedure.
 
 ## Embedded Rust API
 
-The published `rhizadb` v0.1.0 crate exposes an SQL-only embedded owner. It
+The published `rhizadb` v0.2.0 crate exposes an SQL-only embedded owner. It
 does not offer graph or KV Cargo features, re-exports, or embedded methods;
 those remain outside the initial registry product.
 
@@ -138,6 +138,13 @@ use `local_file_backed`.
 `execute_sql` and `query` expose typed SQL, `RETURNING`, consistency, and
 persistent idempotency. HTTP routes and workspace tooling are secondary
 adapters over the same SQL node service contracts.
+
+### v0.2.0 migration
+
+v0.2.0 is a breaking clean-install release. It removes the former Rust
+constructors and legacy persistence decoders. Do not attempt mixed-version
+rolling recovery: stop the old deployment, create a clean data root, and start
+all recovering members on v0.2.0.
 
 ## Kubernetes Deployment
 

@@ -8,4 +8,4 @@ description = "Testing helpers for rhiza"
 publish = false
 
 [dependencies]
-rhiza-core = { version = "0.1.0", path = "../rhiza-core" }
+rhiza-core = { version = "0.2.0", path = "../rhiza-core" }
