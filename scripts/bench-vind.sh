@@ -18,7 +18,7 @@ durability_max_lag="${RHIZA_DURABILITY_MAX_LAG-}"
 durability_interval="${RHIZA_DURABILITY_INTERVAL-}"
 durability_max_lag_set="${RHIZA_DURABILITY_MAX_LAG+x}"
 durability_interval_set="${RHIZA_DURABILITY_INTERVAL+x}"
-recorder_transport="${RHIZA_RECORDER_TRANSPORT:-http}"
+recorder_transport="${RHIZA_RECORDER_TRANSPORT:-tcp-rkyv}"
 recorder_tls="${RHIZA_RECORDER_TLS:-off}"
 recorder_tls_dir=""
 target_base="${RHIZA_BENCH_TARGET_DIR:-target/rhiza-bench}"
@@ -94,8 +94,8 @@ usage() {
     'Set RHIZA_BENCH_MULTI_ENDPOINT=1 to route retries across all three nodes.' \
     'Durability defaults to sync. Set RHIZA_DURABILITY_MODE=bounded with' \
     'RHIZA_DURABILITY_MAX_LAG, or periodic with RHIZA_DURABILITY_INTERVAL.' \
-    'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc to benchmark a TCP transport.' \
-    'Set RHIZA_RECORDER_TLS=on to enable server-authenticated TLS for either TCP transport.' \
+    'Recorder transport defaults to plaintext tcp-rkyv. Set RHIZA_RECORDER_TRANSPORT=http|tcp-postcard|tcp-postcard-rpc to override it.' \
+    'Set RHIZA_RECORDER_TLS=on to enable server-authenticated TLS for Postcard TCP transports.' \
     '' \
     'It creates a vind cluster, deploys RustFS plus a three-node rhiza cluster,' \
     'runs bench/rhiza-bench through a local port-forward, and emits artifacts.json.' >&2
@@ -777,8 +777,8 @@ case "$object_metering" in 0|1) ;; *) die "RHIZA_BENCH_OBJECT_USAGE_METERING mus
 case "$resource_sampling" in 0|1) ;; *) die "RHIZA_BENCH_RESOURCE_SAMPLING must be 0 or 1";; esac
 case "$multi_endpoint" in 0|1) ;; *) die "RHIZA_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
 case "$recorder_transport" in
-  http|tcp-postcard|tcp-postcard-rpc) ;;
-  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc" ;;
+  http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc) ;;
+  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc" ;;
 esac
 case "$recorder_tls" in
   on|off) ;;
@@ -786,6 +786,8 @@ case "$recorder_tls" in
 esac
 [ "$recorder_tls" != on ] || [ "$recorder_transport" != http ] ||
   die "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc"
+[ "$recorder_tls" != on ] || [ "$recorder_transport" != tcp-rkyv ] ||
+  die "RHIZA_RECORDER_TLS=on is not supported with RHIZA_RECORDER_TRANSPORT=tcp-rkyv"
 case "$sample_interval" in ''|*[!0-9]*) die "--sample-interval must be a positive integer";; esac
 [ "$sample_interval" -gt 0 ] || die "--sample-interval must be a positive integer"
 for tool in cargo curl docker jq kubectl openssl rustc sed timeout vcluster yq; do require "$tool"; done

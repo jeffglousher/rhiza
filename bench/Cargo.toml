@@ -26,6 +26,7 @@ rhiza-core = { path = "../crates/rhiza-core" }
 rhiza-node = { path = "../crates/rhiza-node", features = ["recorder-postcard-rpc"] }
 rhiza-quepaxa = { path = "../crates/rhiza-quepaxa" }
 rhiza-sql = { path = "../crates/rhiza-sql" }
+rkyv = { version = "=0.8.17", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32"] }
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +47,10 @@ path = "src/bin/rhiza-cost.rs"
 [[bin]]
 name = "rhiza-recorder-transport"
 path = "src/bin/rhiza-recorder-transport.rs"
+
+[[bin]]
+name = "rhiza-recorder-codec"
+path = "src/bin/rhiza-recorder-codec.rs"
 
 [[bin]]
 name = "rhiza-transport"

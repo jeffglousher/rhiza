@@ -15,7 +15,7 @@ bundle="$3"
 output="$4"
 successor="${5:-}"
 profile="${RHIZA_EXECUTION_PROFILE-}"
-recorder_transport="${RHIZA_RECORDER_TRANSPORT:-http}"
+recorder_transport="${RHIZA_RECORDER_TRANSPORT:-tcp-rkyv}"
 recorder_tls="${RHIZA_RECORDER_TLS:-off}"
 recorder_tls_secret="${RHIZA_RECORDER_TLS_SECRET-}"
 recorder_tls_secret_set="${RHIZA_RECORDER_TLS_SECRET+x}"
@@ -27,8 +27,8 @@ case "$profile" in
   *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
 esac
 case "$recorder_transport" in
-  http|tcp-postcard|tcp-postcard-rpc) ;;
-  *) echo "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc" >&2; exit 65 ;;
+  http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc) ;;
+  *) echo "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc" >&2; exit 65 ;;
 esac
 case "$recorder_tls" in
   on|off) ;;
@@ -38,12 +38,26 @@ esac
   echo "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc" >&2
   exit 65
 }
+[ "$recorder_tls" != on ] || [ "$recorder_transport" != tcp-rkyv ] || {
+  echo "RHIZA_RECORDER_TLS=on is not supported with RHIZA_RECORDER_TRANSPORT=tcp-rkyv" >&2
+  exit 65
+}
 [ -r "$bundle" ] || { echo "cannot read bundle: $bundle" >&2; exit 66; }
 
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
 require jq
 require sed
 require yq
+
+if [ "$recorder_transport" = tcp-rkyv ] &&
+  ! jq -e '
+    type == "object" and
+    (.members | type == "array") and
+    all(.members[]; type == "object" and has("recorder_tcp_addr"))
+  ' "$bundle" >/dev/null; then
+  echo "tcp-rkyv requires recorder_tcp_addr for every bundle member" >&2
+  exit 65
+fi
 
 jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$profile" \
   --arg recorder_transport "$recorder_transport" --arg recorder_tls "$recorder_tls" '
@@ -54,7 +68,7 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$p
   all(.members[];
     (($recorder_transport == "http" and
       (keys | sort) == ["log_url", "node_id", "token", "url"]) or
-     (($recorder_transport == "tcp-postcard" or $recorder_transport == "tcp-postcard-rpc") and
+     (($recorder_transport == "tcp-postcard" or $recorder_transport == "tcp-rkyv" or $recorder_transport == "tcp-postcard-rpc") and
       $recorder_tls == "off" and
       (keys | sort) == ["log_url", "node_id", "recorder_tcp_addr", "token", "url"]) or
      (($recorder_transport == "tcp-postcard" or $recorder_transport == "tcp-postcard-rpc") and
@@ -288,6 +302,18 @@ yq eval --inplace '
       ]
     )
 ' "$output"
+if [ "$recorder_transport" = tcp-rkyv ]; then
+  yq eval --inplace '
+    (select(.kind == "Service" and .metadata.name == strenv(CONFIG_NAME)) |
+      .spec.ports) |= map(select(.name != "recorder")) |
+    (select(.kind == "StatefulSet") |
+      .spec.template.spec.containers[] | select(.name == "rhiza") | .ports) |=
+        map(select(.name != "recorder")) |
+    (select(.kind == "StatefulSet") |
+      .spec.template.spec.containers[] | select(.name == "rhiza") | .env) |=
+        map(select(.name != "RHIZA_RECORDER_LISTEN"))
+  ' "$output"
+fi
 if [ "$recorder_transport" != http ]; then
   yq eval --inplace '
     (select(.kind == "Service" and .metadata.name == strenv(CONFIG_NAME)) |

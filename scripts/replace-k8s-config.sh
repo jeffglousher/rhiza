@@ -3,6 +3,8 @@ set -euo pipefail
 
 [ "$#" -eq 2 ] || {
   echo "usage: $0 OLD_BUNDLE_JSON SUCCESSOR_DRAFT_JSON" >&2
+  echo "RHIZA_RECORDER_TRANSPORT selects one transport for the coordinated old/successor cutover (default: tcp-rkyv); mixed-mode and automatic fallback are unsupported" >&2
+  echo "Both inputs must match that mode: tcp-rkyv bundles require recorder_tcp_addr; an explicit HTTP rollback requires separate address-free bundles" >&2
   exit 64
 }
 if [ -n "${RHIZA_OBJECT_JOB_RESPONSE_FILE+x}" ] ||
@@ -31,10 +33,15 @@ auth_secret="${RHIZA_AUTH_SECRET:-rhiza-auth}"
 object_secret="${RHIZA_OBJECT_SECRET-}"
 object_secret_set="${RHIZA_OBJECT_SECRET+x}"
 member_role_label="rhiza.dev/member-role"
+recorder_transport="${RHIZA_RECORDER_TRANSPORT:-tcp-rkyv}"
 
 case "$profile" in
   sql) ;;
   *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
+esac
+case "$recorder_transport" in
+  http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc) ;;
+  *) echo "RHIZA_RECORDER_TRANSPORT must select one coordinated transport; mixed mode is unsupported" >&2; exit 65 ;;
 esac
 
 for tool in kubectl jq yq openssl; do command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 127; }; done
@@ -66,6 +73,9 @@ old_preflight_yaml="$(mktemp)"
 successor_preflight_yaml="$(mktemp)"
 transition_secret_compare="$(mktemp)"
 trap 'rm -f "$old_preflight_yaml" "$successor_preflight_yaml" "$transition_secret_compare"' EXIT
+# One explicit transport is rendered for both configurations. A failed preflight
+# aborts the cutover; this workflow never negotiates or falls back to another codec.
+export RHIZA_RECORDER_TRANSPORT="$recorder_transport"
 scripts/render-k8s-config.sh \
   "$old_id" "$old_replicas" "$old_bundle" "$old_preflight_yaml"
 RHIZA_PRESTAGE_SOURCE_SECRET="${old_name}-bundle" scripts/render-k8s-config.sh \

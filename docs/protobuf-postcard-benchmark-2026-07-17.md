@@ -1,11 +1,20 @@
 # Protobuf(Prost) versus Postcard RPC benchmark
 
 Date: 2026-07-17
-Status: diagnostic only; no production codec change
+Status: diagnostic only; Protobuf candidate superseded by rkyv direction
+
+> **Superseded on 2026-07-25:** This document preserves the decision and
+> evidence available on 2026-07-17. The current decision promotes plaintext
+> `tcp-rkyv` as the exclusive default; `http` and `tcp-postcard` are explicit
+> rollback/diagnostic modes. See
+> [`rkyv-recorder-path-2026-07-25.md`](rkyv-recorder-path-2026-07-25.md).
 
 ## Decision
 
-Keep Postcard as the Recorder RPC default for now.
+Keep Postcard as the Recorder RPC production default until a replacement passes
+the real-workload adoption gate. The next codec candidate is now rkyv, not
+Protobuf; see
+[`rkyv-recorder-path-2026-07-25.md`](rkyv-recorder-path-2026-07-25.md).
 
 The synthetic TCP benchmark shows that Prost can be faster for some payload and
 concurrency combinations, but the advantage is not stable across runs or
@@ -14,8 +23,8 @@ enums, domain conversion, QuePaxa quorum, persistence, checkpointing, or
 recovery. It is therefore insufficient evidence for replacing the production
 codec.
 
-This decision does not reject Protobuf. It keeps Protobuf as an explicit
-candidate for a real Recorder adapter and a durable three-node benchmark.
+This historical comparison does not reject Protobuf as a format, but Protobuf
+is no longer the agreed next Recorder codec path.
 
 ## What was compared
 
@@ -139,9 +148,9 @@ mismatch and invalid domain conversion.
 
 ## Adoption gate
 
-Protobuf should replace Postcard only after all of the following pass:
+The rkyv candidate should replace Postcard only after all of the following pass:
 
-1. Implement a private Protobuf mirror of all seven Recorder operations with
+1. Implement a private candidate mirror of all eight Recorder operations with
    bounded frames and checked domain conversion, without changing QuePaxa.
 2. Run a clean, CPU-isolated codec benchmark with at least 5-10 seconds per cell
    and multiple fully balanced order cycles.
@@ -151,4 +160,4 @@ Protobuf should replace Postcard only after all of the following pass:
    zero request errors, and identical applied state and checkpoints.
 5. Verify restart and recovery equality before changing the default.
 
-Until that gate passes, the production result is **HOLD: keep Postcard**.
+Until the rkyv gate passes, the production result is **HOLD: keep Postcard**.

@@ -6,7 +6,10 @@ cd "$repo_root"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-grep -Fq 'http|tcp-postcard|tcp-postcard-rpc)' scripts/bench-vind.sh
+grep -Fq 'http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc)' scripts/bench-vind.sh
+# shellcheck disable=SC2016 # Match the literal environment-default expression.
+grep -Fq 'recorder_transport="${RHIZA_RECORDER_TRANSPORT:-tcp-rkyv}"' scripts/bench-vind.sh
+grep -Fq '! grep -Eqi ":1F91' scripts/bench-vind.sh
 grep -Fq 'RHIZA_RECORDER_TLS=on' scripts/bench-vind.sh
 grep -Fq 'RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls' scripts/bench-vind.sh
 grep -Fq 'recorder_tls_server_name:' scripts/bench-vind.sh
@@ -897,6 +900,54 @@ if yq eval -e 'select(.kind == "StatefulSet") |
   exit 1
 fi
 
+env -u RHIZA_RECORDER_TRANSPORT -u RHIZA_RECORDER_TLS \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tcp.json" "$tmp/cluster-rkyv.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") | .env[] |
+  select(.name == "RHIZA_RECORDER_TRANSPORT") | .value == "tcp-rkyv"' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") | .env[] |
+  select(.name == "RHIZA_RECORDER_TLS") | .value == "off"' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") | .env[] |
+  select(.name == "RHIZA_RECORDER_TCP_LISTEN") | .value == "0.0.0.0:8082"' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") | .ports[] |
+  select(.name == "recorder-tcp") | .containerPort == 8082' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null
+yq eval -e 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c1") |
+  .spec.ports[] |
+  select(.name == "recorder-tcp" and .port == 8082 and .targetPort == "recorder-tcp")' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null
+if yq eval -e 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c1") |
+  .spec.ports[] | select(.name == "recorder" or .port == 8081)' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null 2>&1 ||
+  yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  (.ports[] | select(.name == "recorder" or .containerPort == 8081)),
+  (.env[] | select(.name == "RHIZA_RECORDER_LISTEN"))' \
+  "$tmp/cluster-rkyv.yaml" >/dev/null 2>&1; then
+  echo "default rkyv render retained the Recorder HTTP listener" >&2
+  exit 1
+fi
+if yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[].name' "$tmp/cluster-rkyv.yaml" | grep -Eq '^RHIZA_RECORDER_TLS_(CERT|KEY|CA)_FILE$'; then
+  echo "default rkyv render retained TLS environment" >&2
+  exit 1
+fi
+if yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .volumeMounts[]?.name,
+  select(.kind == "StatefulSet") | .spec.template.spec.volumes[]?.name' \
+  "$tmp/cluster-rkyv.yaml" | grep -q '^recorder-tls$'; then
+  echo "default rkyv render retained TLS secret mount" >&2
+  exit 1
+fi
+
 RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
   scripts/render-k8s-config.sh 1 3 "$tmp/config-tcp.json" "$tmp/cluster-postcard-rpc.yaml"
 yq eval -e 'select(.kind == "StatefulSet") |
@@ -959,6 +1010,14 @@ yq eval -e 'select(.kind == "StatefulSet") |
   .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
   .secret.secretName == "rhiza-sql-c1-recorder-tls"' \
   "$tmp/cluster-tls.yaml" >/dev/null
+
+if RHIZA_RECORDER_TRANSPORT=tcp-rkyv \
+  RHIZA_RECORDER_TLS=on \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tls.json" \
+    "$tmp/cluster-rkyv-tls.yaml"; then
+  echo "rkyv benchmark render accepted unsupported TLS" >&2
+  exit 1
+fi
 
 RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
 RHIZA_RECORDER_TLS=on \

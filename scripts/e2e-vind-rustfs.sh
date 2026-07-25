@@ -208,6 +208,7 @@ make_bundle() {
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://" + $name + "-" + ($n|tostring) + "." + $name + ":8081"),
       log_url:("http://" + $name + "-" + ($n|tostring) + "." + $name + ":8080"),
+      recorder_tcp_addr:($name + "-" + ($n|tostring) + "." + $name + ":8082"),
       token:$tokens[$n]
     }]}
   ' > "$output"

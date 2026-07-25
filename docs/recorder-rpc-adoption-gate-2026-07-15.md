@@ -1,5 +1,11 @@
 # RecorderRpc adoption gate (2026-07-15)
 
+> **Superseded on 2026-07-25:** This document preserves the decision and
+> evidence available on 2026-07-15. The current decision promotes plaintext
+> `tcp-rkyv` as the exclusive default; `http` and `tcp-postcard` are explicit
+> rollback/diagnostic modes. See
+> [`rkyv-recorder-path-2026-07-25.md`](rkyv-recorder-path-2026-07-25.md).
+
 ## Decision
 
 Keep HTTP/JSON as the production default. `tcp-postcard` is available as an

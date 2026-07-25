@@ -258,6 +258,7 @@ Membership accepts 3 through 7 members through a JSON bundle:
       "node_id": "node-1",
       "url": "http://rhiza-sql-c1-0.rhiza-sql-c1:8081",
       "log_url": "http://rhiza-sql-c1-0.rhiza-sql-c1:8080",
+      "recorder_tcp_addr": "rhiza-sql-c1-0.rhiza-sql-c1:8082",
       "token": "secret"
     }
   ]
@@ -269,16 +270,49 @@ The bundle is mounted from an immutable Secret and selected with
 client/admin tokens and object-store credentials live in separate Secrets.
 Never put any of those values in a ConfigMap.
 
-### Recorder transport candidate
+### Recorder transport
 
-HTTP/JSON remains the default recorder transport. The opt-in
-`tcp-postcard` candidate replaces the HTTP recorder listener for that process
-and uses persistent, lane-separated plaintext TCP connections for QuePaxa
-recorder calls. Rollback means restarting with the `http` selector; the two
-recorder transports are not exposed together:
+Plaintext `tcp-rkyv` is the default Recorder transport. It uses persistent,
+lane-separated TCP connections and a checked rkyv wire adapter for QuePaxa
+Recorder calls. An absent `RHIZA_RECORDER_TRANSPORT` selector chooses
+`tcp-rkyv`; the default deployment therefore listens on port 8082 and every
+bundle member must include `recorder_tcp_addr`.
+
+`http` and plaintext `tcp-postcard` remain explicit rollback and diagnostic
+modes. A process and configuration run exactly one mode: there is no
+negotiation, fallback, dual listener, or mixed-codec connection pool. A mode
+change requires a coordinated stop/restart of the whole configuration or an
+atomic cutover to a newly activated configuration. Do not replace Pods
+sequentially under `OnDelete` while changing Recorder mode.
+
+The default rkyv bundle is not reusable for HTTP rollback:
+`recorder_tcp_addr` is required by the rkyv shape and rejected by the strict
+HTTP shape. Prepare a separate immutable, address-free HTTP bundle and switch
+every member to it in one coordinated restart. A non-HTTP rendered manifest
+exposes only Recorder TCP port 8082 and omits the Recorder HTTP 8081
+port/environment; it must not leave both Recorder listeners configured.
+
+For an in-place mode cutover:
+
+1. Drain client traffic.
+2. Scale the StatefulSet to `replicas=0`.
+3. Confirm that every Pod has terminated and graceful shutdown completed.
+4. Apply the new mode's immutable bundle Secret, Service, and StatefulSet
+   manifest together. Never change the Service before all old Pods terminate.
+5. Confirm that NetworkPolicy and host/firewall rules allow Recorder TCP 8082
+   when the new mode requires it.
+6. Scale the StatefulSet back to `replicas=N`.
+7. Require readiness and quorum health before restoring client traffic.
+
+HTTP rollback follows the same sequence with its separate address-free bundle.
+An atomic cutover to a newly activated configuration remains the alternative.
+The checked reference template sets `publishNotReadyAddresses: true`,
+`podManagementPolicy: Parallel`, and `terminationGracePeriodSeconds: 30`;
+the 30-second Pod grace period is greater than the runtime's 25-second shutdown
+budget.
 
 ```bash
-export RHIZA_RECORDER_TRANSPORT=tcp-postcard
+export RHIZA_RECORDER_TRANSPORT=tcp-rkyv
 export RHIZA_RECORDER_TCP_LISTEN=0.0.0.0:8082
 ```
 
@@ -294,47 +328,21 @@ Every bundle member must then include its in-cluster TCP address:
 }
 ```
 
-`tcp-postcard` provides no encryption or cryptographic peer authentication.
-The HELLO token and all recorder traffic cross the network in plaintext; HELLO
-still fences accidental node/configuration mismatches, but it is not a security
-boundary. Use this transport only when the Kubernetes cluster network, nodes,
-CNI, and workloads are inside one trusted boundary. The supplied renderer
+The default `tcp-rkyv` mode provides no encryption or cryptographic peer
+authentication. TLS is deliberately excluded. The HELLO token and all Recorder
+traffic cross the network in plaintext; HELLO still fences accidental
+node/configuration mismatches, but it is not a security boundary. Use this
+transport only when the Kubernetes cluster network, nodes, CNI, and workloads
+are inside one trusted boundary. The supplied renderer
 accepts only the generated headless-Service DNS addresses and exposes port 8082
 only on that cluster-internal Service; it does not create an Ingress, NodePort,
 LoadBalancer, `hostPort`, or `hostNetwork` listener. Apply a namespace-level
 default-deny NetworkPolicy in environments that run untrusted workloads.
 
-Set `RHIZA_RECORDER_TLS=on` to use the server-authenticated TLS 1.3 variant of
-the same framed Postcard protocol. TLS is off by default and does not fall back
-to plaintext when enabled. In addition to `RHIZA_RECORDER_TCP_LISTEN`, it
-requires readable certificate, private-key, and CA-bundle files:
-
-```bash
-export RHIZA_RECORDER_TRANSPORT=tcp-postcard
-export RHIZA_RECORDER_TLS=on
-export RHIZA_RECORDER_TCP_LISTEN=0.0.0.0:8082
-export RHIZA_RECORDER_TLS_CERT_FILE=/run/secrets/rhiza/recorder-tls/tls.crt
-export RHIZA_RECORDER_TLS_KEY_FILE=/run/secrets/rhiza/recorder-tls/tls.key
-export RHIZA_RECORDER_TLS_CA_FILE=/run/secrets/rhiza/recorder-tls/ca-bundle.pem
-```
-
-Every bundle member must also set `recorder_tls_server_name` to the DNS name in
-that member's certificate SAN. The Kubernetes renderer takes
-`RHIZA_RECORDER_TLS_SECRET`, mounts its `tls.crt`, `tls.key`, and
-`ca-bundle.pem` keys, and uses the exact ordinal headless-Service DNS names.
-Because all Pods in one StatefulSet mount the same Secret, its server
-certificate must cover every ordinal member name in that configuration.
-Set `RHIZA_RECORDER_TLS=off` (the default) for plaintext TCP/Postcard; TLS
-files, TLS server names, or a TLS Secret are rejected in that mode. TLS cannot
-be enabled with the HTTP transport, and the removed `tcp-tls-postcard`
-transport value is rejected so conflicting settings fail closed.
-
-This is server-authenticated TLS, not mTLS. The encrypted HELLO exchange still
-authenticates callers with configured peer tokens. It protects RecorderRpc
-only; public APIs and log-fetch URLs keep their separately configured HTTP
-security contract. HTTP/JSON remains the production default, and promotion of
-either TCP variant still requires the documented multi-host durability,
-reconnect, rollback, and soak gates.
+The promoted Recorder contract is plaintext-only. TLS settings, codec
+negotiation, and implicit downgrade are rejected rather than interpreted.
+Public APIs and log-fetch URLs keep their separately configured HTTP security
+contract.
 
 ## rhiza sql API
 
@@ -556,8 +564,10 @@ repair quorum by itself.
 This automatic repair is not a membership change and is not a general binary
 upgrade guarantee. Changing member identities still uses the stop-and-replace
 flow below. `OnDelete` also means an image/template change does not roll pods
-automatically; only deploy mutually compatible binaries and verify them one
-ordinal at a time under a separate upgrade procedure.
+automatically. In particular, never change Recorder transport or codec by
+deleting Pods one ordinal at a time: mixed modes fail closed. Use a coordinated
+stop/restart of every member on the same immutable bundle, or atomically
+activate a new configuration whose members all use the new mode.
 
 The node-bound local identity marker is
 `.rhiza-checkpoint-identity-v2.json`; its format version is `2` and includes
@@ -701,6 +711,9 @@ The implemented fast-path, microbatch, failover, and OSS cost results are in
 The current Recorder durability, typed-batch, and production-adapter transport
 evidence is in
 [docs/performance-optimization-2026-07-17.md](docs/performance-optimization-2026-07-17.md).
+The agreed next Recorder consensus-path codec candidate and its production
+promotion gate are in
+[docs/rkyv-recorder-path-2026-07-25.md](docs/rkyv-recorder-path-2026-07-25.md).
 Its Linux WAL syscall comparison is reproducible with
 [`bench/run-recorder-sync-linux.py`](bench/run-recorder-sync-linux.py) and
 [`bench/support/fdatasync-as-fsync.c`](bench/support/fdatasync-as-fsync.c); the

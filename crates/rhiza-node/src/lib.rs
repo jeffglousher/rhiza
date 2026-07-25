@@ -95,8 +95,9 @@ pub use recorder_tcp::{
     TcpPostcardRpcRecorderClient,
 };
 pub use recorder_tcp::{
-    serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
-    RecorderTlsClientConfig, RecorderTlsServerConfig, TcpPostcardRecorderClient,
+    serve_recorder_rkyv_tcp, serve_recorder_tcp, serve_recorder_tcp_tls,
+    validate_recorder_tcp_endpoint, RecorderTlsClientConfig, RecorderTlsServerConfig,
+    TcpPostcardRecorderClient, TcpRkyvRecorderClient,
 };
 
 pub const MAX_FETCH_ENTRIES: u32 = 1_024;

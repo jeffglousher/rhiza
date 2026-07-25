@@ -17,15 +17,15 @@ use rhiza_core::{
 };
 use rhiza_node::{
     effective_cluster_id, install_successor_recorder, node_router,
-    node_router_with_admin_and_tasks, recorder_router_for_generation, serve_recorder_tcp,
-    serve_recorder_tcp_tls, validate_recorder_tcp_endpoint, AdminActivateRequest,
-    AdminActivateResponse, AdminCompactRequest, AdminCompactResponse, AdminConfig,
-    AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
+    node_router_with_admin_and_tasks, recorder_router_for_generation, serve_recorder_rkyv_tcp,
+    serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
+    AdminActivateRequest, AdminActivateResponse, AdminCompactRequest, AdminCompactResponse,
+    AdminConfig, AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
     AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
     AdminTaskTracker, CertifiedTailErrorResponse, CertifiedTailResponse, CheckpointCoordinator,
     DurabilityMode, HttpLogPeer, HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime,
     PeerConfig, ReadConsistency, RecorderTlsClientConfig, RecorderTlsServerConfig, StopInformation,
-    TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH,
+    TcpPostcardRecorderClient, TcpRkyvRecorderClient, ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH,
     ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH, CERTIFIED_TAIL_PATH,
     DEFAULT_CERTIFIED_TAIL_ENTRIES, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH,
     RECOVERY_GENERATION_HEADER, TAIL_CLUSTER_ID_HEADER, TAIL_CONFIG_ID_HEADER, TAIL_EPOCH_HEADER,
@@ -523,6 +523,7 @@ enum RecorderTransport {
     Http,
     TcpPostcard,
     TcpTlsPostcard,
+    TcpRkyv,
     #[cfg(feature = "recorder-postcard-rpc")]
     TcpPostcardRpc,
     #[cfg(feature = "recorder-postcard-rpc")]
@@ -547,6 +548,7 @@ impl RecorderTransport {
         match self {
             Self::Http => "http",
             Self::TcpPostcard | Self::TcpTlsPostcard => "tcp-postcard",
+            Self::TcpRkyv => "tcp-rkyv",
             #[cfg(feature = "recorder-postcard-rpc")]
             Self::TcpPostcardRpc | Self::TcpTlsPostcardRpc => "tcp-postcard-rpc",
         }
@@ -843,8 +845,10 @@ impl ServeConfig {
         let recorder_listen =
             lookup("RHIZA_RECORDER_LISTEN").unwrap_or_else(|| "0.0.0.0:8081".into());
         let requested_recorder_transport = match lookup("RHIZA_RECORDER_TRANSPORT").as_deref() {
-            None | Some("http") => RecorderTransport::Http,
+            None => RecorderTransport::TcpRkyv,
+            Some("http") => RecorderTransport::Http,
             Some("tcp-postcard") => RecorderTransport::TcpPostcard,
+            Some("tcp-rkyv") => RecorderTransport::TcpRkyv,
             Some("tcp-postcard-rpc") => {
                 #[cfg(feature = "recorder-postcard-rpc")]
                 {
@@ -860,7 +864,8 @@ impl ServeConfig {
             }
             Some(_) => {
                 return Err(
-                    "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc".into(),
+                    "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-rkyv|tcp-postcard-rpc"
+                        .into(),
                 )
             }
         };
@@ -872,6 +877,12 @@ impl ServeConfig {
         if recorder_tls_enabled && requested_recorder_transport == RecorderTransport::Http {
             return Err(
                 "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc"
+                    .into(),
+            );
+        }
+        if recorder_tls_enabled && requested_recorder_transport == RecorderTransport::TcpRkyv {
+            return Err(
+                "RHIZA_RECORDER_TLS=on is not supported with RHIZA_RECORDER_TRANSPORT=tcp-rkyv"
                     .into(),
             );
         }
@@ -3060,6 +3071,16 @@ async fn bind_ha_recorder_listener(
                 .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
             Ok((listener, HaRecorderTransport::TcpTlsPostcard(tls)))
         }
+        RecorderTransport::TcpRkyv => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
+            Ok((listener, HaRecorderTransport::TcpRkyv))
+        }
         #[cfg(feature = "recorder-postcard-rpc")]
         RecorderTransport::TcpPostcardRpc => {
             let tcp = config
@@ -3166,6 +3187,27 @@ where
                     peers,
                     recovery_generation,
                     tls,
+                    wait_for_shutdown(shutdown),
+                )
+                .await
+            })))
+        }
+        RecorderTransport::TcpRkyv => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
+            let peers = config.bundle.peers.clone();
+            let recovery_generation = config.recovery_generation;
+            Ok(AbortOnDrop(tokio::spawn(async move {
+                serve_recorder_rkyv_tcp(
+                    listener,
+                    recorder,
+                    peers,
+                    recovery_generation,
                     wait_for_shutdown(shutdown),
                 )
                 .await
@@ -3351,6 +3393,20 @@ fn build_recorder_clients(config: &ServeConfig) -> Result<RecorderClients, Strin
                         tls,
                     )?)
                 }
+                RecorderTransport::TcpRkyv => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    Box::new(TcpRkyvRecorderClient::new(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                    )?)
+                }
                 #[cfg(feature = "recorder-postcard-rpc")]
                 RecorderTransport::TcpPostcardRpc => {
                     let endpoint = config.bundle.recorder_tcp_peers[index]
@@ -3481,6 +3537,20 @@ fn build_consensus_at_checkpoint(
                         local_token.clone(),
                         config.recovery_generation,
                         tls,
+                    )?)
+                }
+                RecorderTransport::TcpRkyv => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    Box::new(TcpRkyvRecorderClient::new(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
                     )?)
                 }
                 #[cfg(feature = "recorder-postcard-rpc")]
@@ -5081,14 +5151,24 @@ mod tests {
     #[test]
     fn serve_config_uses_default_listeners_and_local_peer_token() {
         let (profile_name, profile, canonical_cluster_id) = compiled_profile_fixture();
+        let bundle = serde_json::json!({
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "log_url":"http://node-1:8080", "recorder_tcp_addr":"node-1:8082", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
         let values = HashMap::from([
             ("RHIZA_EXECUTION_PROFILE", profile_name),
             ("RHIZA_CLUSTER_ID", "cluster-a"),
             ("RHIZA_NODE_ID", "node-2"),
             ("RHIZA_DATA_DIR", "/tmp/node-2"),
             ("RHIZA_EPOCH", "1"),
-            ("RHIZA_CONFIG_BUNDLE", base_bundle_json()),
+            ("RHIZA_CONFIG_BUNDLE", bundle.as_str()),
             ("RHIZA_CLIENT_TOKEN", "client-secret"),
+            ("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082"),
         ]);
 
         let config =
@@ -5104,8 +5184,32 @@ mod tests {
         assert_eq!(config.bundle.peers[1].log_base_url(), "http://node-2:8081");
         assert_eq!(config.recovery_generation, 1);
         assert!(config.remote.is_none());
+        assert_eq!(config.recorder_transport, RecorderTransport::TcpRkyv);
+        assert_eq!(config.recorder_tcp.as_ref().unwrap().listen, "0.0.0.0:8082");
+        assert!(config.recorder_tcp.as_ref().unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn explicit_http_transport_keeps_http_recorder_without_tcp_configuration() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TRANSPORT", "http");
+
+        let config = parse_serve_env(&values).unwrap();
+
         assert_eq!(config.recorder_transport, RecorderTransport::Http);
         assert!(config.recorder_tcp.is_none());
+    }
+
+    #[test]
+    fn default_rkyv_transport_requires_listener_and_all_peer_addresses() {
+        let mut values = base_serve_env();
+        values.remove("RHIZA_RECORDER_TRANSPORT");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("RHIZA_RECORDER_TCP_LISTEN"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tcp_addr"), "{error}");
     }
 
     #[test]
@@ -5138,6 +5242,45 @@ mod tests {
         let error = parse_serve_env(&values).unwrap_err();
         assert!(error.contains("irrelevant"), "{error}");
         values.remove("RHIZA_RECORDER_TLS_CA_FILE");
+    }
+
+    #[test]
+    fn tcp_rkyv_transport_requires_listener_and_all_peer_addresses_without_tls() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-rkyv");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("RHIZA_RECORDER_TCP_LISTEN"), "{error}");
+        assert!(!error.contains("peer-1-secret"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tcp_addr"), "{error}");
+
+        let bundle = serde_json::json!({
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "log_url":"http://node-1:8080", "recorder_tcp_addr":"node-1:8082", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
+        values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+        let config = parse_serve_env(&values).unwrap();
+        assert_eq!(config.recorder_transport, RecorderTransport::TcpRkyv);
+        assert_eq!(config.recorder_tcp.as_ref().unwrap().listen, "0.0.0.0:8082");
+    }
+
+    #[test]
+    fn tcp_rkyv_rejects_tls_instead_of_falling_back_to_postcard() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-rkyv");
+        values.insert("RHIZA_RECORDER_TLS", "on");
+
+        let error = parse_serve_env(&values).unwrap_err();
+
+        assert!(error.contains("not supported"), "{error}");
+        assert!(error.contains("tcp-rkyv"), "{error}");
     }
 
     #[cfg(not(feature = "recorder-postcard-rpc"))]
@@ -5200,13 +5343,13 @@ mod tests {
         .to_string();
         let mut values = base_serve_env();
         values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
 
         let error = parse_serve_env(&values).unwrap_err();
         assert!(error.contains("recorder_tls_server_name"), "{error}");
         assert!(error.contains("irrelevant"), "{error}");
 
         values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard");
-        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
         let error = parse_serve_env(&values).unwrap_err();
         assert!(error.contains("recorder_tls_server_name"), "{error}");
         assert!(error.contains("irrelevant"), "{error}");
@@ -5706,6 +5849,7 @@ mod tests {
             ("RHIZA_EPOCH", "1"),
             ("RHIZA_CONFIG_BUNDLE", base_bundle_json()),
             ("RHIZA_CLIENT_TOKEN", "client-secret"),
+            ("RHIZA_RECORDER_TRANSPORT", "http"),
         ])
     }
 
@@ -6676,6 +6820,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "sql")]
+    async fn sequential_tcp_rkyv_cluster_commits_without_process_restart() {
+        sequential_cluster_start(RecorderTransport::TcpRkyv).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[cfg(all(feature = "sql", feature = "recorder-postcard-rpc"))]
     async fn sequential_postcard_rpc_cluster_commits_without_process_restart() {
         sequential_cluster_start(RecorderTransport::TcpPostcardRpc).await;
@@ -6770,7 +6920,9 @@ mod tests {
         }));
         let first_recorder_address = match recorder_transport {
             RecorderTransport::Http => &recorder_addresses[0],
-            RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard => &tcp_addresses[0],
+            RecorderTransport::TcpPostcard
+            | RecorderTransport::TcpTlsPostcard
+            | RecorderTransport::TcpRkyv => &tcp_addresses[0],
             #[cfg(feature = "recorder-postcard-rpc")]
             RecorderTransport::TcpPostcardRpc | RecorderTransport::TcpTlsPostcardRpc => {
                 &tcp_addresses[0]

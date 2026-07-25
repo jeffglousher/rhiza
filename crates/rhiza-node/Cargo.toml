@@ -26,6 +26,7 @@ axum.workspace = true
 postcard.workspace = true
 postcard-rpc = { workspace = true, optional = true }
 reqwest.workspace = true
+rkyv.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true

@@ -79,6 +79,7 @@ for replicas in 3 7; do
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8081"),
       log_url:("http://rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8080"),
+      recorder_tcp_addr:("rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8082"),
       token:("not-a-real-secret-" + ($n + 1 | tostring))
     }]}
   ' > "$tmp/config-${profile}-${id}.json"
@@ -189,6 +190,18 @@ jq '.members |= to_entries | .members |= map(
     recorder_tcp_addr:("rhiza-sql-c3-" + (.key|tostring) + ".rhiza-sql-c3:8082")
   }
 )' "$tmp/config-sql-3.json" > "$tmp/config-sql-3-tcp.json"
+missing_rkyv_address_bundle="$tmp/config-sql-3-rkyv-missing-address.json"
+jq 'del(.members[].recorder_tcp_addr)' "$tmp/config-sql-3.json" \
+  > "$missing_rkyv_address_bundle"
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-rkyv \
+  scripts/render-k8s-config.sh 3 3 "$missing_rkyv_address_bundle" \
+    "$tmp/config-sql-3-rkyv-missing-address.yaml" \
+    2>"$tmp/config-sql-3-rkyv-missing-address.stderr"; then
+  echo "rkyv render accepted a bundle without recorder_tcp_addr" >&2
+  exit 1
+fi
+grep -Fq 'tcp-rkyv requires recorder_tcp_addr for every bundle member' \
+  "$tmp/config-sql-3-rkyv-missing-address.stderr"
 RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
     "$tmp/config-sql-3-tcp.yaml"
@@ -219,6 +232,87 @@ if yq eval -r 'select(.kind == "StatefulSet") |
   select(.kind == "StatefulSet") | .spec.template.spec.volumes[].name' \
   "$tmp/config-sql-3-tcp.yaml" | grep -q '^recorder-tls$'; then
   echo "plaintext recorder render retained TLS secret mount" >&2
+  exit 1
+fi
+
+RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-rkyv \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
+    "$tmp/config-sql-3-rkyv.yaml"
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
+  "$tmp/config-sql-3-rkyv.yaml")" = tcp-rkyv ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TCP_LISTEN") | .value' \
+  "$tmp/config-sql-3-rkyv.yaml")" = '0.0.0.0:8082' ]
+env -u RHIZA_RECORDER_TRANSPORT -u RHIZA_RECORDER_TLS \
+  RHIZA_EXECUTION_PROFILE=sql \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
+    "$tmp/config-sql-3-default.yaml"
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
+  "$tmp/config-sql-3-default.yaml")" = tcp-rkyv ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TLS") | .value' \
+  "$tmp/config-sql-3-default.yaml")" = off ]
+[ "$(yq eval -r 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c3") |
+  .spec.ports[] | select(.name == "recorder-tcp") | .port' \
+  "$tmp/config-sql-3-default.yaml")" = 8082 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].ports[] |
+  select(.name == "recorder-tcp") | .containerPort' \
+  "$tmp/config-sql-3-default.yaml")" = 8082 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TCP_LISTEN") | .value' \
+  "$tmp/config-sql-3-default.yaml")" = '0.0.0.0:8082' ]
+if yq eval -e 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c3") |
+  .spec.ports[] | select(.name == "recorder" or .port == 8081)' \
+  "$tmp/config-sql-3-default.yaml" >/dev/null 2>&1 ||
+  yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0] |
+  (.ports[] | select(.name == "recorder" or .containerPort == 8081)),
+  (.env[] | select(.name == "RHIZA_RECORDER_LISTEN"))' \
+  "$tmp/config-sql-3-default.yaml" >/dev/null 2>&1; then
+  echo "default rkyv render retained the Recorder HTTP listener" >&2
+  exit 1
+fi
+if yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[].name' "$tmp/config-sql-3-default.yaml" |
+  grep -Eq '^RHIZA_RECORDER_TLS_(CERT|KEY|CA)_FILE$'; then
+  echo "default rkyv render retained TLS environment" >&2
+  exit 1
+fi
+if yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].volumeMounts[]?.name,
+  select(.kind == "StatefulSet") | .spec.template.spec.volumes[]?.name' \
+  "$tmp/config-sql-3-default.yaml" | grep -q '^recorder-tls$'; then
+  echo "default rkyv render retained TLS secret mount" >&2
+  exit 1
+fi
+jq 'del(.members[].recorder_tcp_addr)' "$tmp/config-sql-3.json" \
+  > "$tmp/config-sql-3-http.json"
+RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=http \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-http.json" \
+    "$tmp/config-sql-3-http.yaml"
+[ "$(yq eval -r 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c3") |
+  .spec.ports[] | select(.name == "recorder") | .port' \
+  "$tmp/config-sql-3-http.yaml")" = 8081 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].ports[] |
+  select(.name == "recorder") | .containerPort' \
+  "$tmp/config-sql-3-http.yaml")" = 8081 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_LISTEN") | .value' \
+  "$tmp/config-sql-3-http.yaml")" = '0.0.0.0:8081' ]
+if yq eval -e 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c3") |
+  .spec.ports[] | select(.name == "recorder-tcp" or .port == 8082)' \
+  "$tmp/config-sql-3-http.yaml" >/dev/null 2>&1; then
+  echo "explicit HTTP rollback render retained the rkyv service port" >&2
   exit 1
 fi
 if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
@@ -286,6 +380,14 @@ assert_statefulset_env_values_are_quoted_strings "$tmp/config-sql-3-tls.yaml"
   .spec.template.spec.containers[0].volumeMounts[] |
   select(.name == "recorder-tls") | .mountPath' \
   "$tmp/config-sql-3-tls.yaml")" = /run/secrets/rhiza/recorder-tls ]
+
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-rkyv \
+  RHIZA_RECORDER_TLS=on \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tls.json" \
+    "$tmp/config-sql-3-rkyv-tls.yaml"; then
+  echo "rkyv render accepted unsupported TLS" >&2
+  exit 1
+fi
 
 for recorder_tls in off on; do
   candidate_bundle="$tmp/config-sql-3-tcp.json"
@@ -413,7 +515,8 @@ fi
 jq '.config_id = 4 |
   .members |= to_entries | .members |= map(
     .value.url = "http://rhiza-sql-c4-\(.key).rhiza-sql-c4:8081" |
-    .value.log_url = "http://rhiza-sql-c4-\(.key).rhiza-sql-c4:8080" | .value
+    .value.log_url = "http://rhiza-sql-c4-\(.key).rhiza-sql-c4:8080" |
+    .value.recorder_tcp_addr = "rhiza-sql-c4-\(.key).rhiza-sql-c4:8082" | .value
   )' "$tmp/config-3.json" > "$tmp/config-4.json"
 jq '.members[0].node_id = "other-1"' "$tmp/config-4.json" \
   > "$tmp/config-4-invalid-node.json"
@@ -606,6 +709,7 @@ assert_semantic_bundle_rejected() {
     RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
     RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
     RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_RECORDER_TRANSPORT=http \
     scripts/replace-k8s-config.sh "$bundle" "$tmp/config-5.json" \
     >/dev/null 2>&1
   rc=$?
@@ -894,14 +998,14 @@ jq -e '
   .predecessor.stop_entry.config_id == 3 and .predecessor.stop_proof != null
 ' "$partial_successor_bundle" >/dev/null
 valid_predecessor_bundle=scripts/test-fixtures/config-4-predecessor.json
-scripts/render-k8s-config.sh 4 3 \
+RHIZA_RECORDER_TRANSPORT=http scripts/render-k8s-config.sh 4 3 \
   "$valid_predecessor_bundle" "$tmp/valid-predecessor.yaml" successor
 
 assert_predecessor_rejected() {
   local filter="$1" label="$2"
   local invalid_bundle="$tmp/invalid-predecessor-${label}.json"
   jq "$filter" "$valid_predecessor_bundle" > "$invalid_bundle"
-  if scripts/render-k8s-config.sh 4 3 \
+  if RHIZA_RECORDER_TRANSPORT=http scripts/render-k8s-config.sh 4 3 \
     "$invalid_bundle" "$tmp/invalid-predecessor-${label}.yaml" successor; then
     echo "render accepted malformed predecessor $label" >&2
     exit 1
@@ -1098,6 +1202,8 @@ resume_bin="$tmp/resume-bin"
 mkdir "$resume_bin"
 cp scripts/test-fixtures/kubectl-replace-resume.sh "$resume_bin/kubectl"
 chmod +x "$resume_bin/kubectl"
+resume_old_bundle="$tmp/resume-old-bundle.json"
+jq 'del(.members[].recorder_tcp_addr)' "$tmp/config-3.json" > "$resume_old_bundle"
 
 assert_replace_resume_fixture() {
   local mode="$1" transition_dir="$2" command_log="$3"
@@ -1105,15 +1211,16 @@ assert_replace_resume_fixture() {
   env PATH="$resume_bin:$PATH" \
     RHIZA_REPLACE_RESUME_MODE="$mode" \
     RHIZA_REPLACE_RESUME_LOG="$command_log" \
-    RHIZA_REPLACE_RESUME_OLD_BUNDLE="$tmp/config-3.json" \
+    RHIZA_REPLACE_RESUME_OLD_BUNDLE="$resume_old_bundle" \
     RHIZA_REPLACE_RESUME_TRANSITION_SECRET="$resume_transition_secret" \
     RHIZA_REPLACE_RESUME_AUTH_SECRET="$valid_auth_secret" \
     RHIZA_REPLACE_RESUME_STOPPED_STATUS_DIR="$status_dir" \
     RHIZA_REPLACE_RESUME_ADMIN_POD="$tmp/${mode}-admin-pod" \
     RHIZA_REPLACE_RESUME_RHIZA="$rhiza_fixture_bin" \
     RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_RECORDER_TRANSPORT=http \
     scripts/replace-k8s-config.sh \
-      "$tmp/config-3.json" "$resume_successor_draft" \
+      "$resume_old_bundle" "$resume_successor_draft" \
       > "$command_log.stdout" 2> "$command_log.stderr"
 }
 

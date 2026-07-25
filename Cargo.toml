@@ -32,6 +32,7 @@ object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
 postcard = { version = "1", features = ["alloc"] }
 postcard-rpc = { version = "=0.12.1", features = ["use-std"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rkyv = { version = "=0.8.17", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks"] }

@@ -25,10 +25,11 @@ use rhiza_node::{
     },
     node_router_with_checkpoint, node_router_with_checkpoint_and_admin_tasks,
     recorder_router_for_generation, recover_successor_recorder_after_checkpoint,
-    rehydrate_recorder_after_checkpoint, serve_recorder_tcp, serve_recorder_tcp_tls, AdminConfig,
-    AdminTaskTracker, CertifiedTailRequest, CertifiedTailResponse, CheckpointCoordinator,
-    DurabilityMode, LearnerProgress, LearnerStore, LogPeer, NodeConfig, NodeError, NodeRuntime,
-    RecorderTlsServerConfig, StopInformation, TailReaderConfig, MAX_CERTIFIED_TAIL_ENTRIES,
+    rehydrate_recorder_after_checkpoint, serve_recorder_rkyv_tcp, serve_recorder_tcp,
+    serve_recorder_tcp_tls, AdminConfig, AdminTaskTracker, CertifiedTailRequest,
+    CertifiedTailResponse, CheckpointCoordinator, DurabilityMode, LearnerProgress, LearnerStore,
+    LogPeer, NodeConfig, NodeError, NodeRuntime, RecorderTlsServerConfig, StopInformation,
+    TailReaderConfig, MAX_CERTIFIED_TAIL_ENTRIES,
 };
 #[cfg(feature = "recorder-postcard-rpc")]
 use rhiza_node::{
@@ -64,6 +65,7 @@ pub enum HaStartupMode {
 pub enum HaRecorderTransport {
     Http,
     TcpPostcard,
+    TcpRkyv,
     TcpTlsPostcard(RecorderTlsServerConfig),
     #[cfg(feature = "recorder-postcard-rpc")]
     TcpPostcardRpc,
@@ -1146,6 +1148,15 @@ fn spawn_ha_recorder_server(
                     .map_err(|error| HaNodeError::RecorderServer(error.to_string()))
             }
             HaRecorderTransport::TcpPostcard => serve_recorder_tcp(
+                listener,
+                recorder,
+                peers,
+                recovery_generation,
+                wait_for_ha_shutdown(shutdown),
+            )
+            .await
+            .map_err(HaNodeError::RecorderServer),
+            HaRecorderTransport::TcpRkyv => serve_recorder_rkyv_tcp(
                 listener,
                 recorder,
                 peers,
