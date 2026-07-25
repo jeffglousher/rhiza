@@ -1,5 +1,6 @@
 use rhiza_core::{
-    ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot, StopBinding,
+    ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot,
+    StopBinding,
 };
 use rhiza_sql::{
     decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
@@ -409,6 +410,14 @@ fn existing_qwal_pair_opens_when_supplied_configuration_is_ahead() {
     .unwrap();
     drop(db);
 
+    let stop_change = ConfigChange::bound_stop(
+        "cluster-a",
+        1,
+        initial.digest(),
+        2,
+        vec!["node-1".into(), "node-2".into(), "node-3".into()],
+    )
+    .unwrap();
     let reopened = SqliteStateMachine::open_with_configuration(
         &path,
         "cluster-a",
@@ -418,7 +427,10 @@ fn existing_qwal_pair_opens_when_supplied_configuration_is_ahead() {
             1,
             initial.digest(),
             LogAnchor::new(1, LogHash::digest(&[b"stop"])),
-            StopBinding::Unbound,
+            StopBinding::Bound {
+                successor: stop_change.successor().expect("bound stop").clone(),
+                stop_command_hash: stop_change.to_stored_command().hash(),
+            },
         ),
     )
     .unwrap();

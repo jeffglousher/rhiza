@@ -76,9 +76,10 @@ impl fmt::Display for Error {
             Self::InvalidIndexRange { start, end } => {
                 write!(f, "invalid index range: start {start} is after end {end}")
             }
-            Self::CompactionUnsupported => {
-                write!(f, "prefix compaction is unsupported by qlog v1")
-            }
+            Self::CompactionUnsupported => write!(
+                f,
+                "prefix compaction is unsupported by the canonical qlog format"
+            ),
             Self::CompactionAboveTip { target, tip } => {
                 write!(f, "compaction target {target} is above log tip {tip:?}")
             }
@@ -2562,7 +2563,7 @@ mod tests {
     const INJECTED_CRASH: &str = "injected crash";
 
     #[test]
-    fn legacy_anchor_binary_version_is_rejected() {
+    fn unsupported_anchor_binary_version_is_rejected() {
         let entry = chain(&[b"one"]).pop().unwrap();
         let anchor = recovery_anchor(&entry);
         let mut bytes = encode_anchor(&anchor).unwrap();

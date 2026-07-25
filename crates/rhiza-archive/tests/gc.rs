@@ -322,7 +322,7 @@ async fn gc_preserves_active_snapshot_and_collects_orphans_after_grace() {
     root.execute_gc(plan.plan_hash(), NOW + 11).await.unwrap();
     assert!(store.get(&active_key).await.is_ok());
     assert_eq!(
-        root.restore_checkpoint_v2()
+        root.restore_checkpoint_state()
             .await
             .unwrap()
             .snapshot()

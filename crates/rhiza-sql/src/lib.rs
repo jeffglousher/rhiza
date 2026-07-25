@@ -4670,7 +4670,15 @@ mod query_policy_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
-        let change = rhiza_core::ConfigChange::stop(1, LogHash::ZERO).to_stored_command();
+        let change = rhiza_core::ConfigChange::bound_stop(
+            "cluster-a",
+            1,
+            LogHash::ZERO,
+            2,
+            vec!["node-1".into(), "node-2".into(), "node-3".into()],
+        )
+        .unwrap()
+        .to_stored_command();
         let hash = LogEntry::calculate_hash(
             "cluster-a",
             1,

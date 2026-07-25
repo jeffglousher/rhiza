@@ -5,6 +5,17 @@ use rhiza_quepaxa::{
     RejectReason, SealFaultPoint, ThreeNodeConsensus,
 };
 
+fn same_membership_stop(cluster_id: &str, config_id: u64, membership: &Membership) -> ConfigChange {
+    ConfigChange::bound_stop(
+        cluster_id,
+        config_id,
+        membership.digest(),
+        config_id + 1,
+        membership.members().to_vec(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn membership_is_canonical_for_three_through_seven_unique_voters() {
     for count in 3..=7 {
@@ -57,21 +68,23 @@ fn decision_certificate_requires_sorted_exact_membership_quorum_and_digest() {
 }
 
 #[test]
-fn config_change_commands_are_versioned_opaque_and_strictly_recognized() {
+fn config_change_commands_are_opaque_and_strictly_recognized() {
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
-    let stop = ConfigChange::stop(4, membership.digest()).to_stored_command();
+    let stop_change = same_membership_stop("cluster-a", 4, &membership);
+    let stop = stop_change.to_stored_command();
     assert_eq!(stop.entry_type, EntryType::ConfigChange);
-    assert_eq!(
-        ConfigChange::recognize(&stop).unwrap(),
-        ConfigChange::stop(4, membership.digest())
-    );
+    assert_eq!(ConfigChange::recognize(&stop).unwrap(), stop_change);
 
-    let activation =
-        ConfigChange::activation_barrier(5, membership.digest(), 10, LogHash::from_bytes([9; 32]))
-            .to_stored_command();
+    let activation_change = ConfigChange::bound_activation_barrier(
+        stop_change.successor().expect("bound stop").clone(),
+        10,
+        LogHash::from_bytes([9; 32]),
+        stop.hash(),
+    );
+    let activation = activation_change.to_stored_command();
     assert_eq!(
         ConfigChange::recognize(&activation).unwrap(),
-        ConfigChange::activation_barrier(5, membership.digest(), 10, LogHash::from_bytes([9; 32]),)
+        activation_change
     );
 
     let unknown = StoredCommand::new(EntryType::ConfigChange, b"not-a-quepaxa-change".to_vec());
@@ -87,9 +100,8 @@ fn stop_seal_is_durable_before_ack_and_blocks_later_old_slots() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
-        let recorder = store(&dir, "r1", 4, membership);
-        let stop = ConfigChange::stop(4, recorder.configuration_state().unwrap().config_digest())
-            .to_stored_command();
+        let recorder = store(&dir, "r1", 4, membership.clone());
+        let stop = same_membership_stop("cluster-a", 4, &membership).to_stored_command();
         let value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
         recorder.store_command(stop.hash(), stop).unwrap();
         recorder.set_seal_fault(Some(fault)).unwrap();
@@ -118,8 +130,7 @@ fn higher_normal_record_does_not_clear_provisional_stop_seal() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     let recorder = store(&dir, "r1", 4, membership.clone());
-    let digest = recorder.configuration_state().unwrap().config_digest();
-    let stop = ConfigChange::stop(4, digest).to_stored_command();
+    let stop = same_membership_stop("cluster-a", 4, &membership).to_stored_command();
     let stop_value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
     recorder.store_command(stop.hash(), stop).unwrap();
     record(&recorder, 7, 4, proposal("stopper", 1, 1, stop_value)).unwrap();
@@ -149,14 +160,13 @@ fn higher_normal_record_does_not_clear_provisional_stop_seal() {
 fn stop_rejects_a_recorder_that_already_accepted_a_later_old_slot() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
-    let recorder = store(&dir, "r1", 4, membership);
+    let recorder = store(&dir, "r1", 4, membership.clone());
     let normal = StoredCommand::new(EntryType::Command, b"normal".to_vec());
     let normal_value = AcceptedValue::from_command("cluster-a", 8, 2, 4, LogHash::ZERO, &normal);
     recorder.store_command(normal.hash(), normal).unwrap();
     record(&recorder, 8, 4, proposal("writer", 1, 1, normal_value)).unwrap();
 
-    let stop = ConfigChange::stop(4, recorder.configuration_state().unwrap().config_digest())
-        .to_stored_command();
+    let stop = same_membership_stop("cluster-a", 4, &membership).to_stored_command();
     let stop_value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
     recorder.store_command(stop.hash(), stop).unwrap();
     assert_eq!(
@@ -177,7 +187,7 @@ fn validated_stop_proof_seals_a_recorder_that_did_not_record_the_stop() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     let recorder = store(&dir, "r3", 4, membership.clone());
-    let stop = ConfigChange::stop(4, membership.digest()).to_stored_command();
+    let stop = same_membership_stop("cluster-a", 4, &membership).to_stored_command();
     let value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
     recorder.store_command(stop.hash(), stop).unwrap();
     let stop_proposal = proposal("writer", 1, 1, value);
@@ -334,7 +344,7 @@ fn activation_proof_reinstall_accepts_same_value_and_rejects_conflict() {
         .unwrap();
 
     let activation = ConfigChange::bound_activation_barrier(
-        stop_change.successor().unwrap().clone(),
+        stop_change.successor().expect("bound stop").clone(),
         7,
         stop_value.entry_hash,
         stop_value.command_hash,
@@ -594,7 +604,7 @@ fn losing_stop_never_seals_with_the_aggregate_winner_hash() {
         proposal("winner", 1, 9, normal_value.clone()),
     )
     .unwrap();
-    let stop = ConfigChange::stop(4, membership.digest()).to_stored_command();
+    let stop = same_membership_stop("cluster-a", 4, &membership).to_stored_command();
     let stop_value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
     recorder.store_command(stop.hash(), stop).unwrap();
     record(&recorder, 7, 4, proposal("loser", 2, 1, stop_value.clone())).unwrap();
@@ -614,7 +624,7 @@ fn validated_non_stop_proof_clears_provisional_seal() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     let recorder = store(&dir, "r1", 4, membership.clone());
-    let stop = ConfigChange::stop(4, membership.digest()).to_stored_command();
+    let stop = same_membership_stop("cluster-a", 4, &membership).to_stored_command();
     let stop_value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
     recorder.store_command(stop.hash(), stop).unwrap();
     record(&recorder, 7, 4, proposal("stopper", 1, 1, stop_value)).unwrap();

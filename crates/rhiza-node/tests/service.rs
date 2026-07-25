@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_node::{
     CheckpointCoordinator, DurabilityMode, NodeConfig, NodeError, NodeRuntime, NodeService,
-    PeerConfig, ReadConsistency, WriteRequest, SQL_EXECUTE_RESPONSE_VERSION,
+    PeerConfig, ReadConsistency, WriteRequest,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
@@ -146,7 +146,9 @@ async fn direct_sql_retry_preserves_returning_results() {
     let first = service.execute_sql(command.clone()).await.unwrap();
     let replay = service.execute_sql(command).await.unwrap();
 
-    assert_eq!(first.version, SQL_EXECUTE_RESPONSE_VERSION);
+    let serialized = serde_json::to_value(&first).unwrap();
+    assert!(serialized.get("version").is_none());
+    assert!(serialized.get("results").is_some());
     assert_eq!(replay, first);
     assert_eq!(first.results[0].rows_affected, 1);
     assert_eq!(

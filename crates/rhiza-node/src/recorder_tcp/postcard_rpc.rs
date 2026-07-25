@@ -103,8 +103,8 @@ impl fmt::Debug for RecorderPostcardRpcTlsServerConfig {
 
 impl RecorderPostcardRpcTlsServerConfig {
     pub fn from_pem(certificate_chain_pem: &[u8], private_key_pem: &[u8]) -> Result<Self, String> {
-        let legacy = RecorderTlsServerConfig::from_pem(certificate_chain_pem, private_key_pem)?;
-        let mut config = (*legacy.inner).clone();
+        let framed = RecorderTlsServerConfig::from_pem(certificate_chain_pem, private_key_pem)?;
+        let mut config = (*framed.inner).clone();
         config.alpn_protocols = vec![POSTCARD_RPC_TLS_ALPN.to_vec()];
         Ok(Self {
             inner: Arc::new(config),
@@ -129,12 +129,12 @@ impl fmt::Debug for RecorderPostcardRpcTlsClientConfig {
 
 impl RecorderPostcardRpcTlsClientConfig {
     pub fn from_ca_pem(ca_bundle_pem: &[u8], server_name: &str) -> Result<Self, String> {
-        let legacy = RecorderTlsClientConfig::from_ca_pem(ca_bundle_pem, server_name)?;
-        let mut config = (*legacy.inner).clone();
+        let framed = RecorderTlsClientConfig::from_ca_pem(ca_bundle_pem, server_name)?;
+        let mut config = (*framed.inner).clone();
         config.alpn_protocols = vec![POSTCARD_RPC_TLS_ALPN.to_vec()];
         Ok(Self {
             inner: Arc::new(config),
-            server_name: legacy.server_name,
+            server_name: framed.server_name,
         })
     }
 }

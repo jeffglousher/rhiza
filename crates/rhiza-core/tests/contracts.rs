@@ -158,7 +158,7 @@ fn log_entry_hash_changes_when_any_identity_field_changes() {
 }
 
 #[test]
-fn log_entry_hash_uses_cluster_bound_v3_encoding() {
+fn log_entry_hash_uses_canonical_cluster_bound_encoding() {
     assert_eq!(
         LogEntry::calculate_hash(
             "cluster-a",
@@ -280,7 +280,7 @@ fn snapshot_manifest_rejects_missing_canonical_fields() {
 }
 
 #[test]
-fn recovery_anchor_round_trips_versioned_log_and_snapshot_identity() {
+fn recovery_anchor_round_trips_canonical_log_and_snapshot_identity() {
     let executor_fingerprint = LogHash::from_bytes([6; 32]);
     let anchor = RecoveryAnchor::new(
         "cluster-a",
@@ -328,8 +328,8 @@ fn recovery_anchor_round_trips_versioned_log_and_snapshot_identity() {
 }
 
 #[test]
-fn recovery_anchor_rejects_missing_canonical_fields_and_legacy_version() {
-    let legacy = serde_json::json!({
+fn recovery_anchor_rejects_missing_canonical_fields_and_unsupported_format() {
+    let incomplete = serde_json::json!({
         "format_version": RECOVERY_ANCHOR_FORMAT_VERSION,
         "cluster_id": "cluster-a",
         "epoch": 7,
@@ -351,22 +351,22 @@ fn recovery_anchor_rejects_missing_canonical_fields_and_legacy_version() {
         },
     });
 
-    assert!(serde_json::from_value::<RecoveryAnchor>(legacy.clone()).is_err());
+    assert!(serde_json::from_value::<RecoveryAnchor>(incomplete.clone()).is_err());
 
-    let mut legacy_version = legacy;
-    legacy_version["snapshot"]["executor_fingerprint"] = serde_json::json!(vec![6; 32]);
-    legacy_version["format_version"] = 1.into();
-    assert!(serde_json::from_value::<RecoveryAnchor>(legacy_version).is_err());
+    let mut unsupported = incomplete;
+    unsupported["snapshot"]["executor_fingerprint"] = serde_json::json!(vec![6; 32]);
+    unsupported["format_version"] = 1.into();
+    assert!(serde_json::from_value::<RecoveryAnchor>(unsupported).is_err());
 }
 
 #[test]
-fn config_change_codec_preserves_quepaxa_v1_wire_bytes() {
+fn config_change_codec_round_trips_the_single_wire_format() {
     let digest = LogHash::from_bytes([3; 32]);
     let stop = ConfigChange::stop(4, digest).to_stored_command();
     let activation = ConfigChange::activation_barrier(5, digest, 10, LogHash::from_bytes([9; 32]))
         .to_stored_command();
 
-    let mut expected_stop = b"QCFG\0\x01\x01".to_vec();
+    let mut expected_stop = b"QCFG\x01".to_vec();
     expected_stop.extend_from_slice(&4_u64.to_be_bytes());
     expected_stop.extend_from_slice(digest.as_bytes());
     assert_eq!(stop.payload, expected_stop);
@@ -418,7 +418,7 @@ fn bound_stop_binary_rejects_noncanonical_member_order() {
     )
     .unwrap();
     let mut command = stop.to_stored_command();
-    let member_start = 7 + 2 + "cluster-a".len() + 8 + 32 + 8 + 32 + 1;
+    let member_start = 5 + 2 + "cluster-a".len() + 8 + 32 + 8 + 32 + 1;
     let (_, members) = command.payload.split_at_mut(member_start);
     let (first, rest) = members.split_at_mut(4);
     first.swap_with_slice(&mut rest[..4]);
@@ -747,7 +747,7 @@ fn configuration_state_rejects_malformed_or_misbound_transitions() {
 }
 
 #[test]
-fn recovery_anchor_v2_preserves_configuration_state_and_rejects_missing_state() {
+fn recovery_anchor_preserves_configuration_state_and_rejects_missing_state() {
     let stopped = ConfigurationState::stopped(
         4,
         LogHash::from_bytes([4; 32]),
@@ -781,7 +781,7 @@ fn recovery_anchor_v2_preserves_configuration_state_and_rejects_missing_state() 
 
 #[test]
 fn stopped_state_rejects_missing_binding() {
-    let legacy = serde_json::json!({
+    let incomplete = serde_json::json!({
         "phase": "stopped",
         "config_id": 4,
         "digest": LogHash::from_bytes([4; 32]),
@@ -791,5 +791,5 @@ fn stopped_state_rejects_missing_binding() {
         }
     });
 
-    assert!(serde_json::from_value::<ConfigurationState>(legacy).is_err());
+    assert!(serde_json::from_value::<ConfigurationState>(incomplete).is_err());
 }

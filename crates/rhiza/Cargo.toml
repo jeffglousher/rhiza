@@ -10,14 +10,22 @@ description = "Embeddable facade for rhiza replicated state machines"
 [lib]
 name = "rhizadb"
 
+[features]
+default = []
+recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
+
 [dependencies]
+axum.workspace = true
+rhiza-archive = { version = "0.2.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.2.0", path = "../rhiza-core" }
+rhiza-log = { version = "0.2.0", path = "../rhiza-log" }
 rhiza-node = { version = "0.2.0", path = "../rhiza-node" }
 rhiza-quepaxa = { version = "0.2.0", path = "../rhiza-quepaxa" }
 rhiza-sql = { version = "0.2.0", path = "../rhiza-sql" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-rhiza-archive = { version = "0.2.0", path = "../rhiza-archive" }
 rhiza-obj-store = { version = "0.2.0", path = "../rhiza-obj-store" }
 tempfile.workspace = true

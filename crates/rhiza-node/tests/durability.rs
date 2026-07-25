@@ -3,18 +3,16 @@ use std::{path::Path, sync::Arc, time::Duration};
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::ExecutionProfile;
-use rhiza_core::{ConfigurationState, LogAnchor, LogHash};
+use rhiza_core::{ConfigurationState, LogHash};
 use rhiza_log::{FileLogStore, LogStore};
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_node::effective_cluster_id;
 #[cfg(feature = "kv")]
 use rhiza_node::KvCommandV1;
 use rhiza_node::{
-    install_successor_recorder, rehydrate_recorder_after_checkpoint,
-    restore_checkpoint_to_fresh_data_dir, restore_checkpoint_to_fresh_data_dir_for_node,
-    restore_successor_checkpoint_to_fresh_data_dir, CheckpointCoordinator, DurabilityError,
-    DurabilityHealth, DurabilityMode, NodeConfig, NodeError, NodeRuntime, PeerConfig,
-    ReadConsistency, RuntimeConfigurationStatus,
+    rehydrate_recorder_after_checkpoint, restore_checkpoint_to_fresh_data_dir,
+    restore_checkpoint_to_fresh_data_dir_for_node, CheckpointCoordinator, DurabilityError,
+    DurabilityHealth, DurabilityMode, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
 };
 #[cfg(feature = "graph")]
 use rhiza_node::{GraphCommandV1, GraphValueV1};
@@ -682,37 +680,7 @@ async fn restore_preserves_an_existing_empty_data_directory() {
 }
 
 #[tokio::test]
-async fn unsupported_restore_intent_fails_without_mutating_nonfresh_data() {
-    let root = tempfile::tempdir().unwrap();
-    let archive = initialized_checkpoint(&root.path().join("archive")).await;
-    let data_dir = root.path().join("mounted-data");
-    std::fs::create_dir_all(data_dir.join("consensus/partial")).unwrap();
-    std::fs::write(data_dir.join("consensus/partial/sentinel"), b"preserve").unwrap();
-    std::fs::create_dir(data_dir.join(".restore-stage-old")).unwrap();
-    std::fs::write(
-        data_dir.join(".rhiza-restore-v1"),
-        b"rhiza restore in progress\n",
-    )
-    .unwrap();
-
-    let intent_before = std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap();
-    let error = restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("unsupported"));
-    assert_eq!(
-        std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap(),
-        intent_before
-    );
-    assert_eq!(
-        std::fs::read(data_dir.join("consensus/partial/sentinel")).unwrap(),
-        b"preserve"
-    );
-    assert!(data_dir.join(".restore-stage-old").is_dir());
-}
-
-#[tokio::test]
-async fn checkpoint_compact_publishes_format2_and_restores_snapshot_with_exact_suffix() {
+async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
     let root = tempfile::tempdir().unwrap();
     let archive = initialized_checkpoint(&root.path().join("archive")).await;
     let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
@@ -726,7 +694,6 @@ async fn checkpoint_compact_publishes_format2_and_restores_snapshot_with_exact_s
         .unwrap();
     let anchor = source.checkpoint_compact(&coordinator).await.unwrap();
     let local = source.log_store().logical_state().unwrap();
-    assert_eq!(anchor.format_version(), 2);
     assert_eq!(local.anchor, Some(anchor.clone()));
     assert!(source
         .log_store()
@@ -745,7 +712,7 @@ async fn checkpoint_compact_publishes_format2_and_restores_snapshot_with_exact_s
             .await
             .unwrap();
     assert_eq!(tip.index(), second.applied_index);
-    let restored_checkpoint = archive.restore_checkpoint_v2().await.unwrap();
+    let restored_checkpoint = archive.restore_checkpoint_state().await.unwrap();
     assert_eq!(restored_checkpoint.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(restored_checkpoint.suffix().len(), 1);
     assert_eq!(restored_checkpoint.suffix()[0].index, second.applied_index);
@@ -799,7 +766,7 @@ async fn graph_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_no
         .await
         .unwrap();
 
-    let remote = archive.restore_checkpoint_v2().await.unwrap();
+    let remote = archive.restore_checkpoint_state().await.unwrap();
     assert_eq!(remote.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(remote.suffix().len(), 1);
     assert_eq!(remote.suffix()[0].index, second.applied_index());
@@ -863,7 +830,7 @@ async fn kv_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node(
         .await
         .unwrap();
 
-    let remote = archive.restore_checkpoint_v2().await.unwrap();
+    let remote = archive.restore_checkpoint_state().await.unwrap();
     assert_eq!(remote.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(remote.suffix().len(), 1);
     assert_eq!(remote.suffix()[0].index, second.applied_index());
@@ -926,271 +893,6 @@ async fn failed_snapshot_publication_leaves_local_qlog_prefix_intact() {
         .read(committed.applied_index)
         .unwrap()
         .is_some());
-}
-
-#[tokio::test]
-async fn stopped_checkpoint_compact_publishes_and_restores_the_stop_snapshot() {
-    let root = tempfile::tempdir().unwrap();
-    let archive = initialized_checkpoint(&root.path().join("archive")).await;
-    let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
-        .await
-        .unwrap();
-    let source = bound_runtime(root.path().join("node"));
-    source.write("request-1", "alpha", "one").unwrap();
-    let successor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-    let stop = source
-        .stop_current_configuration_for_successor(&successor)
-        .unwrap();
-    let expected = LogAnchor::new(stop.entry.index, stop.entry.hash);
-
-    let anchor = coordinator
-        .checkpoint_compact_fenced(&source, 1, 1, expected)
-        .await
-        .unwrap();
-
-    assert_eq!(anchor.compacted(), &expected);
-    assert!(!anchor.configuration_state().is_active());
-    let restored_dir = root.path().join("restored");
-    restore_checkpoint_to_fresh_data_dir_for_node(archive, &restored_dir, "node-1")
-        .await
-        .unwrap();
-    let restored = runtime(restored_dir);
-    assert!(!restored.configuration_state().unwrap().is_active());
-    assert_eq!(
-        restored.configuration_state().unwrap().stop(),
-        Some(&expected)
-    );
-    assert!(matches!(
-        restored.write("request-2", "beta", "two"),
-        Err(NodeError::ConfigurationTransition { .. })
-    ));
-}
-
-#[tokio::test]
-async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activation() {
-    let root = tempfile::tempdir().unwrap();
-    let archive_root = root.path().join("archive");
-    let source_archive = initialized_checkpoint(&archive_root).await;
-    let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
-        .await
-        .unwrap();
-    let source = bound_runtime(root.path().join("source"));
-    source.write("request-1", "alpha", "one").unwrap();
-    let successor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-    let stop = source
-        .stop_current_configuration_for_successor(&successor)
-        .unwrap();
-    coordinator
-        .checkpoint_compact_fenced(
-            &source,
-            1,
-            1,
-            LogAnchor::new(stop.entry.index, stop.entry.hash),
-        )
-        .await
-        .unwrap();
-    let target_store = ObjStore::new(ObjStoreConfig::Local { root: archive_root }).unwrap();
-    let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
-        target_store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
-    );
-    source_archive
-        .fork_stopped_successor(&target_archive, &stop.entry)
-        .await
-        .unwrap();
-    let data_dir = root.path().join("successor");
-    let stopped = source.configuration_state().unwrap().clone();
-    let config = NodeConfig::new_with_configuration(
-        "rhiza:sql:cluster-a",
-        "node-1",
-        data_dir.clone(),
-        1,
-        successor.clone(),
-        stopped.clone(),
-        successor_peers(),
-        "client-token",
-    )
-    .unwrap()
-    .with_log_initial_configuration(ConfigurationState::active(1, successor.digest()))
-    .with_predecessor_stop_entry(stop.entry.clone());
-
-    let preparation =
-        restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
-            .await
-            .unwrap();
-    assert!(preparation.requires_recorder_install());
-    drop(preparation);
-    std::fs::create_dir_all(data_dir.join("recorder")).unwrap();
-    std::fs::write(data_dir.join("recorder/partial"), b"partial").unwrap();
-    let resumed = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
-        .await
-        .unwrap();
-    assert!(resumed.requires_recorder_install());
-    assert!(!data_dir.join("recorder/partial").exists());
-    let recorder_root = root.path().join("successor-recorders");
-    let mut recorders: Vec<(String, Box<dyn RecorderRpc>)> = Vec::new();
-    for node_id in ["node-1", "node-2", "node-3"] {
-        let recorder = RecorderFileStore::new_with_membership(
-            recorder_root.join(node_id),
-            node_id,
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            successor.clone(),
-        )
-        .unwrap();
-        install_successor_recorder(&recorder, 2, successor.clone(), &stop).unwrap();
-        recorders.push((node_id.to_string(), Box::new(recorder)));
-    }
-    resumed.complete().unwrap();
-    let consensus = Arc::new(
-        ThreeNodeConsensus::from_recorders_with_ids(
-            "rhiza:sql:cluster-a",
-            "node-1",
-            1,
-            2,
-            recorders,
-        )
-        .unwrap(),
-    );
-    let runtime = NodeRuntime::open(config.clone(), consensus.clone(), &[]).unwrap();
-    assert_eq!(
-        runtime.status().unwrap().configuration_status,
-        RuntimeConfigurationStatus::AwaitingActivation
-    );
-    let activation = runtime.activate_successor().unwrap();
-    assert_eq!(activation.index, stop.entry.index + 1);
-    assert_eq!(
-        runtime.status().unwrap().configuration_status,
-        RuntimeConfigurationStatus::Active
-    );
-    drop(runtime);
-
-    std::fs::write(
-        data_dir.join(".rhiza-checkpoint-identity-v2.json"),
-        b"matching-cli-identity-marker",
-    )
-    .unwrap();
-    let completed = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
-        .await
-        .unwrap();
-    assert!(!completed.requires_recorder_install());
-    assert_eq!(completed.tip().index(), stop.entry.index);
-    drop(completed);
-    let reopened = NodeRuntime::open(config.clone(), consensus.clone(), &[]).unwrap();
-    assert_eq!(
-        reopened.status().unwrap().configuration_status,
-        RuntimeConfigurationStatus::Active
-    );
-    let successor_coordinator =
-        CheckpointCoordinator::open(target_archive.clone(), DurabilityMode::Sync)
-            .await
-            .unwrap();
-    let active_anchor = successor_coordinator
-        .checkpoint_compact_fenced(
-            &reopened,
-            2,
-            1,
-            LogAnchor::new(activation.index, activation.hash),
-        )
-        .await
-        .unwrap();
-    assert!(active_anchor.configuration_state().is_active());
-    assert_eq!(active_anchor.configuration_state().config_id(), 2);
-    drop(reopened);
-
-    let rejoin = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
-        .await
-        .unwrap();
-    assert!(!rejoin.requires_recorder_install());
-    assert_eq!(rejoin.tip().index(), activation.index);
-    drop(rejoin);
-    let rejoined = NodeRuntime::open(config.clone(), consensus, &[]).unwrap();
-    assert_eq!(
-        rejoined.status().unwrap().configuration_status,
-        RuntimeConfigurationStatus::Active
-    );
-    drop(rejoined);
-
-    std::fs::remove_dir_all(data_dir.join("sqlite")).unwrap();
-    let repaired = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
-        .await
-        .unwrap();
-    assert!(!repaired.requires_recorder_install());
-    assert!(data_dir.join("sqlite/db.sqlite").is_file());
-    assert!(std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .any(|entry| entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".rebuildable-quarantine-")));
-    drop(repaired);
-
-    // A repaired Complete successor must remain restartable. The first repair keeps the
-    // replaced recovery view in a quarantine directory, but that implementation detail must
-    // not turn the next prepare/open into a non-fresh data-directory failure.
-    let restarted = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
-        .await
-        .unwrap();
-    assert!(!restarted.requires_recorder_install());
-    drop(restarted);
-    let restarted_recorders: Vec<(String, Box<dyn RecorderRpc>)> = ["node-1", "node-2", "node-3"]
-        .into_iter()
-        .map(|node_id| {
-            (
-                node_id.to_string(),
-                Box::new(
-                    RecorderFileStore::new_with_membership(
-                        recorder_root.join(node_id),
-                        node_id,
-                        "rhiza:sql:cluster-a",
-                        1,
-                        2,
-                        successor.clone(),
-                    )
-                    .unwrap(),
-                ) as Box<dyn RecorderRpc>,
-            )
-        })
-        .collect();
-    let restarted_consensus = Arc::new(
-        ThreeNodeConsensus::from_recorders_with_ids(
-            "rhiza:sql:cluster-a",
-            "node-1",
-            1,
-            2,
-            restarted_recorders,
-        )
-        .unwrap(),
-    );
-    let reopened_after_repair =
-        NodeRuntime::open(config.clone(), restarted_consensus, &[]).unwrap();
-    assert_eq!(
-        reopened_after_repair.status().unwrap().configuration_status,
-        RuntimeConfigurationStatus::Active
-    );
-    drop(reopened_after_repair);
-
-    let wrong = NodeConfig::new_with_configuration(
-        "rhiza:sql:cluster-a",
-        "other-1",
-        root.path().join("wrong"),
-        1,
-        Membership::new(["other-1", "other-2", "other-3"]).unwrap(),
-        stopped.clone(),
-        [
-            PeerConfig::new("other-1", "http://other-1", "token-1").unwrap(),
-            PeerConfig::new("other-2", "http://other-2", "token-2").unwrap(),
-            PeerConfig::new("other-3", "http://other-3", "token-3").unwrap(),
-        ],
-        "client-token",
-    )
-    .unwrap();
-    assert!(matches!(
-        restore_successor_checkpoint_to_fresh_data_dir(target_archive, &wrong).await,
-        Err(DurabilityError::SnapshotVerification(_))
-    ));
 }
 
 async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
@@ -1370,12 +1072,4 @@ fn bound_runtime(data_dir: impl AsRef<Path>) -> NodeRuntime {
         &[],
     )
     .unwrap()
-}
-
-fn successor_peers() -> [PeerConfig; 3] {
-    [
-        PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
-        PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
-        PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
-    ]
 }

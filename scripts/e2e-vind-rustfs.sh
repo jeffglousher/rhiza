@@ -175,19 +175,21 @@ fi
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
+tail_token="$(openssl rand -hex 24)"
 peer_tokens="$(jq -cn \
   --arg first "$(openssl rand -hex 24)" \
   --arg second "$(openssl rand -hex 24)" \
   --arg third "$(openssl rand -hex 24)" \
   '[$first, $second, $third]')"
 [ "$(jq 'unique | length' <<< "$peer_tokens")" = 3 ] || die "peer tokens must be unique"
-diagnostic_secrets=("$client_token" "$admin_token")
+diagnostic_secrets=("$client_token" "$admin_token" "$tail_token")
 while IFS= read -r peer_token; do
   diagnostic_secrets+=("$peer_token")
 done < <(jq -r '.[]' <<< "$peer_tokens")
 k create secret generic rhiza-auth \
   --from-literal=client-token="$client_token" \
-  --from-literal=admin-token="$admin_token" >/dev/null
+  --from-literal=admin-token="$admin_token" \
+  --from-literal=tail-token="$tail_token" >/dev/null
 
 sed -e "s|__RUSTFS_IMAGE__|$rustfs_image|g" -e "s|__AWS_CLI_IMAGE__|$aws_image|g" \
   deploy/k8s/rustfs-e2e.yaml > "$target/rustfs.yaml"
@@ -202,7 +204,7 @@ rustfs_uid="$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0]
 make_bundle() {
   id="$1" output="$2" name="rhiza-${profile}-c${id}"
   jq -n --argjson id "$id" --argjson tokens "$peer_tokens" --arg name "$name" '
-    {version:1, config_id:$id, members:[range(3) as $n | {
+    {config_id:$id, members:[range(3) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://" + $name + "-" + ($n|tostring) + "." + $name + ":8081"),
       log_url:("http://" + $name + "-" + ($n|tostring) + "." + $name + ":8080"),
@@ -1157,7 +1159,7 @@ done
 jq -e '.anchor.format_version == 2 and .anchor.configuration_state.phase == "active"' \
   "$generation_compact" >/dev/null
 
-echo "== restart successor container in place and rejoin preserved emptyDir state =="
+echo "== restart successor container in place and rejoin preserved PVC state =="
 restart_pod="${name_c2}-1"
 restart_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
 restart_count="$(k get pod "$restart_pod" \
@@ -1221,9 +1223,7 @@ if [ "$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0].metad
   [ "$recovery_matrix" != 1 ] || matrix_emit_summary failed rustfs_uid_changed
   die "RustFS changed during the restore lifecycle"
 fi
-if [ -n "$(k get persistentvolumeclaims -o name)" ]; then
-  [ "$recovery_matrix" != 1 ] || matrix_emit_summary failed unexpected_pvc
-  die "vind E2E created a PVC"
-fi
+[ "$(k get persistentvolumeclaims -o json | jq '.items | length')" = 3 ] ||
+  die "successor prestage must retain one PVC per successor Pod"
 [ "$recovery_matrix" != 1 ] || matrix_emit_summary passed
-echo "vind RustFS emptyDir restore, V2 compact, 3->3 replacement, and exact-hash GC passed"
+echo "vind RustFS emptyDir recovery, PVC prestage, V2 compact, 3->3 replacement, and exact-hash GC passed"

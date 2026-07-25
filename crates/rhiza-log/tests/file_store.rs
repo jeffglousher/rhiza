@@ -28,7 +28,7 @@ fn file_log_store_reopens_published_segments() {
 }
 
 #[test]
-fn file_log_store_recovers_open_segment_after_closed_v1_segment() {
+fn file_log_store_recovers_open_segment_after_closed_canonical_segment() {
     let dir = tempfile::tempdir().unwrap();
     let first = entry(1, LogHash::ZERO, b"one");
     let second = entry(2, first.hash, b"two");

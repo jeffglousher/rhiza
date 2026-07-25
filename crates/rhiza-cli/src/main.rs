@@ -1,37 +1,35 @@
+#[cfg(test)]
+use std::path::Path;
 use std::{
     env, fmt, fs,
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
+    io::{self, Read},
+    path::PathBuf,
     process,
     sync::Arc,
     time::Duration,
 };
 
 use reqwest::{header, Method, RequestBuilder, Response};
-use rhiza_archive::{
-    CheckpointIdentity, CheckpointPublisherOptions, CheckpointTip, GcPlan, GcPolicy,
-    ObjectArchiveStore,
-};
+use rhiza_archive::{CheckpointIdentity, CheckpointTip, GcPlan, GcPolicy, ObjectArchiveStore};
 use rhiza_client::RhizaClient;
 use rhiza_core::{
-    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, StoredCommand,
+    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, StoredCommand,
 };
-use rhiza_log::LogStore;
 use rhiza_node::{
     effective_cluster_id, install_successor_recorder, node_router,
-    node_router_with_admin_and_tasks, node_router_with_checkpoint,
-    node_router_with_checkpoint_and_admin_tasks, recorder_router_for_generation,
-    recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
-    restore_successor_checkpoint_to_fresh_data_dir, serve_recorder_tcp, serve_recorder_tcp_tls,
-    validate_recorder_tcp_endpoint, AdminActivateRequest, AdminActivateResponse,
-    AdminCompactRequest, AdminCompactResponse, AdminConfig, AdminErrorResponse,
-    AdminInstallSuccessorRequest, AdminInstallSuccessorResponse, AdminStatusResponse,
-    AdminStopRequest, AdminStopResponse, AdminSuccessorBundle, AdminTaskTracker,
-    CheckpointCoordinator, DurabilityMode, HttpLogPeer, HttpRecorderClient, LogPeer, NodeConfig,
-    NodeError, NodeRuntime, PeerConfig, ReadConsistency, RecorderTlsClientConfig,
-    RecorderTlsServerConfig, StopInformation, TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH,
-    ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH,
-    LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+    node_router_with_admin_and_tasks, recorder_router_for_generation, serve_recorder_tcp,
+    serve_recorder_tcp_tls, validate_recorder_tcp_endpoint, AdminActivateRequest,
+    AdminActivateResponse, AdminCompactRequest, AdminCompactResponse, AdminConfig,
+    AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
+    AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
+    AdminTaskTracker, CertifiedTailErrorResponse, CertifiedTailResponse, CheckpointCoordinator,
+    DurabilityMode, HttpLogPeer, HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime,
+    PeerConfig, ReadConsistency, RecorderTlsClientConfig, RecorderTlsServerConfig, StopInformation,
+    TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH,
+    ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH, CERTIFIED_TAIL_PATH,
+    DEFAULT_CERTIFIED_TAIL_ENTRIES, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH,
+    RECOVERY_GENERATION_HEADER, TAIL_CLUSTER_ID_HEADER, TAIL_CONFIG_ID_HEADER, TAIL_EPOCH_HEADER,
+    TAIL_MEMBERSHIP_DIGEST_HEADER, TAIL_PROTOCOL_VERSION, TAIL_VERSION_HEADER, VERSION_HEADER,
 };
 #[cfg(feature = "sql")]
 use rhiza_node::{
@@ -53,12 +51,18 @@ use rhiza_node::{
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
-    DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
-    RecordSummary, RecorderFileStore, RecorderPreflight, RecorderRpc, ThreeNodeConsensus,
+    DecisionProof, Membership, RecorderFileStore, RecorderPreflight, RecorderRpc,
+    ThreeNodeConsensus,
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{SqlStatement, SqlValue};
+use rhizadb::{
+    HaNode, HaNodeError, HaPredecessor, HaRecorderTransport, HaServeConfig, HaStartupConfig,
+    HaStartupMode, HaSuccessorPrestageConfig, PublishedHaSuccessorPrestage,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+type RecorderClients = Vec<(String, Box<dyn RecorderRpc>)>;
 
 #[tokio::main]
 async fn main() {
@@ -100,6 +104,10 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             Ok(()) => 0,
             Err(error) => fail("serve", error),
         },
+        Command::PrestageServe(config) => match run_prestage_serve(*config).await {
+            Ok(()) => 0,
+            Err(error) => fail("prestage serve", error),
+        },
         Command::InitCheckpoint(config) => match run_init_checkpoint(config).await {
             Ok(tip) => {
                 println!("checkpoint initialized: durable_tip={}", tip.index());
@@ -125,15 +133,6 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             }
             Err(error) => fail("checkpoint inspect", error),
         },
-        Command::CheckpointForkSuccessor(config) => {
-            match run_checkpoint_fork_successor(config).await {
-                Ok(json) => {
-                    println!("{json}");
-                    0
-                }
-                Err(error) => fail("checkpoint fork-successor", error),
-            }
-        }
         Command::CheckpointCompact(config) => match run_checkpoint_compact(*config).await {
             Ok(json) => {
                 println!("{json}");
@@ -311,10 +310,10 @@ enum Command {
     #[cfg(feature = "sql")]
     E2e(E2eConfig),
     Serve(Box<ServeConfig>),
+    PrestageServe(Box<PrestageServeConfig>),
     InitCheckpoint(CheckpointCommandConfig),
     RollCheckpoint(RollCheckpointConfig),
     CheckpointInspect(CheckpointCommandConfig),
-    CheckpointForkSuccessor(CheckpointForkSuccessorConfig),
     CheckpointCompact(Box<AdminCommandConfig>),
     ValidateConfigBundle(Option<u64>),
     GcPlan(GcPlanConfig),
@@ -433,11 +432,6 @@ const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
-const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = rhiza_node::durability::LOCAL_CHECKPOINT_IDENTITY_FILE;
-const MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES: u64 = 4 * 1024;
-const SUCCESSOR_RESTORE_INTENT_FILE: &str = ".successor-restore.intent";
-const SUCCESSOR_RESTORE_COMPLETE_FILE: &str = ".successor-restore.complete";
-const MAX_SUCCESSOR_RESTORE_CONTROL_BYTES: u64 = 16 * 1024;
 
 impl fmt::Debug for AdminClientConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -466,7 +460,6 @@ struct AdminCommandConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigurationBundleDocument {
-    version: u32,
     config_id: u64,
     members: Vec<MemberDocument>,
     #[serde(default)]
@@ -496,7 +489,6 @@ struct RecorderTcpPeer {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PredecessorDocument {
-    version: u16,
     members: Vec<String>,
     stop_entry: LogEntry,
     stop_proof: DecisionProof,
@@ -599,6 +591,7 @@ struct ServeConfig {
     bundle: ConfigurationBundle,
     client_token: String,
     admin_token: Option<String>,
+    tail_token: Option<String>,
     client_listen: String,
     recorder_listen: String,
     recorder_transport: RecorderTransport,
@@ -623,6 +616,10 @@ impl fmt::Debug for ServeConfig {
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "[redacted]"),
             )
+            .field(
+                "tail_token",
+                &self.tail_token.as_ref().map(|_| "[redacted]"),
+            )
             .field("client_listen", &self.client_listen)
             .field("recorder_listen", &self.recorder_listen)
             .field("recorder_transport", &self.recorder_transport)
@@ -644,40 +641,78 @@ struct RemoteCheckpointConfig {
     startup: StartupMode,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct LocalCheckpointIdentityMarker {
-    format_version: u32,
-    cluster_id: String,
-    node_id: String,
-    execution_profile: ExecutionProfile,
-    epoch: u64,
-    config_id: u64,
-    recovery_generation: u64,
+struct PrestageServeConfig {
+    target: ServeConfig,
+    source_bundle: ConfigurationBundle,
+    source_archive: ObjectArchiveStore,
+    prestage_dir: PathBuf,
+    transition_bundle_file: PathBuf,
+    tail_token: String,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SuccessorRestoreReceipt {
-    version: u32,
-    cluster_id: String,
-    epoch: u64,
-    target_config_id: u64,
-    recovery_generation: u64,
-    node_id: String,
-    membership_digest: String,
-    predecessor_config_id: u64,
-    stop_index: u64,
-    stop_hash: String,
-    checkpoint_index: u64,
-    checkpoint_hash: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SuccessorRestoreControlState {
-    Fresh,
-    Intent,
-    Complete,
+impl PrestageServeConfig {
+    fn from_env() -> Result<Self, String> {
+        let target = ServeConfig::from_env()?;
+        let remote = target
+            .remote
+            .as_ref()
+            .ok_or_else(|| "prestage serve requires RHIZA_OBJECT_STORE".to_string())?;
+        if remote.startup != StartupMode::Rejoin {
+            return Err("prestage serve requires RHIZA_STARTUP_MODE=rejoin".into());
+        }
+        if target.bundle.predecessor.is_some() {
+            return Err("prestage serve requires an unbound successor draft bundle".into());
+        }
+        let source_bundle_file = env::var("RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE")
+            .map_err(|_| "RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE is required".to_string())?;
+        let source_bundle =
+            parse_configuration_bundle(&fs::read_to_string(&source_bundle_file).map_err(
+                |error| format!("cannot read RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE: {error}"),
+            )?)?;
+        if source_bundle.predecessor.is_some()
+            || source_bundle
+                .config_id
+                .checked_add(1)
+                .is_none_or(|next| next != target.bundle.config_id)
+        {
+            return Err(
+                "prestage source must be Active(S) and target draft must be exactly S+1".into(),
+            );
+        }
+        let tail_token = target
+            .tail_token
+            .clone()
+            .ok_or_else(|| "prestage serve requires RHIZA_TAIL_TOKEN".to_string())?;
+        let transition_bundle_file = PathBuf::from(
+            env::var("RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE")
+                .map_err(|_| "RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE is required".to_string())?,
+        );
+        let prestage_dir = env::var("RHIZA_PRESTAGE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| target.data_dir.with_extension("prestage"));
+        let store = open_object_store(&remote.object_store)?;
+        if !store.supports_strong_cross_process_cas() {
+            return Err("prestage serve requires strong cross-process compare-and-swap".into());
+        }
+        let source_archive = ObjectArchiveStore::new_checkpoint(
+            store,
+            CheckpointIdentity::new(
+                target.cluster_id.clone(),
+                target.epoch,
+                source_bundle.config_id,
+                target.recovery_generation,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            target,
+            source_bundle,
+            source_archive,
+            prestage_dir,
+            transition_bundle_file,
+            tail_token,
+        })
+    }
 }
 
 impl RemoteCheckpointConfig {
@@ -754,14 +789,6 @@ struct RollCheckpointConfig {
 }
 
 #[derive(Clone)]
-struct CheckpointForkSuccessorConfig {
-    target: CheckpointCommandConfig,
-    source_config_id: u64,
-    source_generation: u64,
-    stop_entry: LogEntry,
-}
-
-#[derive(Clone)]
 struct GcPlanConfig {
     base: CheckpointCommandConfig,
     operation_id: String,
@@ -800,6 +827,15 @@ impl ServeConfig {
                 AdminConfig::new(token.clone())
                     .map(|_| token)
                     .map_err(|error| format!("invalid RHIZA_ADMIN_TOKEN: {error}"))
+            })
+            .transpose()?;
+        let tail_token = lookup("RHIZA_TAIL_TOKEN")
+            .map(|token| {
+                if token.is_empty() || token.chars().any(char::is_whitespace) {
+                    Err("RHIZA_TAIL_TOKEN must be nonblank and contain no whitespace".to_string())
+                } else {
+                    Ok(token)
+                }
             })
             .transpose()?;
         let bundle = load_configuration_bundle(&mut lookup, |path| fs::read_to_string(path))?;
@@ -972,6 +1008,7 @@ impl ServeConfig {
             bundle,
             client_token,
             admin_token,
+            tail_token,
             client_listen,
             recorder_listen,
             recorder_transport,
@@ -990,6 +1027,20 @@ impl ServeConfig {
             {
                 return Err(
                     "RHIZA_ADMIN_TOKEN must be distinct from client and peer tokens".into(),
+                );
+            }
+        }
+        if let Some(tail_token) = &config.tail_token {
+            if tail_token == &config.client_token
+                || config.admin_token.as_ref() == Some(tail_token)
+                || config
+                    .bundle
+                    .peers
+                    .iter()
+                    .any(|peer| peer.token() == tail_token)
+            {
+                return Err(
+                    "RHIZA_TAIL_TOKEN must be distinct from client, admin, and peer tokens".into(),
                 );
             }
         }
@@ -1057,6 +1108,16 @@ where
             reject_extra_args(args)?;
             ServeConfig::from_env().map(Box::new).map(Command::Serve)
         }
+        "prestage" => match args.next().as_deref() {
+            Some("serve") => {
+                reject_extra_args(args)?;
+                PrestageServeConfig::from_env()
+                    .map(Box::new)
+                    .map(Command::PrestageServe)
+            }
+            Some(other) => Err(format!("unknown prestage subcommand: {other}")),
+            None => Err("missing prestage subcommand: serve".into()),
+        },
         "init-checkpoint" => {
             reject_extra_args(args)?;
             CheckpointCommandConfig::from_lookup(|name| env::var(name).ok())
@@ -1847,54 +1908,11 @@ fn parse_checkpoint_command(mut args: impl Iterator<Item = String>) -> Result<Co
             CheckpointCommandConfig::from_lookup(|name| env::var(name).ok())
                 .map(Command::CheckpointInspect)
         }
-        "fork-successor" => parse_checkpoint_fork_successor(args, |name| env::var(name).ok())
-            .map(Command::CheckpointForkSuccessor),
         "compact" => parse_admin_command_config(args, true, true, |name| env::var(name).ok())
             .map(Box::new)
             .map(Command::CheckpointCompact),
         _ => Err(format!("unknown checkpoint subcommand: {subcommand}")),
     }
-}
-
-fn parse_checkpoint_fork_successor(
-    args: impl IntoIterator<Item = String>,
-    mut lookup: impl FnMut(&str) -> Option<String>,
-) -> Result<CheckpointForkSuccessorConfig, String> {
-    let mut source_config_id = None;
-    let mut source_generation = None;
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--from-config-id" => {
-                source_config_id = Some(next_value(&mut args, "--from-config-id")?)
-            }
-            "--from-generation" => {
-                source_generation = Some(next_value(&mut args, "--from-generation")?)
-            }
-            _ => return Err(format!("unknown argument: {arg}")),
-        }
-    }
-    let source_config_id = parse_positive_value(source_config_id, "--from-config-id")?;
-    let source_generation = parse_positive_value(source_generation, "--from-generation")?;
-    let target = CheckpointCommandConfig::from_lookup(&mut lookup)?;
-    let bundle = load_configuration_bundle(&mut lookup, |path| fs::read_to_string(path))?;
-    let predecessor = bundle.require_predecessor()?;
-    if bundle.config_id != target.config_id
-        || source_config_id.checked_add(1) != Some(target.config_id)
-        || predecessor.stop.entry.config_id != source_config_id
-        || predecessor.stop.entry.cluster_id != target.cluster_id
-        || predecessor.stop.entry.epoch != target.epoch
-    {
-        return Err(
-            "predecessor proof/bundle does not match the exact source and target identity".into(),
-        );
-    }
-    Ok(CheckpointForkSuccessorConfig {
-        target,
-        source_config_id,
-        source_generation,
-        stop_entry: predecessor.stop.entry.clone(),
-    })
 }
 
 fn parse_membership_command(args: impl Iterator<Item = String>) -> Result<Command, String> {
@@ -2152,18 +2170,6 @@ fn load_configuration_bundle(
             "RHIZA_CONFIG_BUNDLE and RHIZA_CONFIG_BUNDLE_FILE are mutually exclusive".into(),
         );
     }
-    if lookup("RHIZA_CONFIG_ID").is_some()
-        || (1..=7).any(|index| {
-            ["ID", "URL", "LOG_URL", "TOKEN"]
-                .iter()
-                .any(|suffix| lookup(&format!("RHIZA_PEER_{index}_{suffix}")).is_some())
-        })
-    {
-        return Err(
-            "RHIZA_CONFIG_ID and RHIZA_PEER_* are unsupported; use RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE"
-                .into(),
-        );
-    }
     let json = match (inline, file) {
         (Some(json), None) => json,
         (None, Some(path)) => read_file(&path)
@@ -2179,12 +2185,6 @@ fn load_configuration_bundle(
 fn parse_configuration_bundle(json: &str) -> Result<ConfigurationBundle, String> {
     let document: ConfigurationBundleDocument = serde_json::from_str(json)
         .map_err(|error| format!("invalid configuration bundle JSON: {error}"))?;
-    if document.version != 1 {
-        return Err(format!(
-            "unsupported configuration bundle version: {}",
-            document.version
-        ));
-    }
     if document.config_id == 0 {
         return Err("configuration bundle config_id must be positive".into());
     }
@@ -2264,9 +2264,6 @@ fn parse_predecessor(
     let membership = Membership::from_voters(predecessor.members)
         .map_err(|error| format!("invalid predecessor membership: {error}"))?;
     let entry = predecessor.stop_entry;
-    if predecessor.version != 2 {
-        return Err("predecessor transition document must use version 2".into());
-    }
     let proof = predecessor.stop_proof;
     if entry.config_id.checked_add(1) != Some(successor_config_id) {
         return Err("successor config_id must equal predecessor config_id + 1".into());
@@ -2280,10 +2277,12 @@ fn parse_predecessor(
         .as_ref()
         .ok_or_else(|| "predecessor Stop proof has no value".to_string())?;
     let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
-    let bound_successor = ConfigChange::recognize(&command)
-        .ok()
-        .and_then(|change| change.successor().cloned())
-        .ok_or_else(|| "predecessor Stop must be bound to an exact successor".to_string())?;
+    let change = ConfigChange::recognize(&command)
+        .map_err(|_| "predecessor Stop must be bound to an exact successor".to_string())?;
+    let bound_successor = change
+        .successor()
+        .ok_or_else(|| "predecessor Stop must be bound to an exact successor".to_string())?
+        .clone();
     let transitioned = ConfigurationState::active(entry.config_id, membership.digest())
         .validate_entry(&entry)
         .map_err(|error| format!("invalid predecessor stop entry: {error}"))?;
@@ -2301,16 +2300,272 @@ fn parse_predecessor(
     }
     Ok(PredecessorConfiguration {
         membership,
-        stop: StopInformation {
-            version: 2,
-            entry,
-            proof,
-        },
+        stop: StopInformation { entry, proof },
     })
 }
 
 async fn serve(config: ServeConfig) -> Result<(), String> {
     serve_until(config, shutdown_signal()).await
+}
+
+async fn run_prestage_serve(config: PrestageServeConfig) -> Result<(), String> {
+    let prepared = match HaSuccessorPrestageConfig::resume(
+        &config.target.data_dir,
+        config.source_bundle.config_id,
+        config.source_bundle.membership.clone(),
+        config.tail_token.clone(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(_resume_error) if data_directory_is_empty(&config.target.data_dir)? => {
+            HaSuccessorPrestageConfig::new(
+                config.source_archive.clone(),
+                &config.prestage_dir,
+                config.target.node_id.clone(),
+                config.target.execution_profile,
+                config.source_bundle.membership.clone(),
+                config.target.bundle.membership.clone(),
+                config.tail_token.clone(),
+            )
+            .prepare()
+            .await
+            .map_err(|error| error.to_string())?
+        }
+        Err(error) => match transition_serve_config(&config)? {
+            Some(final_config) => {
+                let stop = final_config.bundle.require_predecessor()?.stop.clone();
+                let prepared = prestage_startup_config(&final_config)?
+                    .resume_finalized_successor_prestage()
+                    .await
+                    .map_err(|final_error| {
+                        format!(
+                            "cannot resume successor prestage ({error}) or finalized successor ({final_error})"
+                        )
+                    })?;
+                drop(prepared);
+                println!(
+                    "{{\"state\":\"finalized\",\"node_id\":{},\"target_config_id\":{},\"stop_index\":{},\"resumed\":true}}",
+                    serde_json::to_string(&config.target.node_id)
+                        .map_err(|error| error.to_string())?,
+                    final_config.bundle.config_id,
+                    stop.entry.index
+                );
+                return Ok(());
+            }
+            None => {
+                return Err(format!(
+                    "cannot resume successor prestage ({error}); local data is not fresh"
+                ))
+            }
+        },
+    };
+    let learner = prepared
+        .publish(&config.target.data_dir)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{{\"state\":\"prestage\",\"node_id\":{},\"source_config_id\":{},\"target_config_id\":{},\"seed_index\":{}}}",
+        serde_json::to_string(&config.target.node_id).map_err(|error| error.to_string())?,
+        config.source_bundle.config_id,
+        config.target.bundle.config_id,
+        learner.identity().seed_anchor().index()
+    );
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        if let Some(final_config) = ready_transition_config(&config, &learner)? {
+            let stop = final_config.bundle.require_predecessor()?.stop.clone();
+            let startup = prestage_startup_config(&final_config)?;
+            let prepared = learner
+                .finalize(startup)
+                .await
+                .map_err(|error| error.to_string())?;
+            drop(prepared);
+            println!(
+                "{{\"state\":\"finalized\",\"node_id\":{},\"target_config_id\":{},\"stop_index\":{}}}",
+                serde_json::to_string(&config.target.node_id)
+                    .map_err(|error| error.to_string())?,
+                final_config.bundle.config_id,
+                stop.entry.index
+            );
+            return Ok(());
+        }
+
+        tokio::select! {
+            () = &mut shutdown => return Ok(()),
+            result = prestage_tail_once(&config, &learner) => {
+                result?;
+            }
+        }
+    }
+}
+
+fn data_directory_is_empty(path: &std::path::Path) -> Result<bool, String> {
+    match fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!("cannot inspect prestage data directory: {error}")),
+    }
+}
+
+fn ready_transition_config(
+    config: &PrestageServeConfig,
+    learner: &PublishedHaSuccessorPrestage,
+) -> Result<Option<ServeConfig>, String> {
+    let Some(final_config) = transition_serve_config(config)? else {
+        return Ok(None);
+    };
+    let predecessor = final_config.bundle.require_predecessor()?;
+    let stop = LogAnchor::new(predecessor.stop.entry.index, predecessor.stop.entry.hash);
+    let durable = learner
+        .durable_anchor()
+        .map_err(|error| error.to_string())?;
+    if durable.index() > stop.index()
+        || (durable.index() == stop.index() && durable.hash() != stop.hash())
+    {
+        return Err("successor prestage diverged from the exact predecessor Stop".into());
+    }
+    if durable != stop {
+        return Ok(None);
+    }
+    Ok(Some(final_config))
+}
+
+fn transition_serve_config(config: &PrestageServeConfig) -> Result<Option<ServeConfig>, String> {
+    let transition = match fs::read_to_string(&config.transition_bundle_file) {
+        Ok(json) => parse_configuration_bundle(&json)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read successor transition bundle: {error}")),
+    };
+    let predecessor = transition.require_predecessor()?;
+    if transition.config_id != config.target.bundle.config_id
+        || transition.membership != config.target.bundle.membership
+        || predecessor.membership != config.source_bundle.membership
+    {
+        return Err("successor transition bundle differs from the prestaged identities".into());
+    }
+    let transition_path = config.transition_bundle_file.to_string_lossy().into_owned();
+    let final_config = ServeConfig::from_lookup(|name| {
+        if name == "RHIZA_CONFIG_BUNDLE_FILE" {
+            Some(transition_path.clone())
+        } else if name == "RHIZA_CONFIG_BUNDLE" {
+            None
+        } else {
+            env::var(name).ok()
+        }
+    })?;
+    Ok(Some(final_config))
+}
+
+fn prestage_startup_config(config: &ServeConfig) -> Result<HaStartupConfig, String> {
+    let remote = config
+        .remote
+        .as_ref()
+        .ok_or_else(|| "prestage finalization requires RHIZA_OBJECT_STORE".to_string())?;
+    let store = open_object_store(&remote.object_store)?;
+    let archive = ObjectArchiveStore::new_checkpoint(
+        store,
+        CheckpointIdentity::new(
+            config.cluster_id.clone(),
+            config.epoch,
+            config.bundle.config_id,
+            config.recovery_generation,
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    let predecessor = config.bundle.require_predecessor()?;
+    Ok(HaStartupConfig::new(
+        config.node_config()?,
+        archive,
+        remote.durability.clone(),
+        remote.lease_duration_ms,
+        HaStartupMode::Rejoin,
+    )
+    .with_predecessor(HaPredecessor::new(
+        predecessor.membership.clone(),
+        predecessor.stop.clone(),
+    )))
+}
+
+async fn prestage_tail_once(
+    config: &PrestageServeConfig,
+    learner: &PublishedHaSuccessorPrestage,
+) -> Result<(), String> {
+    let request = learner
+        .tail_request(DEFAULT_CERTIFIED_TAIL_ENTRIES)
+        .map_err(|error| error.to_string())?;
+    let client = bounded_http_client(HEALTH_CONNECT_TIMEOUT, HEALTH_REQUEST_TIMEOUT)?;
+    let identity = learner.identity();
+    let mut failures = Vec::new();
+    for peer in &config.source_bundle.peers {
+        let url = endpoint(peer.log_base_url(), CERTIFIED_TAIL_PATH);
+        let response = client
+            .post(&url)
+            .header(
+                header::AUTHORIZATION,
+                format!("Rhiza-Tail {}", config.tail_token),
+            )
+            .header(TAIL_VERSION_HEADER, TAIL_PROTOCOL_VERSION)
+            .header(TAIL_CLUSTER_ID_HEADER, identity.cluster_id())
+            .header(TAIL_EPOCH_HEADER, identity.epoch())
+            .header(TAIL_CONFIG_ID_HEADER, identity.predecessor_config_id())
+            .header(
+                TAIL_MEMBERSHIP_DIGEST_HEADER,
+                config.source_bundle.membership.digest().to_hex(),
+            )
+            .header(
+                RECOVERY_GENERATION_HEADER,
+                identity.predecessor_recovery_generation(),
+            )
+            .json(&request)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                let response: CertifiedTailResponse = response.json().await.map_err(|error| {
+                    format!("invalid certified tail response from {url}: {error}")
+                })?;
+                learner
+                    .apply_page(&request, &response)
+                    .map_err(|error| error.to_string())?;
+                if response.records.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                return Ok(());
+            }
+            Ok(response) if response.status().as_u16() == 409 => {
+                return Err(prestage_rebase_error(&url, response).await?)
+            }
+            Ok(response) if matches!(response.status().as_u16(), 429 | 503 | 504) => {
+                failures.push(format!("{url}: HTTP {}", response.status()))
+            }
+            Ok(response) => {
+                return Err(format!(
+                "predecessor certified-tail endpoint rejected the bound request: {url}: HTTP {}",
+                response.status()
+            ))
+            }
+            Err(error) => failures.push(format!("{url}: {}", request_error(error))),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    eprintln!(
+        "prestage waiting for a predecessor certified-tail endpoint: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
+async fn prestage_rebase_error(url: &str, response: Response) -> Result<String, String> {
+    let error: CertifiedTailErrorResponse = response
+        .json()
+        .await
+        .map_err(|error| format!("invalid certified tail error response from {url}: {error}"))?;
+    let CertifiedTailErrorResponse::RebaseRequired { checkpoint } = error;
+    Ok(format!(
+        "local prestage/checkpoint is obsolete; prestage must restart from source checkpoint at index {} with hash {}",
+        checkpoint.index(),
+        checkpoint.hash().to_hex()
+    ))
 }
 
 async fn serve_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
@@ -2359,7 +2614,6 @@ enum ServeExit {
     Shutdown,
     Client,
     Recorder,
-    CheckpointWorker,
 }
 
 async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -2584,383 +2838,92 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::pin!(shutdown);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let authoritative_identity = archive
-        .checkpoint_identity()
-        .map_err(|error| error.to_string())?
-        .clone();
     let node_config = config.node_config()?;
-    let preparation = tokio::select! {
-        biased;
-        () = &mut shutdown => return Ok(()),
-        result = async {
-            if config.bundle.predecessor.is_some() {
-                require_successor_startup_mode(remote.startup)?;
-                let exact_marker_exists = match fs::symlink_metadata(
-                    config.data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE),
-                ) {
-                    Ok(_) => read_and_validate_local_checkpoint_identity_marker(
-                        &config.data_dir,
-                        config.execution_profile,
-                        &authoritative_identity,
-                        &config.node_id,
-                    )
-                    .map(|_| true)?,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                    Err(error) => {
-                        return Err(format!(
-                            "cannot inspect local checkpoint identity marker: {error}"
-                        ))
-                    }
-                };
-                let expected_receipt =
-                    expected_successor_restore_receipt(&archive, &config).await?;
-                let successor_control = validate_successor_restore_controls(
-                    &config.data_dir,
-                    &expected_receipt,
-                )?;
-                if !exact_marker_exists
-                    && successor_control == SuccessorRestoreControlState::Fresh
-                    && !local_data_is_fresh(&config.data_dir)?
-                {
-                    return Err(
-                        "successor rejoin requires a local checkpoint identity marker or validated restore receipt"
-                            .into(),
-                    );
-                }
-                let recorder_state = if successor_control == SuccessorRestoreControlState::Intent {
-                    LocalRecorderState::Missing
-                } else {
-                    preflight_local_recorder(
-                        &config.data_dir,
-                        &authoritative_identity,
-                        &config.bundle.membership,
-                    )?
-                };
-                let recorder_state = recover_local_recorder_before_view_recovery(
-                    recorder_state,
-                    &config.data_dir,
-                    &config.node_id,
-                    &authoritative_identity,
-                    &config.bundle.membership,
-                )?;
-                let restored =
-                    restore_successor_checkpoint_to_fresh_data_dir(archive.clone(), &node_config)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                if restored.requires_recorder_install()
-                    || recorder_state == LocalRecorderState::Missing
-                {
-                    install_successor_recorder_for_startup(&config)?;
-                }
-                if restored.requires_recorder_install() {
-                    restored.complete().map_err(|error| error.to_string())?;
-                }
-                write_local_checkpoint_identity_marker(
-                    &config.data_dir,
-                    config.execution_profile,
-                    &authoritative_identity,
-                    &config.node_id,
-                )?;
-                Ok::<_, String>(StartupPreparation::RecorderFirst {
-                    recorder_open: RecorderOpenPolicy::MustExist,
-                })
-            } else {
-                prepare_remote_startup_with_membership(
-                    remote.startup,
-                    &archive,
-                    &config.data_dir,
-                    &config.node_id,
-                    config.execution_profile,
-                    &config.bundle.membership,
-                )
-                .await
-            }
-        } => result?,
+    let startup_mode = match remote.startup {
+        StartupMode::Bootstrap => HaStartupMode::Bootstrap,
+        StartupMode::Rejoin => HaStartupMode::Rejoin,
+        StartupMode::Disaster => HaStartupMode::Disaster,
     };
-    let recorder = open_recorder_for_preparation(&config, preparation.recorder_open_policy())?;
-    let startup_recorder = match &preparation {
-        StartupPreparation::RuntimeFirstWithPeerCatchup {
-            checkpoint_root, ..
-        } => Some(StartupRecorderGate::new(recorder.clone(), *checkpoint_root)),
-        StartupPreparation::RecorderFirst { .. }
-        | StartupPreparation::VerifyLocalCheckpoint { .. } => None,
-    };
-    let mut recorder_server = match &startup_recorder {
-        Some(startup_recorder) => tokio::select! {
-            biased;
-            () = &mut shutdown => return Ok(()),
-            result = spawn_recorder_server(
-                &config,
-                startup_recorder.clone(),
-                shutdown_rx.clone(),
-            ) => result?,
-        },
-        None => tokio::select! {
-            biased;
-            () = &mut shutdown => return Ok(()),
-            result = spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()) => result?,
-        },
-    };
-    tokio::select! {
-        biased;
-        () = &mut shutdown => {
-            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
-            return Ok(());
-        }
-        result = &mut recorder_server.0 => return Err(recorder_task_error(result)),
-        () = tokio::task::yield_now() => {}
-    }
-
-    let local_recorder = remote_startup_uses_direct_recorder(&preparation).then_some(&recorder);
-    let recovered_checkpoint = match &preparation {
-        StartupPreparation::RuntimeFirstWithPeerCatchup {
-            checkpoint_root, ..
-        } => Some(*checkpoint_root),
-        StartupPreparation::RecorderFirst { .. }
-        | StartupPreparation::VerifyLocalCheckpoint { .. } => None,
-    };
-    let consensus = build_consensus_at_checkpoint(&config, local_recorder, recovered_checkpoint)?;
-    let peer_candidates = match &preparation {
-        StartupPreparation::RuntimeFirstWithPeerCatchup { .. } => build_log_peers(&config)?,
-        StartupPreparation::RecorderFirst { .. }
-        | StartupPreparation::VerifyLocalCheckpoint { .. } => Vec::new(),
-    };
-    let runtime_startup = open_runtime_with_retry(node_config, consensus, peer_candidates);
-    tokio::pin!(runtime_startup);
-    let runtime = tokio::select! {
-        biased;
-        () = &mut shutdown => {
-            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
-            return Ok(());
-        }
-        result = &mut recorder_server.0 => return Err(recorder_task_error(result)),
-        result = &mut runtime_startup => result?,
-    };
-    if let StartupPreparation::VerifyLocalCheckpoint { identity, root } = &preparation {
-        verify_local_rejoin_checkpoint(&runtime, identity, *root)?;
-    }
-    if let StartupPreparation::RuntimeFirstWithPeerCatchup {
-        checkpoint_root, ..
-    } = &preparation
-    {
-        verify_local_rejoin_checkpoint(&runtime, &authoritative_identity, *checkpoint_root)?;
-        let rehydration = rehydrate_recorder_with_retry(
-            runtime.clone(),
-            recorder.clone(),
-            checkpoint_root.index(),
-        );
-        tokio::pin!(rehydration);
-        tokio::select! {
-            biased;
-            () = &mut shutdown => {
-                runtime.cancel_operations();
-                stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
-                return Ok(());
-            }
-            result = &mut recorder_server.0 => {
-                runtime.cancel_operations();
-                return Err(recorder_task_error(result));
-            }
-            result = &mut rehydration => result?,
-        }
-        startup_recorder
-            .as_ref()
-            .expect("runtime-first startup has a recorder gate")
-            .activate();
-    }
-
-    let coordinator_startup = CheckpointCoordinator::open_with_holder_and_options(
+    let mut startup = HaStartupConfig::new(
+        node_config,
         archive,
         remote.durability.clone(),
-        &config.node_id,
-        CheckpointPublisherOptions::new(remote.lease_duration_ms),
+        remote.lease_duration_ms,
+        startup_mode,
     );
-    tokio::pin!(coordinator_startup);
-    let coordinator = Arc::new(tokio::select! {
+    if let Some(predecessor) = &config.bundle.predecessor {
+        startup = startup.with_predecessor(HaPredecessor::new(
+            predecessor.membership.clone(),
+            predecessor.stop.clone(),
+        ));
+    }
+    let prepared = tokio::select! {
         biased;
-        () = &mut shutdown => {
-            runtime.cancel_operations();
-            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
-            return Ok(());
-        }
-        result = &mut recorder_server.0 => {
-            runtime.cancel_operations();
-            return Err(recorder_task_error(result));
-        }
-        result = &mut coordinator_startup => result.map_err(|error| error.to_string())?,
-    });
-    coordinator
-        .note_recovered_committed(runtime.applied_index().map_err(|error| error.to_string())?);
-    let client_listener_startup = bind_client_listener(&config);
-    tokio::pin!(client_listener_startup);
-    let client_listener = tokio::select! {
-        biased;
-        () = &mut shutdown => {
-            runtime.cancel_operations();
-            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
-            return Ok(());
-        }
-        result = &mut recorder_server.0 => {
-            runtime.cancel_operations();
-            return Err(recorder_task_error(result));
-        }
-        result = &mut client_listener_startup => result?,
+        () = &mut shutdown => return Ok(()),
+        result = startup.prepare() => result.map_err(|error| error.to_string())?,
     };
+    let recorder_clients = build_recorder_clients(&config)?;
+    let log_peers = build_log_peers(&config)?
+        .into_iter()
+        .map(|peer| Arc::new(peer) as Arc<dyn LogPeer>)
+        .collect();
+    let (recorder_listener, recorder_transport) = tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        result = bind_ha_recorder_listener(&config) => result?,
+    };
+    let service_listener = tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        result = bind_client_listener(&config) => result?,
+    };
+    let mut serve = HaServeConfig::new(
+        recorder_listener,
+        service_listener,
+        recorder_transport,
+        recorder_clients,
+        log_peers,
+    );
+    if let Some(admin) = config.admin_config()? {
+        serve = serve.with_admin(admin);
+    }
+    if let Some(tail_token) = config.tail_token.clone() {
+        serve = serve.with_tail_token(tail_token);
+    }
+    let node = tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        result = prepared.start(serve) => result.map_err(|error| error.to_string())?,
+    };
+    let ready = tokio::select! {
+        biased;
+        () = &mut shutdown => return shutdown_ha_node(node, Ok(())).await,
+        result = node.ready() => result,
+        result = node.monitor() => {
+            return shutdown_ha_node(node, result).await;
+        }
+    };
+    if let Err(error) = ready {
+        return shutdown_ha_node(node, Err(error)).await;
+    }
     println!(
         "rhiza serving client={} recorder={} recovery_generation={}",
         config.client_listen,
         active_recorder_listen(&config)?,
         config.recovery_generation
     );
-    let mut materializer = materializer_worker(runtime.clone(), shutdown_rx.clone());
-
-    let (app, admin_tasks) = match config.admin_config()? {
-        Some(admin) => {
-            let (router, tasks) = node_router_with_checkpoint_and_admin_tasks(
-                runtime.clone(),
-                recorder,
-                coordinator.clone(),
-                admin,
-            )
-            .map_err(|error| error.to_string())?;
-            (router, Some(tasks))
-        }
-        None => (
-            node_router_with_checkpoint(runtime.clone(), recorder, coordinator.clone()),
-            None,
-        ),
-    };
-    let client_shutdown = shutdown_rx.clone();
-    let mut client_server = AbortOnDrop(tokio::spawn(async move {
-        axum::serve(client_listener, app)
-            .with_graceful_shutdown(wait_for_shutdown(client_shutdown))
-            .await
-            .map_err(|error| format!("client server stopped: {error}"))
-    }));
-    let mut worker = checkpoint_worker(
-        remote.durability,
-        Arc::clone(&runtime),
-        Arc::clone(&coordinator),
-        shutdown_rx.clone(),
-    );
-    let (exit, result) = if let Some(worker) = worker.as_mut() {
-        tokio::select! {
-            biased;
-            () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
-            result = &mut client_server.0 => (ServeExit::Client, server_task_result(result, "client server")),
-            result = &mut recorder_server.0 => (ServeExit::Recorder, Err(recorder_task_error(result))),
-            result = &mut worker.0 => (ServeExit::CheckpointWorker, Err(checkpoint_worker_error(result))),
-        }
-    } else {
-        tokio::select! {
-            biased;
-            () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
-            result = &mut client_server.0 => (ServeExit::Client, server_task_result(result, "client server")),
-            result = &mut recorder_server.0 => (ServeExit::Recorder, Err(recorder_task_error(result))),
-        }
-    };
-    stop_admin_admission(admin_tasks.as_ref());
-    shutdown_tx.send_replace(true);
-    runtime.cancel_operations();
-    let deadline = tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT;
-    let drained = before_shutdown_deadline(deadline, SERVE_SHUTDOWN_TIMEOUT, async {
-        let mut drained = Ok(());
-        if exit != ServeExit::Client {
-            retain_first_error(
-                &mut drained,
-                server_task_result((&mut client_server.0).await, "client server"),
-            );
-        }
-        if exit != ServeExit::Recorder {
-            retain_first_error(
-                &mut drained,
-                server_task_result((&mut recorder_server.0).await, "recorder server"),
-            );
-        }
-        if exit != ServeExit::CheckpointWorker {
-            if let Some(worker) = worker.as_mut() {
-                retain_first_error(
-                    &mut drained,
-                    task_result((&mut worker.0).await, "checkpoint worker"),
-                );
-            }
-        }
-        retain_first_error(
-            &mut drained,
-            task_result((&mut materializer.0).await, "materializer worker"),
-        );
-        wait_for_admin_tasks(admin_tasks.as_ref()).await;
-        drained
-    })
-    .await
-    .unwrap_or_else(Err);
-    let mut shutdown_result = result;
-    retain_first_error(&mut shutdown_result, drained);
-    finish_remote_shutdown(shutdown_result, runtime, coordinator, deadline).await
-}
-
-fn require_successor_startup_mode(mode: StartupMode) -> Result<(), String> {
-    if mode == StartupMode::Rejoin {
-        Ok(())
-    } else {
-        Err("successor startup requires rejoin mode".into())
+    tokio::select! {
+        biased;
+        () = &mut shutdown => shutdown_ha_node(node, Ok(())).await,
+        result = node.monitor() => shutdown_ha_node(node, result).await,
     }
 }
 
-async fn finish_remote_shutdown(
-    mut result: Result<(), String>,
-    runtime: Arc<NodeRuntime>,
-    coordinator: Arc<CheckpointCoordinator>,
-    deadline: tokio::time::Instant,
-) -> Result<(), String> {
-    runtime.cancel_operations();
-    let final_flush = before_shutdown_deadline(deadline, SERVE_SHUTDOWN_TIMEOUT, async {
-        match runtime.applied_index() {
-            Ok(applied_index) => coordinator
-                .flush_runtime(&runtime, applied_index)
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    format!(
-                        "final checkpoint durability is unconfirmed because the flush failed: {error}"
-                    )
-                }),
-            Err(error) => Err(format!(
-                "final checkpoint durability is unconfirmed because the applied index is unavailable: {error}"
-            )),
-        }
-    })
-    .await
-    .unwrap_or_else(Err);
-    append_shutdown_error(&mut result, final_flush);
-    append_shutdown_error(
-        &mut result,
-        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)),
-    );
-    result
-}
-
-fn install_successor_recorder_for_startup(config: &ServeConfig) -> Result<(), String> {
-    let predecessor = config.bundle.require_predecessor()?;
-    let recorder = open_recorder_after_preflight(
-        config.data_dir.join("recorder"),
-        config.node_id.clone(),
-        config.cluster_id.clone(),
-        config.epoch,
-        predecessor.stop.entry.config_id,
-        predecessor.membership.clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    recover_successor_recorder_after_checkpoint(
-        &recorder,
-        &config.node_config()?,
-        config.bundle.config_id,
-        config.bundle.membership.clone(),
-        &predecessor.stop,
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+async fn shutdown_ha_node(node: HaNode, observed: Result<(), HaNodeError>) -> Result<(), String> {
+    match node.shutdown().await {
+        Ok(()) => observed.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn open_object_store(config: &ObjStoreConfig) -> Result<ObjStore, String> {
@@ -3005,70 +2968,6 @@ fn open_recorder_from_current_state(config: &ServeConfig) -> Result<RecorderFile
     )
 }
 
-fn open_recorder_for_preparation(
-    config: &ServeConfig,
-    policy: RecorderOpenPolicy,
-) -> Result<RecorderFileStore, String> {
-    open_recorder_at_policy(
-        config.data_dir.join("recorder"),
-        config.node_id.clone(),
-        config.cluster_id.clone(),
-        config.epoch,
-        config.bundle.config_id,
-        config.bundle.membership.clone(),
-        policy,
-    )
-}
-
-fn open_recorder_at_policy(
-    root: PathBuf,
-    recorder_id: String,
-    cluster_id: String,
-    epoch: u64,
-    config_id: u64,
-    membership: Membership,
-    policy: RecorderOpenPolicy,
-) -> Result<RecorderFileStore, String> {
-    match policy {
-        RecorderOpenPolicy::MustExist => RecorderFileStore::open_existing_with_membership(
-            root,
-            recorder_id,
-            cluster_id,
-            epoch,
-            config_id,
-            membership,
-        )
-        .map_err(|error| {
-            format!("required local recorder disappeared after startup preparation: {error}")
-        }),
-        RecorderOpenPolicy::CreateAfterRehydration => {
-            match RecorderFileStore::preflight_existing_with_membership_outcome(
-                &root,
-                &cluster_id,
-                epoch,
-                config_id,
-                &membership,
-            )
-            .map_err(|error| format!("local recorder is not trustworthy: {error}"))?
-            {
-                RecorderPreflight::Missing => RecorderFileStore::new_with_membership(
-                    root,
-                    recorder_id,
-                    cluster_id,
-                    epoch,
-                    config_id,
-                    membership,
-                )
-                .map_err(|error| error.to_string()),
-                RecorderPreflight::Valid | RecorderPreflight::Recoverable => Err(
-                    "local recorder appeared after startup preparation; refusing to replace it"
-                        .into(),
-                ),
-            }
-        }
-    }
-}
-
 fn open_recorder_after_preflight(
     root: PathBuf,
     recorder_id: impl Into<String>,
@@ -3110,177 +3009,6 @@ fn open_recorder_after_preflight(
     opened.map_err(|error| error.to_string())
 }
 
-fn preflight_local_recorder(
-    data_dir: &Path,
-    identity: &CheckpointIdentity,
-    membership: &Membership,
-) -> Result<LocalRecorderState, String> {
-    RecorderFileStore::preflight_existing_with_membership_outcome(
-        data_dir.join("recorder"),
-        identity.cluster_id(),
-        identity.epoch(),
-        identity.config_id(),
-        membership,
-    )
-    .map(|outcome| match outcome {
-        RecorderPreflight::Missing => LocalRecorderState::Missing,
-        RecorderPreflight::Valid => LocalRecorderState::Valid,
-        RecorderPreflight::Recoverable => LocalRecorderState::Recoverable,
-    })
-    .map_err(|error| format!("local recorder is not trustworthy: {error}"))
-}
-
-fn recover_local_recorder_before_view_recovery(
-    state: LocalRecorderState,
-    data_dir: &Path,
-    node_id: &str,
-    identity: &CheckpointIdentity,
-    membership: &Membership,
-) -> Result<LocalRecorderState, String> {
-    if state != LocalRecorderState::Recoverable {
-        return Ok(state);
-    }
-
-    eprintln!(
-        "local recorder has normal crash artifacts; completing locked recorder recovery before rebuilding local views"
-    );
-    // This must-exist locked open revalidates the same durable files before it can finish crash
-    // recovery. A replacement or deletion after preflight therefore fails rather than creating a
-    // new empty recorder.
-    RecorderFileStore::open_existing_with_membership(
-        data_dir.join("recorder"),
-        node_id,
-        identity.cluster_id(),
-        identity.epoch(),
-        identity.config_id(),
-        membership.clone(),
-    )
-    .map_err(|error| format!("local recorder crash recovery failed: {error}"))?;
-
-    match preflight_local_recorder(data_dir, identity, membership)? {
-        LocalRecorderState::Valid => Ok(LocalRecorderState::Valid),
-        state => Err(format!(
-            "local recorder crash recovery did not produce a valid recorder: {state:?}"
-        )),
-    }
-}
-
-#[derive(Clone)]
-struct StartupRecorderGate {
-    recorder: RecorderFileStore,
-    checkpoint_root: LogAnchor,
-    active: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl StartupRecorderGate {
-    fn new(recorder: RecorderFileStore, checkpoint_root: LogAnchor) -> Self {
-        Self {
-            recorder,
-            checkpoint_root,
-            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    fn activate(&self) {
-        self.active
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    fn require_active(&self) -> rhiza_quepaxa::Result<()> {
-        if self.active.load(std::sync::atomic::Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(rhiza_quepaxa::Error::Io(
-                "recorder is quarantined during checkpoint recovery".into(),
-            ))
-        }
-    }
-
-    fn require_visible_slot(&self, slot: u64) -> rhiza_quepaxa::Result<()> {
-        if slot <= self.checkpoint_root.index() {
-            return Err(rhiza_quepaxa::Error::Io(format!(
-                "recorder checkpoint root {} does not expose historical slot {slot}",
-                self.checkpoint_root.index()
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl RecorderRpc for StartupRecorderGate {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
-        self.recorder.recorder_id()
-    }
-
-    fn store_command_for(
-        &self,
-        cluster_id: String,
-        epoch: u64,
-        config_id: u64,
-        config_digest: rhiza_core::LogHash,
-        command_hash: rhiza_core::LogHash,
-        command: StoredCommand,
-    ) -> rhiza_quepaxa::Result<()> {
-        self.require_active()?;
-        self.recorder.store_command_for(
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            command_hash,
-            command,
-        )
-    }
-
-    fn fetch_command_for(
-        &self,
-        cluster_id: String,
-        epoch: u64,
-        config_id: u64,
-        config_digest: rhiza_core::LogHash,
-        command_hash: rhiza_core::LogHash,
-    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
-        self.recorder
-            .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
-    }
-
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-        self.require_active()?;
-        self.recorder.record(request)
-    }
-
-    fn install_decision_proof(
-        &self,
-        proof: DecisionProof,
-        membership: &Membership,
-    ) -> rhiza_quepaxa::Result<()> {
-        self.require_active()?;
-        self.recorder.install_decision_proof(proof, membership)
-    }
-
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
-        self.require_visible_slot(slot)?;
-        self.recorder.inspect_decision_proof(slot)
-    }
-
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-        self.require_visible_slot(slot)?;
-        self.recorder.inspect_record_summary(slot)
-    }
-
-    fn supports_context_read_fence(&self) -> bool {
-        self.recorder.supports_context_read_fence()
-    }
-
-    fn observe_read_fence(
-        &self,
-        request: ReadFenceRequest,
-    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
-        self.require_visible_slot(request.slot)?;
-        self.recorder.observe_read_fence(request)
-    }
-}
-
 fn active_recorder_listen(config: &ServeConfig) -> Result<&str, String> {
     if config.recorder_transport.is_tcp() {
         config
@@ -3290,6 +3018,79 @@ fn active_recorder_listen(config: &ServeConfig) -> Result<&str, String> {
             .ok_or_else(|| "recorder TCP configuration is missing".to_string())
     } else {
         Ok(&config.recorder_listen)
+    }
+}
+
+async fn bind_ha_recorder_listener(
+    config: &ServeConfig,
+) -> Result<(tokio::net::TcpListener, HaRecorderTransport), String> {
+    match config.recorder_transport {
+        RecorderTransport::Http => {
+            let listener = tokio::net::TcpListener::bind(&config.recorder_listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder listener: {error}"))?;
+            Ok((listener, HaRecorderTransport::Http))
+        }
+        RecorderTransport::TcpPostcard => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
+            Ok((listener, HaRecorderTransport::TcpPostcard))
+        }
+        RecorderTransport::TcpTlsPostcard => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let tls = tcp
+                .tls
+                .as_ref()
+                .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+            let certificate = fs::read(&tls.certificate)
+                .map_err(|error| format!("cannot read recorder TLS certificate: {error}"))?;
+            let private_key = fs::read(&tls.private_key)
+                .map_err(|error| format!("cannot read recorder TLS private key: {error}"))?;
+            let tls = RecorderTlsServerConfig::from_pem(&certificate, &private_key)?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
+            Ok((listener, HaRecorderTransport::TcpTlsPostcard(tls)))
+        }
+        #[cfg(feature = "recorder-postcard-rpc")]
+        RecorderTransport::TcpPostcardRpc => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
+            Ok((listener, HaRecorderTransport::TcpPostcardRpc))
+        }
+        #[cfg(feature = "recorder-postcard-rpc")]
+        RecorderTransport::TcpTlsPostcardRpc => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let tls = tcp
+                .tls
+                .as_ref()
+                .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+            let certificate = fs::read(&tls.certificate)
+                .map_err(|error| format!("cannot read recorder TLS certificate: {error}"))?;
+            let private_key = fs::read(&tls.private_key)
+                .map_err(|error| format!("cannot read recorder TLS private key: {error}"))?;
+            let tls = RecorderPostcardRpcTlsServerConfig::from_pem(&certificate, &private_key)?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
+            Ok((listener, HaRecorderTransport::TcpTlsPostcardRpc(tls)))
+        }
     }
 }
 
@@ -3452,35 +3253,6 @@ async fn stop_recorder_during_startup(
     joined.map_err(|error| format!("recorder server task failed: {error}"))?
 }
 
-fn checkpoint_worker(
-    mode: DurabilityMode,
-    runtime: Arc<NodeRuntime>,
-    coordinator: Arc<CheckpointCoordinator>,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Option<AbortOnDrop<()>> {
-    let cadence = match mode {
-        DurabilityMode::Sync => return None,
-        DurabilityMode::Bounded { max_lag } => (max_lag / 2).min(Duration::from_secs(1)),
-        DurabilityMode::Periodic { interval } => interval,
-    };
-    Some(AbortOnDrop(tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = wait_for_shutdown(shutdown.clone()) => return,
-                () = tokio::time::sleep(cadence) => {}
-            }
-            tokio::select! {
-                () = wait_for_shutdown(shutdown.clone()) => return,
-                result = coordinator.flush_runtime(&runtime, u64::MAX) => {
-                    if let Err(error) = result {
-                        eprintln!("checkpoint flush failed; retrying after {cadence:?}: {error}");
-                    }
-                }
-            }
-        }
-    })))
-}
-
 fn materializer_worker(
     runtime: Arc<NodeRuntime>,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -3505,19 +3277,6 @@ fn retain_first_error(current: &mut Result<(), String>, next: Result<(), String>
     }
 }
 
-fn append_shutdown_error(current: &mut Result<(), String>, next: Result<(), String>) {
-    let Err(next) = next else {
-        return;
-    };
-    match current {
-        Ok(()) => *current = Err(next),
-        Err(current) => {
-            current.push_str("; ");
-            current.push_str(&next);
-        }
-    }
-}
-
 fn server_task_result(
     result: Result<Result<(), String>, tokio::task::JoinError>,
     name: &str,
@@ -3525,11 +3284,116 @@ fn server_task_result(
     task_result(result, name)?
 }
 
-fn checkpoint_worker_error(result: Result<(), tokio::task::JoinError>) -> String {
-    match result {
-        Ok(()) => "checkpoint worker stopped".into(),
-        Err(error) => format!("checkpoint worker failed: {error}"),
-    }
+fn build_recorder_clients(config: &ServeConfig) -> Result<RecorderClients, String> {
+    let local_token = config.local_peer_token()?.to_owned();
+    let tls_ca_bundle = if config.recorder_transport.is_tls() {
+        let tls = config
+            .recorder_tcp
+            .as_ref()
+            .and_then(|tcp| tcp.tls.as_ref())
+            .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+        Some(
+            fs::read(&tls.ca_bundle)
+                .map_err(|error| format!("cannot read recorder TLS CA bundle: {error}"))?,
+        )
+    } else {
+        None
+    };
+    config
+        .bundle
+        .peers
+        .iter()
+        .enumerate()
+        .map(|(index, peer)| {
+            let client: Box<dyn RecorderRpc> = match config.recorder_transport {
+                RecorderTransport::Http => Box::new(
+                    HttpRecorderClient::new_with_recovery_generation(
+                        peer.base_url(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                    )
+                    .map_err(|error| error.to_string())?,
+                ),
+                RecorderTransport::TcpPostcard => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    Box::new(TcpPostcardRecorderClient::new(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                    )?)
+                }
+                RecorderTransport::TcpTlsPostcard => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    let server_name = endpoint.tls_server_name.as_deref().ok_or_else(|| {
+                        format!("recorder TLS server name is missing for {}", peer.node_id())
+                    })?;
+                    let ca_bundle = tls_ca_bundle
+                        .as_deref()
+                        .ok_or_else(|| "recorder TLS CA bundle is missing".to_string())?;
+                    let tls = RecorderTlsClientConfig::from_ca_pem(ca_bundle, server_name)?;
+                    Box::new(TcpPostcardRecorderClient::new_tls(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                        tls,
+                    )?)
+                }
+                #[cfg(feature = "recorder-postcard-rpc")]
+                RecorderTransport::TcpPostcardRpc => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    Box::new(TcpPostcardRpcRecorderClient::new(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                    )?)
+                }
+                #[cfg(feature = "recorder-postcard-rpc")]
+                RecorderTransport::TcpTlsPostcardRpc => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    let server_name = endpoint.tls_server_name.as_deref().ok_or_else(|| {
+                        format!("recorder TLS server name is missing for {}", peer.node_id())
+                    })?;
+                    let ca_bundle = tls_ca_bundle
+                        .as_deref()
+                        .ok_or_else(|| "recorder TLS CA bundle is missing".to_string())?;
+                    let tls =
+                        RecorderPostcardRpcTlsClientConfig::from_ca_pem(ca_bundle, server_name)?;
+                    Box::new(TcpPostcardRpcRecorderClient::new_tls(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                        tls,
+                    )?)
+                }
+            };
+            Ok((peer.node_id().to_owned(), client))
+        })
+        .collect()
 }
 
 fn build_consensus(
@@ -3752,35 +3616,6 @@ async fn open_runtime_with_retry(
     }
 }
 
-async fn rehydrate_recorder_with_retry(
-    runtime: Arc<NodeRuntime>,
-    recorder: RecorderFileStore,
-    checkpoint_index: u64,
-) -> Result<(), String> {
-    const RETRY_DELAY: Duration = Duration::from_millis(100);
-
-    loop {
-        let attempt_runtime = runtime.clone();
-        let attempt_recorder = recorder.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            rehydrate_recorder_after_checkpoint(
-                &attempt_runtime,
-                &attempt_recorder,
-                checkpoint_index,
-            )
-        })
-        .await
-        .map_err(|error| format!("recorder rehydration task failed: {error}"))?;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(NodeError::Unavailable(_) | NodeError::Contention(_)) => {
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
 async fn run_init_checkpoint(config: CheckpointCommandConfig) -> Result<CheckpointTip, String> {
     initialize_empty_checkpoint(&config.archive()?).await
 }
@@ -3803,21 +3638,6 @@ async fn run_checkpoint_inspect(config: CheckpointCommandConfig) -> Result<Strin
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "checkpoint is not initialized".to_string())?;
-    serde_json::to_string(loaded.manifest()).map_err(|error| error.to_string())
-}
-
-async fn run_checkpoint_fork_successor(
-    config: CheckpointForkSuccessorConfig,
-) -> Result<String, String> {
-    let target = config.target.archive()?;
-    let mut source_config = config.target.clone();
-    source_config.config_id = config.source_config_id;
-    source_config.recovery_generation = config.source_generation;
-    let source = source_config.archive()?;
-    let loaded = source
-        .fork_stopped_successor(&target, &config.stop_entry)
-        .await
-        .map_err(|error| error.to_string())?;
     serde_json::to_string(loaded.manifest()).map_err(|error| error.to_string())
 }
 
@@ -4017,7 +3837,6 @@ async fn run_membership_stop(config: AdminCommandConfig) -> Result<String, Strin
             )
             .await?;
             let material = PredecessorDocument {
-                version: response.stop.version,
                 members: serve.bundle.membership.members().to_vec(),
                 stop_entry: response.stop.entry,
                 stop_proof: response.stop.proof,
@@ -4043,7 +3862,6 @@ fn run_membership_stop_offline(
         .stop_current_configuration_for_successor(&successor.membership)
         .map_err(|error| error.to_string())?;
     let material = PredecessorDocument {
-        version: stop.version,
         members: config.bundle.membership.members().to_vec(),
         stop_entry: stop.entry,
         stop_proof: stop.proof,
@@ -4374,802 +4192,6 @@ async fn roll_checkpoint(
     Ok((source_tip, target_tip))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum StartupPreparation {
-    RecorderFirst {
-        recorder_open: RecorderOpenPolicy,
-    },
-    VerifyLocalCheckpoint {
-        identity: CheckpointIdentity,
-        root: LogAnchor,
-    },
-    RuntimeFirstWithPeerCatchup {
-        checkpoint_root: LogAnchor,
-        recorder_open: RecorderOpenPolicy,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecorderOpenPolicy {
-    MustExist,
-    CreateAfterRehydration,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LocalRecorderState {
-    Missing,
-    Valid,
-    /// Normal crash artifacts are present. This state must be opened under the recorder lock and
-    /// reclassified before any rebuildable local view is changed.
-    Recoverable,
-}
-
-impl StartupPreparation {
-    fn recorder_open_policy(&self) -> RecorderOpenPolicy {
-        match self {
-            Self::RecorderFirst { recorder_open }
-            | Self::RuntimeFirstWithPeerCatchup { recorder_open, .. } => *recorder_open,
-            Self::VerifyLocalCheckpoint { .. } => RecorderOpenPolicy::MustExist,
-        }
-    }
-}
-
-fn recorder_open_policy_for_state(state: LocalRecorderState) -> RecorderOpenPolicy {
-    match state {
-        LocalRecorderState::Missing => RecorderOpenPolicy::CreateAfterRehydration,
-        LocalRecorderState::Valid | LocalRecorderState::Recoverable => {
-            RecorderOpenPolicy::MustExist
-        }
-    }
-}
-
-fn remote_startup_uses_direct_recorder(preparation: &StartupPreparation) -> bool {
-    !matches!(
-        preparation,
-        StartupPreparation::RuntimeFirstWithPeerCatchup { .. }
-    )
-}
-
-async fn prepare_remote_startup_with_membership(
-    mode: StartupMode,
-    archive: &ObjectArchiveStore,
-    data_dir: &Path,
-    node_id: &str,
-    execution_profile: ExecutionProfile,
-    membership: &Membership,
-) -> Result<StartupPreparation, String> {
-    match mode {
-        StartupMode::Bootstrap => {
-            if !local_data_is_fresh(data_dir)? {
-                return Err("bootstrap requires a fresh local data directory".into());
-            }
-            let loaded = archive
-                .load_checkpoint()
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "bootstrap requires an initialized empty checkpoint".to_string())?;
-            if loaded.manifest().tip().index() != 0 || !loaded.manifest().segments().is_empty() {
-                return Err("bootstrap requires an initialized empty checkpoint".into());
-            }
-            write_local_checkpoint_identity_marker(
-                data_dir,
-                execution_profile,
-                loaded.manifest().identity(),
-                node_id,
-            )?;
-            Ok(StartupPreparation::RecorderFirst {
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            })
-        }
-        StartupMode::Rejoin if local_data_is_fresh(data_dir)? => {
-            let identity = archive
-                .checkpoint_identity()
-                .map_err(|error| error.to_string())?;
-            let marker =
-                encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
-            let tip =
-                rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
-                    archive.clone(),
-                    data_dir,
-                    node_id,
-                    LOCAL_CHECKPOINT_IDENTITY_FILE,
-                    &marker,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            read_and_validate_local_checkpoint_identity_marker(
-                data_dir,
-                execution_profile,
-                identity,
-                node_id,
-            )?;
-            Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            })
-        }
-        StartupMode::Rejoin => {
-            let loaded = archive
-                .load_checkpoint()
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "rejoin requires an initialized checkpoint".to_string())?;
-            let checkpoint_root = LogAnchor::new(
-                loaded.manifest().tip().index(),
-                loaded.manifest().tip().hash(),
-            );
-            let exact_marker_exists =
-                match fs::symlink_metadata(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)) {
-                    Ok(_) => {
-                        read_and_validate_local_checkpoint_identity_marker(
-                            data_dir,
-                            execution_profile,
-                            loaded.manifest().identity(),
-                            node_id,
-                        )?;
-                        true
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                    Err(error) => {
-                        return Err(format!(
-                            "cannot inspect local checkpoint identity marker: {error}"
-                        ))
-                    }
-                };
-            let restore_state = rhiza_node::durability::checkpoint_restore_in_progress(
-                data_dir,
-                loaded.manifest().identity(),
-                node_id,
-                execution_profile,
-                checkpoint_root,
-            )
-            .map_err(|error| error.to_string())?;
-            // A normal nonfresh rejoin is fenced by the exact node-bound marker. The only
-            // exception is an identity-bound restore intent which has already been validated
-            // against this node and checkpoint above. Do not open a recoverable recorder before
-            // one of those read-only fences succeeds.
-            if !exact_marker_exists
-                && restore_state == rhiza_node::durability::CheckpointRestoreState::None
-            {
-                return Err("rejoin requires a local checkpoint identity marker".into());
-            }
-            let recorder_state =
-                preflight_local_recorder(data_dir, loaded.manifest().identity(), membership)?;
-            let recorder_state = recover_local_recorder_before_view_recovery(
-                recorder_state,
-                data_dir,
-                node_id,
-                loaded.manifest().identity(),
-                membership,
-            )?;
-            if restore_state != rhiza_node::durability::CheckpointRestoreState::None {
-                let marker = encode_local_checkpoint_identity_marker(
-                    execution_profile,
-                    loaded.manifest().identity(),
-                    node_id,
-                )?;
-                let tip = if execution_profile == ExecutionProfile::Graph {
-                    rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
-                        archive.clone(),
-                        data_dir,
-                        node_id,
-                        LOCAL_CHECKPOINT_IDENTITY_FILE,
-                        &marker,
-                    )
-                    .await
-                } else {
-                    rhiza_node::durability::restore_checkpoint_for_rejoin_preserving_recorder(
-                        archive.clone(),
-                        data_dir,
-                        node_id,
-                        execution_profile,
-                        LOCAL_CHECKPOINT_IDENTITY_FILE,
-                        &marker,
-                    )
-                    .await
-                }
-                .map_err(|error| error.to_string())?;
-                read_and_validate_local_checkpoint_identity_marker(
-                    data_dir,
-                    execution_profile,
-                    loaded.manifest().identity(),
-                    node_id,
-                )?;
-                return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                    checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
-                    recorder_open: recorder_open_policy_for_state(recorder_state),
-                });
-            }
-            read_and_validate_local_checkpoint_identity_marker(
-                data_dir,
-                execution_profile,
-                loaded.manifest().identity(),
-                node_id,
-            )?;
-            let checkpoint_root = LogAnchor::new(
-                loaded.manifest().tip().index(),
-                loaded.manifest().tip().hash(),
-            );
-            if let Err(error) = rhiza_node::durability::validate_local_recovery_view(
-                data_dir,
-                loaded.manifest().identity(),
-                node_id,
-                execution_profile,
-                checkpoint_root,
-            ) {
-                eprintln!(
-                    "local recovery view is not trustworthy ({error}); quarantining rebuildable state and restoring the verified checkpoint"
-                );
-                let marker = encode_local_checkpoint_identity_marker(
-                    execution_profile,
-                    loaded.manifest().identity(),
-                    node_id,
-                )?;
-                let tip = rhiza_node::durability::restore_checkpoint_for_rejoin_preserving_recorder(
-                    archive.clone(),
-                    data_dir,
-                    node_id,
-                    execution_profile,
-                    LOCAL_CHECKPOINT_IDENTITY_FILE,
-                    &marker,
-                )
-                .await
-                .map_err(|restore_error| {
-                    format!(
-                        "rebuildable local recovery view was quarantined but verified checkpoint restore failed: {restore_error}"
-                    )
-                })?;
-                read_and_validate_local_checkpoint_identity_marker(
-                    data_dir,
-                    execution_profile,
-                    loaded.manifest().identity(),
-                    node_id,
-                )?;
-                return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                    checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
-                    recorder_open: recorder_open_policy_for_state(recorder_state),
-                });
-            }
-            if recorder_state == LocalRecorderState::Missing {
-                return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                    checkpoint_root,
-                    recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-                });
-            }
-            Ok(StartupPreparation::VerifyLocalCheckpoint {
-                identity: loaded.manifest().identity().clone(),
-                root: LogAnchor::new(
-                    loaded.manifest().tip().index(),
-                    loaded.manifest().tip().hash(),
-                ),
-            })
-        }
-        StartupMode::Disaster => {
-            let identity = archive
-                .checkpoint_identity()
-                .map_err(|error| error.to_string())?;
-            let checkpoint = archive
-                .load_checkpoint()
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "disaster startup requires an initialized checkpoint".to_string())?;
-            let checkpoint_root = LogAnchor::new(
-                checkpoint.manifest().tip().index(),
-                checkpoint.manifest().tip().hash(),
-            );
-            match fs::symlink_metadata(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)) {
-                Ok(_) => read_and_validate_local_checkpoint_identity_marker(
-                    data_dir,
-                    execution_profile,
-                    identity,
-                    node_id,
-                )?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot inspect local checkpoint identity marker: {error}"
-                    ))
-                }
-            }
-            let restore_state = rhiza_node::durability::checkpoint_restore_in_progress(
-                data_dir,
-                identity,
-                node_id,
-                execution_profile,
-                checkpoint_root,
-            )
-            .map_err(|error| error.to_string())?;
-            if restore_state == rhiza_node::durability::CheckpointRestoreState::None
-                && !local_data_is_fresh(data_dir)?
-            {
-                return Err("disaster startup requires a fresh local data directory".into());
-            }
-            let marker =
-                encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
-            rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
-                archive.clone(),
-                data_dir,
-                node_id,
-                LOCAL_CHECKPOINT_IDENTITY_FILE,
-                &marker,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            read_and_validate_local_checkpoint_identity_marker(
-                data_dir,
-                execution_profile,
-                identity,
-                node_id,
-            )?;
-            Ok(StartupPreparation::RecorderFirst {
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            })
-        }
-    }
-}
-
-#[cfg(test)]
-async fn prepare_remote_startup(
-    mode: StartupMode,
-    archive: &ObjectArchiveStore,
-    data_dir: &Path,
-    node_id: &str,
-    execution_profile: ExecutionProfile,
-) -> Result<StartupPreparation, String> {
-    let membership =
-        Membership::new(["node-1", "node-2", "node-3"]).map_err(|error| error.to_string())?;
-    prepare_remote_startup_with_membership(
-        mode,
-        archive,
-        data_dir,
-        node_id,
-        execution_profile,
-        &membership,
-    )
-    .await
-}
-
-fn marker_from_identity(
-    execution_profile: ExecutionProfile,
-    identity: &CheckpointIdentity,
-    node_id: &str,
-) -> LocalCheckpointIdentityMarker {
-    LocalCheckpointIdentityMarker {
-        format_version: 2,
-        cluster_id: identity.cluster_id().to_owned(),
-        node_id: node_id.to_owned(),
-        execution_profile,
-        epoch: identity.epoch(),
-        config_id: identity.config_id(),
-        recovery_generation: identity.recovery_generation(),
-    }
-}
-
-fn encode_local_checkpoint_identity_marker(
-    execution_profile: ExecutionProfile,
-    identity: &CheckpointIdentity,
-    node_id: &str,
-) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&marker_from_identity(execution_profile, identity, node_id))
-        .map_err(|error| format!("cannot encode local checkpoint identity marker: {error}"))
-}
-
-fn validate_local_checkpoint_identity_marker(
-    marker: &LocalCheckpointIdentityMarker,
-    execution_profile: ExecutionProfile,
-    identity: &CheckpointIdentity,
-    node_id: &str,
-) -> Result<(), String> {
-    if marker.format_version != 2
-        || marker.cluster_id != identity.cluster_id()
-        || marker.node_id != node_id
-        || marker.execution_profile != execution_profile
-        || marker.epoch != identity.epoch()
-        || marker.config_id != identity.config_id()
-        || marker.recovery_generation != identity.recovery_generation()
-    {
-        return Err(
-            "local checkpoint identity marker does not exactly match the authoritative checkpoint"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-fn read_and_validate_local_checkpoint_identity_marker(
-    data_dir: &Path,
-    execution_profile: ExecutionProfile,
-    identity: &CheckpointIdentity,
-    node_id: &str,
-) -> Result<(), String> {
-    let marker_path = data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE);
-    let bytes = read_bounded_regular_file_no_follow(
-        &marker_path,
-        MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES,
-        "local checkpoint identity marker",
-    )?;
-    let marker: LocalCheckpointIdentityMarker = serde_json::from_slice(&bytes)
-        .map_err(|_| "local checkpoint identity marker is invalid".to_string())?;
-    validate_local_checkpoint_identity_marker(&marker, execution_profile, identity, node_id)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-
-fn open_read_no_follow(path: &Path) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(O_NOFOLLOW_FLAG);
-    }
-    options.open(path)
-}
-
-fn read_bounded_regular_file_no_follow(
-    path: &Path,
-    max_bytes: u64,
-    label: &str,
-) -> Result<Vec<u8>, String> {
-    read_optional_bounded_regular_file_no_follow(path, max_bytes, label)?
-        .ok_or_else(|| format!("nonfresh rejoin requires a {label}"))
-}
-
-fn read_optional_bounded_regular_file_no_follow(
-    path: &Path,
-    max_bytes: u64,
-    label: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    let mut file = match open_read_no_follow(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            let is_symlink =
-                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
-            return Err(
-                if is_symlink || (cfg!(unix) && error.raw_os_error() == Some(40)) {
-                    format!("{label} must be a regular file")
-                } else {
-                    format!("cannot open {label}: {error}")
-                },
-            );
-        }
-    };
-    let before = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect open {label}: {error}"))?;
-    if !before.is_file() {
-        return Err(format!("{label} must be a regular file"));
-    }
-    if before.len() == 0 || before.len() > max_bytes {
-        return Err(format!("{label} has an invalid size"));
-    }
-
-    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read {label}: {error}"))?;
-    let after = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect open {label}: {error}"))?;
-    if !after.is_file()
-        || after.len() != before.len()
-        || bytes.len() as u64 != before.len()
-        || bytes.len() as u64 > max_bytes
-    {
-        return Err(format!("{label} changed during bounded read"));
-    }
-    Ok(Some(bytes))
-}
-
-async fn expected_successor_restore_receipt(
-    archive: &ObjectArchiveStore,
-    config: &ServeConfig,
-) -> Result<Vec<u8>, String> {
-    let loaded = archive
-        .load_checkpoint()
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "successor startup requires an initialized checkpoint".to_string())?;
-    let identity = loaded.manifest().identity();
-    let transition = loaded
-        .manifest()
-        .successor_transition()
-        .ok_or_else(|| "successor startup requires transition provenance".to_string())?;
-    let predecessor = config.bundle.require_predecessor()?;
-    if identity.cluster_id() != config.cluster_id
-        || identity.epoch() != config.epoch
-        || identity.config_id() != config.bundle.config_id
-        || identity.recovery_generation() != config.recovery_generation
-        || transition.predecessor().config_id() != predecessor.stop.entry.config_id
-        || transition.stop_entry() != &predecessor.stop.entry
-    {
-        return Err("successor checkpoint does not match target node configuration".into());
-    }
-    serde_json::to_vec(&SuccessorRestoreReceipt {
-        version: 1,
-        cluster_id: config.cluster_id.clone(),
-        epoch: config.epoch,
-        target_config_id: identity.config_id(),
-        recovery_generation: config.recovery_generation,
-        node_id: config.node_id.clone(),
-        membership_digest: config.bundle.membership.digest().to_hex(),
-        predecessor_config_id: transition.predecessor().config_id(),
-        stop_index: transition.stop_entry().index,
-        stop_hash: transition.stop_entry().hash.to_hex(),
-        checkpoint_index: loaded.manifest().tip().index(),
-        checkpoint_hash: loaded.manifest().tip().hash().to_hex(),
-    })
-    .map_err(|error| format!("cannot encode successor restore receipt: {error}"))
-}
-
-fn validate_successor_restore_controls(
-    data_dir: &Path,
-    expected: &[u8],
-) -> Result<SuccessorRestoreControlState, String> {
-    let intent = read_optional_bounded_regular_file_no_follow(
-        &data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE),
-        MAX_SUCCESSOR_RESTORE_CONTROL_BYTES,
-        "successor restore intent",
-    )?;
-    let complete = read_optional_bounded_regular_file_no_follow(
-        &data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE),
-        MAX_SUCCESSOR_RESTORE_CONTROL_BYTES,
-        "successor restore completion",
-    )?;
-    match (intent, complete) {
-        (None, None) => Ok(SuccessorRestoreControlState::Fresh),
-        (Some(actual), None) if actual == expected => Ok(SuccessorRestoreControlState::Intent),
-        (None, Some(actual)) if completed_successor_receipt_matches(&actual, expected) => {
-            Ok(SuccessorRestoreControlState::Complete)
-        }
-        _ => {
-            Err("successor restore receipt does not exactly match this node and checkpoint".into())
-        }
-    }
-}
-
-fn completed_successor_receipt_matches(actual: &[u8], expected: &[u8]) -> bool {
-    let (Ok(mut actual), Ok(mut expected)) = (
-        serde_json::from_slice::<serde_json::Value>(actual),
-        serde_json::from_slice::<serde_json::Value>(expected),
-    ) else {
-        return false;
-    };
-    let (Some(actual_index), Some(expected_index), Some(actual_hash), Some(expected_hash)) = (
-        actual["checkpoint_index"].as_u64(),
-        expected["checkpoint_index"].as_u64(),
-        actual["checkpoint_hash"].as_str(),
-        expected["checkpoint_hash"].as_str(),
-    ) else {
-        return false;
-    };
-    if LogHash::from_hex(actual_hash).is_none()
-        || LogHash::from_hex(expected_hash).is_none()
-        || actual_index > expected_index
-        || (actual_index == expected_index && actual_hash != expected_hash)
-    {
-        return false;
-    }
-    for receipt in [&mut actual, &mut expected] {
-        let Some(receipt) = receipt.as_object_mut() else {
-            return false;
-        };
-        receipt.remove("checkpoint_index");
-        receipt.remove("checkpoint_hash");
-    }
-    actual == expected
-}
-
-fn write_local_checkpoint_identity_marker(
-    data_dir: &Path,
-    execution_profile: ExecutionProfile,
-    identity: &CheckpointIdentity,
-    node_id: &str,
-) -> Result<(), String> {
-    fs::create_dir_all(data_dir)
-        .map_err(|error| format!("cannot create local data directory: {error}"))?;
-    let data_dir_metadata = fs::symlink_metadata(data_dir)
-        .map_err(|error| format!("cannot inspect local data directory: {error}"))?;
-    if data_dir_metadata.file_type().is_symlink() || !data_dir_metadata.is_dir() {
-        return Err("local data directory must be a real directory".into());
-    }
-
-    let marker_path = data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE);
-    match fs::symlink_metadata(&marker_path) {
-        Ok(_) => {
-            return read_and_validate_local_checkpoint_identity_marker(
-                data_dir,
-                execution_profile,
-                identity,
-                node_id,
-            )
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "cannot inspect local checkpoint identity marker: {error}"
-            ))
-        }
-    }
-    let bytes = encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
-    let nonce = LOCAL_MARKER_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temporary = data_dir.join(format!(
-        ".rhiza-checkpoint-identity.tmp-{}-{nonce}",
-        std::process::id()
-    ));
-    let result = (|| -> Result<(), String> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("cannot create checkpoint identity marker: {error}"))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("cannot write checkpoint identity marker: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("cannot sync checkpoint identity marker: {error}"))?;
-        match fs::hard_link(&temporary, &marker_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot atomically publish checkpoint identity marker: {error}"
-                ))
-            }
-        }
-        fs::remove_file(&temporary)
-            .map_err(|error| format!("cannot remove checkpoint marker staging file: {error}"))?;
-        fs::File::open(data_dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("cannot sync local data directory: {error}"))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result?;
-    read_and_validate_local_checkpoint_identity_marker(
-        data_dir,
-        execution_profile,
-        identity,
-        node_id,
-    )
-}
-
-static LOCAL_MARKER_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn verify_local_rejoin_checkpoint(
-    runtime: &NodeRuntime,
-    identity: &CheckpointIdentity,
-    authoritative_root: LogAnchor,
-) -> Result<(), String> {
-    let config = runtime.config();
-    let local_identity = CheckpointIdentity::new(
-        config.cluster_id().to_owned(),
-        config.epoch(),
-        runtime.consensus().config_id(),
-        config.recovery_generation(),
-    );
-    if &local_identity != identity {
-        return Err(
-            "nonfresh rejoin local qlog identity does not match the authoritative checkpoint"
-                .into(),
-        );
-    }
-    let expected_profile_prefix = format!("rhiza:{}:", config.execution_profile());
-    if !identity.cluster_id().starts_with(&expected_profile_prefix) {
-        return Err(
-            "nonfresh rejoin execution profile does not match the checkpoint identity".into(),
-        );
-    }
-
-    let state = runtime
-        .log_store()
-        .logical_state()
-        .map_err(|error| error.to_string())?;
-    let local_tip = state
-        .tip
-        .unwrap_or_else(|| LogAnchor::new(0, rhiza_core::LogHash::ZERO));
-    if local_tip.index() < authoritative_root.index() {
-        return Err(format!(
-            "nonfresh rejoin local qlog tip {} is behind authoritative checkpoint {}",
-            local_tip.index(),
-            authoritative_root.index(),
-        ));
-    }
-    if authoritative_root.index() == 0 {
-        if authoritative_root.hash() != rhiza_core::LogHash::ZERO {
-            return Err("authoritative checkpoint genesis hash is not zero".into());
-        }
-        return Ok(());
-    }
-    let local_hash = if state
-        .anchor
-        .as_ref()
-        .is_some_and(|anchor| anchor.compacted().index() == authoritative_root.index())
-    {
-        state
-            .anchor
-            .as_ref()
-            .map(|anchor| anchor.compacted().hash())
-    } else if state
-        .anchor
-        .as_ref()
-        .is_some_and(|anchor| anchor.compacted().index() > authoritative_root.index())
-    {
-        return Err(
-            "nonfresh rejoin local qlog compacted past the authoritative checkpoint without exact inclusion evidence"
-                .into(),
-        );
-    } else {
-        runtime
-            .log_store()
-            .read(authoritative_root.index())
-            .map_err(|error| error.to_string())?
-            .map(|entry| entry.hash)
-    };
-    if local_hash != Some(authoritative_root.hash()) {
-        return Err(format!(
-            "nonfresh rejoin local qlog hash at index {} does not match the authoritative checkpoint",
-            authoritative_root.index(),
-        ));
-    }
-    Ok(())
-}
-
-fn local_data_is_fresh(data_dir: &Path) -> Result<bool, String> {
-    for path in [
-        data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE),
-        data_dir.join("consensus/log"),
-        data_dir.join("sqlite"),
-        data_dir.join("ladybug"),
-        data_dir.join("kv"),
-        data_dir.join("recorder"),
-        data_dir.join("consensus/recorder"),
-    ] {
-        if path_has_state(&path).map_err(|error| error.to_string())? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if !metadata.is_dir() {
-        return Ok(true);
-    }
-    fs::read_dir(path)?
-        .next()
-        .transpose()
-        .map(|entry| entry.is_some())
-}
-
 #[cfg(feature = "sql")]
 async fn request_write(args: &WriteArgs) -> Result<WriteResponse, String> {
     let request = WriteRequest {
@@ -5441,7 +4463,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza prestage serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza health --url <url> [--ready]\n\nServe, prestage, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. prestage serve additionally requires RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE, RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE, and a distinct RHIZA_TAIL_TOKEN. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -5449,12 +4471,8 @@ fn usage() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "sql")]
-    use std::collections::BTreeMap;
     use std::collections::HashMap;
-    #[cfg(feature = "sql")]
-    use std::sync::{mpsc, Condvar};
-    #[cfg(any(feature = "sql", all(feature = "graph", feature = "kv")))]
+    #[cfg(all(feature = "graph", feature = "kv"))]
     use std::sync::{Arc, Mutex};
 
     #[cfg(all(feature = "graph", feature = "kv"))]
@@ -5464,8 +4482,6 @@ mod tests {
     use rhiza_core::{
         ConfigChange, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
     };
-    #[cfg(feature = "sql")]
-    use rhiza_log::FileLogStore;
     #[cfg(feature = "graph")]
     use rhiza_node::GraphQueryParameterDto;
     use rhiza_node::{NodeStatus, RuntimeConfigurationStatus};
@@ -5474,37 +4490,12 @@ mod tests {
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
     use rhiza_quepaxa::AcceptedValue;
     #[cfg(feature = "sql")]
-    use rhiza_quepaxa::{Proposal, ProposalPriority};
-    #[cfg(feature = "sql")]
-    use rhiza_quepaxa::{RecordRequest, RecordSummary};
-    #[cfg(feature = "sql")]
     use rhiza_sql::{
         encode_sql_command, sql_executor_fingerprint, SqlBatchMember, SqlCommand,
         SqliteStateMachine,
     };
 
     use super::*;
-
-    #[cfg(feature = "sql")]
-    fn directory_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn collect(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
-            for entry in std::fs::read_dir(path).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                if entry.file_type().unwrap().is_dir() {
-                    collect(root, &path, files);
-                } else {
-                    files.insert(
-                        path.strip_prefix(root).unwrap().to_path_buf(),
-                        std::fs::read(path).unwrap(),
-                    );
-                }
-            }
-        }
-        let mut files = BTreeMap::new();
-        collect(root, root, &mut files);
-        files
-    }
 
     #[test]
     #[cfg(feature = "sql")]
@@ -6055,6 +5046,38 @@ mod tests {
         assert_eq!(exit_code, 1);
     }
 
+    #[tokio::test]
+    async fn certified_tail_reports_obsolete_prestage_when_rebase_is_required() {
+        let checkpoint = LogAnchor::new(41, LogHash::from_bytes([7; 32]));
+        let body = CertifiedTailErrorResponse::RebaseRequired { checkpoint };
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let body = body.clone();
+                async move { (StatusCode::CONFLICT, Json(body)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = bounded_http_client(Duration::from_millis(20), Duration::from_millis(100))
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            prestage_rebase_error(&url, response).await.unwrap(),
+            format!(
+                "local prestage/checkpoint is obsolete; prestage must restart from source checkpoint at index 41 with hash {}",
+                checkpoint.hash().to_hex()
+            )
+        );
+        server.abort();
+    }
+
     #[test]
     fn serve_config_uses_default_listeners_and_local_peer_token() {
         let (profile_name, profile, canonical_cluster_id) = compiled_profile_fixture();
@@ -6098,7 +5121,6 @@ mod tests {
         assert!(error.contains("recorder_tcp_addr"), "{error}");
 
         let bundle = serde_json::json!({
-            "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "log_url":"http://node-1:8080", "recorder_tcp_addr":"node-1:8082", "token":"peer-1-secret"},
@@ -6133,9 +5155,8 @@ mod tests {
 
     #[cfg(feature = "recorder-postcard-rpc")]
     #[test]
-    fn postcard_rpc_transport_uses_tcp_listener_and_legacy_tls_configuration() {
+    fn postcard_rpc_transport_uses_tcp_listener_and_tls_configuration() {
         let bundle = serde_json::json!({
-            "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "log_url":"http://node-1:8080", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
@@ -6169,7 +5190,6 @@ mod tests {
     #[test]
     fn non_tls_transports_reject_bundle_tls_server_names() {
         let bundle = serde_json::json!({
-            "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
@@ -6211,7 +5231,6 @@ mod tests {
         assert!(error.contains("recorder_tcp_addr"), "{error}");
 
         let bundle = serde_json::json!({
-            "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
@@ -6257,7 +5276,6 @@ mod tests {
     #[test]
     fn configuration_bundle_accepts_tls_server_name_for_each_member() {
         let json = serde_json::json!({
-            "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"t1"},
@@ -6292,7 +5310,6 @@ mod tests {
                 .collect::<Vec<_>>();
             let bundle = parse_configuration_bundle(
                 &serde_json::json!({
-                    "version": 1,
                     "config_id": 7,
                     "members": members,
                 })
@@ -6315,11 +5332,10 @@ mod tests {
     }
 
     #[test]
-    fn configuration_bundle_rejects_bad_versions_counts_and_duplicate_members() {
+    fn configuration_bundle_rejects_invalid_counts_and_duplicate_members() {
         for json in [
-            serde_json::json!({"version": 2, "config_id": 1, "members": []}),
+            serde_json::json!({"config_id": 1, "members": []}),
             serde_json::json!({
-                "version": 1,
                 "config_id": 1,
                 "members": [
                     {"node_id": "n1", "url": "http://n1", "token": "t1"},
@@ -6327,7 +5343,6 @@ mod tests {
                 ],
             }),
             serde_json::json!({
-                "version": 1,
                 "config_id": 1,
                 "members": [
                     {"node_id": "n1", "url": "http://n1", "token": "t1"},
@@ -6341,10 +5356,19 @@ mod tests {
     }
 
     #[test]
+    fn configuration_bundle_rejects_obsolete_top_level_version_as_unknown_field() {
+        let mut json: serde_json::Value = serde_json::from_str(base_bundle_json()).unwrap();
+        json["version"] = serde_json::json!(1);
+
+        let error = parse_configuration_bundle(&json.to_string()).unwrap_err();
+
+        assert!(error.contains("unknown field `version`"), "{error}");
+    }
+
+    #[test]
     fn bundle_source_is_exclusive_and_never_exposes_tokens() {
         let token = "bundle-token-that-must-stay-private";
         let json = serde_json::json!({
-            "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id": "n1", "url": "http://n1", "token": token},
@@ -6376,7 +5400,6 @@ mod tests {
         std::fs::write(
             &path,
             serde_json::json!({
-                "version": 1,
                 "config_id": 9,
                 "members": [
                     {"node_id": "n3", "url": "http://n3", "token": "t3"},
@@ -6400,23 +5423,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_legacy_configuration_environment_is_rejected() {
-        for (name, value) in [
-            ("RHIZA_CONFIG_ID", "7"),
-            ("RHIZA_PEER_1_ID", "node-1"),
-            ("RHIZA_PEER_2_URL", "http://node-2:8081"),
-        ] {
-            let values = HashMap::from([(name, value)]);
-            let error = load_configuration_bundle(
-                |key| values.get(key).map(ToString::to_string),
-                |_| unreachable!("legacy variables fail before file access"),
-            )
-            .unwrap_err();
-            assert!(error.contains("unsupported"));
-        }
-    }
-
-    #[test]
     fn serve_rejects_a_local_node_outside_the_bundle() {
         let mut values = base_serve_env();
         values.insert("RHIZA_NODE_ID", "node-9");
@@ -6429,7 +5435,6 @@ mod tests {
     #[test]
     fn checkpoint_identity_uses_bundle_config_id() {
         let json = serde_json::json!({
-            "version": 1,
             "config_id": 11,
             "members": [
                 {"node_id": "n1", "url": "http://n1", "token": "t1"},
@@ -6494,7 +5499,6 @@ mod tests {
     #[test]
     fn membership_install_requires_predecessor_transition_material() {
         let json = serde_json::json!({
-            "version": 1,
             "config_id": 2,
             "members": [
                 {"node_id": "n1", "url": "http://n1", "token": "t1"},
@@ -6568,7 +5572,6 @@ mod tests {
                 .collect(),
         };
         serde_json::json!({
-            "version": 1,
             "config_id": 4,
             "members": [
                 {"node_id": "node-1", "url": "http://rhiza-sql-c4-0.rhiza-sql-c4:8081", "log_url": "http://rhiza-sql-c4-0.rhiza-sql-c4:8080", "token": "peer-1-secret"},
@@ -6576,7 +5579,6 @@ mod tests {
                 {"node_id": "node-3", "url": "http://rhiza-sql-c4-2.rhiza-sql-c4:8081", "log_url": "http://rhiza-sql-c4-2.rhiza-sql-c4:8080", "token": "peer-3-secret"},
             ],
             "predecessor": {
-                "version": 2,
                 "members": ["node-1", "node-2", "node-3"],
                 "stop_entry": entry,
                 "stop_proof": proof,
@@ -6618,6 +5620,16 @@ mod tests {
         );
         assert_eq!(bundle.configuration_state.stop().unwrap().index(), 10);
         assert!(bundle.require_predecessor().is_ok());
+    }
+
+    #[test]
+    fn configuration_bundle_rejects_obsolete_predecessor_version_as_unknown_field() {
+        let mut json = exact_predecessor_bundle();
+        json["predecessor"]["version"] = serde_json::json!(2);
+
+        let error = parse_configuration_bundle(&json.to_string()).unwrap_err();
+
+        assert!(error.contains("unknown field `version`"), "{error}");
     }
 
     #[test]
@@ -6702,11 +5714,11 @@ mod tests {
     }
 
     fn base_bundle_json() -> &'static str {
-        r#"{"version":1,"config_id":7,"members":[{"node_id":"node-1","url":"http://node-1:8081","log_url":"http://node-1:8080","token":"peer-1-secret"},{"node_id":"node-2","url":"http://node-2:8081","token":"peer-2-secret"},{"node_id":"node-3","url":"http://node-3:8081","token":"peer-3-secret"}]}"#
+        r#"{"config_id":7,"members":[{"node_id":"node-1","url":"http://node-1:8081","log_url":"http://node-1:8080","token":"peer-1-secret"},{"node_id":"node-2","url":"http://node-2:8081","token":"peer-2-secret"},{"node_id":"node-3","url":"http://node-3:8081","token":"peer-3-secret"}]}"#
     }
 
     fn checkpoint_bundle_json() -> &'static str {
-        r#"{"version":1,"config_id":11,"members":[{"node_id":"n1","url":"http://n1","token":"t1"},{"node_id":"n2","url":"http://n2","token":"t2"},{"node_id":"n3","url":"http://n3","token":"t3"}]}"#
+        r#"{"config_id":11,"members":[{"node_id":"n1","url":"http://n1","token":"t1"},{"node_id":"n2","url":"http://n2","token":"t2"},{"node_id":"n3","url":"http://n3","token":"t3"}]}"#
     }
 
     fn parse_serve_env(values: &HashMap<&str, &str>) -> Result<ServeConfig, String> {
@@ -6756,7 +5768,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_admin_token_is_optional_nonempty_distinct_and_redacted() {
+    fn serve_admin_and_tail_tokens_are_optional_distinct_and_redacted() {
         let values = base_serve_env();
         assert!(parse_serve_env(&values).unwrap().admin_token.is_none());
 
@@ -6775,6 +5787,17 @@ mod tests {
         for invalid in [" admin ", "admin secret", "admin\tsecret", "café"] {
             values.insert("RHIZA_ADMIN_TOKEN", invalid);
             assert!(parse_serve_env(&values).is_err(), "accepted {invalid:?}");
+        }
+
+        let mut values = base_serve_env();
+        values.insert("RHIZA_ADMIN_TOKEN", "admin-secret");
+        values.insert("RHIZA_TAIL_TOKEN", "tail-secret");
+        let config = parse_serve_env(&values).unwrap();
+        assert_eq!(config.tail_token.as_deref(), Some("tail-secret"));
+        assert!(!format!("{config:?}").contains("tail-secret"));
+        for collision in ["client-secret", "admin-secret", "peer-2-secret"] {
+            values.insert("RHIZA_TAIL_TOKEN", collision);
+            assert!(parse_serve_env(&values).unwrap_err().contains("distinct"));
         }
     }
 
@@ -7184,7 +6207,7 @@ mod tests {
             ("RHIZA_EPOCH", "1"),
             (
                 "RHIZA_CONFIG_BUNDLE",
-                r#"{"version":1,"config_id":1,"members":[{"node_id":"n1","url":"http://n1","token":"t1"},{"node_id":"n2","url":"http://n2","token":"t2"},{"node_id":"n3","url":"http://n3","token":"t3"}]}"#,
+                r#"{"config_id":1,"members":[{"node_id":"n1","url":"http://n1","token":"t1"},{"node_id":"n2","url":"http://n2","token":"t2"},{"node_id":"n3","url":"http://n3","token":"t3"}]}"#,
             ),
             ("RHIZA_OBJECT_STORE", "gcs"),
             ("RHIZA_GCS_BUCKET", "checkpoints"),
@@ -7353,471 +6376,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "sql")]
-    fn runtime_for_final_flush(root: &Path) -> Arc<NodeRuntime> {
-        Arc::new(
-            NodeRuntime::open(
-                NodeConfig::new(
-                    "cluster-a",
-                    "node-1",
-                    root.join("node"),
-                    1,
-                    1,
-                    [
-                        PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
-                        PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
-                        PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
-                    ],
-                    "client-token",
-                )
-                .unwrap(),
-                Arc::new(
-                    ThreeNodeConsensus::from_recovered_tip(
-                        "rhiza:sql:cluster-a",
-                        "node-1",
-                        1,
-                        1,
-                        [
-                            root.join("recorders/node-1"),
-                            root.join("recorders/node-2"),
-                            root.join("recorders/node-3"),
-                        ],
-                        1,
-                        LogHash::ZERO,
-                    )
-                    .unwrap(),
-                ),
-                &[],
-            )
-            .unwrap(),
-        )
-    }
-
-    #[cfg(feature = "sql")]
-    fn runtime_with_blocked_minority(
-        root: &Path,
-    ) -> (Arc<NodeRuntime>, mpsc::Receiver<()>, BlockingRelease) {
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let release = BlockingRelease::default();
-        let recorders = membership
-            .members()
-            .iter()
-            .enumerate()
-            .map(|(index, id)| {
-                let recorder = RecorderFileStore::new_with_membership(
-                    root.join("recorders").join(id),
-                    id.clone(),
-                    "rhiza:sql:cluster-a",
-                    1,
-                    1,
-                    membership.clone(),
-                )
-                .unwrap();
-                let recorder: Box<dyn RecorderRpc> = if index == 2 {
-                    Box::new(BlockingRecorder {
-                        inner: recorder,
-                        started: started_tx.clone(),
-                        release: release.clone(),
-                    })
-                } else {
-                    Box::new(recorder)
-                };
-                (id.clone(), recorder)
-            })
-            .collect();
-        let consensus = Arc::new(
-            ThreeNodeConsensus::from_recorders_with_ids(
-                "rhiza:sql:cluster-a",
-                "node-1",
-                1,
-                1,
-                recorders,
-            )
-            .unwrap(),
-        );
-        let runtime = Arc::new(
-            NodeRuntime::open(
-                NodeConfig::new(
-                    "cluster-a",
-                    "node-1",
-                    root.join("node"),
-                    1,
-                    1,
-                    [
-                        PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
-                        PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
-                        PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
-                    ],
-                    "client-token",
-                )
-                .unwrap(),
-                consensus,
-                &[],
-            )
-            .unwrap(),
-        );
-        (runtime, started_rx, release)
-    }
-
-    #[cfg(feature = "sql")]
-    #[derive(Clone, Default)]
-    struct BlockingRelease(Arc<(Mutex<bool>, Condvar)>);
-
-    #[cfg(feature = "sql")]
-    impl BlockingRelease {
-        fn wait(&self) {
-            let (released, condition) = &*self.0;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = condition.wait(released).unwrap();
-            }
-        }
-
-        fn release(&self) {
-            let (released, condition) = &*self.0;
-            *released.lock().unwrap() = true;
-            condition.notify_all();
-        }
-    }
-
-    #[cfg(feature = "sql")]
-    struct BlockingRecorder {
-        inner: RecorderFileStore,
-        started: mpsc::Sender<()>,
-        release: BlockingRelease,
-    }
-
-    #[cfg(feature = "sql")]
-    impl RecorderRpc for BlockingRecorder {
-        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
-            self.inner.recorder_id()
-        }
-
-        fn store_command_for(
-            &self,
-            cluster_id: String,
-            epoch: u64,
-            config_id: u64,
-            config_digest: LogHash,
-            command_hash: LogHash,
-            command: StoredCommand,
-        ) -> rhiza_quepaxa::Result<()> {
-            self.inner.store_command_for(
-                cluster_id,
-                epoch,
-                config_id,
-                config_digest,
-                command_hash,
-                command,
-            )
-        }
-
-        fn fetch_command_for(
-            &self,
-            cluster_id: String,
-            epoch: u64,
-            config_id: u64,
-            config_digest: LogHash,
-            command_hash: LogHash,
-        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
-            self.inner
-                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
-        }
-
-        fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-            let _ = self.started.send(());
-            self.release.wait();
-            self.inner.record(request)
-        }
-
-        fn install_decision_proof(
-            &self,
-            proof: DecisionProof,
-            membership: &Membership,
-        ) -> rhiza_quepaxa::Result<()> {
-            self.inner.install_decision_proof(proof, membership)
-        }
-
-        fn inspect_decision_proof(
-            &self,
-            slot: u64,
-        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
-            self.inner.inspect_decision_proof(slot)
-        }
-
-        fn inspect_record_summary(
-            &self,
-            slot: u64,
-        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-            self.inner.inspect_record_summary(slot)
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn remote_shutdown_flushes_the_applied_tip_before_returning() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        let coordinator = Arc::new(
-            CheckpointCoordinator::open_with_holder(
-                archive.clone(),
-                DurabilityMode::Periodic {
-                    interval: Duration::from_secs(3600),
-                },
-                "node-1",
-            )
-            .await
-            .unwrap(),
-        );
-        let runtime = runtime_for_final_flush(root.path());
-        let committed = runtime.write("request-1", "alpha", "one").unwrap();
-
-        finish_remote_shutdown(
-            Ok(()),
-            Arc::clone(&runtime),
-            Arc::clone(&coordinator),
-            tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
-        assert_eq!(
-            archive
-                .load_checkpoint()
-                .await
-                .unwrap()
-                .unwrap()
-                .manifest()
-                .tip()
-                .index(),
-            committed.applied_index
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn remote_shutdown_preserves_the_primary_error_after_the_final_flush() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        let coordinator = Arc::new(
-            CheckpointCoordinator::open_with_holder(
-                archive,
-                DurabilityMode::Periodic {
-                    interval: Duration::from_secs(3600),
-                },
-                "node-1",
-            )
-            .await
-            .unwrap(),
-        );
-        let runtime = runtime_for_final_flush(root.path());
-        let committed = runtime.write("request-1", "alpha", "one").unwrap();
-
-        let error = finish_remote_shutdown(
-            Err("client server failed".into()),
-            Arc::clone(&runtime),
-            Arc::clone(&coordinator),
-            tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error, "client server failed");
-        assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[cfg(feature = "sql")]
-    async fn remote_shutdown_reports_primary_durability_and_consensus_errors_together() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        let coordinator = Arc::new(
-            CheckpointCoordinator::open_with_holder(
-                archive,
-                DurabilityMode::Periodic {
-                    interval: Duration::from_secs(3600),
-                },
-                "node-1",
-            )
-            .await
-            .unwrap(),
-        );
-        let (runtime, started, release) = runtime_with_blocked_minority(root.path());
-        runtime.write("request-1", "alpha", "one").unwrap();
-        tokio::task::spawn_blocking(move || started.recv().unwrap())
-            .await
-            .unwrap();
-
-        let error = finish_remote_shutdown(
-            Err("client server failed".into()),
-            Arc::clone(&runtime),
-            coordinator,
-            tokio::time::Instant::now(),
-        )
-        .await
-        .unwrap_err();
-        release.release();
-        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).unwrap();
-
-        assert_eq!(
-            error,
-            format!(
-                "client server failed; {}; consensus RPCs did not finish before the shutdown deadline",
-                shutdown_deadline_error(SERVE_SHUTDOWN_TIMEOUT)
-            )
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "sql")]
-    fn unfinished_consensus_rpcs_fail_an_otherwise_successful_shutdown() {
-        assert!(pending_consensus_rpc_result(true).is_ok());
-        assert!(pending_consensus_rpc_result(false)
-            .unwrap_err()
-            .contains("consensus RPCs did not finish"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[cfg(feature = "sql")]
-    async fn consensus_drain_uses_only_the_remaining_shutdown_budget() {
-        let root = tempfile::tempdir().unwrap();
-        let (runtime, started, release) = runtime_with_blocked_minority(root.path());
-        runtime.write("request-1", "alpha", "one").unwrap();
-        tokio::task::spawn_blocking(move || started.recv().unwrap())
-            .await
-            .unwrap();
-        let exhausted_deadline = tokio::time::Instant::now();
-        let prior_drain = before_shutdown_deadline(
-            exhausted_deadline,
-            Duration::ZERO,
-            std::future::pending::<()>(),
-        )
-        .await;
-        assert!(prior_drain.is_err());
-
-        let error =
-            finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(exhausted_deadline))
-                .unwrap_err();
-
-        assert!(error.contains("consensus RPCs did not finish"));
-        release.release();
-        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).unwrap();
-    }
-
-    #[test]
-    #[cfg(feature = "sql")]
-    fn consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
-        const HANG_GUARD: Duration = Duration::from_secs(10);
-
-        let root = tempfile::tempdir().unwrap();
-        let root_path = root.path().to_path_buf();
-        let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
-        let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
-        let (drain_finished_tx, drain_finished_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let executor = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .max_blocking_threads(1)
-                .enable_all()
-                .build()
-                .unwrap();
-            executor.block_on(async move {
-                let runtime = runtime_for_final_flush(&root_path);
-                finish_pending_consensus_rpcs(&runtime, HANG_GUARD).expect(
-                    "startup consensus RPCs must drain before saturating the blocking pool",
-                );
-                let blocker = tokio::task::spawn_blocking(move || {
-                    blocker_started_tx.send(()).unwrap();
-                    release_blocker_rx.recv().unwrap();
-                });
-                let result = finish_pending_consensus_rpcs(&runtime, Duration::ZERO);
-                drain_finished_tx.send(result).unwrap();
-                blocker.await.unwrap();
-            });
-        });
-        blocker_started_rx
-            .recv_timeout(HANG_GUARD)
-            .expect("blocking-pool saturation must be established");
-
-        let result = drain_finished_rx.recv_timeout(HANG_GUARD);
-        release_blocker_tx.send(()).unwrap();
-        worker.join().unwrap();
-
-        result
-            .expect("consensus drain must start immediately despite blocking-pool saturation")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn shutdown_deadline_bounds_a_stalled_drain_or_final_flush() {
-        let result = before_shutdown_deadline(
-            tokio::time::Instant::now() + Duration::from_millis(10),
-            Duration::from_millis(10),
-            std::future::pending::<Result<(), String>>(),
-        )
-        .await;
-
-        assert!(result
-            .unwrap_err()
-            .contains("final checkpoint durability is unconfirmed"));
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn shutdown_deadline_rejects_ready_work_when_budget_is_already_exhausted() {
-        let timeout = Duration::from_millis(10);
-        let result = before_shutdown_deadline(
-            tokio::time::Instant::now() - Duration::from_millis(1),
-            timeout,
-            std::future::ready(()),
-        )
-        .await;
-
-        assert_eq!(result.unwrap_err(), shutdown_deadline_error(timeout));
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn checkpoint_worker_stops_before_the_final_flush_phase() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        let coordinator = Arc::new(
-            CheckpointCoordinator::open_with_holder(
-                archive,
-                DurabilityMode::Periodic {
-                    interval: Duration::from_secs(3600),
-                },
-                "node-1",
-            )
-            .await
-            .unwrap(),
-        );
-        let runtime = runtime_for_final_flush(root.path());
-        let (shutdown, wait) = tokio::sync::watch::channel(false);
-        let mut worker = checkpoint_worker(
-            DurabilityMode::Periodic {
-                interval: Duration::from_secs(3600),
-            },
-            runtime,
-            coordinator,
-            wait,
-        )
-        .unwrap();
-
-        shutdown.send_replace(true);
-        tokio::time::timeout(Duration::from_secs(1), &mut worker.0)
-            .await
-            .expect("checkpoint worker must stop before final flush")
-            .unwrap();
-    }
-
     #[test]
     fn usage_describes_live_admin_as_the_default_and_offline_as_explicit() {
         assert!(USAGE.contains("live admin API by default"));
@@ -7925,7 +6483,7 @@ mod tests {
         let (source_tip, target_tip) = roll_checkpoint(&source, &target).await.unwrap();
 
         assert_eq!(source_tip, target_tip);
-        let restored = target.restore_checkpoint_v2().await.unwrap();
+        let restored = target.restore_checkpoint_state().await.unwrap();
         assert_eq!(restored.snapshot().unwrap().bytes(), bytes);
         assert_eq!(
             restored.snapshot().unwrap().anchor().recovery_generation(),
@@ -7934,1310 +6492,10 @@ mod tests {
         assert_eq!(restored.suffix(), &committed[2..]);
     }
 
-    #[cfg(feature = "sql")]
-    #[tokio::test]
-    async fn startup_preparation_enforces_bootstrap_rejoin_and_disaster_guards() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        let data_dir = root.path().join("node");
-
-        assert!(prepare_remote_startup(
-            StartupMode::Bootstrap,
-            &archive,
-            &data_dir,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("initialized empty checkpoint"));
-        archive.initialize_checkpoint().await.unwrap();
-
-        assert_eq!(
-            prepare_remote_startup(
-                StartupMode::Bootstrap,
-                &archive,
-                &data_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RecorderFirst {
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            }
-        );
-        let empty_rejoin_dir = root.path().join("empty-rejoin");
-        assert_eq!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &empty_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(0, LogHash::ZERO),
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            }
-        );
-        let genesis_without_qlog_dir = root.path().join("genesis-without-qlog");
-        write_local_checkpoint_identity_marker(
-            &genesis_without_qlog_dir,
-            ExecutionProfile::Sqlite,
-            archive.checkpoint_identity().unwrap(),
-            "node-1",
-        )
-        .unwrap();
-        drop(
-            SqliteStateMachine::open(
-                genesis_without_qlog_dir.join("sqlite/db.sqlite"),
-                "rhiza:sql:cluster-a",
-                "node-1",
-                1,
-                1,
-            )
-            .unwrap(),
-        );
-        let genesis_without_qlog_before = directory_file_bytes(&genesis_without_qlog_dir);
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &genesis_without_qlog_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
-                if checkpoint_root == LogAnchor::new(0, LogHash::ZERO)
-        ));
-        assert_eq!(
-            directory_file_bytes(&genesis_without_qlog_dir),
-            genesis_without_qlog_before
-        );
-        let committed = entries(5);
-        archive.publish_committed(&committed[..2]).await.unwrap();
-        let snapshot_dir = root.path().join("snapshot-source");
-        let snapshot_state = SqliteStateMachine::open(
-            snapshot_dir.join("db.sqlite"),
-            "rhiza:sql:cluster-a",
-            "node-1",
-            1,
-            1,
-        )
-        .unwrap();
-        for entry in &committed[..2] {
-            snapshot_state.apply_entry(entry).unwrap();
-        }
-        let recovery = snapshot_state.create_recovery_snapshot(1).unwrap();
-        archive
-            .publish_checkpoint_snapshot(recovery.anchor().clone(), recovery.db_bytes())
-            .await
-            .unwrap();
-        let unsupported_restore_intent_dir = root.path().join("unsupported-restore-intent");
-        std::fs::create_dir_all(unsupported_restore_intent_dir.join("sqlite")).unwrap();
-        write_local_checkpoint_identity_marker(
-            &unsupported_restore_intent_dir,
-            ExecutionProfile::Sqlite,
-            archive.checkpoint_identity().unwrap(),
-            "node-1",
-        )
-        .unwrap();
-        std::fs::write(
-            unsupported_restore_intent_dir.join(".rhiza-restore-v1"),
-            b"rhiza restore in progress\n",
-        )
-        .unwrap();
-        let unsupported_restore_intent_before =
-            directory_file_bytes(&unsupported_restore_intent_dir);
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &unsupported_restore_intent_dir,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("unsupported"));
-        assert_eq!(
-            directory_file_bytes(&unsupported_restore_intent_dir),
-            unsupported_restore_intent_before
-        );
-        let fresh_bootstrap_dir = root.path().join("fresh-bootstrap-nonempty");
-        assert!(prepare_remote_startup(
-            StartupMode::Bootstrap,
-            &archive,
-            &fresh_bootstrap_dir,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("empty checkpoint"));
-
-        let fresh_rejoin_dir = root.path().join("fresh-rejoin");
-        assert_eq!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(2, committed[1].hash),
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            }
-        );
-        assert!(fresh_rejoin_dir.join("consensus/log").exists());
-        assert!(fresh_rejoin_dir
-            .join(LOCAL_CHECKPOINT_IDENTITY_FILE)
-            .is_file());
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
-                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
-        ));
-
-        std::fs::remove_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
-                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert!(fresh_rejoin_dir.join("sqlite/db.sqlite").is_file());
-
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let recorder = RecorderFileStore::new_with_membership(
-            fresh_rejoin_dir.join("recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            membership.clone(),
-        )
-        .unwrap();
-        let recorder_command = StoredCommand::new(EntryType::Command, b"preserved-qcmd".to_vec());
-        recorder
-            .store_command_for(
-                "rhiza:sql:cluster-a".into(),
-                1,
-                1,
-                membership.digest(),
-                recorder_command.hash(),
-                recorder_command.clone(),
-            )
-            .unwrap();
-        recorder
-            .record(RecordRequest {
-                cluster_id: "rhiza:sql:cluster-a".into(),
-                epoch: 1,
-                config_id: 1,
-                config_digest: membership.digest(),
-                slot: 3,
-                step: 4,
-                proposal: Proposal::new(
-                    ProposalPriority::MAX,
-                    "node-1",
-                    1,
-                    AcceptedValue::from_command(
-                        "rhiza:sql:cluster-a",
-                        3,
-                        1,
-                        1,
-                        committed[1].hash,
-                        &recorder_command,
-                    ),
-                ),
-                command: None,
-            })
-            .unwrap();
-        drop(recorder);
-        let recorder_before = directory_file_bytes(&fresh_rejoin_dir.join("recorder"));
-        assert!(recorder_before
-            .values()
-            .any(|bytes| bytes.starts_with(b"QCMD")));
-        assert!(recorder_before
-            .get(Path::new("recorder.wal"))
-            .is_some_and(|bytes| bytes.starts_with(b"QWAL")));
-        let quarantine_count = || {
-            std::fs::read_dir(&fresh_rejoin_dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".rebuildable-quarantine-")
-                })
-                .count()
-        };
-        let quarantine_count_before = quarantine_count();
-        std::fs::remove_dir_all(fresh_rejoin_dir.join("consensus")).unwrap();
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
-                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert_eq!(
-            directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
-            recorder_before
-        );
-        // A valid local-view validation cleans up an exact-identity, owned quarantine from an
-        // earlier completed repair. The next repair replaces that one owned artifact rather than
-        // retaining an unbounded history of rebuildable views.
-        assert_eq!(quarantine_count(), quarantine_count_before);
-
-        let materializer =
-            SqliteStateMachine::open_existing(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap();
-        materializer.apply_entry(&committed[2]).unwrap();
-        let qlog = FileLogStore::open(
-            fresh_rejoin_dir.join("consensus/log"),
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-        )
-        .unwrap();
-        qlog.append(&committed[2]).unwrap();
-        drop(materializer);
-        drop(qlog);
-        let sqlite_before = directory_file_bytes(&fresh_rejoin_dir.join("sqlite"));
-        let consensus_before = directory_file_bytes(&fresh_rejoin_dir.join("consensus"));
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::VerifyLocalCheckpoint { root, .. }
-                if root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert_eq!(
-            directory_file_bytes(&fresh_rejoin_dir.join("sqlite")),
-            sqlite_before
-        );
-        assert_eq!(
-            directory_file_bytes(&fresh_rejoin_dir.join("consensus")),
-            consensus_before
-        );
-        // Verification may remove only the exact-identity, owned recovery quarantine left by
-        // the preceding completed repair. It must leave the active view intact.
-        assert_eq!(quarantine_count(), 0);
-        assert_eq!(
-            directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
-            recorder_before
-        );
-
-        let materializer =
-            SqliteStateMachine::open_existing(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap();
-        materializer.apply_entry(&committed[3]).unwrap();
-        drop(materializer);
-        let local_view_before = directory_file_bytes(&fresh_rejoin_dir);
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::VerifyLocalCheckpoint { root, .. }
-                if root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert_eq!(directory_file_bytes(&fresh_rejoin_dir), local_view_before);
-
-        let qlog = FileLogStore::open(
-            fresh_rejoin_dir.join("consensus/log"),
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-        )
-        .unwrap();
-        qlog.append_batch(&committed[3..]).unwrap();
-        drop(qlog);
-        let local_view_before = directory_file_bytes(&fresh_rejoin_dir);
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::VerifyLocalCheckpoint { root, .. }
-                if root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert_eq!(directory_file_bytes(&fresh_rejoin_dir), local_view_before);
-
-        std::fs::create_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
-        std::fs::write(fresh_rejoin_dir.join("sqlite/db.sqlite"), b"corrupt").unwrap();
-        let quarantine_count_before = quarantine_count();
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &fresh_rejoin_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
-                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
-        ));
-        assert_ne!(
-            std::fs::read(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap(),
-            b"corrupt"
-        );
-        assert!(fresh_rejoin_dir.join("consensus/log").exists());
-        assert_eq!(
-            directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
-            recorder_before
-        );
-        let recorder = RecorderFileStore::new_with_membership(
-            fresh_rejoin_dir.join("recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            membership,
-        )
-        .unwrap();
-        assert_eq!(
-            recorder.fetch_command(recorder_command.hash()).unwrap(),
-            Some(recorder_command)
-        );
-        assert_eq!(quarantine_count(), quarantine_count_before + 1);
-
-        let disaster_dir = root.path().join("disaster");
-        std::fs::create_dir_all(disaster_dir.join("sqlite")).unwrap();
-        std::fs::write(disaster_dir.join("sqlite/existing"), b"state").unwrap();
-        assert!(prepare_remote_startup(
-            StartupMode::Disaster,
-            &archive,
-            &disaster_dir,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("fresh"));
-
-        let fresh_disaster_dir = root.path().join("fresh-disaster");
-        assert_eq!(
-            prepare_remote_startup(
-                StartupMode::Disaster,
-                &archive,
-                &fresh_disaster_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RecorderFirst {
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            }
-        );
-        assert!(fresh_disaster_dir.join("consensus/log").exists());
-    }
-
-    #[tokio::test]
-    async fn nonfresh_rejoin_rejects_missing_mismatched_and_torn_identity_markers() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        archive.publish_committed(&entries(1)).await.unwrap();
-
-        let missing = root.path().join("missing");
-        std::fs::create_dir_all(missing.join("sqlite")).unwrap();
-        std::fs::write(missing.join("sqlite/existing"), b"state").unwrap();
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &missing,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("requires a local checkpoint identity marker"));
-
-        let wrong_intent = root.path().join("wrong-intent");
-        write_local_checkpoint_identity_marker(
-            &wrong_intent,
-            ExecutionProfile::Sqlite,
-            archive.checkpoint_identity().unwrap(),
-            "node-1",
-        )
-        .unwrap();
-        std::fs::write(wrong_intent.join("sentinel"), b"preserve").unwrap();
-        let committed = entries(1);
-        std::fs::write(
-            wrong_intent.join(".rhiza-restore-v2.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 2,
-                "cluster_id": "rhiza:sql:cluster-a",
-                "node_id": "node-2",
-                "execution_profile": "sql",
-                "epoch": 1,
-                "config_id": 1,
-                "recovery_generation": 1,
-                "checkpoint_index": 1,
-                "checkpoint_hash": committed[0].hash.to_hex(),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let wrong_intent_before = directory_file_bytes(&wrong_intent);
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &wrong_intent,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("does not exactly match this node and checkpoint"));
-        assert_eq!(directory_file_bytes(&wrong_intent), wrong_intent_before);
-
-        let ambiguous_intent = root.path().join("ambiguous-intent");
-        std::fs::create_dir_all(&ambiguous_intent).unwrap();
-        write_local_checkpoint_identity_marker(
-            &ambiguous_intent,
-            ExecutionProfile::Sqlite,
-            archive.checkpoint_identity().unwrap(),
-            "node-1",
-        )
-        .unwrap();
-        std::fs::write(
-            ambiguous_intent.join(".rhiza-restore-v2.json"),
-            std::fs::read(wrong_intent.join(".rhiza-restore-v2.json")).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            ambiguous_intent.join(".rhiza-restore-unknown"),
-            b"unsupported restore intent",
-        )
-        .unwrap();
-        let ambiguous_before = directory_file_bytes(&ambiguous_intent);
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &ambiguous_intent,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("unsupported"));
-        assert_eq!(directory_file_bytes(&ambiguous_intent), ambiguous_before);
-
-        let mismatch = root.path().join("mismatch");
-        write_local_checkpoint_identity_marker(
-            &mismatch,
-            ExecutionProfile::Sqlite,
-            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 2),
-            "node-1",
-        )
-        .unwrap();
-        let mismatch_before = directory_file_bytes(&mismatch);
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &mismatch,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("does not exactly match"));
-        assert_eq!(directory_file_bytes(&mismatch), mismatch_before);
-
-        let wrong_node = root.path().join("wrong-node");
-        write_local_checkpoint_identity_marker(
-            &wrong_node,
-            ExecutionProfile::Sqlite,
-            archive.checkpoint_identity().unwrap(),
-            "node-2",
-        )
-        .unwrap();
-        let wrong_node_before = directory_file_bytes(&wrong_node);
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &wrong_node,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("does not exactly match"));
-        assert_eq!(directory_file_bytes(&wrong_node), wrong_node_before);
-
-        let corrupt_recorder = root.path().join("corrupt-recorder");
-        write_local_checkpoint_identity_marker(
-            &corrupt_recorder,
-            ExecutionProfile::Sqlite,
-            archive.checkpoint_identity().unwrap(),
-            "node-1",
-        )
-        .unwrap();
-        std::fs::create_dir_all(corrupt_recorder.join("recorder")).unwrap();
-        std::fs::write(
-            corrupt_recorder.join("recorder/recorded-head.rec"),
-            b"corrupt",
-        )
-        .unwrap();
-        let corrupt_recorder_before = directory_file_bytes(&corrupt_recorder);
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &corrupt_recorder,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("local recorder is not trustworthy"));
-        assert_eq!(
-            directory_file_bytes(&corrupt_recorder),
-            corrupt_recorder_before
-        );
-        assert!(!std::fs::read_dir(&corrupt_recorder)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".rebuildable-quarantine-")));
-
-        let torn = root.path().join("torn");
-        std::fs::create_dir_all(&torn).unwrap();
-        std::fs::write(
-            torn.join(LOCAL_CHECKPOINT_IDENTITY_FILE),
-            b"{\"format_version\":",
-        )
-        .unwrap();
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &torn,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("marker is invalid"));
-    }
-
-    #[cfg(feature = "sql")]
-    #[tokio::test]
-    async fn nonfresh_rejoin_keeps_recoverable_recorder_unchanged_when_identity_marker_is_missing()
-    {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        archive.publish_committed(&entries(1)).await.unwrap();
-        let data_dir = root.path().join("node");
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let recorder = RecorderFileStore::new_with_membership(
-            data_dir.join("recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            membership.clone(),
-        )
-        .unwrap();
-        let command = StoredCommand::new(EntryType::Command, b"missing-marker".to_vec());
-        recorder
-            .record(RecordRequest {
-                cluster_id: "rhiza:sql:cluster-a".into(),
-                epoch: 1,
-                config_id: 1,
-                config_digest: membership.digest(),
-                slot: 2,
-                step: 4,
-                proposal: Proposal::new(
-                    ProposalPriority::MAX,
-                    "node-1",
-                    1,
-                    AcceptedValue::from_command(
-                        "rhiza:sql:cluster-a",
-                        2,
-                        1,
-                        1,
-                        LogHash::ZERO,
-                        &command,
-                    ),
-                ),
-                command: Some(command),
-            })
-            .unwrap();
-        drop(recorder);
-        let wal = data_dir.join("recorder/recorder.wal");
-        let wal_len = std::fs::metadata(&wal).unwrap().len();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&wal)
-            .unwrap()
-            .set_len(wal_len - 7)
-            .unwrap();
-        assert_eq!(
-            RecorderFileStore::preflight_existing_with_membership_outcome(
-                data_dir.join("recorder"),
-                "rhiza:sql:cluster-a",
-                1,
-                1,
-                &membership,
-            )
-            .unwrap(),
-            RecorderPreflight::Recoverable,
-        );
-        let before = directory_file_bytes(&data_dir);
-
-        assert!(prepare_remote_startup(
-            StartupMode::Rejoin,
-            &archive,
-            &data_dir,
-            "node-1",
-            ExecutionProfile::Sqlite,
-        )
-        .await
-        .unwrap_err()
-        .contains("requires a local checkpoint identity marker"));
-
-        assert_eq!(directory_file_bytes(&data_dir), before);
-        assert!(!std::fs::read_dir(&data_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".rebuildable-quarantine-")));
-    }
-
-    #[cfg(feature = "sql")]
-    #[test]
-    fn successor_control_rejects_corrupt_complete_before_recoverable_recorder_is_opened() {
-        let root = tempfile::tempdir().unwrap();
-        let data_dir = root.path().join("node");
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let recorder = RecorderFileStore::new_with_membership(
-            data_dir.join("recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            2,
-            membership.clone(),
-        )
-        .unwrap();
-        let command = StoredCommand::new(EntryType::Command, b"forged-complete".to_vec());
-        recorder
-            .record(RecordRequest {
-                cluster_id: "rhiza:sql:cluster-a".into(),
-                epoch: 1,
-                config_id: 2,
-                config_digest: membership.digest(),
-                slot: 1,
-                step: 4,
-                proposal: Proposal::new(
-                    ProposalPriority::MAX,
-                    "node-1",
-                    1,
-                    AcceptedValue::from_command(
-                        "rhiza:sql:cluster-a",
-                        1,
-                        1,
-                        2,
-                        LogHash::ZERO,
-                        &command,
-                    ),
-                ),
-                command: Some(command),
-            })
-            .unwrap();
-        drop(recorder);
-        let wal = data_dir.join("recorder/recorder.wal");
-        let wal_len = std::fs::metadata(&wal).unwrap().len();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&wal)
-            .unwrap()
-            .set_len(wal_len - 7)
-            .unwrap();
-        assert_eq!(
-            RecorderFileStore::preflight_existing_with_membership_outcome(
-                data_dir.join("recorder"),
-                "rhiza:sql:cluster-a",
-                1,
-                2,
-                &membership,
-            )
-            .unwrap(),
-            RecorderPreflight::Recoverable,
-        );
-        assert!(!data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE).exists());
-        std::fs::write(
-            data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE),
-            br#"{"forged":true}"#,
-        )
-        .unwrap();
-        let before = directory_file_bytes(&data_dir);
-        let expected = serde_json::to_vec(&SuccessorRestoreReceipt {
-            version: 1,
-            cluster_id: "rhiza:sql:cluster-a".into(),
-            epoch: 1,
-            target_config_id: 2,
-            recovery_generation: 1,
-            node_id: "node-1".into(),
-            membership_digest: membership.digest().to_hex(),
-            predecessor_config_id: 1,
-            stop_index: 9,
-            stop_hash: LogHash::ZERO.to_hex(),
-            checkpoint_index: 9,
-            checkpoint_hash: LogHash::ZERO.to_hex(),
-        })
-        .unwrap();
-
-        assert!(validate_successor_restore_controls(&data_dir, &expected)
-            .unwrap_err()
-            .contains("does not exactly match"));
-        assert_eq!(directory_file_bytes(&data_dir), before);
-    }
-
-    #[cfg(feature = "sql")]
-    #[tokio::test]
-    async fn rejoin_repairs_recoverable_recorder_before_rebuilding_a_corrupt_local_view() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = local_checkpoint(&root.path().join("archive"), 1);
-        archive.initialize_checkpoint().await.unwrap();
-        let committed = entries(2);
-        archive.publish_committed(&committed).await.unwrap();
-        let snapshot_state = SqliteStateMachine::open(
-            root.path().join("snapshot/db.sqlite"),
-            "rhiza:sql:cluster-a",
-            "node-1",
-            1,
-            1,
-        )
-        .unwrap();
-        for entry in &committed {
-            snapshot_state.apply_entry(entry).unwrap();
-        }
-        let snapshot = snapshot_state.create_recovery_snapshot(1).unwrap();
-        archive
-            .publish_checkpoint_snapshot(snapshot.anchor().clone(), snapshot.db_bytes())
-            .await
-            .unwrap();
-        let data_dir = root.path().join("node");
-
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &data_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { .. }
-        ));
-
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let recorder = RecorderFileStore::new_with_membership(
-            data_dir.join("recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            membership.clone(),
-        )
-        .unwrap();
-        let command = StoredCommand::new(EntryType::Command, b"recover-before-view".to_vec());
-        recorder
-            .record(RecordRequest {
-                cluster_id: "rhiza:sql:cluster-a".into(),
-                epoch: 1,
-                config_id: 1,
-                config_digest: membership.digest(),
-                slot: 3,
-                step: 4,
-                proposal: Proposal::new(
-                    ProposalPriority::MAX,
-                    "node-1",
-                    1,
-                    AcceptedValue::from_command(
-                        "rhiza:sql:cluster-a",
-                        3,
-                        1,
-                        1,
-                        LogHash::from_bytes([2; 32]),
-                        &command,
-                    ),
-                ),
-                command: Some(command),
-            })
-            .unwrap();
-        drop(recorder);
-        let wal = data_dir.join("recorder/recorder.wal");
-        let wal_len = std::fs::metadata(&wal).unwrap().len();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&wal)
-            .unwrap()
-            .set_len(wal_len - 7)
-            .unwrap();
-        assert_eq!(
-            RecorderFileStore::preflight_existing_with_membership_outcome(
-                data_dir.join("recorder"),
-                "rhiza:sql:cluster-a",
-                1,
-                1,
-                &membership,
-            )
-            .unwrap(),
-            RecorderPreflight::Recoverable,
-        );
-
-        std::fs::write(data_dir.join("sqlite/db.sqlite"), b"corrupt").unwrap();
-        assert!(matches!(
-            prepare_remote_startup(
-                StartupMode::Rejoin,
-                &archive,
-                &data_dir,
-                "node-1",
-                ExecutionProfile::Sqlite,
-            )
-            .await
-            .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { .. }
-        ));
-
-        assert_eq!(
-            RecorderFileStore::preflight_existing_with_membership_outcome(
-                data_dir.join("recorder"),
-                "rhiza:sql:cluster-a",
-                1,
-                1,
-                &membership,
-            )
-            .unwrap(),
-            RecorderPreflight::Valid,
-        );
-        assert_ne!(
-            std::fs::read(data_dir.join("sqlite/db.sqlite")).unwrap(),
-            b"corrupt"
-        );
-        assert!(std::fs::read_dir(&data_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".rebuildable-quarantine-")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn checkpoint_identity_marker_rejects_symlink_files_and_data_directories() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
-        let data_dir = root.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let target = root.path().join("target.json");
-        std::fs::write(&target, b"{}").unwrap();
-        symlink(&target, data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)).unwrap();
-        let target_before = std::fs::read(&target).unwrap();
-        assert!(read_and_validate_local_checkpoint_identity_marker(
-            &data_dir,
-            ExecutionProfile::Sqlite,
-            &identity,
-            "node-1",
-        )
-        .unwrap_err()
-        .contains("regular file"));
-        assert_eq!(std::fs::read(&target).unwrap(), target_before);
-
-        std::fs::remove_file(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)).unwrap();
-        let oversized = vec![b'x'; (MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES + 1) as usize];
-        std::fs::write(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE), &oversized).unwrap();
-        let before = directory_file_bytes(&data_dir);
-        assert!(read_and_validate_local_checkpoint_identity_marker(
-            &data_dir,
-            ExecutionProfile::Sqlite,
-            &identity,
-            "node-1",
-        )
-        .unwrap_err()
-        .contains("invalid size"));
-        assert_eq!(directory_file_bytes(&data_dir), before);
-
-        let real_dir = root.path().join("real");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        let linked_dir = root.path().join("linked");
-        symlink(&real_dir, &linked_dir).unwrap();
-        assert!(write_local_checkpoint_identity_marker(
-            &linked_dir,
-            ExecutionProfile::Sqlite,
-            &identity,
-            "node-1",
-        )
-        .unwrap_err()
-        .contains("real directory"));
-    }
-
-    #[test]
-    fn successor_startup_uses_rejoin_as_its_steady_mode() {
-        assert!(require_successor_startup_mode(StartupMode::Rejoin).is_ok());
-        assert!(require_successor_startup_mode(StartupMode::Bootstrap).is_err());
-        assert!(require_successor_startup_mode(StartupMode::Disaster).is_err());
-    }
-
-    #[test]
-    #[cfg(feature = "sql")]
-    fn nonfresh_rejoin_accepts_a_local_suffix_only_after_exact_checkpoint_inclusion() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_final_flush(root.path());
-        runtime.write("request-1", "key", "one").unwrap();
-        let authoritative_root = runtime.log_root().unwrap();
-        runtime.write("request-2", "key", "two").unwrap();
-        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
-
-        write_local_checkpoint_identity_marker(
-            &root.path().join("node"),
-            ExecutionProfile::Sqlite,
-            &identity,
-            "node-1",
-        )
-        .unwrap();
-        read_and_validate_local_checkpoint_identity_marker(
-            &root.path().join("node"),
-            ExecutionProfile::Sqlite,
-            &identity,
-            "node-1",
-        )
-        .unwrap();
-
-        verify_local_rejoin_checkpoint(&runtime, &identity, authoritative_root).unwrap();
-
-        let wrong_root = LogAnchor::new(authoritative_root.index(), LogHash::from_bytes([9; 32]));
-        assert!(
-            verify_local_rejoin_checkpoint(&runtime, &identity, wrong_root)
-                .unwrap_err()
-                .contains("hash at index")
-        );
-        let wrong_generation = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 2);
-        assert!(
-            verify_local_rejoin_checkpoint(&runtime, &wrong_generation, authoritative_root,)
-                .unwrap_err()
-                .contains("identity")
-        );
-    }
-
     fn unused_local_address() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().to_string()
     }
-
-    #[test]
-    fn remote_startup_direct_recorder_selection_preserves_peer_catchup_quarantine() {
-        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
-        let root = LogAnchor::new(1, LogHash::from_bytes([1; 32]));
-
-        assert!(remote_startup_uses_direct_recorder(
-            &StartupPreparation::RecorderFirst {
-                recorder_open: RecorderOpenPolicy::MustExist,
-            }
-        ));
-        assert!(remote_startup_uses_direct_recorder(
-            &StartupPreparation::VerifyLocalCheckpoint { identity, root }
-        ));
-        assert!(!remote_startup_uses_direct_recorder(
-            &StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: root,
-                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
-            }
-        ));
-    }
-
-    #[test]
-    fn must_exist_recorder_policy_does_not_recreate_a_recorder_deleted_after_preparation() {
-        let root = tempfile::tempdir().unwrap();
-        let recorder_root = root.path().join("recorder");
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        drop(
-            RecorderFileStore::new_with_membership(
-                &recorder_root,
-                "node-1",
-                "rhiza:sql:cluster-a",
-                1,
-                1,
-                membership.clone(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            RecorderFileStore::preflight_existing_with_membership_outcome(
-                &recorder_root,
-                "rhiza:sql:cluster-a",
-                1,
-                1,
-                &membership,
-            )
-            .unwrap(),
-            RecorderPreflight::Valid,
-        );
-        std::fs::remove_dir_all(&recorder_root).unwrap();
-
-        assert!(open_recorder_at_policy(
-            recorder_root.clone(),
-            "node-1".into(),
-            "rhiza:sql:cluster-a".into(),
-            1,
-            1,
-            membership,
-            RecorderOpenPolicy::MustExist,
-        )
-        .unwrap_err()
-        .contains("disappeared after startup preparation"));
-        assert!(!recorder_root.exists());
-        assert!(!root.path().join("sqlite").exists());
-        assert!(!root.path().join("consensus").exists());
-    }
-
-    #[test]
-    fn startup_recorder_gate_allows_inspection_but_rejects_mutation_until_activation() {
-        let root = tempfile::tempdir().unwrap();
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let recorder = RecorderFileStore::new_with_membership(
-            root.path().join("recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            membership.clone(),
-        )
-        .unwrap();
-        let gate = StartupRecorderGate::new(
-            recorder.clone(),
-            LogAnchor::new(2, LogHash::from_bytes([2; 32])),
-        );
-        let command = StoredCommand::new(EntryType::Noop, Vec::new());
-
-        assert!(gate.inspect_record_summary(1).is_err());
-        assert!(gate.inspect_decision_proof(2).is_err());
-        assert!(gate
-            .observe_read_fence(ReadFenceRequest {
-                cluster_id: "rhiza:sql:cluster-a".into(),
-                epoch: 1,
-                config_id: 1,
-                config_digest: membership.digest(),
-                slot: 2,
-            })
-            .is_err());
-        assert_eq!(gate.inspect_record_summary(3).unwrap(), None);
-        assert!(gate
-            .store_command_for(
-                "rhiza:sql:cluster-a".into(),
-                1,
-                1,
-                membership.digest(),
-                command.hash(),
-                command.clone(),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("quarantined"));
-        assert_eq!(
-            recorder
-                .fetch_command_for(
-                    "rhiza:sql:cluster-a".into(),
-                    1,
-                    1,
-                    membership.digest(),
-                    command.hash(),
-                )
-                .unwrap(),
-            None
-        );
-
-        gate.activate();
-        assert!(gate.inspect_record_summary(1).is_err());
-        gate.store_command_for(
-            "rhiza:sql:cluster-a".into(),
-            1,
-            1,
-            membership.digest(),
-            command.hash(),
-            command.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            recorder
-                .fetch_command_for(
-                    "rhiza:sql:cluster-a".into(),
-                    1,
-                    1,
-                    membership.digest(),
-                    command.hash(),
-                )
-                .unwrap(),
-            Some(command)
-        );
-    }
-
-    #[test]
-    fn divergent_fresh_checkpoint_roots_cannot_reclassify_an_existing_slot_as_empty() {
-        let root = tempfile::tempdir().unwrap();
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let committed = entries(3);
-        let checkpoint_roots = [
-            LogAnchor::new(2, committed[1].hash),
-            LogAnchor::new(3, committed[2].hash),
-            LogAnchor::new(3, committed[2].hash),
-        ];
-        let recorders = membership
-            .members()
-            .iter()
-            .zip(checkpoint_roots)
-            .map(|(node_id, checkpoint_root)| {
-                let recorder = RecorderFileStore::new_with_membership(
-                    root.path().join(node_id),
-                    node_id.clone(),
-                    "rhiza:sql:cluster-a",
-                    1,
-                    1,
-                    membership.clone(),
-                )
-                .unwrap();
-                (
-                    node_id.clone(),
-                    Box::new(StartupRecorderGate::new(recorder, checkpoint_root))
-                        as Box<dyn RecorderRpc>,
-                )
-            })
-            .collect();
-        let consensus = ThreeNodeConsensus::from_recorders_with_ids_and_recovered_tip(
-            "rhiza:sql:cluster-a",
-            "node-1",
-            1,
-            1,
-            recorders,
-            3,
-            committed[1].hash,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            consensus.inspect_decision_at(3, committed[1].hash).unwrap(),
-            rhiza_quepaxa::DecisionInspection::Unavailable
-        ));
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn recorder_rehydration_installs_a_real_suffix_before_gate_activation() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_final_flush(root.path());
-        runtime.write("request-1", "key", "one").unwrap();
-        runtime.write("request-2", "key", "two").unwrap();
-        let suffix = runtime.log_store().read(2).unwrap().unwrap();
-        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-        let recorder = RecorderFileStore::new_with_membership(
-            root.path().join("rehydrated-recorder"),
-            "node-1",
-            "rhiza:sql:cluster-a",
-            1,
-            1,
-            membership,
-        )
-        .unwrap();
-        let checkpoint_root = runtime.log_store().read(1).unwrap().unwrap();
-        let gate = StartupRecorderGate::new(
-            recorder.clone(),
-            LogAnchor::new(checkpoint_root.index, checkpoint_root.hash),
-        );
-        std::fs::remove_dir_all(root.path().join("recorders/node-3")).unwrap();
-
-        rehydrate_recorder_with_retry(runtime.clone(), recorder.clone(), checkpoint_root.index)
-            .await
-            .unwrap();
-        assert!(gate.inspect_decision_proof(1).is_err());
-        assert!(gate.inspect_decision_proof(2).unwrap().is_some());
-
-        gate.activate();
-        assert!(gate.inspect_decision_proof(1).is_err());
-        let command = StoredCommand::new(suffix.entry_type, suffix.payload);
-        assert_eq!(
-            recorder.fetch_command(command.hash()).unwrap(),
-            Some(command)
-        );
-        let replay = runtime.write("request-2", "key", "two").unwrap();
-        assert_eq!(replay.applied_index, 2);
-        assert_eq!(
-            runtime
-                .read("key", ReadConsistency::Local)
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("two")
-        );
-        let next = runtime.write("request-3", "key", "three").unwrap();
-        assert_eq!(next.applied_index, 3);
-        assert_eq!(
-            runtime
-                .read("key", ReadConsistency::Local)
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("three")
-        );
-    }
-
     #[test]
     fn build_consensus_rejects_a_mismatched_direct_recorder_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -9337,6 +6595,7 @@ mod tests {
             },
             client_token: "client-secret".into(),
             admin_token: None,
+            tail_token: None,
             client_listen: unused_local_address(),
             recorder_listen: unused_local_address(),
             recorder_transport: RecorderTransport::Http,
@@ -9422,279 +6681,6 @@ mod tests {
         sequential_cluster_start(RecorderTransport::TcpPostcardRpc).await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[cfg(feature = "sql")]
-    async fn three_fresh_rejoin_nodes_restore_checkpoint_without_recorder_startup_deadlock() {
-        let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
-        let temp = tempfile::tempdir().unwrap();
-        let archive_root = temp.path().join("archive");
-        let archive = local_checkpoint(&archive_root, 1);
-        archive.initialize_checkpoint().await.unwrap();
-        archive.publish_committed(&entries(2)).await.unwrap();
-
-        let recorder_addresses = [
-            unused_local_address(),
-            unused_local_address(),
-            unused_local_address(),
-        ];
-        let client_addresses = [
-            unused_local_address(),
-            unused_local_address(),
-            unused_local_address(),
-        ];
-        let peers = [
-            PeerConfig::new_with_log_url(
-                "node-1",
-                format!("http://{}", recorder_addresses[0]),
-                format!("http://{}", client_addresses[0]),
-                "peer-1-secret",
-            )
-            .unwrap(),
-            PeerConfig::new_with_log_url(
-                "node-2",
-                format!("http://{}", recorder_addresses[1]),
-                format!("http://{}", client_addresses[1]),
-                "peer-2-secret",
-            )
-            .unwrap(),
-            PeerConfig::new_with_log_url(
-                "node-3",
-                format!("http://{}", recorder_addresses[2]),
-                format!("http://{}", client_addresses[2]),
-                "peer-3-secret",
-            )
-            .unwrap(),
-        ];
-        let membership =
-            Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_string())).unwrap();
-        let configs: [ServeConfig; 3] = std::array::from_fn(|index| ServeConfig {
-            execution_profile: ExecutionProfile::Sqlite,
-            logical_cluster_id: "cluster-a".into(),
-            cluster_id: "rhiza:sql:cluster-a".into(),
-            node_id: format!("node-{}", index + 1),
-            data_dir: temp.path().join(format!("node-{}", index + 1)),
-            epoch: 1,
-            bundle: ConfigurationBundle {
-                config_id: 1,
-                configuration_state: ConfigurationState::active(1, membership.digest()),
-                membership: membership.clone(),
-                peers: peers.to_vec(),
-                recorder_tcp_peers: vec![None, None, None],
-                predecessor: None,
-            },
-            client_token: "client-secret".into(),
-            admin_token: None,
-            client_listen: client_addresses[index].clone(),
-            recorder_listen: recorder_addresses[index].clone(),
-            recorder_transport: RecorderTransport::Http,
-            recorder_tcp: None,
-            recovery_generation: 1,
-            remote: Some(RemoteCheckpointConfig {
-                object_store: ObjStoreConfig::Local {
-                    root: archive_root.clone(),
-                },
-                durability: DurabilityMode::Sync,
-                lease_duration_ms: 300_000,
-                startup: StartupMode::Rejoin,
-            }),
-        });
-
-        let (first_shutdown, first_wait) = tokio::sync::oneshot::channel();
-        let first = tokio::spawn(serve_remote_with_archive_until(
-            configs[0].clone(),
-            configs[0].remote.clone().unwrap(),
-            archive.clone(),
-            async move {
-                let _ = first_wait.await;
-            },
-        ));
-        let (second_shutdown, second_wait) = tokio::sync::oneshot::channel();
-        let second = tokio::spawn(serve_remote_with_archive_until(
-            configs[1].clone(),
-            configs[1].remote.clone().unwrap(),
-            archive.clone(),
-            async move {
-                let _ = second_wait.await;
-            },
-        ));
-        let (third_shutdown, third_wait) = tokio::sync::oneshot::channel();
-        let third = tokio::spawn(serve_remote_with_archive_until(
-            configs[2].clone(),
-            configs[2].remote.clone().unwrap(),
-            archive.clone(),
-            async move {
-                let _ = third_wait.await;
-            },
-        ));
-
-        for address in &recorder_addresses {
-            wait_for_tcp(address).await;
-        }
-        let recorder_inspections = peers
-            .iter()
-            .map(|peer| {
-                HttpRecorderClient::new_with_recovery_generation(
-                    peer.base_url(),
-                    "node-1",
-                    "peer-1-secret",
-                    1,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        tokio::task::spawn_blocking(move || {
-            for recorder in recorder_inspections {
-                assert_eq!(recorder.inspect_record_summary(3).unwrap(), None);
-            }
-        })
-        .await
-        .unwrap();
-
-        let ready = tokio::time::timeout(Duration::from_secs(3), async {
-            wait_until_ready(&client_addresses[0]).await;
-            wait_until_ready(&client_addresses[1]).await;
-            wait_until_ready(&client_addresses[2]).await;
-        })
-        .await;
-        if ready.is_err() {
-            let first_finished = first.is_finished();
-            let second_finished = second.is_finished();
-            let third_finished = third.is_finished();
-            if first_finished && second_finished && third_finished {
-                panic!(
-                    "fresh rejoin servers exited before readiness: first={:?} second={:?} third={:?}",
-                    first.await, second.await, third.await
-                );
-            }
-            first.abort();
-            second.abort();
-            third.abort();
-        }
-        ready.expect("fresh rejoin nodes must form recorder quorum after checkpoint restore");
-        let restored = request_sql_query(&SqlQueryArgs {
-            urls: client_addresses
-                .iter()
-                .map(|address| format!("http://{address}"))
-                .collect(),
-            token: "client-secret".into(),
-            statement: SqlStatement {
-                sql: "SELECT id, value FROM checkpoint_fixture ORDER BY id".into(),
-                parameters: Vec::new(),
-            },
-            consistency: Some(ReadConsistency::ReadBarrier),
-            max_rows: Some(10),
-        })
-        .await
-        .unwrap();
-        assert_eq!(restored.applied_index, 2);
-        assert_eq!(
-            restored.rows,
-            vec![
-                vec![SqlValue::Integer(1), SqlValue::Text("entry-1".into())],
-                vec![SqlValue::Integer(2), SqlValue::Text("entry-2".into())],
-            ]
-        );
-
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
-        let _ = third_shutdown.send(());
-        let joined = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(first, second, third)
-        })
-        .await
-        .expect("rejoined servers must stop within the graceful shutdown bound");
-        assert!(joined.0.unwrap().is_ok());
-        assert!(joined.1.unwrap().is_ok());
-        assert!(joined.2.unwrap().is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sql")]
-    async fn shutdown_while_runtime_first_waits_for_quorum_closes_the_recorder_listener() {
-        let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
-        let temp = tempfile::tempdir().unwrap();
-        let archive_root = temp.path().join("archive");
-        let archive = local_checkpoint(&archive_root, 1);
-        archive.initialize_checkpoint().await.unwrap();
-        archive.publish_committed(&entries(2)).await.unwrap();
-        let recorder_addresses = [
-            unused_local_address(),
-            unused_local_address(),
-            unused_local_address(),
-        ];
-        let client_addresses = [
-            unused_local_address(),
-            unused_local_address(),
-            unused_local_address(),
-        ];
-        let peers = recorder_addresses
-            .iter()
-            .zip(&client_addresses)
-            .enumerate()
-            .map(|(index, (recorder, client))| {
-                PeerConfig::new_with_log_url(
-                    format!("node-{}", index + 1),
-                    format!("http://{recorder}"),
-                    format!("http://{client}"),
-                    format!("peer-{}-secret", index + 1),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let membership =
-            Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_string())).unwrap();
-        let config = ServeConfig {
-            execution_profile: ExecutionProfile::Sqlite,
-            logical_cluster_id: "cluster-a".into(),
-            cluster_id: "rhiza:sql:cluster-a".into(),
-            node_id: "node-1".into(),
-            data_dir: temp.path().join("node-1"),
-            epoch: 1,
-            bundle: ConfigurationBundle {
-                config_id: 1,
-                configuration_state: ConfigurationState::active(1, membership.digest()),
-                membership,
-                peers,
-                recorder_tcp_peers: vec![None, None, None],
-                predecessor: None,
-            },
-            client_token: "client-secret".into(),
-            admin_token: None,
-            client_listen: client_addresses[0].clone(),
-            recorder_listen: recorder_addresses[0].clone(),
-            recorder_transport: RecorderTransport::Http,
-            recorder_tcp: None,
-            recovery_generation: 1,
-            remote: Some(RemoteCheckpointConfig {
-                object_store: ObjStoreConfig::Local { root: archive_root },
-                durability: DurabilityMode::Sync,
-                lease_duration_ms: 300_000,
-                startup: StartupMode::Rejoin,
-            }),
-        };
-        let remote = config.remote.clone().unwrap();
-        let (shutdown, wait) = tokio::sync::oneshot::channel();
-        let serving = tokio::spawn(serve_remote_with_archive_until(
-            config,
-            remote,
-            archive,
-            async move {
-                let _ = wait.await;
-            },
-        ));
-
-        wait_for_tcp(&recorder_addresses[0]).await;
-        shutdown.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), serving)
-            .await
-            .expect("startup shutdown must not wait for recorder quorum")
-            .unwrap()
-            .unwrap();
-        assert!(tokio::net::TcpStream::connect(&recorder_addresses[0])
-            .await
-            .is_err());
-    }
-
     #[cfg(feature = "sql")]
     async fn sequential_cluster_start(recorder_transport: RecorderTransport) {
         let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
@@ -9766,6 +6752,7 @@ mod tests {
             },
             client_token: "client-secret".into(),
             admin_token: None,
+            tail_token: None,
             client_listen: client_addresses[index].clone(),
             recorder_listen: recorder_addresses[index].clone(),
             recorder_transport,

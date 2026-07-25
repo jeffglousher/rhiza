@@ -19,25 +19,6 @@ spec:
       port: 8081
       targetPort: recorder
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: __CONFIG_NAME__-client
-  labels:
-    app.kubernetes.io/name: rhiza
-    app.kubernetes.io/component: client
-    rhiza.dev/execution-profile: "__EXECUTION_PROFILE__"
-    rhiza.dev/config-id: "__CONFIG_ID__"
-spec:
-  selector:
-    app.kubernetes.io/name: rhiza
-    rhiza.dev/execution-profile: "__EXECUTION_PROFILE__"
-    rhiza.dev/config-id: "__CONFIG_ID__"
-  ports:
-    - name: client
-      port: 8080
-      targetPort: client
----
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -79,6 +60,7 @@ spec:
         app.kubernetes.io/name: rhiza
         rhiza.dev/execution-profile: "__EXECUTION_PROFILE__"
         rhiza.dev/config-id: "__CONFIG_ID__"
+        rhiza.dev/member-role: "voter"
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
@@ -155,6 +137,11 @@ spec:
                 secretKeyRef:
                   name: __AUTH_SECRET__
                   key: admin-token
+            - name: RHIZA_TAIL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __AUTH_SECRET__
+                  key: tail-token
           startupProbe:
             httpGet:
               path: /livez

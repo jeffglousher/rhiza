@@ -11,10 +11,30 @@ shellcheck scripts/*.sh
 bash -n scripts/*.sh
 yq eval '.' deploy/k8s/*.yaml >/dev/null
 
-if grep -R -nE '^[[:space:]]*kind:[[:space:]]*PersistentVolumeClaim|^[[:space:]]*volumeClaimTemplates:' deploy; then
-  echo "PVCs are forbidden" >&2
+client_service=deploy/k8s/rhiza-client-services.yaml
+[ "$(yq eval-all '[select(.kind == "Service")] | length' "$client_service")" = 1 ]
+yq eval -e '
+  .kind == "Service" and
+  .metadata.name == "rhiza-sql-client" and
+  (.metadata.labels | keys | sort | join(",")) ==
+    "app.kubernetes.io/component,app.kubernetes.io/name,rhiza.dev/execution-profile" and
+  .metadata.labels["app.kubernetes.io/name"] == "rhiza" and
+  .metadata.labels["app.kubernetes.io/component"] == "client" and
+  .metadata.labels["rhiza.dev/execution-profile"] == "sql" and
+  (.metadata.labels | has("rhiza.dev/config-id") | not) and
+  (.spec.selector | keys | sort | join(",")) ==
+    "app.kubernetes.io/name,rhiza.dev/execution-profile,rhiza.dev/member-role" and
+  .spec.selector["app.kubernetes.io/name"] == "rhiza" and
+  .spec.selector["rhiza.dev/execution-profile"] == "sql" and
+  .spec.selector["rhiza.dev/member-role"] == "voter" and
+  (.spec.ports | length) == 1 and .spec.ports[0].name == "client" and
+  .spec.ports[0].port == 8080 and .spec.ports[0].targetPort == "client"
+' "$client_service" >/dev/null
+if grep -Eq '__[A-Z0-9_]+__|rhiza.dev/config-id' "$client_service"; then
+  echo "stable client Service must not be config-rendered or config-scoped" >&2
   exit 1
 fi
+
 if grep -R -nE 'RHIZA_PEER_[1-7]' deploy scripts; then
   echo "legacy peer environment variables are forbidden" >&2
   exit 1
@@ -55,7 +75,7 @@ profile=sql
 for replicas in 3 7; do
   id="$replicas"
   jq -n --arg profile "$profile" --argjson id "$id" --argjson replicas "$replicas" '
-    {version:1, config_id:$id, members:[range($replicas) as $n | {
+    {config_id:$id, members:[range($replicas) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8081"),
       log_url:("http://rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8080"),
@@ -64,6 +84,7 @@ for replicas in 3 7; do
   ' > "$tmp/config-${profile}-${id}.json"
   [ "$(jq '[.members[].token] | unique | length' "$tmp/config-${profile}-${id}.json")" = "$replicas" ]
   env -u RHIZA_IMAGE RHIZA_EXECUTION_PROFILE="$profile" \
+    RHIZA_PRESTAGE_SOURCE_SECRET="rhiza-${profile}-c$((id - 1))-bundle" \
     scripts/render-k8s-config.sh "$id" "$replicas" \
     "$tmp/config-${profile}-${id}.json" "$tmp/config-${profile}-${id}.yaml" successor
   assert_statefulset_env_values_are_quoted_strings "$tmp/config-${profile}-${id}.yaml"
@@ -72,19 +93,43 @@ for replicas in 3 7; do
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${profile}-${id}.yaml")" = "$replicas" ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.podManagementPolicy' "$tmp/config-${profile}-${id}.yaml")" = Parallel ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.updateStrategy.type' "$tmp/config-${profile}-${id}.yaml")" = OnDelete ]
-  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | has("emptyDir")' "$tmp/config-${profile}-${id}.yaml")" = true ]
-  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec | has("initContainers")' "$tmp/config-${profile}-${id}.yaml")" = false ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.volumeClaimTemplates[0].metadata.name' "$tmp/config-${profile}-${id}.yaml")" = data ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers[0].name' "$tmp/config-${profile}-${id}.yaml")" = prestage ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.selector.matchLabels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.metadata.labels["rhiza.dev/member-role"]' "$tmp/config-${profile}-${id}.yaml")" = learner ]
+  [ "$(yq eval-all '[select(.kind == "Service")] | length' \
+    "$tmp/config-${profile}-${id}.yaml")" = 1 ]
+  export CHECK_CONFIG_NAME="rhiza-${profile}-c${id}"
+  export CHECK_EXECUTION_PROFILE="$profile"
+  export CHECK_CONFIG_ID="$id"
+  yq eval -e '
+    select(.kind == "Service") |
+    .metadata.name == strenv(CHECK_CONFIG_NAME) and .spec.clusterIP == "None" and
+    .metadata.labels["app.kubernetes.io/component"] == "peer" and
+    .metadata.labels["rhiza.dev/execution-profile"] ==
+      strenv(CHECK_EXECUTION_PROFILE) and
+    .metadata.labels["rhiza.dev/config-id"] == strenv(CHECK_CONFIG_ID) and
+    (.spec.selector | keys | sort | join(",")) ==
+      "app.kubernetes.io/name,rhiza.dev/config-id,rhiza.dev/execution-profile" and
+    .spec.selector["app.kubernetes.io/name"] == "rhiza" and
+    .spec.selector["rhiza.dev/execution-profile"] ==
+      strenv(CHECK_EXECUTION_PROFILE) and
+    .spec.selector["rhiza.dev/config-id"] == strenv(CHECK_CONFIG_ID) and
+    (.spec.selector | has("rhiza.dev/member-role") | not)
+  ' "$tmp/config-${profile}-${id}.yaml" >/dev/null
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].image' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}:dev" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_DATA_DIR") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/var/lib/rhiza/${profile}" ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/${profile}/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/transition/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/prestage/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.initContainers[0].env[] | select(.name == "RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/source/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_TAIL_TOKEN") | .valueFrom.secretKeyRef.key' "$tmp/config-${profile}-${id}.yaml")" = tail-token ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.cpu' "$tmp/config-${profile}-${id}.yaml")" = 250m ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.memory' "$tmp/config-${profile}-${id}.yaml")" = 512Mi ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.cpu' "$tmp/config-${profile}-${id}.yaml")" = 2 ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.memory' "$tmp/config-${profile}-${id}.yaml")" = 2Gi ]
-  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | .emptyDir.sizeLimit' "$tmp/config-${profile}-${id}.yaml")" = 20Gi ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.volumeClaimTemplates[0].spec.resources.requests.storage' "$tmp/config-${profile}-${id}.yaml")" = 20Gi ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[] |
     select(.name == "RHIZA_S3_ALLOW_HTTP") | .value' \
@@ -382,7 +427,6 @@ jq '.members[0].token = "peer-sécret"' "$tmp/config-4.json" \
   > "$tmp/config-4-nonascii-token.json"
 jq '.members[0].unknown = true' "$tmp/config-4.json" \
   > "$tmp/config-4-unknown-member-field.json"
-jq '.version = 2' "$tmp/config-3.json" > "$tmp/config-3-version-2.json"
 stub_bin="$tmp/stub-bin"
 mkdir "$stub_bin"
 # shellcheck disable=SC2016
@@ -411,19 +455,6 @@ assert_replace_rejects_before_kubectl "$tmp/config-4-spaced-token.json" spaced-t
 assert_replace_rejects_before_kubectl "$tmp/config-4-nonascii-token.json" nonascii-token
 assert_replace_rejects_before_kubectl \
   "$tmp/config-4-unknown-member-field.json" unknown-member-field
-
-invalid_old_marker="$tmp/invalid-old-version.kubectl-called"
-invalid_old_dir="$tmp/invalid-old-version-transition"
-set +e
-PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_old_marker" \
-  RHIZA_RECONFIG_WORK_DIR="$invalid_old_dir" \
-  scripts/replace-k8s-config.sh \
-    "$tmp/config-3-version-2.json" "$tmp/config-4.json" >/dev/null 2>&1
-invalid_old_rc=$?
-set -e
-[ "$invalid_old_rc" = 65 ]
-[ ! -e "$invalid_old_marker" ]
-[ ! -e "$invalid_old_dir/stop-c3.state.json" ]
 
 for invalid_env in \
   'RHIZA_EPOCH=abc' \
@@ -490,7 +521,8 @@ jq -n '{
   cluster_id:"rhiza:sql:rhiza-vind",
   execution_profile:"sql",
   epoch:1,
-  node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
+  node:{configuration_status:"active",active_config_id:3,
+    configuration_state:{phase:"active",config_id:3}},
   members:["node-1","node-2","other-node"],
   recovery_generation:1,
   qlog_root:{index:0,hash:[range(32) | 0]},
@@ -518,7 +550,31 @@ valid_auth_secret="$tmp/valid-auth-secret.json"
 jq -n \
   --arg client "$(printf '%s' successor-client | openssl base64 -A)" \
   --arg admin "$(printf '%s' successor-admin | openssl base64 -A)" \
-  '{data:{"client-token":$client,"admin-token":$admin}}' > "$valid_auth_secret"
+  --arg tail "$(printf '%s' successor-tail | openssl base64 -A)" \
+  '{data:{"client-token":$client,"admin-token":$admin,"tail-token":$tail}}' \
+  > "$valid_auth_secret"
+
+for stable_service_failure in missing mismatch; do
+  stable_service_dir="$tmp/stable-service-${stable_service_failure}-transition"
+  stable_service_log="$tmp/stable-service-${stable_service_failure}.kubectl-log"
+  set +e
+  PATH="$preflight_bin:$PATH" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE="stable-service-${stable_service_failure}" \
+    RHIZA_KUBECTL_FIXTURE_LOG="$stable_service_log" \
+    RHIZA_RECONFIG_WORK_DIR="$stable_service_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  stable_service_rc=$?
+  set -e
+  [ "$stable_service_rc" = 65 ]
+  [ ! -e "$stable_service_dir/stop-c3.state.json" ]
+  grep -Fq 'get service rhiza-sql-client -o json' "$stable_service_log"
+  if grep -Eq 'admin |checkpoint inspect|scale statefulset|apply |create secret|membership/stop' \
+    "$stable_service_log"; then
+    echo "invalid stable client Service reached a transition action" >&2
+    exit 1
+  fi
+done
 
 jq 'del(.predecessor) | .config_id = 5 |
   .members |= to_entries | .members |= map(
@@ -595,7 +651,8 @@ jq -n '{
   cluster_id:"rhiza:sql:rhiza-vind",
   execution_profile:"sql",
   epoch:1,
-  node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
+  node:{configuration_status:"active",active_config_id:3,
+    configuration_state:{phase:"active",config_id:3}},
   members:["node-1","node-2","node-3"],
   recovery_generation:1,
   qlog_root:{index:0,hash:[range(32) | 0]},
@@ -731,6 +788,8 @@ assert_auth_secret_rejected() {
 
 jq 'del(.data["admin-token"])' "$valid_auth_secret" > "$tmp/missing-admin-auth.json"
 assert_auth_secret_rejected "$tmp/missing-admin-auth.json" missing-admin
+jq 'del(.data["tail-token"])' "$valid_auth_secret" > "$tmp/missing-tail-auth.json"
+assert_auth_secret_rejected "$tmp/missing-tail-auth.json" missing-tail
 jq --arg blank "$(printf ' ' | openssl base64 -A)" \
   '.data["client-token"] = $blank' "$valid_auth_secret" > "$tmp/blank-client-auth.json"
 assert_auth_secret_rejected "$tmp/blank-client-auth.json" blank-client
@@ -808,13 +867,14 @@ jq -n --argjson successor "$stop_successor" '{
   node:{configuration_status:"stopped",active_config_id:3,
     configuration_state:{phase:"stopped"}},
   stopped_transition:{
-    stop:{version:2,entry:{config_id:3,index:9,hash:[range(32) | 1]},proof:{}},
+    stop:{entry:{config_id:3,index:9,hash:[range(32) | 1]},proof:{}},
     successor:$successor}
 }' > "$tmp/stopped-status.json"
 scripts/k8s-stop-state.sh recover \
   "$stop_state" "$tmp/stopped-status.json" "$tmp/recovered-stop.json"
 jq -e --arg operation "$first_stop_operation" --argjson successor "$stop_successor" '
-  .operation_id == $operation and .stop.version == 2 and .successor == $successor
+  .operation_id == $operation and
+  (.stop | keys | sort) == ["entry", "proof"] and .successor == $successor
 ' "$tmp/recovered-stop.json" >/dev/null
 scripts/k8s-stop-state.sh validate "$stop_state" "$tmp/recovered-stop.json"
 legacy_stop_state="$tmp/legacy-stop-c3.state.json"
@@ -825,12 +885,12 @@ scripts/k8s-stop-state.sh validate "$legacy_stop_state" "$tmp/recovered-stop.jso
 successor_draft="$tmp/successor-draft.json"
 jq 'del(.predecessor)' "$tmp/config-4.json" > "$successor_draft"
 partial_successor_bundle="$tmp/partial-successor-bundle.json"
-printf '{"version":' > "$partial_successor_bundle"
+printf '{"config_id":' > "$partial_successor_bundle"
 scripts/k8s-stop-state.sh write-bundle \
   "$tmp/recovered-stop.json" "$tmp/config-3.json" "$successor_draft" \
   "$partial_successor_bundle"
 jq -e '
-  .version == 1 and .config_id == 4 and .predecessor.version == 2 and
+  .config_id == 4 and
   .predecessor.stop_entry.config_id == 3 and .predecessor.stop_proof != null
 ' "$partial_successor_bundle" >/dev/null
 valid_predecessor_bundle=scripts/test-fixtures/config-4-predecessor.json
@@ -847,7 +907,6 @@ assert_predecessor_rejected() {
     exit 1
   fi
 }
-assert_predecessor_rejected '.predecessor.version = 1' version
 assert_predecessor_rejected '.predecessor.members = "not-an-array"' members
 assert_predecessor_rejected '.predecessor.stop_entry = null' stop-entry
 assert_predecessor_rejected '.predecessor.stop_proof = null' stop-proof
@@ -901,7 +960,6 @@ live_shape_stop="$tmp/live-shape-stop.json"
 jq -n --slurpfile bundle "$live_shape_bundle" '{
   operation_id:"stop-live-shape",
   stop:{
-    version:2,
     entry:$bundle[0].predecessor.stop_entry,
     proof:$bundle[0].predecessor.stop_proof
   },
@@ -984,6 +1042,183 @@ for attempt in "$stop_state".attempt.*; do
   [ ! -e "$attempt" ] || { echo "atomic Stop state attempt file leaked" >&2; exit 1; }
 done
 
+resume_successor_draft="$tmp/resume-successor-draft.json"
+jq 'del(.predecessor)' scripts/test-fixtures/config-4-predecessor.json \
+  > "$resume_successor_draft"
+resume_stop_successor="$(jq -c '{
+  config_id,
+  members:[.members[].node_id] | sort,
+  digest:.predecessor.stop_proof.Phase2.config_digest
+}' scripts/test-fixtures/config-4-predecessor.json)"
+resume_stop_response="$tmp/resume-stop-response.json"
+jq -n --argjson successor "$resume_stop_successor" \
+  --slurpfile bundle scripts/test-fixtures/config-4-predecessor.json '{
+  operation_id:"resume-stop",
+  stop:{
+    entry:$bundle[0].predecessor.stop_entry,
+    proof:$bundle[0].predecessor.stop_proof},
+  successor:$successor
+}' > "$resume_stop_response"
+resume_stopped_status="$tmp/resume-stopped-status.json"
+jq -n --argjson successor "$resume_stop_successor" \
+  --slurpfile stop "$resume_stop_response" '{
+  cluster_id:"rhiza:sql:rhiza-vind",
+  execution_profile:"sql",
+  epoch:1,
+  recovery_generation:1,
+  node:{
+    configuration_status:"stopped",
+    active_config_id:3,
+    configuration_state:{phase:"stopped"}},
+  members:["node-1","node-2","node-3"],
+  stopped_transition:{
+    stop:$stop[0].stop,
+    successor:$successor}
+}' > "$resume_stopped_status"
+resume_old_uids="$tmp/resume-old-pod-uids.json"
+jq -cn '["old-uid-0","old-uid-1","old-uid-2"]' > "$resume_old_uids"
+resume_transition_secret="$tmp/resume-transition-secret.json"
+jq -n \
+  --arg config "$(openssl base64 -A \
+    -in scripts/test-fixtures/config-4-predecessor.json)" \
+  --arg stop "$(openssl base64 -A -in "$resume_stop_response")" \
+  --arg uids "$(openssl base64 -A -in "$resume_old_uids")" '{
+  data:{
+    "config.json":$config,
+    "stop.json":$stop,
+    "old-pod-uids.json":$uids}
+}' > "$resume_transition_secret"
+resume_status_dir="$tmp/resume-statuses"
+mkdir "$resume_status_dir"
+for ordinal in 0 1 2; do
+  cp "$resume_stopped_status" \
+    "$resume_status_dir/rhiza-sql-c3-${ordinal}.json"
+done
+resume_bin="$tmp/resume-bin"
+mkdir "$resume_bin"
+cp scripts/test-fixtures/kubectl-replace-resume.sh "$resume_bin/kubectl"
+chmod +x "$resume_bin/kubectl"
+
+assert_replace_resume_fixture() {
+  local mode="$1" transition_dir="$2" command_log="$3"
+  local status_dir="${4:-$resume_status_dir}"
+  env PATH="$resume_bin:$PATH" \
+    RHIZA_REPLACE_RESUME_MODE="$mode" \
+    RHIZA_REPLACE_RESUME_LOG="$command_log" \
+    RHIZA_REPLACE_RESUME_OLD_BUNDLE="$tmp/config-3.json" \
+    RHIZA_REPLACE_RESUME_TRANSITION_SECRET="$resume_transition_secret" \
+    RHIZA_REPLACE_RESUME_AUTH_SECRET="$valid_auth_secret" \
+    RHIZA_REPLACE_RESUME_STOPPED_STATUS_DIR="$status_dir" \
+    RHIZA_REPLACE_RESUME_ADMIN_POD="$tmp/${mode}-admin-pod" \
+    RHIZA_REPLACE_RESUME_RHIZA="$rhiza_fixture_bin" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
+    scripts/replace-k8s-config.sh \
+      "$tmp/config-3.json" "$resume_successor_draft" \
+      > "$command_log.stdout" 2> "$command_log.stderr"
+}
+
+stopped_resume_dir="$tmp/stopped-resume-transition"
+mkdir "$stopped_resume_dir"
+scripts/k8s-stop-state.sh prepare \
+  "$stopped_resume_dir/stop-c3.state.json" 3 4 \
+  "$resume_stop_successor" resume-stop >/dev/null
+stopped_resume_log="$tmp/stopped-resume.kubectl-log"
+set +e
+assert_replace_resume_fixture stopped "$stopped_resume_dir" "$stopped_resume_log"
+stopped_resume_rc=$?
+set -e
+[ "$stopped_resume_rc" = 73 ] || {
+  cat "$stopped_resume_log.stderr" >&2
+  exit 1
+}
+[ "$(grep -c '^admin-status-job$' "$stopped_resume_log")" = 3 ]
+grep -Fq immutable-transition-secret "$stopped_resume_log"
+if grep -Fq 'checkpoint inspect' "$stopped_resume_log"; then
+  echo "Stopped(S) recovery reran the Active(S)-only preflight" >&2
+  exit 1
+fi
+jq -e --slurpfile expected "$resume_stop_response" \
+  '. == $expected[0]' "$stopped_resume_dir/stop-c3.json" >/dev/null
+jq -e --slurpfile expected scripts/test-fixtures/config-4-predecessor.json \
+  '. == $expected[0]' "$stopped_resume_dir/config-c4.json" >/dev/null
+
+mismatched_status_dir="$tmp/mismatched-resume-statuses"
+cp -R "$resume_status_dir" "$mismatched_status_dir"
+jq '.stopped_transition.stop.entry.hash[0] += 1' \
+  "$resume_stopped_status" \
+  > "$mismatched_status_dir/rhiza-sql-c3-1.json"
+mismatched_resume_dir="$tmp/mismatched-resume-transition"
+mkdir "$mismatched_resume_dir"
+scripts/k8s-stop-state.sh prepare \
+  "$mismatched_resume_dir/stop-c3.state.json" 3 4 \
+  "$resume_stop_successor" resume-stop >/dev/null
+set +e
+assert_replace_resume_fixture stopped "$mismatched_resume_dir" \
+  "$tmp/mismatched-resume.kubectl-log" "$mismatched_status_dir"
+mismatched_resume_rc=$?
+set -e
+[ "$mismatched_resume_rc" = 65 ]
+[ ! -e "$mismatched_resume_dir/config-c4.json" ]
+
+sealed_resume_dir="$tmp/sealed-resume-transition"
+sealed_resume_log="$tmp/sealed-resume.kubectl-log"
+set +e
+assert_replace_resume_fixture sealed "$sealed_resume_dir" "$sealed_resume_log"
+sealed_resume_rc=$?
+set -e
+[ "$sealed_resume_rc" = 65 ] || {
+  cat "$sealed_resume_log.stderr" >&2
+  exit 1
+}
+grep -Fq 'object-job validate-config-bundle' "$sealed_resume_log"
+if grep -Fq immutable-transition-secret "$sealed_resume_log"; then
+  echo "durable sealed resume attempted to replace its transition Secret" >&2
+  exit 1
+fi
+
+scaled_zero_resume_dir="$tmp/scaled-zero-resume-transition"
+scaled_zero_resume_log="$tmp/scaled-zero-resume.kubectl-log"
+set +e
+assert_replace_resume_fixture sealed-zero \
+  "$scaled_zero_resume_dir" "$scaled_zero_resume_log"
+scaled_zero_resume_rc=$?
+set -e
+[ "$scaled_zero_resume_rc" = 65 ] || {
+  cat "$scaled_zero_resume_log.stderr" >&2
+  exit 1
+}
+grep -Fq 'get statefulset rhiza-sql-c3 -o jsonpath={.spec.replicas}' \
+  "$scaled_zero_resume_log"
+grep -Fq 'object-job validate-config-bundle' "$scaled_zero_resume_log"
+
+zero_live_resume_dir="$tmp/zero-live-resume-transition"
+zero_live_resume_log="$tmp/zero-live-resume.kubectl-log"
+set +e
+assert_replace_resume_fixture sealed-zero-live \
+  "$zero_live_resume_dir" "$zero_live_resume_log"
+zero_live_resume_rc=$?
+set -e
+[ "$zero_live_resume_rc" = 65 ]
+grep -Fq 'get statefulset rhiza-sql-c3 -o jsonpath={.spec.replicas}' \
+  "$zero_live_resume_log"
+if grep -Fq 'object-job validate-config-bundle' "$zero_live_resume_log"; then
+  echo "durable resume accepted zero old Pods while the StatefulSet desired replicas" >&2
+  exit 1
+fi
+
+recreated_resume_dir="$tmp/recreated-resume-transition"
+recreated_resume_log="$tmp/recreated-resume.kubectl-log"
+set +e
+assert_replace_resume_fixture sealed-recreated \
+  "$recreated_resume_dir" "$recreated_resume_log"
+recreated_resume_rc=$?
+set -e
+[ "$recreated_resume_rc" = 65 ]
+if grep -Fq 'object-job validate-config-bundle' "$recreated_resume_log"; then
+  echo "durable resume accepted a recreated old Pod UID" >&2
+  exit 1
+fi
+
 RHIZA_S3_ENDPOINT=http://rustfs:9000 \
 RHIZA_OBJECT_SECRET=rustfs-credentials \
 RHIZA_S3_ALLOW_HTTP=true \
@@ -1021,7 +1256,8 @@ grep -Fq '{config_id:$id,members:$members,digest:$digest}' \
   scripts/replace-k8s-config.sh
 # shellcheck disable=SC2016
 grep -Fq 'scripts/k8s-stop-state.sh prepare "$stop_state"' scripts/replace-k8s-config.sh
-stop_state_line="$(grep -n 'k8s-stop-state.sh prepare' scripts/replace-k8s-config.sh | cut -d: -f1)"
+stop_state_line="$(grep -n 'k8s-stop-state.sh prepare' \
+  scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
 object_preflight_line="$(grep -n 'k8s-object-job.sh.*checkpoint inspect' \
   scripts/replace-k8s-config.sh | head -n 1 | cut -d: -f1)"
 # shellcheck disable=SC2016
@@ -1034,22 +1270,48 @@ first_kubectl_line="$(grep -n '"${k\[@\]}" get statefulset "$old_name"' \
 grep -Fq 'k8s-stop-state.sh validate "$stop_state" "$stop_json"' \
   scripts/replace-k8s-config.sh
 # shellcheck disable=SC2016
-stop_validate_line="$(grep -n 'k8s-stop-state.sh validate "$stop_state" "$stop_json"' \
-  scripts/replace-k8s-config.sh | head -n 1 | cut -d: -f1)"
+stop_validate_line="$(awk -v start="$stop_state_line" '
+  NR > start && index($0,
+    "k8s-stop-state.sh validate \"$stop_state\" \"$stop_json\"") {
+      print NR
+      exit
+    }
+' scripts/replace-k8s-config.sh)"
 # shellcheck disable=SC2016
 stop_post_line="$(grep -n 'POST "$stop_path"' scripts/replace-k8s-config.sh | cut -d: -f1)"
+stable_service_preflight_line="$(grep -n 'stable client Service is unavailable or does not match' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+old_active_validation_line="$(grep -n '^[[:space:]]*verify_old_active_configuration$' \
+  scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
+old_voter_adoption_line="$(grep -n '^[[:space:]]*adopt_old_voter_role$' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+old_uid_capture_line="$(grep -n '^[[:space:]]*capture_or_validate_old_pod_uids$' \
+  scripts/replace-k8s-config.sh | head -n 1 | cut -d: -f1)"
+stopped_resume_line="$(grep -n '^  if recover_exact_stop_from_all_old_nodes; then$' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$stop_state_line" -lt "$stop_post_line" ]
 [ "$stop_state_line" -lt "$stop_validate_line" ]
 [ "$stop_validate_line" -lt "$stop_post_line" ]
 [ "$successor_preflight_line" -lt "$first_kubectl_line" ]
 [ "$successor_preflight_line" -lt "$stop_state_line" ]
 [ "$object_preflight_line" -lt "$stop_state_line" ]
+[ "$stable_service_preflight_line" -lt "$stop_post_line" ]
+[ "$stopped_resume_line" -lt "$old_active_validation_line" ]
+[ "$old_active_validation_line" -lt "$old_voter_adoption_line" ]
+[ "$old_voter_adoption_line" -lt "$old_uid_capture_line" ]
 grep -Fq 'k8s-stop-state.sh recover' scripts/replace-k8s-config.sh
 grep -Fq 'incomplete successor bundle artifact will be rebuilt' \
   scripts/replace-k8s-config.sh
 grep -Fq 'k8s-stop-state.sh write-bundle' scripts/replace-k8s-config.sh
 grep -Fq 'k8s-stop-state.sh hydrate' scripts/replace-k8s-config.sh
 grep -Fq 'transition_secret_matches_artifacts' scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq '. as $statuses |' scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq '$statuses[0].stopped_transition' scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq '.metadata.labels[$role_label] == "sealed"' \
+  scripts/replace-k8s-config.sh
 if grep -Eq 'actual_(bundle|stop)_b64|expected_(bundle|stop)_b64' \
   scripts/replace-k8s-config.sh; then
   echo "transition Secret resume still compares raw base64 bytes" >&2
@@ -1059,17 +1321,79 @@ fi
 grep -Fq 'rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=${old_id}' \
   scripts/replace-k8s-config.sh
 grep -Fq "stop_proof: \$stopped[0].stop.proof" scripts/k8s-stop-state.sh
-compact_line="$(grep -n 'publishing final checkpoint V2' scripts/replace-k8s-config.sh | cut -d: -f1)"
-fork_line="$(grep -n 'forking stopped checkpoint' scripts/replace-k8s-config.sh | cut -d: -f1)"
+compact_line="$(grep -n 'publishing first Active checkpoint' scripts/replace-k8s-config.sh | cut -d: -f1)"
 durable_secret_line="$(grep -n -- '--from-file=stop.json=' scripts/replace-k8s-config.sh \
   | tail -n 1 | cut -d: -f1)"
 # shellcheck disable=SC2016
+prestage_secret_line="$(grep -n 'create secret generic "${new_name}-prestage"' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
 scale_down_line="$(grep -n 'scale statefulset "$old_name" --replicas=0' \
   scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
-start_line="$(grep -n 'RHIZA_STARTUP_MODE=rejoin' scripts/replace-k8s-config.sh | cut -d: -f1)"
-[ "$compact_line" -lt "$fork_line" ]
-[ "$fork_line" -lt "$start_line" ]
-[ "$durable_secret_line" -lt "$scale_down_line" ]
+# shellcheck disable=SC2016
+successor_apply_line="$(grep -n '"${k\[@\]}" apply -f "$successor_yaml"' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+successor_running_line="$(grep -n 'successor learner Pods did not reach Running' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+successor_prestage_line="$(grep -n 'successor learner admin status prerequisite' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+successor_active_line="$(grep -n 'not every successor node reached Active(S+1)' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+voter_promotion_line="$(grep -n 'patch statefulset "$new_name"' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+predecessor_seal_line="$(grep -n 'patch statefulset "$old_name"' \
+  scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
+endpoint_slice_line="$(grep -n 'get endpointslices.discovery.k8s.io' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+old_delete_line="$(grep -n 'wait --for=delete pod' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+old_zero_replicas_line="$(grep -n 'get statefulset "$old_name" -o jsonpath=' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+old_zero_pods_line="$(grep -nF -- '-o name)" ]' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+cutover_success_line="$(grep -n 'GC is now permitted' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+[ "$prestage_secret_line" -lt "$successor_apply_line" ]
+[ "$successor_apply_line" -lt "$stop_post_line" ]
+[ "$stop_post_line" -lt "$durable_secret_line" ]
+[ "$durable_secret_line" -lt "$successor_running_line" ]
+[ "$successor_running_line" -lt "$successor_prestage_line" ]
+[ "$successor_prestage_line" -lt "$successor_active_line" ]
+[ "$successor_active_line" -lt "$voter_promotion_line" ]
+[ "$voter_promotion_line" -lt "$predecessor_seal_line" ]
+[ "$predecessor_seal_line" -lt "$endpoint_slice_line" ]
+[ "$endpoint_slice_line" -lt "$compact_line" ]
+[ "$compact_line" -lt "$scale_down_line" ]
+[ "$scale_down_line" -lt "$old_delete_line" ]
+[ "$old_delete_line" -lt "$old_zero_replicas_line" ]
+[ "$old_zero_replicas_line" -lt "$old_zero_pods_line" ]
+[ "$old_zero_pods_line" -lt "$cutover_success_line" ]
+if grep -Fq 'fork-successor' scripts/replace-k8s-config.sh; then
+  echo "replacement must not fork a successor checkpoint" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+grep -Fq -- '--from-file=old-pod-uids.json="$old_pod_uids"' \
+  scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq '.targetRef.uid as $uid | ($old[0] | index($uid)) == null' \
+  scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq -- '--resource-version="$resource_version"' \
+  scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq '.kind == "StatefulSet" and .name == $name and .controller == true' \
+  scripts/replace-k8s-config.sh
+grep -Fq -- '--timeout=180s' scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+if grep -Fq 'wait-k8s-statefulset-ready.sh "$new_name"' \
+  scripts/replace-k8s-config.sh; then
+  echo "successor learner flow must not wait for client readiness before activation" >&2
+  exit 1
+fi
 grep -Fq "context=\"\$(kubectl config current-context" scripts/e2e-vind-rustfs.sh
 grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
 grep -Fq 'export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials' \
@@ -1138,10 +1462,6 @@ fi
 # shellcheck disable=SC2016
 grep -Fq 'token:$tokens[$n]' \
   scripts/e2e-vind-rustfs.sh
-# Assert literal runtime variables in the helper call.
-# shellcheck disable=SC2016
-grep -Fq 'scripts/wait-k8s-statefulset-ready.sh "$new_name" "$new_replicas" "$new_id"' \
-  scripts/replace-k8s-config.sh
 if grep -Fq "wait --for=jsonpath='{.status.phase}'=Running" scripts/replace-k8s-config.sh; then
   echo "configuration replacement must wait for Ready pods, not merely Running pods" >&2
   exit 1

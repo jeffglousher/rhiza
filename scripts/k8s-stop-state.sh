@@ -70,7 +70,8 @@ case "${1-}" in
     successor="$(jq -ec '.successor' "$state_file")"
     jq -e --argjson old "$old_id" --arg operation "$operation" \
       --argjson successor "$successor" '
-      .operation_id == $operation and .stop.version == 2 and
+      .operation_id == $operation and
+      (.stop | keys | sort) == ["entry", "proof"] and
       .stop.entry.config_id == $old and .stop.proof != null and
       .successor == $successor
     ' "$response_file" >/dev/null || die "Stop response does not match persisted Stop state"
@@ -87,7 +88,8 @@ case "${1-}" in
     old_id="$(jq -er '.config_id' "$old_bundle")"
     new_id="$(jq -er '.config_id' "$successor_draft")"
     jq -e --argjson old "$old_id" --argjson new "$new_id" '
-      .operation_id != null and .stop.version == 2 and
+      .operation_id != null and
+      (.stop | keys | sort) == ["entry", "proof"] and
       .stop.entry.config_id == $old and .stop.proof != null and
       .successor.config_id == $new
     ' "$response_file" >/dev/null || die "Stop response cannot produce the successor bundle"
@@ -96,7 +98,6 @@ case "${1-}" in
     umask 077
     jq --slurpfile stopped "$response_file" --slurpfile old "$old_bundle" '
       . + {predecessor: {
-        version: 2,
         members: [$old[0].members[].node_id],
         stop_entry: $stopped[0].stop.entry,
         stop_proof: $stopped[0].stop.proof
@@ -104,7 +105,7 @@ case "${1-}" in
     ' "$successor_draft" > "$bundle_attempt"
     jq -e --argjson new "$new_id" --slurpfile stopped "$response_file" \
       --slurpfile old "$old_bundle" '
-      .version == 1 and .config_id == $new and .predecessor.version == 2 and
+      .config_id == $new and
       .predecessor.members == [$old[0].members[].node_id] and
       .predecessor.stop_entry == $stopped[0].stop.entry and
       .predecessor.stop_proof == $stopped[0].stop.proof
@@ -136,13 +137,13 @@ case "${1-}" in
     jq -e --argjson old "$old_id" --argjson new "$new_id" \
       --slurpfile stop "$stop_attempt" --slurpfile old_bundle "$old_bundle" \
       --slurpfile draft "$successor_draft" '
-      .version == 1 and .config_id == $new and
-      (del(.predecessor) == $draft[0]) and .predecessor.version == 2 and
+      .config_id == $new and
+      (del(.predecessor) == $draft[0]) and
       .predecessor.members == [$old_bundle[0].members[].node_id] and
       .predecessor.stop_entry == $stop[0].stop.entry and
       .predecessor.stop_proof == $stop[0].stop.proof and
       ($stop[0].operation_id | type == "string" and length > 0) and
-      $stop[0].stop.version == 2 and
+      ($stop[0].stop | keys | sort) == ["entry", "proof"] and
       $stop[0].stop.entry.config_id == $old and $stop[0].stop.proof != null and
       $stop[0].successor.config_id == $new
     ' "$bundle_attempt" >/dev/null || die "durable transition Secret is inconsistent"
@@ -170,7 +171,7 @@ case "${1-}" in
       .node.configuration_status == "stopped" and
       .node.active_config_id == $old and
       .node.configuration_state.phase == "stopped" and
-      .stopped_transition.stop.version == 2 and
+      (.stopped_transition.stop | keys | sort) == ["entry", "proof"] and
       .stopped_transition.stop.entry.config_id == $old and
       .stopped_transition.stop.proof != null and
       .stopped_transition.successor == $successor

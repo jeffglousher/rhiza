@@ -288,7 +288,7 @@ impl ProposalPriority {
         Self(bytes)
     }
 
-    fn legacy_u128(self) -> u128 {
+    fn low_u128(self) -> u128 {
         u128::from_be_bytes(self.0[16..].try_into().expect("fixed priority suffix"))
     }
 }
@@ -724,8 +724,17 @@ pub struct RecordRequest {
     pub slot: Slot,
     pub step: Step,
     pub proposal: Proposal,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_command")]
     pub command: Option<StoredCommand>,
+}
+
+fn deserialize_required_command<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<StoredCommand>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -3259,7 +3268,7 @@ pub struct ThreeNodeConsensus {
     read_fence_workers: Vec<ControlWorker>,
     priority_source: Arc<dyn PrioritySource>,
     proposal_sequence: AtomicU64,
-    legacy_tip: Mutex<SingleNodeState>,
+    sequential_tip: Mutex<SingleNodeState>,
 }
 
 struct RecordJob {
@@ -3961,7 +3970,7 @@ impl ThreeNodeConsensus {
             read_fence_workers,
             priority_source: Arc::new(OsPrioritySource),
             proposal_sequence: AtomicU64::new(1),
-            legacy_tip: Mutex::new(SingleNodeState {
+            sequential_tip: Mutex::new(SingleNodeState {
                 next_index,
                 last_hash,
             }),
@@ -3986,7 +3995,10 @@ impl ThreeNodeConsensus {
     }
 
     fn propose_next(&self, command: Command) -> Result<LogEntry> {
-        let mut tip = self.legacy_tip.lock().map_err(|_| Error::ProposeFailed)?;
+        let mut tip = self
+            .sequential_tip
+            .lock()
+            .map_err(|_| Error::ProposeFailed)?;
         let entry = self.propose_at(tip.next_index, tip.last_hash, command)?;
         tip.next_index = entry.index + 1;
         tip.last_hash = entry.hash;
@@ -4748,7 +4760,7 @@ impl ThreeNodeConsensus {
             return Ok(CertifiedDecisionInspection::Unavailable);
         }
         Ok(match self.inspect_certified_decision_at(slot, prev_hash)? {
-            // An occupied fence quorum cannot be weakened by the legacy typed
+            // An occupied fence quorum cannot be weakened by the typed
             // summary path's context-free absence classification.
             CertifiedDecisionInspection::Empty => CertifiedDecisionInspection::Pending,
             inspection => inspection,
@@ -4943,7 +4955,10 @@ impl ThreeNodeConsensus {
     }
 
     pub fn recover_decided_next(&self) -> Result<Option<LogEntry>> {
-        let mut tip = self.legacy_tip.lock().map_err(|_| Error::ProposeFailed)?;
+        let mut tip = self
+            .sequential_tip
+            .lock()
+            .map_err(|_| Error::ProposeFailed)?;
         let Some(entry) = self.recover_decided_at(tip.next_index, tip.last_hash)? else {
             return Ok(None);
         };
@@ -5328,7 +5343,7 @@ fn proposal_ballot(proposal: &Proposal) -> Option<Ballot> {
     proposal.value.as_ref()?;
     Some(Ballot::new(
         proposal.proposal_id,
-        proposal.priority.legacy_u128(),
+        proposal.priority.low_u128(),
         proposal.proposer_id.clone(),
     ))
 }
@@ -5399,7 +5414,7 @@ fn certificate_from_proof(proof: &DecisionProof) -> Result<DecisionCertificate> 
         config_digest,
         ballot: Ballot::new(
             proposal.proposal_id,
-            proposal.priority.legacy_u128(),
+            proposal.priority.low_u128(),
             encode_certificate_proposer(proof_cluster_id(proof), &proposal.proposer_id),
         ),
         value,
@@ -7336,6 +7351,33 @@ mod tests {
                 command: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn record_request_requires_the_current_command_field() {
+        let request = RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::ZERO,
+            slot: 1,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                1,
+                AcceptedValue {
+                    command_hash: LogHash::ZERO,
+                    prev_hash: LogHash::ZERO,
+                    entry_hash: LogHash::ZERO,
+                },
+            ),
+            command: None,
+        };
+        let mut encoded = serde_json::to_value(request).unwrap();
+        encoded.as_object_mut().unwrap().remove("command");
+
+        assert!(serde_json::from_value::<RecordRequest>(encoded).is_err());
     }
 
     fn record_summary(recorder_id: &str, request: RecordRequest) -> RecordSummary {
@@ -9477,7 +9519,15 @@ mod tests {
             })
             .collect();
         let offered = StoredCommand::new(EntryType::Command, b"offered".to_vec());
-        let transition = ConfigChange::stop(1, membership.digest()).to_stored_command();
+        let transition = ConfigChange::bound_stop(
+            "cluster",
+            1,
+            membership.digest(),
+            2,
+            membership.members().to_vec(),
+        )
+        .unwrap()
+        .to_stored_command();
         let adopted = StoredCommand::new(EntryType::Command, b"adopted".to_vec());
         for store in &stores {
             for command in [&transition, &adopted] {

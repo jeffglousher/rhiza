@@ -262,8 +262,8 @@ struct OperationRecord {
 }
 
 #[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OperationLedger {
-    version: u16,
     operations: HashMap<String, OperationRecord>,
 }
 
@@ -689,11 +689,7 @@ fn stopped_transition(runtime: &NodeRuntime) -> Result<Option<AdminStoppedTransi
         .map_err(|error| NodeError::Unavailable(error.to_string()))?
         .ok_or_else(|| NodeError::Unavailable("durable Stop proof is unavailable".into()))?;
     Ok(Some(AdminStoppedTransition {
-        stop: StopInformation {
-            version: 2,
-            entry,
-            proof,
-        },
+        stop: StopInformation { entry, proof },
         successor,
     }))
 }
@@ -701,10 +697,12 @@ fn stopped_transition(runtime: &NodeRuntime) -> Result<Option<AdminStoppedTransi
 fn successor_from_entry(entry: &LogEntry) -> Result<AdminSuccessorBundle, NodeError> {
     let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
     let change = ConfigChange::recognize(&command)
-        .map_err(|_| NodeError::PreconditionFailed("legacy unbound Stop is rejected".into()))?;
-    let successor = change
-        .successor()
-        .ok_or_else(|| NodeError::PreconditionFailed("legacy unbound Stop is rejected".into()))?;
+        .map_err(|_| NodeError::PreconditionFailed("Stop command is not successor-bound".into()))?;
+    let ConfigChange::BoundStop { successor } = change else {
+        return Err(NodeError::PreconditionFailed(
+            "Stop command is not successor-bound".into(),
+        ));
+    };
     Ok(AdminSuccessorBundle {
         config_id: successor.config_id(),
         members: successor.members().to_vec(),
@@ -741,12 +739,6 @@ fn load_operations(path: &Path) -> Result<HashMap<String, OperationRecord>, std:
     };
     let ledger: OperationLedger = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if ledger.version != 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unsupported admin operation ledger version",
-        ));
-    }
     Ok(ledger.operations)
 }
 
@@ -760,7 +752,6 @@ fn persist_operations(
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec(&OperationLedger {
-        version: 1,
         operations: operations.clone(),
     })
     .map_err(std::io::Error::other)?;
@@ -917,7 +908,17 @@ mod tests {
         Arc,
     };
 
-    use super::AdminTaskTracker;
+    use super::{AdminTaskTracker, OperationLedger};
+
+    #[test]
+    fn operation_ledger_has_one_strict_canonical_shape() {
+        let canonical = serde_json::to_value(OperationLedger::default()).unwrap();
+        assert_eq!(canonical, serde_json::json!({"operations": {}}));
+        assert!(serde_json::from_value::<OperationLedger>(
+            serde_json::json!({"version": 1, "operations": {}})
+        )
+        .is_err());
+    }
 
     #[tokio::test]
     async fn shutdown_observes_a_late_admin_mutation_before_sampling_state() {

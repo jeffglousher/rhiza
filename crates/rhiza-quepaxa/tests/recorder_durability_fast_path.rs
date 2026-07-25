@@ -126,7 +126,7 @@ fn normal_record_reopens_with_command_and_max_without_rewriting_configuration() 
     );
     drop(recorder);
 
-    let reopened = store(dir.path(), membership).unwrap();
+    let reopened = store(dir.path(), membership.clone()).unwrap();
     assert_eq!(
         reopened
             .configuration_state()
@@ -139,10 +139,14 @@ fn normal_record_reopens_with_command_and_max_without_rewriting_configuration() 
         Some(command)
     );
 
-    let stop = ConfigChange::stop(
+    let stop = ConfigChange::bound_stop(
+        CLUSTER_ID,
         CONFIG_ID,
-        reopened.configuration_state().unwrap().config_digest(),
+        membership.digest(),
+        CONFIG_ID + 1,
+        membership.members().to_vec(),
     )
+    .unwrap()
     .to_stored_command();
     let stop_value =
         AcceptedValue::from_command(CLUSTER_ID, 7, EPOCH, CONFIG_ID, LogHash::ZERO, &stop);

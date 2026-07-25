@@ -865,8 +865,6 @@ impl StoredCommand {
 }
 
 const CONFIG_CHANGE_MAGIC: &[u8; 4] = b"QCFG";
-const CONFIG_CHANGE_VERSION: u16 = 1;
-const BOUND_CONFIG_CHANGE_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SuccessorDescriptor {
@@ -1090,15 +1088,6 @@ impl ConfigChange {
     pub fn to_stored_command(&self) -> StoredCommand {
         let mut payload = Vec::with_capacity(87);
         payload.extend_from_slice(CONFIG_CHANGE_MAGIC);
-        let version = if matches!(
-            self,
-            Self::BoundStop { .. } | Self::BoundActivationBarrier { .. }
-        ) {
-            BOUND_CONFIG_CHANGE_VERSION
-        } else {
-            CONFIG_CHANGE_VERSION
-        };
-        payload.extend_from_slice(&version.to_be_bytes());
         match self {
             Self::Stop {
                 config_id,
@@ -1121,7 +1110,7 @@ impl ConfigChange {
                 payload.extend_from_slice(prefix_hash.as_bytes());
             }
             Self::BoundStop { successor } => {
-                payload.push(1);
+                payload.push(3);
                 encode_successor(&mut payload, successor);
             }
             Self::BoundActivationBarrier {
@@ -1130,7 +1119,7 @@ impl ConfigChange {
                 prefix_hash,
                 stop_command_hash,
             } => {
-                payload.push(2);
+                payload.push(4);
                 encode_successor(&mut payload, successor);
                 payload.extend_from_slice(&stop_slot.to_be_bytes());
                 payload.extend_from_slice(prefix_hash.as_bytes());
@@ -1155,14 +1144,13 @@ impl ConfigChange {
         if bytes.get(..4) != Some(CONFIG_CHANGE_MAGIC) {
             return Err(ConfigChangeDecodeError);
         }
-        let version = read_config_u16(bytes, 4)?;
-        if version == BOUND_CONFIG_CHANGE_VERSION {
-            let kind = *bytes.get(6).ok_or(ConfigChangeDecodeError)?;
-            let mut cursor = 7;
+        let kind = *bytes.get(4).ok_or(ConfigChangeDecodeError)?;
+        if matches!(kind, 3 | 4) {
+            let mut cursor = 5;
             let successor = decode_successor(bytes, &mut cursor)?;
             let change = match kind {
-                1 => Self::BoundStop { successor },
-                2 => Self::BoundActivationBarrier {
+                3 => Self::BoundStop { successor },
+                4 => Self::BoundActivationBarrier {
                     successor,
                     stop_slot: read_config_u64_at(bytes, &mut cursor)?,
                     prefix_hash: read_config_hash_at(bytes, &mut cursor)?,
@@ -1175,19 +1163,15 @@ impl ConfigChange {
             }
             return Ok(change);
         }
-        if version != CONFIG_CHANGE_VERSION {
-            return Err(ConfigChangeDecodeError);
-        }
-        let kind = *bytes.get(6).ok_or(ConfigChangeDecodeError)?;
-        let config_id = read_config_u64(bytes, 7)?;
-        let config_digest = read_config_hash(bytes, 15)?;
+        let config_id = read_config_u64(bytes, 5)?;
+        let config_digest = read_config_hash(bytes, 13)?;
         match kind {
-            1 if bytes.len() == 47 => Ok(Self::stop(config_id, config_digest)),
-            2 if bytes.len() == 87 => Ok(Self::activation_barrier(
+            1 if bytes.len() == 45 => Ok(Self::stop(config_id, config_digest)),
+            2 if bytes.len() == 85 => Ok(Self::activation_barrier(
                 config_id,
                 config_digest,
-                read_config_u64(bytes, 47)?,
-                read_config_hash(bytes, 55)?,
+                read_config_u64(bytes, 45)?,
+                read_config_hash(bytes, 53)?,
             )),
             _ => Err(ConfigChangeDecodeError),
         }
@@ -1664,17 +1648,17 @@ mod tests {
 
     #[test]
     fn replicated_command_envelope_preserves_backend_bytes_unchanged() {
-        let legacy_qsql = b"QSQL\0\x02{\"request_id\":\"same\"}".to_vec();
+        let opaque_qsql = b"QSQL\0\x02{\"request_id\":\"same\"}".to_vec();
         let envelope = ReplicatedCommandEnvelope::new(
             ExecutionProfile::Sqlite,
             1,
             "same",
-            legacy_qsql.clone(),
+            opaque_qsql.clone(),
         )
         .unwrap();
 
         let decoded = ReplicatedCommandEnvelope::decode(&envelope.encode().unwrap()).unwrap();
-        assert_eq!(decoded.body(), legacy_qsql);
+        assert_eq!(decoded.body(), opaque_qsql);
     }
 
     #[test]

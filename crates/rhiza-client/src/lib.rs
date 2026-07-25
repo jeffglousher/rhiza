@@ -400,13 +400,11 @@ fn protocol_request(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServerErrorResponse {
     code: String,
-    #[serde(default)]
     retryable: bool,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
+    message: String,
     statement_index: Option<usize>,
 }
 
@@ -579,7 +577,7 @@ impl ClientError {
             statement_index: error.statement_index,
             detail: ClientErrorDetail::Http {
                 status,
-                message: server_fields.message(error.message),
+                message: server_fields.message(Some(error.message)),
             },
         }
     }
@@ -1410,12 +1408,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_server_error_is_not_accepted_as_canonical() {
+        let app = Router::new().route(
+            rhiza_node::WRITE_PATH,
+            post(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"code": "request_conflict"})),
+                )
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+
+        let error = RhizaClient::new(vec![endpoint], "client-secret")
+            .unwrap()
+            .write(write_request())
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert_eq!(error.code(), "http_error");
+    }
+
+    #[tokio::test]
     async fn sql_execute_decodes_statement_and_returning_results() {
         let app = Router::new().route(
             rhiza_node::SQL_EXECUTE_PATH,
             post(|| async {
                 Json(serde_json::json!({
-                    "version": 2,
                     "applied_index": 7,
                     "hash": vec![0_u8; 32],
                     "results": [{
@@ -1450,6 +1470,66 @@ mod tests {
             response.results[0].returning.as_ref().unwrap().rows,
             [vec![SqlValue::Integer(42)]]
         );
+    }
+
+    #[tokio::test]
+    async fn sql_execute_rejects_obsolete_response_version_field() {
+        let app = Router::new().route(
+            rhiza_node::SQL_EXECUTE_PATH,
+            post(|| async {
+                Json(serde_json::json!({
+                    "version": 1,
+                    "applied_index": 7,
+                    "hash": vec![0_u8; 32],
+                    "results": []
+                }))
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+
+        let error = RhizaClient::new(vec![endpoint], "client-secret")
+            .unwrap()
+            .sql_execute(SqlExecuteRequest {
+                request_id: "obsolete-response-version".into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO items(id) VALUES (42)".into(),
+                    parameters: Vec::new(),
+                }],
+            })
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert_eq!(error.code(), "invalid_response");
+    }
+
+    #[tokio::test]
+    async fn sql_execute_rejects_response_without_results() {
+        let app = Router::new().route(
+            rhiza_node::SQL_EXECUTE_PATH,
+            post(|| async {
+                Json(serde_json::json!({
+                    "applied_index": 7,
+                    "hash": vec![0_u8; 32]
+                }))
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+
+        let error = RhizaClient::new(vec![endpoint], "client-secret")
+            .unwrap()
+            .sql_execute(SqlExecuteRequest {
+                request_id: "missing-results".into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO items(id) VALUES (42)".into(),
+                    parameters: Vec::new(),
+                }],
+            })
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert_eq!(error.code(), "invalid_response");
     }
 
     #[tokio::test]

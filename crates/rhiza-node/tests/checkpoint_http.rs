@@ -6,8 +6,7 @@ use rhiza_node::{
     node_router, node_router_with_checkpoint, CheckpointCoordinator, ClientErrorResponse,
     DurabilityHealth, DurabilityMode, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
     SqlExecuteRequest, SqlExecuteResponse, SqlQueryRequest, SqlQueryResponse, WriteRequest,
-    WriteResponse, PROTOCOL_VERSION, READYZ_PATH, SQL_EXECUTE_PATH, SQL_EXECUTE_RESPONSE_VERSION,
-    SQL_QUERY_PATH, VERSION_HEADER,
+    WriteResponse, PROTOCOL_VERSION, READYZ_PATH, SQL_EXECUTE_PATH, SQL_QUERY_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
@@ -352,7 +351,9 @@ async fn sql_http_executes_atomic_ddl_dml_and_queries_typed_rows_with_barrier() 
         .unwrap();
     assert!(first.status().is_success());
     let first = first.json::<SqlExecuteResponse>().await.unwrap();
-    assert_eq!(first.version, SQL_EXECUTE_RESPONSE_VERSION);
+    let serialized = serde_json::to_value(&first).unwrap();
+    assert!(serialized.get("version").is_none());
+    assert!(serialized.get("results").is_some());
     runtime
         .write("between-sql-retries", "other", "value")
         .unwrap();

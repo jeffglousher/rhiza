@@ -146,7 +146,7 @@ and container provenance.
 python3 bench/run-recorder-sync-linux.py --pairs 12
 ```
 
-The tracked 2026-07-17 Docker Desktop Linux/aarch64 results are a legacy
+The tracked 2026-07-17 Docker Desktop Linux/aarch64 results are a historical
 diagnostic from an identical-command-per-slot harness. They predate the
 distinct-command workload and explicit command-mode methodology documented
 above, so they do not validate the current workload. That run used 12 balanced
@@ -162,7 +162,7 @@ paired result and win split remain mixed. All 12
 preload runs observed the expected 900 intercepts, and every run observed 900
 WAL frames in generation 1 without a checkpoint.
 
-The legacy tracked artifacts are
+The historical tracked artifacts are
 [`raw.jsonl`](../../docs/benchmarks/recorder-sync-linux-20260717/raw.jsonl)
 (24 rows, 49,782 bytes) and
 [`summary.json`](../../docs/benchmarks/recorder-sync-linux-20260717/summary.json)
@@ -185,14 +185,11 @@ paired performance is inconclusive and is not a production speedup claim.
 Production performance adoption requires clean physical crash/reopen and
 throughput/latency testing on the target ext4/XFS/CSI stack.
 
-## Compatibility policy
+## Current-format policy
 
-The minimum supported Rust version is 1.89. The public Rust API follows
-semantic versioning. Recorder persistence and decision-proof encodings are
-versioned and reject unsupported versions; their byte representation is not an
-unversioned compatibility promise. HTTP or other wire protocols belong to the
-embedding application and are not part of this crate.
-
-`rhiza-core` and `rhiza-quepaxa` are released with matching minor
-versions. Version 0.x may make breaking protocol or API changes in a minor
-release, with migration notes in the repository.
+The minimum supported Rust version is 1.89. This crate is unreleased and makes
+no API, persisted-layout, or mixed-binary compatibility promise. Recorder
+persistence and decision proofs accept only the exact current format. Their
+fixed magic and format identity are corruption and type-safety fences, not
+migration negotiation. HTTP or other wire protocols belong to the embedding
+application and are not part of this crate.
