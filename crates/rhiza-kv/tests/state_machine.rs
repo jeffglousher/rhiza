@@ -364,7 +364,15 @@ fn lifecycle_entries_advance_progress_without_mutating_kv_data() {
     let first = entry(1, LogHash::ZERO, replicated(&put));
     state.apply_entry(&first).unwrap();
 
-    let config_change = ConfigChange::stop(3, LogHash::from_bytes([7; 32])).to_stored_command();
+    let config_change = ConfigChange::stop(
+        "cluster-1",
+        3,
+        LogHash::from_bytes([7; 32]),
+        4,
+        vec!["node-1".into(), "node-2".into(), "node-3".into()],
+    )
+    .unwrap()
+    .to_stored_command();
     let mut previous = first.hash;
     for (index, entry_type, payload) in [
         (2, config_change.entry_type, config_change.payload),

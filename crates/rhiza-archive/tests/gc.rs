@@ -2,7 +2,9 @@ use rhiza_archive::{
     CheckpointIdentity, CheckpointPublisherOptions, Error, GcLeaseKind, GcPolicy,
     ObjectArchiveStore,
 };
-use rhiza_core::{EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity};
+use rhiza_core::{
+    ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
+};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 
 const NOW: u64 = 2_000_000_000_000;
@@ -282,7 +284,7 @@ async fn gc_preserves_active_snapshot_and_collects_orphans_after_grace() {
     let new_bytes = b"snapshot-two";
     let current = root
         .publish_checkpoint_snapshot(
-            anchor_with_executor_fingerprint(&second, new_bytes, LogHash::from_bytes([6; 32])),
+            anchor_for_fingerprint(&second, new_bytes, LogHash::from_bytes([6; 32])),
             new_bytes,
         )
         .await
@@ -320,7 +322,7 @@ async fn gc_preserves_active_snapshot_and_collects_orphans_after_grace() {
     root.execute_gc(plan.plan_hash(), NOW + 11).await.unwrap();
     assert!(store.get(&active_key).await.is_ok());
     assert_eq!(
-        root.restore_checkpoint_v2()
+        root.restore_checkpoint_state()
             .await
             .unwrap()
             .snapshot()
@@ -409,18 +411,19 @@ fn anchor(entry: &LogEntry, bytes: &[u8]) -> RecoveryAnchor {
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         3,
         LogAnchor::new(entry.index, entry.hash),
         SnapshotIdentity::new(
             format!("snapshot-{}", entry.index),
             LogHash::digest(&[bytes]),
             bytes.len() as u64,
+            LogHash::from_bytes([6; 32]),
         ),
     )
 }
 
-fn anchor_with_executor_fingerprint(
+fn anchor_for_fingerprint(
     entry: &LogEntry,
     bytes: &[u8],
     executor_fingerprint: LogHash,
@@ -428,15 +431,15 @@ fn anchor_with_executor_fingerprint(
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         3,
         LogAnchor::new(entry.index, entry.hash),
         SnapshotIdentity::new(
             format!("snapshot-{}", entry.index),
             LogHash::digest(&[bytes]),
             bytes.len() as u64,
-        )
-        .with_executor_fingerprint(executor_fingerprint),
+            executor_fingerprint,
+        ),
     )
 }
 

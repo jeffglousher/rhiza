@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    future::Future,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -8,24 +9,37 @@ use std::{
     time::Duration,
 };
 
-use rhiza_node::{confirm_write_durability, ConfigError, NodeConfig, NodeRuntime, NodeService};
-use rhiza_quepaxa::{Error as ConsensusError, Membership, RecorderFileStore, ThreeNodeConsensus};
+mod ha;
+
+use rhiza_node::{confirm_write_durability, ConfigError, NodeRuntime, NodeService};
+use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
 use tokio::{
     sync::{watch, OwnedRwLockReadGuard, RwLock},
-    task::{JoinError, JoinHandle},
+    task::{JoinError, JoinSet},
+    time::Instant,
 };
 
+pub use rhiza_archive::ObjectArchiveStore;
 pub use rhiza_core::{ErrorCategory, ErrorClassification, ExecutionProfile};
 pub use rhiza_node::{
-    effective_cluster_id, CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode,
-    LogPeer, NodeError, NodeStatus, ReadConsistency, ReadResponse, SqlExecuteResponse,
-    SqlQueryResponse, SqlStatementResult, WriteRequest, WriteResponse,
+    effective_cluster_id, CertifiedTailRecord, CertifiedTailRequest, CertifiedTailResponse,
+    CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode, LearnerProgress,
+    LogPeer, NodeConfig, NodeError, NodeStatus, PeerConfig, ReadConsistency, ReadResponse,
+    SqlExecuteResponse, SqlQueryResponse, SqlStatementResult, StopInformation, WriteRequest,
+    WriteResponse,
 };
-pub use rhiza_quepaxa::RecorderRpc;
+pub use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc};
 pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
+pub use ha::{
+    HaNode, HaNodeError, HaNodeStatus, HaPredecessor, HaRecorderTransport, HaServeConfig,
+    HaStartupConfig, HaStartupError, HaStartupMode, HaSuccessorPrestageConfig,
+    HaSuccessorPrestageIdentity, PreparedHaStartup, PreparedHaSuccessorPrestage,
+    PublishedHaSuccessorPrestage,
+};
+
 const MATERIALIZER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(25);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 const LOCAL_RECORDER_IDS: [&str; 3] = ["recorder-1", "recorder-2", "recorder-3"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,6 +164,16 @@ pub enum Error {
     Node(NodeError),
     Durability(DurabilityError),
     PendingConsensusRpcs,
+    ShutdownDeadlineExceeded {
+        phase: &'static str,
+    },
+    Shutdown {
+        primary: Box<Error>,
+        cleanup: Vec<Error>,
+    },
+    WorkerExited {
+        worker: &'static str,
+    },
     Worker(JoinError),
 }
 
@@ -171,6 +195,19 @@ impl fmt::Display for Error {
                     "consensus RPCs did not finish before the shutdown deadline"
                 )
             }
+            Self::ShutdownDeadlineExceeded { phase } => {
+                write!(f, "shutdown deadline exceeded while {phase}")
+            }
+            Self::Shutdown { primary, cleanup } => {
+                write!(f, "shutdown failed: {primary}")?;
+                for error in cleanup {
+                    write!(f, "; cleanup also failed: {error}")?;
+                }
+                Ok(())
+            }
+            Self::WorkerExited { worker } => {
+                write!(f, "embedded {worker} worker exited before shutdown")
+            }
             Self::Worker(error) => write!(f, "embedded worker failed: {error}"),
         }
     }
@@ -185,6 +222,9 @@ impl std::error::Error for Error {
             Self::Node(error) => Some(error),
             Self::Durability(error) => Some(error),
             Self::PendingConsensusRpcs => None,
+            Self::ShutdownDeadlineExceeded { .. } => None,
+            Self::Shutdown { primary, .. } => Some(primary),
+            Self::WorkerExited { .. } => None,
             Self::Worker(error) => Some(error),
         }
     }
@@ -212,6 +252,15 @@ impl Error {
             }
             Self::PendingConsensusRpcs => {
                 ErrorClassification::new("pending_consensus_rpcs", ErrorCategory::Unavailable, true)
+            }
+            Self::ShutdownDeadlineExceeded { .. } => ErrorClassification::new(
+                "shutdown_deadline_exceeded",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+            Self::Shutdown { primary, .. } => primary.classification(),
+            Self::WorkerExited { .. } => {
+                ErrorClassification::new("worker_exited", ErrorCategory::Internal, false)
             }
             Self::Worker(_) => {
                 ErrorClassification::new("worker_error", ErrorCategory::Internal, false)
@@ -281,6 +330,14 @@ struct Inner {
     operations: Arc<RwLock<()>>,
     closed: AtomicBool,
     shutdown: watch::Sender<bool>,
+    worker_monitor: watch::Sender<WorkerMonitorState>,
+}
+
+#[derive(Clone)]
+enum WorkerMonitorState {
+    Running,
+    Failed(ErrorClassification),
+    Closed,
 }
 
 /// Owns the embedded node runtime and its background workers.
@@ -290,7 +347,7 @@ struct Inner {
 /// workers and cannot report drain or durability errors.
 pub struct Rhiza {
     inner: Option<Arc<Inner>>,
-    workers: Vec<JoinHandle<Result<(), Error>>>,
+    workers: JoinSet<Result<(), Error>>,
 }
 
 #[derive(Clone)]
@@ -337,8 +394,17 @@ impl Rhiza {
             coordinator.note_recovered_committed(runtime.applied_index()?);
         }
 
+        Ok(Self::from_open_runtime(runtime, coordinator))
+    }
+
+    fn from_open_runtime(
+        runtime: Arc<NodeRuntime>,
+        coordinator: Option<Arc<CheckpointCoordinator>>,
+    ) -> Self {
+        let execution_profile = runtime.config().execution_profile();
         let service = NodeService::new(runtime.clone(), coordinator.clone());
         let (shutdown, _) = watch::channel(false);
+        let (worker_monitor, _) = watch::channel(WorkerMonitorState::Running);
         let inner = Arc::new(Inner {
             runtime,
             service,
@@ -347,20 +413,22 @@ impl Rhiza {
             operations: Arc::new(RwLock::new(())),
             closed: AtomicBool::new(false),
             shutdown,
+            worker_monitor,
         });
-        let mut workers = vec![spawn_materializer(&inner)];
+        let mut workers = JoinSet::new();
+        spawn_materializer(&inner, &mut workers);
         if inner
             .coordinator
             .as_ref()
             .is_some_and(|coordinator| !matches!(coordinator.mode(), DurabilityMode::Sync))
         {
-            workers.push(spawn_coordinator(&inner));
+            spawn_coordinator(&inner, &mut workers);
         }
 
-        Ok(Self {
+        Self {
             inner: Some(inner),
             workers,
-        })
+        }
     }
 
     pub fn handle(&self) -> RhizaHandle {
@@ -369,33 +437,95 @@ impl Rhiza {
         }
     }
 
-    /// Drains embedded work and returns any durability or worker failure.
-    pub async fn shutdown(mut self) -> Result<(), Error> {
-        let inner = self.inner.take().expect("open owner has inner state");
-        inner.closed.store(true, Ordering::Release);
-        inner.runtime.cancel_operations();
-        let operations = inner.operations.write().await;
-        stop_inner(&inner);
-        drop(operations);
-        let mut worker_result = Ok(());
-        for worker in self.workers.drain(..) {
-            match worker.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) if worker_result.is_ok() => worker_result = Err(error),
-                Err(error) if worker_result.is_ok() => worker_result = Err(Error::Worker(error)),
-                _ => {}
+    /// Waits for the first background worker failure.
+    ///
+    /// `None` means graceful shutdown was requested. The returned classification is only a
+    /// live-health signal; [`Self::shutdown`] retains and returns the original worker error.
+    pub async fn wait_for_worker_failure(&self) -> Option<ErrorClassification> {
+        let mut monitor = self
+            .inner
+            .as_ref()
+            .expect("open owner has inner state")
+            .worker_monitor
+            .subscribe();
+        loop {
+            match monitor.borrow().clone() {
+                WorkerMonitorState::Running => {}
+                WorkerMonitorState::Failed(classification) => return Some(classification),
+                WorkerMonitorState::Closed => return None,
+            }
+            if monitor.changed().await.is_err() {
+                return None;
             }
         }
-        let mut result = flush_applied_tip(&inner).await;
-        let consensus_result = finish_pending_consensus_rpcs(&inner, SHUTDOWN_RPC_TIMEOUT);
-        if result.is_ok() {
-            result = consensus_result;
+    }
+
+    /// Drains embedded work within the default shutdown budget.
+    pub async fn shutdown(self) -> Result<(), Error> {
+        self.shutdown_with_timeout(SHUTDOWN_TIMEOUT).await
+    }
+
+    /// Drains embedded work within one timeout budget shared by every shutdown phase.
+    pub async fn shutdown_with_timeout(self, timeout: Duration) -> Result<(), Error> {
+        self.shutdown_with_deadline(Instant::now() + timeout).await
+    }
+
+    /// Drains embedded work before an absolute deadline.
+    pub async fn shutdown_with_deadline(mut self, deadline: Instant) -> Result<(), Error> {
+        let inner = self.inner.take().expect("open owner has inner state");
+        let mut errors = Vec::new();
+
+        close_inner(&inner);
+        let operations_drained =
+            match tokio::time::timeout_at(deadline, inner.operations.write()).await {
+                Ok(operations) => {
+                    drop(operations);
+                    true
+                }
+                Err(_) => {
+                    errors.push(Error::ShutdownDeadlineExceeded {
+                        phase: "draining in-flight operations",
+                    });
+                    false
+                }
+            };
+
+        signal_workers(&inner);
+        let mut workers_stopped = true;
+        while !self.workers.is_empty() {
+            match tokio::time::timeout_at(deadline, self.workers.join_next()).await {
+                Ok(Some(Ok(Ok(())))) => {}
+                Ok(Some(Ok(Err(error)))) => errors.push(error),
+                Ok(Some(Err(error))) => errors.push(Error::Worker(error)),
+                Ok(None) => break,
+                Err(_) => {
+                    errors.push(Error::ShutdownDeadlineExceeded {
+                        phase: "stopping background workers",
+                    });
+                    self.workers.abort_all();
+                    workers_stopped = false;
+                    break;
+                }
+            }
         }
-        if result.is_ok() {
-            result = worker_result;
+
+        if operations_drained && workers_stopped {
+            match tokio::time::timeout_at(deadline, flush_applied_tip(&inner)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(_) => errors.push(Error::ShutdownDeadlineExceeded {
+                    phase: "flushing the applied tip",
+                }),
+            }
         }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Err(error) = finish_pending_consensus_rpcs(&inner, remaining) {
+            errors.push(error);
+        }
+
         drop(inner);
-        result
+        combine_shutdown_errors(errors)
     }
 }
 
@@ -404,6 +534,7 @@ impl Drop for Rhiza {
         if let Some(inner) = &self.inner {
             stop_inner(inner);
         }
+        self.workers.abort_all();
     }
 }
 
@@ -576,27 +707,110 @@ async fn confirm_embedded_write(
     .map_err(Error::Durability)
 }
 
-fn spawn_materializer(inner: &Arc<Inner>) -> JoinHandle<Result<(), Error>> {
+fn spawn_materializer(inner: &Arc<Inner>, workers: &mut JoinSet<Result<(), Error>>) {
     let runtime = inner.runtime.clone();
     let shutdown = inner.shutdown.subscribe();
-    tokio::spawn(async move {
-        runtime
-            .run_background_materializer(MATERIALIZER_POLL_INTERVAL, wait_for_shutdown(shutdown))
-            .await
-            .map_err(Error::Node)
-    })
+    let worker_monitor = inner.worker_monitor.clone();
+    workers.spawn(supervise_worker(
+        "materializer",
+        shutdown.clone(),
+        worker_monitor,
+        async move {
+            runtime
+                .run_background_materializer(
+                    MATERIALIZER_POLL_INTERVAL,
+                    wait_for_shutdown(shutdown),
+                )
+                .await
+                .map_err(Error::Node)
+        },
+    ));
 }
 
-fn spawn_coordinator(inner: &Arc<Inner>) -> JoinHandle<Result<(), Error>> {
+fn spawn_coordinator(inner: &Arc<Inner>, workers: &mut JoinSet<Result<(), Error>>) {
     let coordinator = inner.coordinator.as_ref().unwrap().clone();
     let runtime = inner.runtime.clone();
     let shutdown = inner.shutdown.subscribe();
-    tokio::spawn(async move {
-        coordinator
-            .run_background(runtime, wait_for_shutdown(shutdown))
-            .await
-            .map_err(Error::Durability)
-    })
+    let worker_monitor = inner.worker_monitor.clone();
+    workers.spawn(supervise_worker(
+        "checkpoint coordinator",
+        shutdown.clone(),
+        worker_monitor,
+        async move {
+            coordinator
+                .run_background(runtime, wait_for_shutdown(shutdown))
+                .await
+                .map_err(Error::Durability)
+        },
+    ));
+}
+
+async fn supervise_worker<F>(
+    worker_name: &'static str,
+    shutdown: watch::Receiver<bool>,
+    worker_monitor: watch::Sender<WorkerMonitorState>,
+    worker: F,
+) -> Result<(), Error>
+where
+    F: Future<Output = Result<(), Error>> + Send + 'static,
+{
+    let mut exit_monitor = WorkerExitMonitor {
+        shutdown,
+        worker_monitor,
+        armed: true,
+    };
+    let result = worker.await;
+    if *exit_monitor.shutdown.borrow() {
+        exit_monitor.armed = false;
+        return result;
+    }
+
+    let error = match result {
+        Ok(()) => Error::WorkerExited {
+            worker: worker_name,
+        },
+        Err(error) => error,
+    };
+    exit_monitor.publish(error.classification());
+    Err(error)
+}
+
+struct WorkerExitMonitor {
+    shutdown: watch::Receiver<bool>,
+    worker_monitor: watch::Sender<WorkerMonitorState>,
+    armed: bool,
+}
+
+impl WorkerExitMonitor {
+    fn publish(&mut self, classification: ErrorClassification) {
+        self.armed = false;
+        self.worker_monitor.send_if_modified(|state| {
+            if matches!(state, WorkerMonitorState::Running) {
+                *state = WorkerMonitorState::Failed(classification);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+impl Drop for WorkerExitMonitor {
+    fn drop(&mut self) {
+        if !self.armed || *self.shutdown.borrow() {
+            return;
+        }
+        let classification =
+            ErrorClassification::new("worker_error", ErrorCategory::Internal, false);
+        self.worker_monitor.send_if_modified(|state| {
+            if matches!(state, WorkerMonitorState::Running) {
+                *state = WorkerMonitorState::Failed(classification);
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -634,10 +848,41 @@ fn finish_pending_consensus_rpcs(inner: &Inner, timeout: Duration) -> Result<(),
     }
 }
 
-fn stop_inner(inner: &Inner) {
+fn combine_shutdown_errors(mut errors: Vec<Error>) -> Result<(), Error> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let primary = errors.remove(0);
+    if errors.is_empty() {
+        Err(primary)
+    } else {
+        Err(Error::Shutdown {
+            primary: Box::new(primary),
+            cleanup: errors,
+        })
+    }
+}
+
+fn close_inner(inner: &Inner) {
     inner.closed.store(true, Ordering::Release);
     inner.runtime.cancel_operations();
+}
+
+fn signal_workers(inner: &Inner) {
     let _ = inner.shutdown.send(true);
+    inner.worker_monitor.send_if_modified(|state| {
+        if matches!(state, WorkerMonitorState::Running) {
+            *state = WorkerMonitorState::Closed;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn stop_inner(inner: &Inner) {
+    close_inner(inner);
+    signal_workers(inner);
 }
 
 #[cfg(test)]

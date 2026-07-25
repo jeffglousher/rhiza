@@ -126,7 +126,7 @@ fn normal_record_reopens_with_command_and_max_without_rewriting_configuration() 
     );
     drop(recorder);
 
-    let reopened = store(dir.path(), membership).unwrap();
+    let reopened = store(dir.path(), membership.clone()).unwrap();
     assert_eq!(
         reopened
             .configuration_state()
@@ -140,9 +140,13 @@ fn normal_record_reopens_with_command_and_max_without_rewriting_configuration() 
     );
 
     let stop = ConfigChange::stop(
+        CLUSTER_ID,
         CONFIG_ID,
-        reopened.configuration_state().unwrap().config_digest(),
+        membership.digest(),
+        CONFIG_ID + 1,
+        membership.members().to_vec(),
     )
+    .unwrap()
     .to_stored_command();
     let stop_value =
         AcceptedValue::from_command(CLUSTER_ID, 7, EPOCH, CONFIG_ID, LogHash::ZERO, &stop);
@@ -226,37 +230,46 @@ fn reopen_fails_closed_when_the_authoritative_manifest_is_corrupt() {
 }
 
 #[test]
-fn old_slot_format_without_a_durable_head_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("slot-00000000000000000008.rec"), b"legacy").unwrap();
+fn noncurrent_recorder_directories_fail_without_mutation() {
+    for (name, file) in [
+        ("sentinel", "sentinel"),
+        ("partial", "recorded-head.rec"),
+        ("old-slot", "slot-00000000000000000008.rec"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(file), b"not a current recorder layout").unwrap();
+        let before = directory_contents(dir.path());
 
-    assert!(matches!(
-        store(dir.path(), Membership::new(["r1", "r2", "r3"]).unwrap()),
-        Err(Error::MigrationRequired {
-            format: "recorder durable head",
-            version: 2
-        })
-    ));
+        assert!(
+            matches!(
+                store(dir.path(), Membership::new(["r1", "r2", "r3"]).unwrap()),
+                Err(Error::Decode(message))
+                    if message == "recorder directory is not a current durable layout"
+            ),
+            "{name}"
+        );
+        assert_eq!(directory_contents(dir.path()), before, "{name}");
+    }
 }
 
 #[test]
-fn configuration_without_initialization_intent_remains_a_legacy_format() {
+fn incomplete_current_layout_fails_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     drop(store(dir.path(), membership.clone()).unwrap());
     fs::remove_file(dir.path().join("recorded-head.rec")).unwrap();
+    let before = directory_contents(dir.path());
 
     assert!(matches!(
         store(dir.path(), membership),
-        Err(Error::MigrationRequired {
-            format: "recorder durable head",
-            version: 2
-        })
+        Err(Error::Decode(message))
+            if message == "recorder directory is not a current durable layout"
     ));
+    assert_eq!(directory_contents(dir.path()), before);
 }
 
 #[test]
-fn version_one_head_requires_the_breaking_manifest_upgrade() {
+fn noncurrent_recorder_head_fails_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     drop(store(dir.path(), membership.clone()).unwrap());
@@ -265,14 +278,14 @@ fn version_one_head_requires_the_breaking_manifest_upgrade() {
         [b'Q', b'R', b'H', b'D', 0, 1],
     )
     .unwrap();
+    let before = directory_contents(dir.path());
 
     assert!(matches!(
         store(dir.path(), membership),
-        Err(Error::MigrationRequired {
-            format: "recorder durable head",
-            version: 3
-        })
+        Err(Error::Decode(message))
+            if message == "recorder directory is not a current durable layout"
     ));
+    assert_eq!(directory_contents(dir.path()), before);
 }
 
 #[test]
@@ -437,6 +450,18 @@ fn wal_replays_recent_slots_before_cache_checkpoint() {
 
 fn store(root: &std::path::Path, membership: Membership) -> Result<RecorderFileStore, Error> {
     RecorderFileStore::new_with_membership(root, "r1", CLUSTER_ID, EPOCH, CONFIG_ID, membership)
+}
+
+fn directory_contents(root: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut contents = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), fs::read(entry.path()).unwrap())
+        })
+        .collect::<Vec<_>>();
+    contents.sort_by(|left, right| left.0.cmp(&right.0));
+    contents
 }
 
 fn record(slot: u64, proposal: Proposal, command: Option<StoredCommand>) -> RecordRequest {

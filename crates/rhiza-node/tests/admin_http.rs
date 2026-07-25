@@ -260,7 +260,12 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
 
     let first = admin_post(addr, ADMIN_STOP_PATH, &request).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
-    let first = first.json::<AdminStopResponse>().await.unwrap();
+    let first = first.json::<serde_json::Value>().await.unwrap();
+    assert!(first["stop"].get("version").is_none());
+    let mut obsolete = first.clone();
+    obsolete["stop"]["version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<AdminStopResponse>(obsolete).is_err());
+    let first = serde_json::from_value::<AdminStopResponse>(first).unwrap();
     let replay = admin_post(addr, ADMIN_STOP_PATH, &request).await;
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
     assert_eq!(replay.json::<AdminStopResponse>().await.unwrap(), first);
@@ -343,6 +348,11 @@ async fn stop_success_and_changed_body_conflict_survive_router_and_runtime_resta
     let first = router_admin_post(first_router, ADMIN_STOP_PATH, &request).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
     let first = response_json::<AdminStopResponse>(first).await;
+    let ledger: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("node/admin-operations-v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(ledger.get("version").is_none());
     drop(first_runtime);
 
     let runtime = runtime_with_consensus_recorders(

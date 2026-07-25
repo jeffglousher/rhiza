@@ -1,4 +1,6 @@
-use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot};
+use rhiza_core::{
+    ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot,
+};
 use rhiza_sql::{
     decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
     restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, SqlBatchMember,
@@ -408,6 +410,14 @@ fn existing_qwal_pair_opens_when_supplied_configuration_is_ahead() {
     .unwrap();
     drop(db);
 
+    let stop_change = ConfigChange::stop(
+        "cluster-a",
+        1,
+        initial.digest(),
+        2,
+        vec!["node-1".into(), "node-2".into(), "node-3".into()],
+    )
+    .unwrap();
     let reopened = SqliteStateMachine::open_with_configuration(
         &path,
         "cluster-a",
@@ -417,6 +427,8 @@ fn existing_qwal_pair_opens_when_supplied_configuration_is_ahead() {
             1,
             initial.digest(),
             LogAnchor::new(1, LogHash::digest(&[b"stop"])),
+            stop_change.successor().clone(),
+            stop_change.to_stored_command().hash(),
         ),
     )
     .unwrap();

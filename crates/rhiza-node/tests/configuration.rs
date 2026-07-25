@@ -394,9 +394,11 @@ fn stopped_runtime_rejects_writes_with_typed_transition_error() {
         "client-token",
     )
     .unwrap();
-    let consensus = Arc::new(membership_consensus(root.path(), membership));
+    let consensus = Arc::new(membership_consensus(root.path(), membership.clone()));
     let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
-    runtime.stop_current_configuration().unwrap();
+    runtime
+        .stop_current_configuration_for_successor(&membership)
+        .unwrap();
     let stopped = runtime.configuration_state().unwrap();
 
     assert_eq!(runtime.configuration_state().unwrap(), stopped);
@@ -448,7 +450,7 @@ fn stop_advances_past_an_already_decided_normal_command() {
 }
 
 #[test]
-fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
+fn three_to_three_replacement_keeps_stopped_predecessor_alive_until_successor_is_ready() {
     let root = TempDir::new().unwrap();
     let old_membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let old_config = NodeConfig::new(
@@ -461,9 +463,21 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
         "client-token",
     )
     .unwrap();
-    let old_runtime = NodeRuntime::open(
-        old_config,
-        Arc::new(membership_consensus(root.path(), old_membership.clone())),
+    let old_consensus = Arc::new(membership_consensus(root.path(), old_membership.clone()));
+    let old_runtime = NodeRuntime::open(old_config, old_consensus.clone(), &[]).unwrap();
+    let successor_data_dir = root.path().join("successor-node");
+    let successor_predecessor = NodeRuntime::open(
+        NodeConfig::new(
+            "rhiza:sql:cluster-a",
+            "n1",
+            successor_data_dir.clone(),
+            1,
+            1,
+            peers(3),
+            "client-token",
+        )
+        .unwrap(),
+        old_consensus,
         &[],
     )
     .unwrap();
@@ -482,7 +496,12 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
             Command::new(CommandKind::ReadBarrier, Vec::new())
         )
         .is_err());
-    drop(old_runtime);
+    while successor_predecessor.materialize_next_decision().unwrap() {}
+    assert_eq!(
+        successor_predecessor.configuration_state().unwrap(),
+        stopped
+    );
+    drop(successor_predecessor);
 
     let recorder_ids = ["n1", "n2", "n4"];
     let mut successor_recorders: Vec<(String, Box<dyn RecorderRpc>)> = Vec::new();
@@ -499,6 +518,10 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
         install_successor_recorder(&recorder, 2, new_membership.clone(), &stop).unwrap();
         successor_recorders.push((recorder_id.to_string(), Box::new(recorder)));
     }
+    assert!(matches!(
+        old_runtime.write("request-2", "after", "install"),
+        Err(NodeError::ConfigurationTransition { state }) if state.as_ref() == &stopped
+    ));
     let successor_consensus = Arc::new(
         ThreeNodeConsensus::from_recorders_with_ids(
             "rhiza:sql:cluster-a",
@@ -517,19 +540,21 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
     let successor_config = NodeConfig::new_with_configuration(
         "rhiza:sql:cluster-a",
         "n1",
-        root.path().join("node"),
+        successor_data_dir.clone(),
         1,
         new_membership.clone(),
         stopped.clone(),
         successor_peers.clone(),
         "client-token",
     )
-    .unwrap();
+    .unwrap()
+    .with_log_initial_configuration(ConfigurationState::active(1, old_membership.digest()));
     let successor = NodeRuntime::open(successor_config, successor_consensus, &[]).unwrap();
     assert_eq!(
         successor.status().unwrap().configuration_status,
         RuntimeConfigurationStatus::AwaitingActivation
     );
+    drop(old_runtime);
     let activation = successor.activate_successor().unwrap();
     assert_eq!(activation.index, stop.entry.index + 1);
     assert_eq!(activation.config_id, 2);
@@ -537,7 +562,7 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
         successor.status().unwrap().configuration_status,
         RuntimeConfigurationStatus::Active
     );
-    successor.write("request-2", "after", "activation").unwrap();
+    successor.write("request-3", "after", "activation").unwrap();
     drop(successor);
 
     let restarted_recorders: Vec<(String, Box<dyn RecorderRpc>)> = recorder_ids
@@ -571,7 +596,7 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
     let restarted_config = NodeConfig::new(
         "rhiza:sql:cluster-a",
         "n1",
-        root.path().join("node"),
+        successor_data_dir,
         1,
         2,
         successor_peers,
@@ -584,7 +609,7 @@ fn three_to_three_replacement_stops_installs_activates_and_reopens_writes() {
         restarted.status().unwrap().configuration_status,
         RuntimeConfigurationStatus::Active
     );
-    restarted.write("request-3", "restart", "active").unwrap();
+    restarted.write("request-4", "restart", "active").unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

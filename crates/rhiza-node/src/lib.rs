@@ -75,17 +75,19 @@ pub mod durability;
 mod graph;
 #[cfg(feature = "kv")]
 mod kv;
+mod learner;
 mod recorder_tcp;
 pub use admin::*;
 pub use durability::{
     restore_checkpoint_to_fresh_data_dir, restore_checkpoint_to_fresh_data_dir_for_node,
-    restore_successor_checkpoint_to_fresh_data_dir, CheckpointCoordinator, DurabilityError,
-    DurabilityHealth, DurabilityMode, SuccessorRestorePreparation,
+    CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode,
+    SuccessorRestorePreparation,
 };
 #[cfg(feature = "graph")]
 pub use graph::*;
 #[cfg(feature = "kv")]
 pub use kv::*;
+pub use learner::*;
 #[cfg(feature = "recorder-postcard-rpc")]
 pub use recorder_tcp::{
     serve_recorder_postcard_rpc, serve_recorder_postcard_rpc_tls,
@@ -289,8 +291,6 @@ pub const KV_DELETE_PATH: &str = "/v1/kv/delete";
 pub const KV_GET_PATH: &str = "/v1/kv/get";
 #[cfg(feature = "kv")]
 pub const KV_SCAN_PATH: &str = "/v1/kv/scan";
-#[cfg(feature = "sql")]
-pub const SQL_EXECUTE_RESPONSE_VERSION: u16 = 1;
 pub const LIVEZ_PATH: &str = "/livez";
 pub const READYZ_PATH: &str = "/readyz";
 const MAX_STARTUP_RECOVERY_ENTRIES: usize = 100_000;
@@ -3293,6 +3293,10 @@ async fn handle_livez() -> StatusCode {
 async fn handle_readyz(State(state): State<NodeRouteState>) -> StatusCode {
     if state.runtime.is_ready()
         && state
+            .runtime
+            .configuration_state()
+            .is_ok_and(|configuration| configuration.is_active())
+        && state
             .coordinator
             .as_ref()
             .is_none_or(|coordinator| coordinator.health() == DurabilityHealth::Available)
@@ -3540,7 +3544,7 @@ pub fn install_successor_recorder(
     membership: Membership,
     stop: &StopInformation,
 ) -> Result<rhiza_quepaxa::ConfigurationState, NodeError> {
-    if stop.version != 2 || stop.entry.config_id.checked_add(1) != Some(next_config_id) {
+    if stop.entry.config_id.checked_add(1) != Some(next_config_id) {
         return Err(NodeError::PreconditionFailed(
             "successor identity does not match the Stop proof".into(),
         ));
@@ -4460,8 +4464,8 @@ pub struct NodeStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StopInformation {
-    pub version: u16,
     pub entry: LogEntry,
     pub proof: DecisionProof,
 }
@@ -4483,11 +4487,12 @@ pub struct WriteResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientErrorResponse {
     pub code: String,
     pub retryable: bool,
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
 }
 
@@ -4517,11 +4522,10 @@ pub struct SqlExecuteRequest {
 
 #[cfg(feature = "sql")]
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SqlExecuteResponse {
-    pub version: u16,
     pub applied_index: LogIndex,
     pub hash: LogHash,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<SqlStatementResult>,
 }
 
@@ -4552,7 +4556,6 @@ fn sql_execute_response(
         })
         .unwrap_or_default();
     SqlExecuteResponse {
-        version: SQL_EXECUTE_RESPONSE_VERSION,
         applied_index: response.applied_index,
         hash: response.hash,
         results,
@@ -4564,7 +4567,7 @@ fn sql_execute_response(
 pub struct SqlStatementResult {
     pub statement_index: usize,
     pub rows_affected: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub returning: Option<SqlQueryResult>,
 }
 
@@ -5509,6 +5512,77 @@ impl Materializer {
                         },
                     };
                     Ok(Self::Kv(Arc::new(state)))
+                }
+                #[cfg(not(feature = "kv"))]
+                Err(NodeError::Unavailable(
+                    "kv execution profile is not compiled in".into(),
+                ))
+            }
+        }
+    }
+
+    #[cfg_attr(not(feature = "sql"), allow(unused_variables))]
+    fn open_detached(
+        data_dir: &Path,
+        profile: ExecutionProfile,
+        cluster_id: &str,
+        node_id: &str,
+        epoch: u64,
+        configuration_state: &ConfigurationState,
+    ) -> Result<Self, NodeError> {
+        Self::ensure_profile_available(profile)?;
+        match profile {
+            ExecutionProfile::Sqlite => {
+                #[cfg(feature = "sql")]
+                {
+                    SqliteStateMachine::open_with_configuration(
+                        data_dir.join("sqlite/db.sqlite"),
+                        cluster_id,
+                        node_id,
+                        epoch,
+                        configuration_state.clone(),
+                    )
+                    .map(Box::new)
+                    .map(Self::Sql)
+                    .map_err(|error| NodeError::Storage(error.to_string()))
+                }
+                #[cfg(not(feature = "sql"))]
+                Err(NodeError::Unavailable(
+                    "sql execution profile is not compiled in".into(),
+                ))
+            }
+            ExecutionProfile::Graph => {
+                #[cfg(feature = "graph")]
+                {
+                    LadybugStateMachine::open(
+                        data_dir.join("ladybug/graph.lbug"),
+                        cluster_id,
+                        node_id,
+                        epoch,
+                        configuration_state.config_id(),
+                    )
+                    .map(Arc::new)
+                    .map(Self::Graph)
+                    .map_err(|error| NodeError::Storage(error.to_string()))
+                }
+                #[cfg(not(feature = "graph"))]
+                Err(NodeError::Unavailable(
+                    "graph execution profile is not compiled in".into(),
+                ))
+            }
+            ExecutionProfile::Kv => {
+                #[cfg(feature = "kv")]
+                {
+                    RedbStateMachine::open(
+                        data_dir.join("kv/data.redb"),
+                        cluster_id,
+                        node_id,
+                        epoch,
+                        configuration_state.config_id(),
+                    )
+                    .map(Arc::new)
+                    .map(Self::Kv)
+                    .map_err(|error| NodeError::Storage(error.to_string()))
                 }
                 #[cfg(not(feature = "kv"))]
                 Err(NodeError::Unavailable(
@@ -7970,7 +8044,7 @@ impl NodeRuntime {
                 .map_err(|error| self.map_sqlite_error(error))?;
             if !proposal_payload.starts_with(QWAL_V3_MAGIC) {
                 return Err(self.latch(NodeError::Invariant(
-                    "SQLite materializer prepared a non-QWAL v3 legacy put proposal".into(),
+                    "SQLite materializer prepared a non-QWAL v3 key/value write proposal".into(),
                 )));
             }
             if proposal_payload.len() > MAX_COMMAND_BYTES {
@@ -8000,7 +8074,7 @@ impl NodeRuntime {
             }
             if entry.entry_type == EntryType::Command && entry.payload == proposal_payload {
                 return Err(self.latch(NodeError::Invariant(
-                    "committed legacy put request was not recorded by SQLite QWAL".into(),
+                    "committed key/value write request was not recorded by SQLite QWAL".into(),
                 )));
             }
         }
@@ -8235,54 +8309,33 @@ impl NodeRuntime {
         })
     }
 
-    pub fn stop_current_configuration(&self) -> Result<StopInformation, NodeError> {
-        let _commit = self.lock_commit()?;
-        self.stop_current_configuration_locked(None)
-    }
-
     pub fn stop_current_configuration_for_successor(
         &self,
         successor: &Membership,
     ) -> Result<StopInformation, NodeError> {
         let _commit = self.lock_commit()?;
-        self.stop_current_configuration_locked(Some(successor))
-    }
-
-    pub fn stop_current_configuration_if(
-        &self,
-        expected_config_id: u64,
-    ) -> Result<StopInformation, NodeError> {
-        let _commit = self.lock_commit()?;
-        let state = self.configuration_state()?;
-        if !state.is_active() || state.config_id() != expected_config_id {
-            return Err(NodeError::PreconditionFailed(
-                "active configuration does not match expected_config_id".into(),
-            ));
-        }
-        self.stop_current_configuration_locked(None)
+        self.stop_current_configuration_locked(successor)
     }
 
     fn stop_current_configuration_locked(
         &self,
-        successor: Option<&Membership>,
+        successor: &Membership,
     ) -> Result<StopInformation, NodeError> {
         self.ensure_ready()?;
         self.ensure_writes_active()?;
         let state = self.configuration_state()?;
-        let stop_command = match successor {
-            Some(successor) => ConfigChange::bound_stop(
-                self.config.cluster_id.clone(),
-                state.config_id(),
-                state.digest(),
-                state.config_id().checked_add(1).ok_or_else(|| {
-                    NodeError::Invariant("successor config id is exhausted".into())
-                })?,
-                successor.members().to_vec(),
-            )
-            .map_err(|error| NodeError::Invariant(error.to_string()))?
-            .to_stored_command(),
-            None => ConfigChange::stop(state.config_id(), state.digest()).to_stored_command(),
-        };
+        let stop_command = ConfigChange::stop(
+            self.config.cluster_id.clone(),
+            state.config_id(),
+            state.digest(),
+            state
+                .config_id()
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Invariant("successor config id is exhausted".into()))?,
+            successor.members().to_vec(),
+        )
+        .map_err(|error| NodeError::Invariant(error.to_string()))?
+        .to_stored_command();
         loop {
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index
@@ -8321,11 +8374,7 @@ impl NodeRuntime {
                     "Stop proof differs from committed stop entry".into(),
                 )));
             }
-            return Ok(StopInformation {
-                version: 2,
-                entry,
-                proof,
-            });
+            return Ok(StopInformation { entry, proof });
         }
     }
 
@@ -8571,6 +8620,7 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<ReadResponse, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let sqlite = self.lock_sqlite()?;
         let (applied_index, hash) = sqlite
             .applied_tip_value()
@@ -8598,6 +8648,7 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<GraphReadResponse, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let graph = self.graph_materializer()?;
         let (value, applied_index, hash) = graph
             .get_document_with_tip(id)
@@ -8624,6 +8675,7 @@ impl NodeRuntime {
         max_rows: u32,
     ) -> Result<GraphQueryResult, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let graph = self.graph_materializer()?;
         let result = graph
             .query_read_only(
@@ -8651,6 +8703,7 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<KvReadResponse, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let kv = self.kv_materializer()?;
         let result = kv
             .get_with_tip(key)
@@ -8680,6 +8733,7 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<KvScanResult, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let kv = self.kv_materializer()?;
         let result = kv
             .scan_range(start, end, limit, cursor)
@@ -8697,6 +8751,7 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<KvScanResult, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let kv = self.kv_materializer()?;
         let result = kv
             .scan_prefix(prefix, limit, cursor)
@@ -8713,6 +8768,7 @@ impl NodeRuntime {
         max_rows: u32,
     ) -> Result<SqlQueryResponse, NodeError> {
         self.ensure_ready()?;
+        self.ensure_writes_active()?;
         let sqlite = self.lock_sqlite()?;
         let (applied_index, hash) = sqlite
             .applied_tip_value()
@@ -9382,8 +9438,8 @@ mod tests {
     use axum::http::HeaderValue;
 
     use rhiza_core::{
-        Command, CommandKind, EntryType, ErrorCategory, ErrorClassification, ExecutionProfile,
-        LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
+        Command, CommandKind, ConfigurationState, EntryType, ErrorCategory, ErrorClassification,
+        ExecutionProfile, LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
@@ -9534,10 +9590,15 @@ mod tests {
         let snapshot = RecoveryAnchor::new(
             "cluster",
             1,
-            1,
+            ConfigurationState::active(1, LogHash::digest(&[b"node-error-test-config"])),
             1,
             LogAnchor::new(1, LogHash::ZERO),
-            SnapshotIdentity::new("snapshot", LogHash::ZERO, 0),
+            SnapshotIdentity::new(
+                "snapshot",
+                LogHash::ZERO,
+                0,
+                rhiza_sql::sql_executor_fingerprint().unwrap(),
+            ),
         );
         let cases = vec![
             (
@@ -11930,10 +11991,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_put_endpoint_commits_qwal_instead_of_raw_put_payload() {
+    fn key_value_write_commits_qwal_instead_of_raw_put_payload() {
         let (_dir, runtime) = sql_test_runtime();
 
-        let response = runtime.write("legacy-put", "key", "value").unwrap();
+        let response = runtime.write("key-value-put", "key", "value").unwrap();
 
         let entry = runtime
             .log_store()

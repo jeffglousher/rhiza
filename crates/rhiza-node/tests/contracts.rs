@@ -699,7 +699,15 @@ fn startup_replays_qlog_config_change_ahead_of_sqlite_sidecar() {
         ConfigurationState::active(1, test_config_digest()),
     )
     .unwrap();
-    let command = ConfigChange::stop(1, test_config_digest()).to_stored_command();
+    let command = ConfigChange::stop(
+        "rhiza:sql:cluster-a",
+        1,
+        test_config_digest(),
+        2,
+        vec!["node-1".into(), "node-2".into(), "node-3".into()],
+    )
+    .unwrap()
+    .to_stored_command();
     let stop = LogEntry {
         cluster_id: "rhiza:sql:cluster-a".into(),
         epoch: 1,
@@ -1981,7 +1989,11 @@ fn stopped_configuration_rejects_read_barrier_without_advancing_qlog() {
     let runtime = NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap();
     runtime.write("request-1", "alpha", "one").unwrap();
     let before = runtime.read("alpha", ReadConsistency::ReadBarrier).unwrap();
-    let stop = runtime.stop_current_configuration().unwrap();
+    let successor =
+        Membership::from_voters(["node-1".into(), "node-2".into(), "node-3".into()]).unwrap();
+    let stop = runtime
+        .stop_current_configuration_for_successor(&successor)
+        .unwrap();
 
     assert_eq!(before.value.as_deref(), Some("one"));
     assert!(matches!(

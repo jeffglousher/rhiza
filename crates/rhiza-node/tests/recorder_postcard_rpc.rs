@@ -637,10 +637,10 @@ async fn postcard_rpc_does_not_replay_a_mutation_after_session_failure_and_later
 async fn postcard_rpc_tls_round_trips_and_protocol_fences_reject_mismatches() {
     let (cert_pem, key_pem) = tls_material("recorder.test");
 
-    let new_tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let new_tls_address = new_tls_listener.local_addr().unwrap();
-    let new_tls_server = tokio::spawn(serve_recorder_postcard_rpc_tls(
-        new_tls_listener,
+    let rpc_tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc_tls_address = rpc_tls_listener.local_addr().unwrap();
+    let rpc_tls_server = tokio::spawn(serve_recorder_postcard_rpc_tls(
+        rpc_tls_listener,
         ProbeRecorder::default(),
         peers(),
         7,
@@ -648,91 +648,91 @@ async fn postcard_rpc_tls_round_trips_and_protocol_fences_reject_mismatches() {
             .unwrap(),
         std::future::pending(),
     ));
-    let new_tls =
+    let rpc_tls =
         RecorderPostcardRpcTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "recorder.test")
             .unwrap();
     let matching = TcpPostcardRpcRecorderClient::new_tls(
-        new_tls_address,
+        rpc_tls_address,
         "node-1",
         "node-2",
         "peer-token-2",
         7,
-        new_tls.clone(),
+        rpc_tls.clone(),
     )
     .unwrap();
     assert_eq!(matching.recorder_id().unwrap(), "node-1");
-    let legacy_tls =
+    let framed_tls =
         RecorderTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "recorder.test").unwrap();
-    let legacy_to_new = TcpPostcardRecorderClient::new_tls(
-        new_tls_address,
+    let framed_to_rpc = TcpPostcardRecorderClient::new_tls(
+        rpc_tls_address,
         "node-1",
         "node-2",
         "peer-token-2",
         7,
-        legacy_tls,
+        framed_tls,
     )
     .unwrap();
-    assert!(legacy_to_new.recorder_id().is_err());
-    assert!(client(new_tls_address).recorder_id().is_err());
+    assert!(framed_to_rpc.recorder_id().is_err());
+    assert!(client(rpc_tls_address).recorder_id().is_err());
 
-    let legacy_tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let legacy_tls_address = legacy_tls_listener.local_addr().unwrap();
-    let legacy_tls_server = tokio::spawn(serve_recorder_tcp_tls(
-        legacy_tls_listener,
+    let framed_tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let framed_tls_address = framed_tls_listener.local_addr().unwrap();
+    let framed_tls_server = tokio::spawn(serve_recorder_tcp_tls(
+        framed_tls_listener,
         ProbeRecorder::default(),
         peers(),
         7,
         RecorderTlsServerConfig::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap(),
         std::future::pending(),
     ));
-    let new_to_legacy = TcpPostcardRpcRecorderClient::new_tls(
-        legacy_tls_address,
+    let rpc_to_framed = TcpPostcardRpcRecorderClient::new_tls(
+        framed_tls_address,
         "node-1",
         "node-2",
         "peer-token-2",
         7,
-        new_tls.clone(),
+        rpc_tls.clone(),
     )
     .unwrap();
-    assert!(new_to_legacy.recorder_id().is_err());
+    assert!(rpc_to_framed.recorder_id().is_err());
 
-    let new_plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let new_plain_address = new_plain_listener.local_addr().unwrap();
-    let new_plain_server = tokio::spawn(serve_recorder_postcard_rpc(
-        new_plain_listener,
+    let rpc_plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc_plain_address = rpc_plain_listener.local_addr().unwrap();
+    let rpc_plain_server = tokio::spawn(serve_recorder_postcard_rpc(
+        rpc_plain_listener,
         ProbeRecorder::default(),
         peers(),
         7,
         std::future::pending(),
     ));
-    let legacy_plain =
-        TcpPostcardRecorderClient::new(new_plain_address, "node-1", "node-2", "peer-token-2", 7)
+    let framed_plain =
+        TcpPostcardRecorderClient::new(rpc_plain_address, "node-1", "node-2", "peer-token-2", 7)
             .unwrap();
-    assert!(legacy_plain.recorder_id().is_err());
+    assert!(framed_plain.recorder_id().is_err());
     let tls_to_plain = TcpPostcardRpcRecorderClient::new_tls(
-        new_plain_address,
+        rpc_plain_address,
         "node-1",
         "node-2",
         "peer-token-2",
         7,
-        new_tls,
+        rpc_tls,
     )
     .unwrap();
     assert!(tls_to_plain.recorder_id().is_err());
 
-    let legacy_plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let legacy_plain_address = legacy_plain_listener.local_addr().unwrap();
-    let legacy_plain_server = tokio::spawn(serve_recorder_tcp(
-        legacy_plain_listener,
+    let framed_plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let framed_plain_address = framed_plain_listener.local_addr().unwrap();
+    let framed_plain_server = tokio::spawn(serve_recorder_tcp(
+        framed_plain_listener,
         ProbeRecorder::default(),
         peers(),
         7,
         std::future::pending(),
     ));
-    assert!(client(legacy_plain_address).recorder_id().is_err());
+    assert!(client(framed_plain_address).recorder_id().is_err());
 
-    new_tls_server.abort();
-    legacy_tls_server.abort();
-    new_plain_server.abort();
-    legacy_plain_server.abort();
+    rpc_tls_server.abort();
+    framed_tls_server.abort();
+    rpc_plain_server.abort();
+    framed_plain_server.abort();
 }

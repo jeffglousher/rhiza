@@ -258,7 +258,7 @@ fn test_anchor(index: u64, hash: LogHash, recovery_generation: u64) -> RecoveryA
     let digest = rhiza_quepaxa::Membership::new(["node-1", "node-2", "node-3"])
         .unwrap()
         .digest();
-    RecoveryAnchor::new_with_configuration(
+    RecoveryAnchor::new(
         "rhiza:sql:cluster-a",
         1,
         ConfigurationState::active(1, digest),
@@ -268,6 +268,7 @@ fn test_anchor(index: u64, hash: LogHash, recovery_generation: u64) -> RecoveryA
             format!("snapshot-{index:015}"),
             LogHash::digest(&[b"snapshot"]),
             8,
+            rhiza_sql::sql_executor_fingerprint().unwrap(),
         ),
     )
 }

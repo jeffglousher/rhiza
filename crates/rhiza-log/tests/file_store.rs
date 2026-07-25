@@ -2,7 +2,7 @@ use std::fs;
 
 use rhiza_core::{
     ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor,
-    SnapshotIdentity, StopBinding,
+    SnapshotIdentity,
 };
 use rhiza_log::{
     encode_open_segment, encode_segment, segment_file_name, FileLogStore, IndexRange, LogState,
@@ -28,7 +28,7 @@ fn file_log_store_reopens_published_segments() {
 }
 
 #[test]
-fn file_log_store_recovers_open_segment_after_closed_v1_segment() {
+fn file_log_store_recovers_open_segment_after_closed_canonical_segment() {
     let dir = tempfile::tempdir().unwrap();
     let first = entry(1, LogHash::ZERO, b"one");
     let second = entry(2, first.hash, b"two");
@@ -387,7 +387,7 @@ fn file_log_store_compacts_verified_prefix_and_persists_logical_state() {
 fn fresh_file_log_store_installs_verified_recovery_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let configuration = ConfigurationState::active(1, LogHash::from_bytes([7; 32]));
-    let anchor = RecoveryAnchor::new_with_configuration(
+    let anchor = RecoveryAnchor::new(
         "cluster-a",
         1,
         configuration.clone(),
@@ -397,8 +397,8 @@ fn fresh_file_log_store_installs_verified_recovery_anchor() {
             "snapshot-000000000000009",
             LogHash::from_bytes([9; 32]),
             4096,
-        )
-        .with_executor_fingerprint(LogHash::from_bytes([10; 32])),
+            LogHash::from_bytes([10; 32]),
+        ),
     );
     let store =
         FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, configuration.clone())
@@ -423,10 +423,10 @@ fn fresh_file_log_store_installs_verified_recovery_anchor() {
 }
 
 #[test]
-fn recovery_anchor_binary_round_trip_preserves_every_stop_binding() {
+fn recovery_anchor_binary_round_trip_preserves_bound_successor() {
     let digest = LogHash::from_bytes([4; 32]);
     let stop = LogAnchor::new(10, LogHash::from_bytes([5; 32]));
-    let bound_stop = ConfigChange::bound_stop(
+    let stop_change = ConfigChange::stop(
         "cluster-a",
         4,
         digest,
@@ -434,51 +434,43 @@ fn recovery_anchor_binary_round_trip_preserves_every_stop_binding() {
         vec!["node-a".into(), "node-b".into(), "node-c".into()],
     )
     .unwrap();
-    let successor = bound_stop.successor().unwrap().clone();
-    let stop_command_hash = bound_stop.to_stored_command().hash();
+    let state = ConfigurationState::stopped(
+        4,
+        digest,
+        stop,
+        stop_change.successor().clone(),
+        stop_change.to_stored_command().hash(),
+    );
+    let anchor = RecoveryAnchor::new(
+        "cluster-a",
+        1,
+        state.clone(),
+        7,
+        stop,
+        SnapshotIdentity::new(
+            "snapshot-stop",
+            LogHash::from_bytes([9; 32]),
+            4096,
+            LogHash::from_bytes([10; 32]),
+        ),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, state.clone()).unwrap();
 
-    for binding in [
-        StopBinding::Unknown,
-        StopBinding::Unbound,
-        StopBinding::Bound {
-            successor,
-            stop_command_hash,
-        },
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let state = ConfigurationState::Stopped {
-            config_id: 4,
-            digest,
-            stop,
-            binding,
-        };
-        let anchor = RecoveryAnchor::new_with_configuration(
-            "cluster-a",
-            1,
-            state.clone(),
-            7,
-            stop,
-            SnapshotIdentity::new("snapshot-stop", LogHash::from_bytes([9; 32]), 4096),
-        );
-        let store =
-            FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, state.clone())
-                .unwrap();
+    store.install_recovery_anchor(&anchor, 7, &state).unwrap();
+    drop(store);
 
-        store.install_recovery_anchor(&anchor, 7, &state).unwrap();
-        drop(store);
-
-        let reopened =
-            FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, state.clone())
-                .unwrap();
-        assert_eq!(reopened.configuration_state().unwrap(), state);
-        assert_eq!(reopened.logical_state().unwrap().anchor, Some(anchor));
-    }
+    let reopened =
+        FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, state.clone()).unwrap();
+    assert_eq!(reopened.configuration_state().unwrap(), state);
+    assert_eq!(reopened.logical_state().unwrap().anchor, Some(anchor));
 }
 
 #[test]
 fn recovery_anchor_install_rejects_nonempty_or_mismatched_store_without_mutation() {
     let configuration = ConfigurationState::active(1, LogHash::from_bytes([7; 32]));
-    let valid = RecoveryAnchor::new_with_configuration(
+    let valid = RecoveryAnchor::new(
         "cluster-a",
         1,
         configuration.clone(),
@@ -488,11 +480,12 @@ fn recovery_anchor_install_rejects_nonempty_or_mismatched_store_without_mutation
             "snapshot-000000000000009",
             LogHash::from_bytes([9; 32]),
             4096,
+            LogHash::from_bytes([10; 32]),
         ),
     );
 
     for invalid in [
-        RecoveryAnchor::new_with_configuration(
+        RecoveryAnchor::new(
             "cluster-b",
             1,
             configuration.clone(),
@@ -500,7 +493,7 @@ fn recovery_anchor_install_rejects_nonempty_or_mismatched_store_without_mutation
             *valid.compacted(),
             valid.snapshot().clone(),
         ),
-        RecoveryAnchor::new_with_configuration(
+        RecoveryAnchor::new(
             "cluster-a",
             2,
             configuration.clone(),
@@ -609,7 +602,7 @@ fn file_log_store_rejects_unverified_or_regressing_compaction_without_changes() 
     invalid[0] = RecoveryAnchor::new(
         "cluster-a",
         1,
-        1,
+        ConfigurationState::active(1, LogHash::ZERO),
         1,
         LogAnchor::new(4, entries[2].hash),
         invalid[0].snapshot().clone(),
@@ -617,7 +610,7 @@ fn file_log_store_rejects_unverified_or_regressing_compaction_without_changes() 
     invalid[1] = RecoveryAnchor::new(
         "cluster-a",
         1,
-        1,
+        ConfigurationState::active(1, LogHash::ZERO),
         1,
         LogAnchor::new(2, LogHash::ZERO),
         invalid[1].snapshot().clone(),
@@ -740,12 +733,15 @@ fn file_log_store_rejects_configured_identity_mismatch_on_reopen() {
 fn file_log_store_persists_stop_activation_across_homogeneous_segments() {
     let dir = tempfile::tempdir().unwrap();
     let old = ConfigurationState::active(1, LogHash::from_bytes([1; 32]));
-    let stop = transition_entry(1, 1, LogHash::ZERO, ConfigChange::stop(1, old.digest()));
+    let stop_change = canonical_stop(1, old.digest());
+    let successor = stop_change.successor().clone();
+    let stop_command_hash = stop_change.to_stored_command().hash();
+    let stop = transition_entry(1, 1, LogHash::ZERO, stop_change);
     let activation = transition_entry(
         2,
         2,
         stop.hash,
-        ConfigChange::activation_barrier(2, LogHash::from_bytes([2; 32]), 1, stop.hash),
+        ConfigChange::activation_barrier(successor.clone(), 1, stop.hash, stop_command_hash),
     );
     let next = LogEntry {
         cluster_id: "cluster-a".into(),
@@ -765,7 +761,7 @@ fn file_log_store_persists_stop_activation_across_homogeneous_segments() {
     assert_eq!(closed_segments(dir.path()), 2);
     assert_eq!(
         store.configuration_state().unwrap(),
-        ConfigurationState::active(2, LogHash::from_bytes([2; 32]))
+        ConfigurationState::active(2, successor.digest())
     );
     drop(store);
 
@@ -783,12 +779,15 @@ fn file_log_store_persists_stop_activation_across_homogeneous_segments() {
 fn append_batch_advances_configuration_after_each_published_segment() {
     let dir = tempfile::tempdir().unwrap();
     let old = ConfigurationState::active(1, LogHash::from_bytes([1; 32]));
-    let stop = transition_entry(1, 1, LogHash::ZERO, ConfigChange::stop(1, old.digest()));
+    let stop_change = canonical_stop(1, old.digest());
+    let successor = stop_change.successor().clone();
+    let stop_command_hash = stop_change.to_stored_command().hash();
+    let stop = transition_entry(1, 1, LogHash::ZERO, stop_change);
     let activation = transition_entry(
         2,
         2,
         stop.hash,
-        ConfigChange::activation_barrier(2, LogHash::from_bytes([2; 32]), 1, stop.hash),
+        ConfigChange::activation_barrier(successor.clone(), 1, stop.hash, stop_command_hash),
     );
     let activation_path = dir.path().join(open_segment_name(2));
     let store = FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, old).unwrap();
@@ -801,7 +800,9 @@ fn append_batch_advances_configuration_after_each_published_segment() {
         ConfigurationState::stopped(
             1,
             LogHash::from_bytes([1; 32]),
-            LogAnchor::new(1, stop.hash)
+            LogAnchor::new(1, stop.hash),
+            successor,
+            stop_command_hash,
         )
     );
 
@@ -830,13 +831,16 @@ fn append_batch_advances_configuration_after_each_published_segment() {
 fn repeated_compaction_crosses_stop_activation_into_successor_config() {
     let dir = tempfile::tempdir().unwrap();
     let old = ConfigurationState::active(1, LogHash::from_bytes([1; 32]));
-    let stop = transition_entry(1, 1, LogHash::ZERO, ConfigChange::stop(1, old.digest()));
-    let next_state = ConfigurationState::active(2, LogHash::from_bytes([2; 32]));
+    let stop_change = canonical_stop(1, old.digest());
+    let successor = stop_change.successor().clone();
+    let stop_command_hash = stop_change.to_stored_command().hash();
+    let stop = transition_entry(1, 1, LogHash::ZERO, stop_change);
+    let next_state = ConfigurationState::active(2, successor.digest());
     let activation = transition_entry(
         2,
         2,
         stop.hash,
-        ConfigChange::activation_barrier(2, next_state.digest(), 1, stop.hash),
+        ConfigChange::activation_barrier(successor.clone(), 1, stop.hash, stop_command_hash),
     );
     let next = LogEntry {
         cluster_id: "cluster-a".into(),
@@ -854,13 +858,24 @@ fn repeated_compaction_crosses_stop_activation_into_successor_config() {
         .append_batch(&[stop.clone(), activation.clone(), next.clone()])
         .unwrap();
     store
-        .compact_prefix(&RecoveryAnchor::new_with_configuration(
+        .compact_prefix(&RecoveryAnchor::new(
             "cluster-a",
             1,
-            ConfigurationState::stopped(1, old.digest(), LogAnchor::new(1, stop.hash)),
+            ConfigurationState::stopped(
+                1,
+                old.digest(),
+                LogAnchor::new(1, stop.hash),
+                successor,
+                stop_command_hash,
+            ),
             1,
             LogAnchor::new(1, stop.hash),
-            SnapshotIdentity::new("snapshot-stop", LogHash::from_bytes([8; 32]), 4096),
+            SnapshotIdentity::new(
+                "snapshot-stop",
+                LogHash::from_bytes([8; 32]),
+                4096,
+                LogHash::from_bytes([10; 32]),
+            ),
         ))
         .unwrap();
     drop(store);
@@ -868,13 +883,18 @@ fn repeated_compaction_crosses_stop_activation_into_successor_config() {
     let reopened =
         FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, old.clone()).unwrap();
     reopened
-        .compact_prefix(&RecoveryAnchor::new_with_configuration(
+        .compact_prefix(&RecoveryAnchor::new(
             "cluster-a",
             1,
             next_state.clone(),
             1,
             LogAnchor::new(2, activation.hash),
-            SnapshotIdentity::new("snapshot-activation", LogHash::from_bytes([9; 32]), 8192),
+            SnapshotIdentity::new(
+                "snapshot-activation",
+                LogHash::from_bytes([9; 32]),
+                8192,
+                LogHash::from_bytes([10; 32]),
+            ),
         ))
         .unwrap();
     drop(reopened);
@@ -889,13 +909,16 @@ fn compaction_at_stop_or_activation_preserves_transition_enforcement() {
     for compact_activation in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let old = ConfigurationState::active(1, LogHash::from_bytes([1; 32]));
-        let stop = transition_entry(1, 1, LogHash::ZERO, ConfigChange::stop(1, old.digest()));
-        let next_state = ConfigurationState::active(2, LogHash::from_bytes([2; 32]));
+        let stop_change = canonical_stop(1, old.digest());
+        let successor = stop_change.successor().clone();
+        let stop_command_hash = stop_change.to_stored_command().hash();
+        let stop = transition_entry(1, 1, LogHash::ZERO, stop_change);
+        let next_state = ConfigurationState::active(2, successor.digest());
         let activation = transition_entry(
             2,
             2,
             stop.hash,
-            ConfigChange::activation_barrier(2, next_state.digest(), 1, stop.hash),
+            ConfigChange::activation_barrier(successor.clone(), 1, stop.hash, stop_command_hash),
         );
         let store = FileLogStore::open_with_configuration(dir.path(), "cluster-a", 1, old).unwrap();
         store
@@ -910,17 +933,24 @@ fn compaction_at_stop_or_activation_preserves_transition_enforcement() {
                     1,
                     LogHash::from_bytes([1; 32]),
                     LogAnchor::new(1, stop.hash),
+                    successor,
+                    stop_command_hash,
                 ),
             )
         };
         store
-            .compact_prefix(&RecoveryAnchor::new_with_configuration(
+            .compact_prefix(&RecoveryAnchor::new(
                 "cluster-a",
                 1,
                 state.clone(),
                 1,
                 LogAnchor::new(target.index, target.hash),
-                SnapshotIdentity::new("snapshot", LogHash::from_bytes([9; 32]), 4096),
+                SnapshotIdentity::new(
+                    "snapshot",
+                    LogHash::from_bytes([9; 32]),
+                    4096,
+                    LogHash::from_bytes([10; 32]),
+                ),
             ))
             .unwrap();
         drop(store);
@@ -1034,13 +1064,14 @@ fn recovery_anchor(entry: &LogEntry, recovery_generation: u64) -> RecoveryAnchor
     RecoveryAnchor::new(
         entry.cluster_id.clone(),
         entry.epoch,
-        entry.config_id,
+        ConfigurationState::active(entry.config_id, LogHash::ZERO),
         recovery_generation,
         LogAnchor::new(entry.index, entry.hash),
         SnapshotIdentity::new(
             format!("snapshot-{:015}", entry.index),
             LogHash::digest(&[b"verified snapshot", &entry.index.to_be_bytes()]),
             4096 + entry.index,
+            LogHash::from_bytes([10; 32]),
         ),
     )
 }
@@ -1070,4 +1101,15 @@ fn transition_entry(
         payload: command.payload,
         prev_hash,
     }
+}
+
+fn canonical_stop(predecessor_config_id: u64, predecessor_digest: LogHash) -> ConfigChange {
+    ConfigChange::stop(
+        "cluster-a",
+        predecessor_config_id,
+        predecessor_digest,
+        predecessor_config_id + 1,
+        vec!["node-a".into(), "node-b".into(), "node-c".into()],
+    )
+    .unwrap()
 }

@@ -1730,7 +1730,7 @@ impl SqliteStateMachine {
             )));
         }
         let identity = self.control.identity()?;
-        let manifest = SnapshotManifest::new_with_configuration(
+        let manifest = SnapshotManifest::new(
             identity.cluster_id(),
             identity.configuration_state().clone(),
             identity.epoch(),
@@ -1738,8 +1738,8 @@ impl SqliteStateMachine {
             tip.applied_hash(),
             1,
             identity.node_id(),
-        )
-        .with_executor_fingerprint(sql_executor_fingerprint()?);
+            sql_executor_fingerprint()?,
+        );
         self.with_connection(checkpoint_truncate)?;
         self.close_connection()?;
         let snapshot = (|| {
@@ -1785,7 +1785,7 @@ impl SqliteStateMachine {
         let manifest = snapshot.manifest();
         let size_bytes = u64::try_from(snapshot.db_bytes().len())
             .map_err(|_| Error::InvalidSnapshot("snapshot size exceeds u64".into()))?;
-        let anchor = RecoveryAnchor::new_with_configuration(
+        let anchor = RecoveryAnchor::new(
             manifest.cluster_id(),
             manifest.epoch(),
             manifest.configuration_state().clone(),
@@ -1795,11 +1795,7 @@ impl SqliteStateMachine {
                 manifest.snapshot_id(),
                 LogHash::digest(&[snapshot.db_bytes()]),
                 size_bytes,
-            )
-            .with_executor_fingerprint(
-                manifest
-                    .executor_fingerprint()
-                    .expect("new snapshots always bind the executor fingerprint"),
+                manifest.executor_fingerprint(),
             ),
         );
         Ok(RecoverySnapshot { snapshot, anchor })
@@ -1872,7 +1868,7 @@ fn restore_snapshot_file_with_recovery_generation(
         ));
     }
     let container = decode_qwal_snapshot(snapshot.db_bytes())?;
-    if snapshot.manifest().executor_fingerprint() != Some(sql_executor_fingerprint()?) {
+    if snapshot.manifest().executor_fingerprint() != sql_executor_fingerprint()? {
         return Err(Error::InvalidSnapshot(
             "QWAL snapshot materializer fingerprint does not match local SQLite".into(),
         ));
@@ -1966,21 +1962,16 @@ pub fn restore_recovery_snapshot_file(
             "recovery anchor does not match snapshot bytes".into(),
         ));
     }
-    if let Some(fingerprint) = anchor.executor_fingerprint() {
-        let expected = sql_executor_fingerprint()?;
-        if fingerprint != expected {
-            return Err(Error::InvalidSnapshot(format!(
-                "recovery snapshot executor fingerprint {} does not match local {}",
-                fingerprint.to_hex(),
-                expected.to_hex()
-            )));
-        }
-    } else {
-        return Err(Error::InvalidSnapshot(
-            "QWAL recovery snapshot is missing a materializer fingerprint".into(),
-        ));
+    let fingerprint = anchor.executor_fingerprint();
+    let expected = sql_executor_fingerprint()?;
+    if fingerprint != expected {
+        return Err(Error::InvalidSnapshot(format!(
+            "recovery snapshot executor fingerprint {} does not match local {}",
+            fingerprint.to_hex(),
+            expected.to_hex()
+        )));
     }
-    let manifest = SnapshotManifest::new_with_configuration(
+    let manifest = SnapshotManifest::new(
         anchor.cluster_id(),
         anchor.configuration_state().clone(),
         anchor.epoch(),
@@ -1988,8 +1979,8 @@ pub fn restore_recovery_snapshot_file(
         anchor.compacted().hash(),
         1,
         target_node_id,
-    )
-    .with_executor_fingerprint(sql_executor_fingerprint()?);
+        sql_executor_fingerprint()?,
+    );
     if manifest.snapshot_id() != anchor.snapshot().snapshot_id() {
         return Err(Error::InvalidSnapshot(
             "recovery snapshot id does not match compacted index".into(),
@@ -4710,7 +4701,15 @@ mod query_policy_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
-        let change = rhiza_core::ConfigChange::stop(1, LogHash::ZERO).to_stored_command();
+        let change = rhiza_core::ConfigChange::stop(
+            "cluster-a",
+            1,
+            LogHash::ZERO,
+            2,
+            vec!["node-1".into(), "node-2".into(), "node-3".into()],
+        )
+        .unwrap()
+        .to_stored_command();
         let hash = LogEntry::calculate_hash(
             "cluster-a",
             1,

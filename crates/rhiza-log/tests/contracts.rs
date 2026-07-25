@@ -1,7 +1,8 @@
-use rhiza_core::{EntryType, LogEntry, LogHash};
+use rhiza_core::{ConfigChange, ConfigurationState, EntryType, LogEntry, LogHash};
 use rhiza_log::{
-    decode_segment_for_cluster, encode_open_segment, encode_segment, recover_open_segment_file,
-    segment_file_name, IndexRange, SegmentHeader, QLOG_HEADER_LEN, QLOG_MAGIC,
+    decode_segment_for_cluster, decode_segment_for_cluster_with_configuration, encode_open_segment,
+    encode_segment, recover_open_segment_file, segment_file_name, IndexRange, SegmentHeader,
+    QLOG_HEADER_LEN, QLOG_MAGIC,
 };
 
 #[test]
@@ -42,6 +43,51 @@ fn segment_encode_decode_round_trips_entries() {
         decode_segment_for_cluster(&bytes, "cluster-a").unwrap(),
         vec![entry]
     );
+}
+
+#[test]
+fn configuration_aware_decode_accepts_bound_stop_only_from_its_persisted_predecessor() {
+    let predecessor_digest = LogHash::from_bytes([7; 32]);
+    let stop = ConfigChange::stop(
+        "cluster-a",
+        1,
+        predecessor_digest,
+        2,
+        vec!["node-a".into(), "node-b".into(), "node-c".into()],
+    )
+    .unwrap()
+    .to_stored_command();
+    let entry = LogEntry {
+        cluster_id: "cluster-a".into(),
+        epoch: 1,
+        config_id: 1,
+        index: 1,
+        entry_type: stop.entry_type,
+        payload: stop.payload,
+        prev_hash: LogHash::ZERO,
+        hash: LogHash::ZERO,
+    };
+    let entry = LogEntry {
+        hash: entry.recompute_hash(),
+        ..entry
+    };
+    let encoded = encode_segment(std::slice::from_ref(&entry));
+
+    let (decoded, stopped) = decode_segment_for_cluster_with_configuration(
+        &encoded,
+        "cluster-a",
+        ConfigurationState::active(1, predecessor_digest),
+    )
+    .unwrap();
+    assert_eq!(decoded, [entry]);
+    assert!(!stopped.is_active());
+
+    assert!(decode_segment_for_cluster_with_configuration(
+        &encoded,
+        "cluster-a",
+        ConfigurationState::active(1, LogHash::ZERO),
+    )
+    .is_err());
 }
 
 #[test]

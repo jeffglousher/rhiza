@@ -827,7 +827,7 @@ benchmark_line="$(grep -n 'RHIZA_CLIENT_TOKEN=.*bench_binary' scripts/bench-vind
 final_forward_check_line="$(grep -n 'assert_all_port_forwards_ready' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
 [ -n "$final_forward_check_line" ] && [ "$benchmark_line" -lt "$final_forward_check_line" ]
 
-jq -n '{version:1,config_id:1,members:[range(3) as $n | {
+jq -n '{config_id:1,members:[range(3) as $n | {
   node_id:"node-\($n + 1)",
   url:"http://rhiza-sql-c1-\($n).rhiza-sql-c1:8081",
   log_url:"http://rhiza-sql-c1-\($n).rhiza-sql-c1:8080",

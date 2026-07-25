@@ -23,7 +23,7 @@ case "$profile" in
   sql) ;;
   *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
 esac
-jq -e --argjson id "$config_id" '.version == 1 and .config_id == $id' "$bundle" >/dev/null
+jq -e --argjson id "$config_id" '.config_id == $id' "$bundle" >/dev/null
 command_json="$(printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]')"
 
 export JOB_NAME="$job"

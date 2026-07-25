@@ -158,7 +158,7 @@ fn log_entry_hash_changes_when_any_identity_field_changes() {
 }
 
 #[test]
-fn log_entry_hash_uses_cluster_bound_v3_encoding() {
+fn log_entry_hash_uses_canonical_cluster_bound_encoding() {
     assert_eq!(
         LogEntry::calculate_hash(
             "cluster-a",
@@ -188,12 +188,13 @@ fn stored_command_hash_binds_entry_type_and_payload() {
 fn snapshot_manifest_id_uses_zero_padded_snapshot_index() {
     let manifest = SnapshotManifest::new(
         "cluster-a",
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         7,
         104_200,
         LogHash::from_bytes([9; 32]),
         14,
         "node-2",
+        LogHash::from_bytes([6; 32]),
     );
 
     assert_eq!(manifest.snapshot_id(), "snapshot-000000000104200");
@@ -204,12 +205,13 @@ fn snapshot_manifest_id_uses_zero_padded_snapshot_index() {
 fn snapshot_manifest_round_trips_all_snapshot_identity_as_json() {
     let manifest = SnapshotManifest::new(
         "cluster-a",
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         7,
         104_200,
         LogHash::from_bytes([9; 32]),
         14,
         "node-2",
+        LogHash::from_bytes([6; 32]),
     );
 
     let json = serde_json::to_value(&manifest).unwrap();
@@ -239,27 +241,26 @@ fn snapshot_manifest_round_trips_a_known_executor_fingerprint() {
     let executor_fingerprint = LogHash::from_bytes([6; 32]);
     let manifest = SnapshotManifest::new(
         "cluster-a",
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         7,
         104_200,
         LogHash::from_bytes([9; 32]),
         14,
         "node-2",
-    )
-    .with_executor_fingerprint(executor_fingerprint);
+        executor_fingerprint,
+    );
 
     let json = serde_json::to_value(&manifest).unwrap();
     assert_eq!(json["executor_fingerprint"], serde_json::json!(vec![6; 32]));
 
     let decoded: SnapshotManifest = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, manifest);
-    assert_eq!(decoded.executor_fingerprint(), Some(executor_fingerprint));
-    assert!(!decoded.is_legacy_executor_fingerprint());
+    assert_eq!(decoded.executor_fingerprint(), executor_fingerprint);
 }
 
 #[test]
-fn legacy_snapshot_manifest_decodes_without_an_executor_fingerprint() {
-    let legacy = serde_json::json!({
+fn snapshot_manifest_rejects_missing_canonical_fields() {
+    let incomplete = serde_json::json!({
         "snapshot_id": "snapshot-000000000104200",
         "cluster_id": "cluster-a",
         "config_id": 3,
@@ -275,30 +276,24 @@ fn legacy_snapshot_manifest_decodes_without_an_executor_fingerprint() {
         "created_by": "node-2",
     });
 
-    let decoded: SnapshotManifest = serde_json::from_value(legacy).unwrap();
-    assert_eq!(decoded.executor_fingerprint(), None);
-    assert!(decoded.is_legacy_executor_fingerprint());
-    assert!(serde_json::to_value(decoded)
-        .unwrap()
-        .get("executor_fingerprint")
-        .is_none());
+    assert!(serde_json::from_value::<SnapshotManifest>(incomplete).is_err());
 }
 
 #[test]
-fn recovery_anchor_round_trips_versioned_log_and_snapshot_identity() {
+fn recovery_anchor_round_trips_canonical_log_and_snapshot_identity() {
     let executor_fingerprint = LogHash::from_bytes([6; 32]);
     let anchor = RecoveryAnchor::new(
         "cluster-a",
         7,
-        3,
+        ConfigurationState::active(3, LogHash::ZERO),
         4,
         LogAnchor::new(104_200, LogHash::from_bytes([8; 32])),
         SnapshotIdentity::new(
             "snapshot-000000000104200",
             LogHash::from_bytes([9; 32]),
             8192,
-        )
-        .with_executor_fingerprint(executor_fingerprint),
+            executor_fingerprint,
+        ),
     );
 
     let json = serde_json::to_value(&anchor).unwrap();
@@ -329,12 +324,12 @@ fn recovery_anchor_round_trips_versioned_log_and_snapshot_identity() {
     assert_eq!(decoded.snapshot().snapshot_id(), "snapshot-000000000104200");
     assert_eq!(decoded.snapshot().digest(), LogHash::from_bytes([9; 32]));
     assert_eq!(decoded.snapshot().size_bytes(), 8192);
-    assert_eq!(decoded.executor_fingerprint(), Some(executor_fingerprint));
+    assert_eq!(decoded.executor_fingerprint(), executor_fingerprint);
 }
 
 #[test]
-fn legacy_recovery_anchor_decodes_without_an_executor_fingerprint() {
-    let legacy = serde_json::json!({
+fn recovery_anchor_rejects_missing_canonical_fields_and_unsupported_format() {
+    let incomplete = serde_json::json!({
         "format_version": RECOVERY_ANCHOR_FORMAT_VERSION,
         "cluster_id": "cluster-a",
         "epoch": 7,
@@ -356,36 +351,18 @@ fn legacy_recovery_anchor_decodes_without_an_executor_fingerprint() {
         },
     });
 
-    let decoded: RecoveryAnchor = serde_json::from_value(legacy).unwrap();
-    assert_eq!(decoded.executor_fingerprint(), None);
-    assert!(decoded.snapshot().is_legacy_executor_fingerprint());
+    assert!(serde_json::from_value::<RecoveryAnchor>(incomplete.clone()).is_err());
+
+    let mut unsupported = incomplete;
+    unsupported["snapshot"]["executor_fingerprint"] = serde_json::json!(vec![6; 32]);
+    unsupported["format_version"] = 1.into();
+    assert!(serde_json::from_value::<RecoveryAnchor>(unsupported).is_err());
 }
 
 #[test]
-fn config_change_codec_preserves_quepaxa_v1_wire_bytes() {
-    let digest = LogHash::from_bytes([3; 32]);
-    let stop = ConfigChange::stop(4, digest).to_stored_command();
-    let activation = ConfigChange::activation_barrier(5, digest, 10, LogHash::from_bytes([9; 32]))
-        .to_stored_command();
-
-    let mut expected_stop = b"QCFG\0\x01\x01".to_vec();
-    expected_stop.extend_from_slice(&4_u64.to_be_bytes());
-    expected_stop.extend_from_slice(digest.as_bytes());
-    assert_eq!(stop.payload, expected_stop);
-    assert_eq!(
-        ConfigChange::recognize(&stop).unwrap(),
-        ConfigChange::stop(4, digest)
-    );
-    assert_eq!(
-        ConfigChange::recognize(&activation).unwrap(),
-        ConfigChange::activation_barrier(5, digest, 10, LogHash::from_bytes([9; 32]))
-    );
-}
-
-#[test]
-fn bound_stop_round_trip_binds_cluster_predecessor_and_exact_successor() {
+fn stop_round_trip_binds_cluster_predecessor_and_exact_successor() {
     let predecessor = LogHash::from_bytes([3; 32]);
-    let stop = ConfigChange::bound_stop(
+    let stop = ConfigChange::stop(
         "cluster-a",
         4,
         predecessor,
@@ -397,7 +374,7 @@ fn bound_stop_round_trip_binds_cluster_predecessor_and_exact_successor() {
     let decoded = ConfigChange::recognize(&command).unwrap();
     assert_eq!(decoded, stop);
 
-    let descriptor = decoded.successor().unwrap();
+    let descriptor = decoded.successor();
     assert_eq!(descriptor.cluster_id(), "cluster-a");
     assert_eq!(descriptor.predecessor_config_id(), 4);
     assert_eq!(descriptor.predecessor_config_digest(), predecessor);
@@ -410,8 +387,8 @@ fn bound_stop_round_trip_binds_cluster_predecessor_and_exact_successor() {
 }
 
 #[test]
-fn bound_stop_binary_rejects_noncanonical_member_order() {
-    let stop = ConfigChange::bound_stop(
+fn stop_binary_rejects_noncanonical_member_order() {
+    let stop = ConfigChange::stop(
         "cluster-a",
         4,
         LogHash::ZERO,
@@ -420,7 +397,7 @@ fn bound_stop_binary_rejects_noncanonical_member_order() {
     )
     .unwrap();
     let mut command = stop.to_stored_command();
-    let member_start = 7 + 2 + "cluster-a".len() + 8 + 32 + 8 + 32 + 1;
+    let member_start = 5 + 2 + "cluster-a".len() + 8 + 32 + 8 + 32 + 1;
     let (_, members) = command.payload.split_at_mut(member_start);
     let (first, rest) = members.split_at_mut(4);
     first.swap_with_slice(&mut rest[..4]);
@@ -429,8 +406,8 @@ fn bound_stop_binary_rejects_noncanonical_member_order() {
 }
 
 #[test]
-fn bound_stop_rejects_skipped_successor_and_duplicate_members() {
-    assert!(ConfigChange::bound_stop(
+fn stop_rejects_skipped_successor_and_duplicate_members() {
+    assert!(ConfigChange::stop(
         "cluster-a",
         4,
         LogHash::ZERO,
@@ -438,7 +415,7 @@ fn bound_stop_rejects_skipped_successor_and_duplicate_members() {
         vec!["r1".into(), "r2".into(), "r3".into()],
     )
     .is_err());
-    assert!(ConfigChange::bound_stop(
+    assert!(ConfigChange::stop(
         "cluster-a",
         4,
         LogHash::ZERO,
@@ -449,18 +426,18 @@ fn bound_stop_rejects_skipped_successor_and_duplicate_members() {
 }
 
 #[test]
-fn bound_stop_accepts_max_wire_strings_and_rejects_one_byte_more() {
+fn stop_accepts_max_wire_strings_and_rejects_one_byte_more() {
     let max = "x".repeat(u16::MAX as usize);
     let too_long = "x".repeat(u16::MAX as usize + 1);
     let members = vec!["r1".into(), "r2".into(), "r3".into()];
 
-    let max_cluster = ConfigChange::bound_stop(&max, 4, LogHash::ZERO, 5, members.clone()).unwrap();
+    let max_cluster = ConfigChange::stop(&max, 4, LogHash::ZERO, 5, members.clone()).unwrap();
     assert_eq!(
         ConfigChange::recognize(&max_cluster.to_stored_command()).unwrap(),
         max_cluster
     );
-    assert!(ConfigChange::bound_stop(&too_long, 4, LogHash::ZERO, 5, members).is_err());
-    let max_member = ConfigChange::bound_stop(
+    assert!(ConfigChange::stop(&too_long, 4, LogHash::ZERO, 5, members).is_err());
+    let max_member = ConfigChange::stop(
         "cluster-a",
         4,
         LogHash::ZERO,
@@ -472,7 +449,7 @@ fn bound_stop_accepts_max_wire_strings_and_rejects_one_byte_more() {
         ConfigChange::recognize(&max_member.to_stored_command()).unwrap(),
         max_member
     );
-    assert!(ConfigChange::bound_stop(
+    assert!(ConfigChange::stop(
         "cluster-a",
         4,
         LogHash::ZERO,
@@ -530,10 +507,10 @@ fn successor_descriptor_serde_rejects_invalid_or_oversized_data() {
 }
 
 #[test]
-fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_stop() {
+fn activation_requires_the_successor_and_stop_command_authorized_by_stop() {
     let predecessor = LogHash::from_bytes([3; 32]);
     let active = ConfigurationState::active(4, predecessor);
-    let bound_stop = ConfigChange::bound_stop(
+    let stop_change = ConfigChange::stop(
         "cluster-a",
         4,
         predecessor,
@@ -541,14 +518,13 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
         vec!["r1".into(), "r2".into(), "r3".into()],
     )
     .unwrap();
-    let authorized_successor = bound_stop.successor().unwrap().clone();
-    let stop_command_hash = bound_stop.to_stored_command().hash();
-    let stop = config_entry(10, 4, LogHash::ZERO, bound_stop);
+    let authorized_successor = stop_change.successor().clone();
+    let stop_command_hash = stop_change.to_stored_command().hash();
+    let stop = config_entry(10, 4, LogHash::ZERO, stop_change);
     let stopped = active.validate_entry(&stop).unwrap();
     let serialized = serde_json::to_value(&stopped).unwrap();
-    assert_eq!(serialized["binding"]["kind"], "bound");
     assert_eq!(
-        serialized["binding"]["stop_command_hash"],
+        serialized["stop_command_hash"],
         serde_json::to_value(stop_command_hash).unwrap()
     );
     let round_tripped: ConfigurationState = serde_json::from_value(serialized.clone()).unwrap();
@@ -556,14 +532,13 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
 
     let forged_stop_command_hash = LogHash::from_bytes([9; 32]);
     let mut forged_state = serialized;
-    forged_state["binding"]["stop_command_hash"] =
-        serde_json::to_value(forged_stop_command_hash).unwrap();
+    forged_state["stop_command_hash"] = serde_json::to_value(forged_stop_command_hash).unwrap();
     let forged_state: ConfigurationState = serde_json::from_value(forged_state).unwrap();
     let forged_activation = config_entry(
         11,
         5,
         stop.hash,
-        ConfigChange::bound_activation_barrier(
+        ConfigChange::activation_barrier(
             authorized_successor.clone(),
             10,
             stop.hash,
@@ -572,7 +547,7 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
     );
     assert!(forged_state.validate_entry(&forged_activation).is_err());
 
-    let other_successor = ConfigChange::bound_stop(
+    let other_successor = ConfigChange::stop(
         "cluster-a",
         4,
         predecessor,
@@ -581,11 +556,10 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
     )
     .unwrap()
     .successor()
-    .unwrap()
     .clone();
     for invalid in [
-        ConfigChange::bound_activation_barrier(other_successor, 10, stop.hash, stop_command_hash),
-        ConfigChange::bound_activation_barrier(
+        ConfigChange::activation_barrier(other_successor, 10, stop.hash, stop_command_hash),
+        ConfigChange::activation_barrier(
             authorized_successor.clone(),
             10,
             stop.hash,
@@ -601,7 +575,7 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
         11,
         5,
         stop.hash,
-        ConfigChange::bound_activation_barrier(
+        ConfigChange::activation_barrier(
             authorized_successor.clone(),
             10,
             stop.hash,
@@ -615,142 +589,23 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
 }
 
 #[test]
-fn configuration_state_accepts_only_exact_stop_then_successor_activation() {
-    let old_digest = LogHash::from_bytes([1; 32]);
-    let next_digest = LogHash::from_bytes([2; 32]);
-    let active = ConfigurationState::active(4, old_digest);
-    let stop = config_entry(
-        10,
+fn recovery_anchor_preserves_configuration_state_and_rejects_missing_state() {
+    let stop_change = ConfigChange::stop(
+        "cluster-a",
         4,
-        LogHash::from_bytes([8; 32]),
-        ConfigChange::stop(4, old_digest),
-    );
-    let stopped = active.validate_entry(&stop).unwrap();
-    assert_eq!(
-        serde_json::to_value(&stopped).unwrap()["binding"]["kind"],
-        "unbound"
-    );
-    assert_eq!(
-        stopped,
-        ConfigurationState::stopped(4, old_digest, LogAnchor::new(10, stop.hash))
-    );
-
-    let activation = config_entry(
-        11,
+        LogHash::from_bytes([4; 32]),
         5,
-        stop.hash,
-        ConfigChange::activation_barrier(5, next_digest, 10, stop.hash),
-    );
-    assert_eq!(
-        stopped.validate_entry(&activation).unwrap(),
-        ConfigurationState::active(5, next_digest)
-    );
-}
-
-#[test]
-fn configuration_state_rejects_skipped_or_overflowing_successor_ids() {
-    let digest = LogHash::from_bytes([1; 32]);
-    for predecessor_id in [4, u64::MAX] {
-        let active = ConfigurationState::active(predecessor_id, digest);
-        let stop = config_entry(
-            10,
-            predecessor_id,
-            LogHash::ZERO,
-            ConfigChange::stop(predecessor_id, digest),
-        );
-        let stopped = active.validate_entry(&stop).unwrap();
-        let successor_id = if predecessor_id == u64::MAX { 0 } else { 6 };
-        let activation = config_entry(
-            11,
-            successor_id,
-            stop.hash,
-            ConfigChange::activation_barrier(successor_id, digest, 10, stop.hash),
-        );
-
-        assert!(stopped.validate_entry(&activation).is_err());
-    }
-}
-
-#[test]
-fn configuration_state_rejects_malformed_or_misbound_transitions() {
-    let digest = LogHash::from_bytes([1; 32]);
-    let active = ConfigurationState::active(4, digest);
-    let valid_stop = config_entry(10, 4, LogHash::ZERO, ConfigChange::stop(4, digest));
-    let stopped = active.validate_entry(&valid_stop).unwrap();
-
-    let malformed = config_entry(10, 4, LogHash::ZERO, ConfigChange::stop(4, digest));
-    let malformed = LogEntry {
-        payload: b"bad".to_vec(),
-        ..malformed
-    };
-    let wrong_stop_config = config_entry(10, 4, LogHash::ZERO, ConfigChange::stop(3, digest));
-    let old_after_stop = LogEntry {
-        cluster_id: "cluster-a".into(),
-        epoch: 7,
-        config_id: 4,
-        index: 11,
-        entry_type: EntryType::Noop,
-        payload: Vec::new(),
-        prev_hash: valid_stop.hash,
-        hash: LogEntry::calculate_hash(
-            "cluster-a",
-            11,
-            7,
-            4,
-            EntryType::Noop,
-            valid_stop.hash,
-            &[],
-        ),
-    };
-    for invalid in [malformed, wrong_stop_config] {
-        assert!(active.validate_entry(&invalid).is_err());
-    }
-    assert!(stopped.validate_entry(&old_after_stop).is_err());
-
-    for invalid in [
-        config_entry(
-            12,
-            5,
-            valid_stop.hash,
-            ConfigChange::activation_barrier(5, digest, 10, valid_stop.hash),
-        ),
-        config_entry(
-            11,
-            5,
-            LogHash::ZERO,
-            ConfigChange::activation_barrier(5, digest, 10, valid_stop.hash),
-        ),
-        config_entry(
-            11,
-            5,
-            valid_stop.hash,
-            ConfigChange::activation_barrier(5, digest, 9, valid_stop.hash),
-        ),
-        config_entry(
-            11,
-            5,
-            valid_stop.hash,
-            ConfigChange::activation_barrier(5, digest, 10, LogHash::ZERO),
-        ),
-        config_entry(
-            11,
-            4,
-            valid_stop.hash,
-            ConfigChange::activation_barrier(4, digest, 10, valid_stop.hash),
-        ),
-    ] {
-        assert!(stopped.validate_entry(&invalid).is_err());
-    }
-}
-
-#[test]
-fn recovery_anchor_v2_preserves_configuration_state_and_reads_v1_as_active() {
+        vec!["r1".into(), "r2".into(), "r3".into()],
+    )
+    .unwrap();
     let stopped = ConfigurationState::stopped(
         4,
         LogHash::from_bytes([4; 32]),
         LogAnchor::new(10, LogHash::from_bytes([5; 32])),
+        stop_change.successor().clone(),
+        stop_change.to_stored_command().hash(),
     );
-    let anchor = RecoveryAnchor::new_with_configuration(
+    let anchor = RecoveryAnchor::new(
         "cluster-a",
         7,
         stopped.clone(),
@@ -760,29 +615,24 @@ fn recovery_anchor_v2_preserves_configuration_state_and_reads_v1_as_active() {
             "snapshot-000000000000010",
             LogHash::from_bytes([9; 32]),
             8192,
+            LogHash::from_bytes([6; 32]),
         ),
     );
     let json = serde_json::to_value(&anchor).unwrap();
     assert_eq!(anchor.configuration_state(), &stopped);
     assert_eq!(json["configuration_state"]["phase"], "stopped");
 
-    let mut v1 = json;
-    v1["format_version"] = 1.into();
-    v1.as_object_mut().unwrap().remove("configuration_state");
-    let decoded: RecoveryAnchor = serde_json::from_value(v1).unwrap();
-    assert_eq!(
-        decoded.configuration_state(),
-        &ConfigurationState::active(4, LogHash::ZERO)
-    );
-    assert_eq!(
-        serde_json::from_value::<RecoveryAnchor>(serde_json::to_value(&decoded).unwrap()).unwrap(),
-        decoded
-    );
+    let mut missing_state = json;
+    missing_state
+        .as_object_mut()
+        .unwrap()
+        .remove("configuration_state");
+    assert!(serde_json::from_value::<RecoveryAnchor>(missing_state).is_err());
 }
 
 #[test]
-fn stopped_state_with_missing_binding_decodes_but_rejects_all_activation() {
-    let legacy = serde_json::json!({
+fn stopped_state_rejects_missing_successor_authorization() {
+    let incomplete = serde_json::json!({
         "phase": "stopped",
         "config_id": 4,
         "digest": LogHash::from_bytes([4; 32]),
@@ -792,25 +642,5 @@ fn stopped_state_with_missing_binding_decodes_but_rejects_all_activation() {
         }
     });
 
-    let decoded: ConfigurationState = serde_json::from_value(legacy).unwrap();
-    let stop_hash = LogHash::from_bytes([5; 32]);
-    let successor = ConfigChange::bound_stop(
-        "cluster-a",
-        4,
-        LogHash::from_bytes([4; 32]),
-        5,
-        vec!["r1".into(), "r2".into(), "r3".into()],
-    )
-    .unwrap();
-    let stop_command_hash = successor.to_stored_command().hash();
-    let successor = successor.successor().unwrap().clone();
-
-    for activation in [
-        ConfigChange::activation_barrier(5, successor.digest(), 10, stop_hash),
-        ConfigChange::bound_activation_barrier(successor, 10, stop_hash, stop_command_hash),
-    ] {
-        assert!(decoded
-            .validate_entry(&config_entry(11, 5, stop_hash, activation))
-            .is_err());
-    }
+    assert!(serde_json::from_value::<ConfigurationState>(incomplete).is_err());
 }

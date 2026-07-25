@@ -92,7 +92,6 @@ impl ErrorClassification {
 }
 
 pub const RECOVERY_ANCHOR_FORMAT_VERSION: u32 = 2;
-pub const RECOVERY_ANCHOR_V1_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LogHash([u8; 32]);
@@ -159,18 +158,6 @@ impl LogAnchor {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum StopBinding {
-    #[default]
-    Unknown,
-    Unbound,
-    Bound {
-        successor: SuccessorDescriptor,
-        stop_command_hash: LogHash,
-    },
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConfigurationState {
@@ -182,8 +169,8 @@ pub enum ConfigurationState {
         config_id: ConfigId,
         digest: LogHash,
         stop: LogAnchor,
-        #[serde(default)]
-        binding: StopBinding,
+        successor: SuccessorDescriptor,
+        stop_command_hash: LogHash,
     },
 }
 
@@ -192,12 +179,19 @@ impl ConfigurationState {
         Self::Active { config_id, digest }
     }
 
-    pub const fn stopped(config_id: ConfigId, digest: LogHash, stop: LogAnchor) -> Self {
+    pub const fn stopped(
+        config_id: ConfigId,
+        digest: LogHash,
+        stop: LogAnchor,
+        successor: SuccessorDescriptor,
+        stop_command_hash: LogHash,
+    ) -> Self {
         Self::Stopped {
             config_id,
             digest,
             stop,
-            binding: StopBinding::Unbound,
+            successor,
+            stop_command_hash,
         }
     }
 
@@ -238,29 +232,13 @@ impl ConfigurationState {
         };
 
         match (self, change) {
-            (
-                Self::Active { config_id, digest },
-                Some(ConfigChange::Stop {
-                    config_id: stop_config_id,
-                    config_digest,
-                }),
-            ) if entry.config_id == *config_id
-                && stop_config_id == *config_id
-                && (*digest == LogHash::ZERO || config_digest == *digest) =>
-            {
-                Ok(Self::stopped(
-                    *config_id,
-                    config_digest,
-                    LogAnchor::new(entry.index, entry.hash),
-                ))
-            }
-            (Self::Active { config_id, digest }, Some(ConfigChange::BoundStop { successor }))
+            (Self::Active { config_id, digest }, Some(ConfigChange::Stop { successor }))
                 if entry.cluster_id == successor.cluster_id
                     && entry.config_id == *config_id
                     && successor.predecessor_config_id == *config_id
                     && successor.predecessor_config_digest == *digest =>
             {
-                let stop_command_hash = (ConfigChange::BoundStop {
+                let stop_command_hash = (ConfigChange::Stop {
                     successor: successor.clone(),
                 })
                 .to_stored_command()
@@ -269,10 +247,8 @@ impl ConfigurationState {
                     config_id: *config_id,
                     digest: *digest,
                     stop: LogAnchor::new(entry.index, entry.hash),
-                    binding: StopBinding::Bound {
-                        successor,
-                        stop_command_hash,
-                    },
+                    successor,
+                    stop_command_hash,
                 })
             }
             (Self::Active { config_id, .. }, None) if entry.config_id == *config_id => {
@@ -282,37 +258,12 @@ impl ConfigurationState {
             (
                 Self::Stopped {
                     config_id: predecessor_id,
-                    stop,
-                    binding: StopBinding::Unbound,
-                    ..
-                },
-                Some(ConfigChange::ActivationBarrier {
-                    config_id,
-                    config_digest,
-                    stop_slot,
-                    prefix_hash,
-                }),
-            ) if predecessor_id.checked_add(1) == Some(config_id)
-                && entry.config_id == config_id
-                && stop.index().checked_add(1) == Some(entry.index)
-                && entry.prev_hash == stop.hash()
-                && stop_slot == stop.index()
-                && prefix_hash == stop.hash() =>
-            {
-                Ok(Self::active(config_id, config_digest))
-            }
-            (
-                Self::Stopped {
-                    config_id: predecessor_id,
                     digest: predecessor_digest,
                     stop,
-                    binding:
-                        StopBinding::Bound {
-                            successor: authorized_successor,
-                            stop_command_hash: authorized_stop_command_hash,
-                        },
+                    successor: authorized_successor,
+                    stop_command_hash: authorized_stop_command_hash,
                 },
-                Some(ConfigChange::BoundActivationBarrier {
+                Some(ConfigChange::ActivationBarrier {
                     successor,
                     stop_slot,
                     prefix_hash,
@@ -330,7 +281,7 @@ impl ConfigurationState {
                 // Reject a deserialized state whose cached authorization hash
                 // does not match its bound successor descriptor.
                 && *authorized_stop_command_hash
-                    == (ConfigChange::BoundStop {
+                    == (ConfigChange::Stop {
                         successor: authorized_successor.clone(),
                     })
                     .to_stored_command()
@@ -366,23 +317,22 @@ pub struct SnapshotIdentity {
     snapshot_id: String,
     digest: LogHash,
     size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_fingerprint: Option<LogHash>,
+    executor_fingerprint: LogHash,
 }
 
 impl SnapshotIdentity {
-    pub fn new(snapshot_id: impl Into<String>, digest: LogHash, size_bytes: u64) -> Self {
+    pub fn new(
+        snapshot_id: impl Into<String>,
+        digest: LogHash,
+        size_bytes: u64,
+        executor_fingerprint: LogHash,
+    ) -> Self {
         Self {
             snapshot_id: snapshot_id.into(),
             digest,
             size_bytes,
-            executor_fingerprint: None,
+            executor_fingerprint,
         }
-    }
-
-    pub fn with_executor_fingerprint(mut self, executor_fingerprint: LogHash) -> Self {
-        self.executor_fingerprint = Some(executor_fingerprint);
-        self
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -397,12 +347,8 @@ impl SnapshotIdentity {
         self.size_bytes
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.executor_fingerprint
-    }
-
-    pub const fn is_legacy_executor_fingerprint(&self) -> bool {
-        self.executor_fingerprint.is_none()
     }
 }
 
@@ -423,26 +369,6 @@ impl RecoveryAnchor {
     pub fn new(
         cluster_id: impl Into<ClusterId>,
         epoch: Epoch,
-        config_id: ConfigId,
-        recovery_generation: u64,
-        compacted: LogAnchor,
-        snapshot: SnapshotIdentity,
-    ) -> Self {
-        Self {
-            format_version: RECOVERY_ANCHOR_FORMAT_VERSION,
-            cluster_id: cluster_id.into(),
-            epoch,
-            config_id,
-            configuration_state: ConfigurationState::active(config_id, LogHash::ZERO),
-            recovery_generation,
-            compacted,
-            snapshot,
-        }
-    }
-
-    pub fn new_with_configuration(
-        cluster_id: impl Into<ClusterId>,
-        epoch: Epoch,
         configuration_state: ConfigurationState,
         recovery_generation: u64,
         compacted: LogAnchor,
@@ -454,26 +380,6 @@ impl RecoveryAnchor {
             epoch,
             config_id: configuration_state.config_id(),
             configuration_state,
-            recovery_generation,
-            compacted,
-            snapshot,
-        }
-    }
-
-    pub fn from_v1(
-        cluster_id: impl Into<ClusterId>,
-        epoch: Epoch,
-        config_id: ConfigId,
-        recovery_generation: u64,
-        compacted: LogAnchor,
-        snapshot: SnapshotIdentity,
-    ) -> Self {
-        Self {
-            format_version: RECOVERY_ANCHOR_V1_FORMAT_VERSION,
-            cluster_id: cluster_id.into(),
-            epoch,
-            config_id,
-            configuration_state: ConfigurationState::active(config_id, LogHash::ZERO),
             recovery_generation,
             compacted,
             snapshot,
@@ -512,7 +418,7 @@ impl RecoveryAnchor {
         &self.snapshot
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.snapshot.executor_fingerprint()
     }
 }
@@ -529,40 +435,26 @@ impl<'de> serde::Deserialize<'de> for RecoveryAnchor {
             cluster_id: ClusterId,
             epoch: Epoch,
             config_id: ConfigId,
-            #[serde(default)]
-            configuration_state: Option<ConfigurationState>,
+            configuration_state: ConfigurationState,
             recovery_generation: u64,
             compacted: LogAnchor,
             snapshot: SnapshotIdentity,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let configuration_state = match (wire.format_version, wire.configuration_state) {
-            (RECOVERY_ANCHOR_V1_FORMAT_VERSION, None) => {
-                ConfigurationState::active(wire.config_id, LogHash::ZERO)
-            }
-            (RECOVERY_ANCHOR_V1_FORMAT_VERSION, Some(state))
-                if state == ConfigurationState::active(wire.config_id, LogHash::ZERO) =>
-            {
-                state
-            }
-            (RECOVERY_ANCHOR_FORMAT_VERSION, Some(state))
-                if state.config_id() == wire.config_id =>
-            {
-                state
-            }
-            _ => {
-                return Err(serde::de::Error::custom(
-                    "invalid recovery anchor configuration state",
-                ))
-            }
-        };
+        if wire.format_version != RECOVERY_ANCHOR_FORMAT_VERSION
+            || wire.configuration_state.config_id() != wire.config_id
+        {
+            return Err(serde::de::Error::custom(
+                "invalid recovery anchor configuration state",
+            ));
+        }
         Ok(Self {
             format_version: wire.format_version,
             cluster_id: wire.cluster_id,
             epoch: wire.epoch,
             config_id: wire.config_id,
-            configuration_state,
+            configuration_state: wire.configuration_state,
             recovery_generation: wire.recovery_generation,
             compacted: wire.compacted,
             snapshot: wire.snapshot,
@@ -922,8 +814,6 @@ impl StoredCommand {
 }
 
 const CONFIG_CHANGE_MAGIC: &[u8; 4] = b"QCFG";
-const CONFIG_CHANGE_VERSION: u16 = 1;
-const BOUND_CONFIG_CHANGE_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SuccessorDescriptor {
@@ -1061,19 +951,9 @@ pub fn canonical_membership_digest(members: &[NodeId]) -> Result<LogHash, Config
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigChange {
     Stop {
-        config_id: ConfigId,
-        config_digest: LogHash,
-    },
-    ActivationBarrier {
-        config_id: ConfigId,
-        config_digest: LogHash,
-        stop_slot: LogIndex,
-        prefix_hash: LogHash,
-    },
-    BoundStop {
         successor: SuccessorDescriptor,
     },
-    BoundActivationBarrier {
+    ActivationBarrier {
         successor: SuccessorDescriptor,
         stop_slot: LogIndex,
         prefix_hash: LogHash,
@@ -1082,35 +962,14 @@ pub enum ConfigChange {
 }
 
 impl ConfigChange {
-    pub const fn stop(config_id: ConfigId, config_digest: LogHash) -> Self {
-        Self::Stop {
-            config_id,
-            config_digest,
-        }
-    }
-
-    pub const fn activation_barrier(
-        config_id: ConfigId,
-        config_digest: LogHash,
-        stop_slot: LogIndex,
-        prefix_hash: LogHash,
-    ) -> Self {
-        Self::ActivationBarrier {
-            config_id,
-            config_digest,
-            stop_slot,
-            prefix_hash,
-        }
-    }
-
-    pub fn bound_stop(
+    pub fn stop(
         cluster_id: impl Into<ClusterId>,
         predecessor_config_id: ConfigId,
         predecessor_config_digest: LogHash,
         successor_config_id: ConfigId,
         successor_members: Vec<NodeId>,
     ) -> Result<Self, ConfigChangeDecodeError> {
-        Ok(Self::BoundStop {
+        Ok(Self::Stop {
             successor: SuccessorDescriptor::new(
                 cluster_id,
                 predecessor_config_id,
@@ -1121,13 +980,13 @@ impl ConfigChange {
         })
     }
 
-    pub const fn bound_activation_barrier(
+    pub const fn activation_barrier(
         successor: SuccessorDescriptor,
         stop_slot: LogIndex,
         prefix_hash: LogHash,
         stop_command_hash: LogHash,
     ) -> Self {
-        Self::BoundActivationBarrier {
+        Self::ActivationBarrier {
             successor,
             stop_slot,
             prefix_hash,
@@ -1135,53 +994,21 @@ impl ConfigChange {
         }
     }
 
-    pub const fn successor(&self) -> Option<&SuccessorDescriptor> {
+    pub const fn successor(&self) -> &SuccessorDescriptor {
         match self {
-            Self::BoundStop { successor } | Self::BoundActivationBarrier { successor, .. } => {
-                Some(successor)
-            }
-            _ => None,
+            Self::Stop { successor } | Self::ActivationBarrier { successor, .. } => successor,
         }
     }
 
     pub fn to_stored_command(&self) -> StoredCommand {
         let mut payload = Vec::with_capacity(87);
         payload.extend_from_slice(CONFIG_CHANGE_MAGIC);
-        let version = if matches!(
-            self,
-            Self::BoundStop { .. } | Self::BoundActivationBarrier { .. }
-        ) {
-            BOUND_CONFIG_CHANGE_VERSION
-        } else {
-            CONFIG_CHANGE_VERSION
-        };
-        payload.extend_from_slice(&version.to_be_bytes());
         match self {
-            Self::Stop {
-                config_id,
-                config_digest,
-            } => {
-                payload.push(1);
-                payload.extend_from_slice(&config_id.to_be_bytes());
-                payload.extend_from_slice(config_digest.as_bytes());
-            }
-            Self::ActivationBarrier {
-                config_id,
-                config_digest,
-                stop_slot,
-                prefix_hash,
-            } => {
-                payload.push(2);
-                payload.extend_from_slice(&config_id.to_be_bytes());
-                payload.extend_from_slice(config_digest.as_bytes());
-                payload.extend_from_slice(&stop_slot.to_be_bytes());
-                payload.extend_from_slice(prefix_hash.as_bytes());
-            }
-            Self::BoundStop { successor } => {
+            Self::Stop { successor } => {
                 payload.push(1);
                 encode_successor(&mut payload, successor);
             }
-            Self::BoundActivationBarrier {
+            Self::ActivationBarrier {
                 successor,
                 stop_slot,
                 prefix_hash,
@@ -1212,60 +1039,32 @@ impl ConfigChange {
         if bytes.get(..4) != Some(CONFIG_CHANGE_MAGIC) {
             return Err(ConfigChangeDecodeError);
         }
-        let version = read_config_u16(bytes, 4)?;
-        if version == BOUND_CONFIG_CHANGE_VERSION {
-            let kind = *bytes.get(6).ok_or(ConfigChangeDecodeError)?;
-            let mut cursor = 7;
-            let successor = decode_successor(bytes, &mut cursor)?;
-            let change = match kind {
-                1 => Self::BoundStop { successor },
-                2 => Self::BoundActivationBarrier {
-                    successor,
-                    stop_slot: read_config_u64_at(bytes, &mut cursor)?,
-                    prefix_hash: read_config_hash_at(bytes, &mut cursor)?,
-                    stop_command_hash: read_config_hash_at(bytes, &mut cursor)?,
-                },
-                _ => return Err(ConfigChangeDecodeError),
-            };
-            if cursor != bytes.len() {
-                return Err(ConfigChangeDecodeError);
-            }
-            return Ok(change);
-        }
-        if version != CONFIG_CHANGE_VERSION {
+        let kind = *bytes.get(4).ok_or(ConfigChangeDecodeError)?;
+        let mut cursor = 5;
+        let successor = decode_successor(bytes, &mut cursor)?;
+        let change = match kind {
+            1 => Self::Stop { successor },
+            2 => Self::ActivationBarrier {
+                successor,
+                stop_slot: read_config_u64_at(bytes, &mut cursor)?,
+                prefix_hash: read_config_hash_at(bytes, &mut cursor)?,
+                stop_command_hash: read_config_hash_at(bytes, &mut cursor)?,
+            },
+            _ => return Err(ConfigChangeDecodeError),
+        };
+        if cursor != bytes.len() {
             return Err(ConfigChangeDecodeError);
         }
-        let kind = *bytes.get(6).ok_or(ConfigChangeDecodeError)?;
-        let config_id = read_config_u64(bytes, 7)?;
-        let config_digest = read_config_hash(bytes, 15)?;
-        match kind {
-            1 if bytes.len() == 47 => Ok(Self::stop(config_id, config_digest)),
-            2 if bytes.len() == 87 => Ok(Self::activation_barrier(
-                config_id,
-                config_digest,
-                read_config_u64(bytes, 47)?,
-                read_config_hash(bytes, 55)?,
-            )),
-            _ => Err(ConfigChangeDecodeError),
-        }
+        Ok(change)
     }
 
     pub const fn binding(&self) -> (ConfigId, LogHash) {
         match self {
-            Self::Stop {
-                config_id,
-                config_digest,
-            }
-            | Self::ActivationBarrier {
-                config_id,
-                config_digest,
-                ..
-            } => (*config_id, *config_digest),
-            Self::BoundStop { successor } => (
+            Self::Stop { successor } => (
                 successor.predecessor_config_id,
                 successor.predecessor_config_digest,
             ),
-            Self::BoundActivationBarrier { successor, .. } => {
+            Self::ActivationBarrier { successor, .. } => {
                 (successor.config_id, successor.config_digest)
             }
         }
@@ -1467,35 +1266,12 @@ pub struct SnapshotManifest {
     applied_hash: LogHash,
     schema_version: u64,
     created_by: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_fingerprint: Option<LogHash>,
+    executor_fingerprint: LogHash,
 }
 
 impl SnapshotManifest {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cluster_id: impl Into<ClusterId>,
-        config_id: ConfigId,
-        epoch: Epoch,
-        index: LogIndex,
-        applied_hash: LogHash,
-        schema_version: u64,
-        created_by: impl Into<NodeId>,
-    ) -> Self {
-        Self {
-            snapshot_id: format!("snapshot-{index:015}"),
-            cluster_id: cluster_id.into(),
-            config_id,
-            configuration_state: ConfigurationState::active(config_id, LogHash::ZERO),
-            epoch,
-            index,
-            applied_hash,
-            schema_version,
-            created_by: created_by.into(),
-            executor_fingerprint: None,
-        }
-    }
-
-    pub fn new_with_configuration(
         cluster_id: impl Into<ClusterId>,
         configuration_state: ConfigurationState,
         epoch: Epoch,
@@ -1503,6 +1279,7 @@ impl SnapshotManifest {
         applied_hash: LogHash,
         schema_version: u64,
         created_by: impl Into<NodeId>,
+        executor_fingerprint: LogHash,
     ) -> Self {
         Self {
             snapshot_id: format!("snapshot-{index:015}"),
@@ -1514,13 +1291,8 @@ impl SnapshotManifest {
             applied_hash,
             schema_version,
             created_by: created_by.into(),
-            executor_fingerprint: None,
+            executor_fingerprint,
         }
-    }
-
-    pub fn with_executor_fingerprint(mut self, executor_fingerprint: LogHash) -> Self {
-        self.executor_fingerprint = Some(executor_fingerprint);
-        self
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -1563,12 +1335,8 @@ impl SnapshotManifest {
         self.applied_hash
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.executor_fingerprint
-    }
-
-    pub const fn is_legacy_executor_fingerprint(&self) -> bool {
-        self.executor_fingerprint.is_none()
     }
 }
 
@@ -1583,22 +1351,17 @@ impl<'de> serde::Deserialize<'de> for SnapshotManifest {
             snapshot_id: String,
             cluster_id: ClusterId,
             config_id: ConfigId,
-            #[serde(default)]
-            configuration_state: Option<ConfigurationState>,
+            configuration_state: ConfigurationState,
             epoch: Epoch,
             index: LogIndex,
             applied_hash: LogHash,
             schema_version: u64,
             created_by: NodeId,
-            #[serde(default)]
-            executor_fingerprint: Option<LogHash>,
+            executor_fingerprint: LogHash,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let configuration_state = wire
-            .configuration_state
-            .unwrap_or_else(|| ConfigurationState::active(wire.config_id, LogHash::ZERO));
-        if configuration_state.config_id() != wire.config_id {
+        if wire.configuration_state.config_id() != wire.config_id {
             return Err(serde::de::Error::custom(
                 "snapshot configuration state does not match config_id",
             ));
@@ -1607,7 +1370,7 @@ impl<'de> serde::Deserialize<'de> for SnapshotManifest {
             snapshot_id: wire.snapshot_id,
             cluster_id: wire.cluster_id,
             config_id: wire.config_id,
-            configuration_state,
+            configuration_state: wire.configuration_state,
             epoch: wire.epoch,
             index: wire.index,
             applied_hash: wire.applied_hash,
@@ -1757,17 +1520,17 @@ mod tests {
 
     #[test]
     fn replicated_command_envelope_preserves_backend_bytes_unchanged() {
-        let legacy_qsql = b"QSQL\0\x02{\"request_id\":\"same\"}".to_vec();
+        let opaque_qsql = b"QSQL\0\x02{\"request_id\":\"same\"}".to_vec();
         let envelope = ReplicatedCommandEnvelope::new(
             ExecutionProfile::Sqlite,
             1,
             "same",
-            legacy_qsql.clone(),
+            opaque_qsql.clone(),
         )
         .unwrap();
 
         let decoded = ReplicatedCommandEnvelope::decode(&envelope.encode().unwrap()).unwrap();
-        assert_eq!(decoded.body(), legacy_qsql);
+        assert_eq!(decoded.body(), opaque_qsql);
     }
 
     #[test]

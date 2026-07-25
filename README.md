@@ -58,7 +58,7 @@ see [RELEASING.md](RELEASING.md) for the registry procedure.
 
 ## Embedded Rust API
 
-The published `rhizadb` v0.1.0 crate exposes an SQL-only embedded owner. It
+The published `rhizadb` crate exposes an SQL-only embedded owner. It
 does not offer graph or KV Cargo features, re-exports, or embedded methods;
 those remain outside the initial registry product.
 
@@ -135,6 +135,101 @@ those traits or using the broader transport vocabulary still requires direct
 dependencies on `rhiza-quepaxa` and `rhiza-node`. Normal local consumers should
 use `local_file_backed`.
 
+Highly available embedded consumers bind the Recorder and service listeners,
+build a `HaServeConfig`, and pass it to `PreparedHaStartup::start`. The returned
+`HaNode` owns both ingress servers, recovery, background workers, and ordered
+durability-aware shutdown. `ready()` waits for the active, writable node and
+returns a cloneable `RhizaHandle` for application requests; `monitor()` reports
+terminal server or worker failures.
+
+```rust,no_run
+use std::{future::Future, sync::Arc};
+
+use rhizadb::{
+    HaRecorderTransport, HaServeConfig, HaStartupConfig, LogPeer, RecorderRpc,
+};
+use tokio::net::TcpListener;
+
+async fn run_ha_node(
+    startup: HaStartupConfig,
+    recorders: Vec<(String, Box<dyn RecorderRpc>)>,
+    log_peers: Vec<Arc<dyn LogPeer>>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), String> {
+    let recorder_listener = TcpListener::bind("127.0.0.1:7001")
+        .await
+        .map_err(|error| error.to_string())?;
+    let service_listener = TcpListener::bind("127.0.0.1:7002")
+        .await
+        .map_err(|error| error.to_string())?;
+    let prepared = startup.prepare().await.map_err(|error| error.to_string())?;
+    let node = prepared
+        .start(HaServeConfig::new(
+            recorder_listener,
+            service_listener,
+            HaRecorderTransport::Http,
+            recorders,
+            log_peers,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    tokio::pin!(shutdown);
+    let observed = tokio::select! {
+        result = observe_ha_node(&node) => result,
+        () = &mut shutdown => Ok(()),
+    };
+    let cleanup = node.shutdown().await.map_err(|error| error.to_string());
+    preserve_observation_and_cleanup(observed, cleanup)
+}
+
+async fn observe_ha_node(node: &rhizadb::HaNode) -> Result<(), String> {
+    let db = node.ready().await.map_err(|error| error.to_string())?;
+    db.status().await.map_err(|error| error.to_string())?;
+    node.monitor().await.map_err(|error| error.to_string())
+}
+
+fn preserve_observation_and_cleanup(
+    observed: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    match (observed, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            Err(format!("{primary}; HA shutdown also failed: {cleanup}"))
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+```
+
+Call `HaServeConfig::with_admin` or `with_tail_token` before `start` to add
+those routes to the service listener. `rhizadb` owns the required
+Recorder-before-runtime ordering, checkpoint restore, successor proof
+installation, Recorder rehydration, runtime retry, and
+`CheckpointCoordinator` construction. The embedding application supplies
+provider configuration, prebound listeners, configuration-scoped Recorder and
+log-peer clients, and its process shutdown signal. Dropping `HaNode` requests
+best-effort shutdown but cannot report cleanup failures, so planned shutdown
+must always await `HaNode::shutdown`.
+
+Membership replacement can move bulk restore out of the Stop fence through the
+public successor-prestage boundary. `HaSuccessorPrestageConfig::prepare`
+restores an Active(S) checkpoint into a detached store without opening a
+runtime, Recorder, proposer, or client endpoint. The predecessor enables its
+certified-tail route with `HaServeConfig::with_tail_token` and a separate
+configuration-bound credential; the successor repeatedly uses `tail_request`
+and `apply_page` until Stop(S).
+`PublishedHaSuccessorPrestage::finalize` accepts only the exact bound Stop,
+requires identical durable and applied anchors, adopts the staged files without
+copying the checkpoint again, and returns the normal `PreparedHaStartup`.
+Starting that value still reports `HaNodeStatus::AwaitingActivation`;
+activation remains the first S+1 proposal. Kubernetes successor init
+containers now run this facade through `rhiza prestage serve`: they restore and
+tail before Stop, observe the projected bound transition bundle, finalize the
+exact Stop, and only then let the normal `rhiza serve` container start.
+
 `execute_sql` and `query` expose typed SQL, `RETURNING`, consistency, and
 persistent idempotency. HTTP routes and workspace tooling are secondary
 adapters over the same SQL node service contracts.
@@ -146,11 +241,10 @@ the runtime does not call Kubernetes APIs and receives no service-account
 token.
 Each configuration has its own SQL headless Service and StatefulSet named
 `rhiza-sql-c<config_id>`. Stable ordinals map to `node-1` through `node-N`.
-Membership accepts 3 through 7 members through a version-1 JSON bundle:
+Membership accepts 3 through 7 members through a JSON bundle:
 
 ```json
 {
-  "version": 1,
   "config_id": 1,
   "members": [
     {
@@ -225,8 +319,8 @@ Because all Pods in one StatefulSet mount the same Secret, its server
 certificate must cover every ordinal member name in that configuration.
 Set `RHIZA_RECORDER_TLS=off` (the default) for plaintext TCP/Postcard; TLS
 files, TLS server names, or a TLS Secret are rejected in that mode. TLS cannot
-be enabled with the HTTP transport, and the legacy `tcp-tls-postcard` transport
-value is rejected so conflicting settings fail closed.
+be enabled with the HTTP transport, and the removed `tcp-tls-postcard`
+transport value is rejected so conflicting settings fail closed.
 
 This is server-authenticated TLS, not mTLS. The encrypted HELLO exchange still
 authenticates callers with configured peer tokens. It protects RecorderRpc
@@ -356,18 +450,14 @@ steps are documented in
 
 ## Storage Model
 
-The SQL StatefulSet deliberately has no `volumeClaimTemplates`.
-Every SQL pod uses `emptyDir` for `/var/lib/rhiza`. StatefulSet identity is
-still useful:
-it gives each ephemeral process a stable ordinal and DNS name while making a
-replacement prove that recovery does not depend on an old local disk. A fresh
-pod restores an official snapshot and then replays the exact qlog suffix.
-
-This trades restart speed and object-store dependency for a smaller local
-state-management surface. Production object storage must have an independent
-failure domain and strong cross-process conditional writes. The local vind
-RustFS Deployment also uses `emptyDir`; it simulates S3 compatibility but is
-not production durability evidence.
+Successor StatefulSets provision a `ReadWriteOnce` PVC for `/var/lib/rhiza`.
+Prestage and normal successor serving use the same claim, so publishing the
+detached stage and starting the main container does not recopy the checkpoint.
+Ordinary same-configuration manifests retain `emptyDir` and recover from the
+object-store authority. The successor PVC is a restart and cutover-performance
+cache, not a substitute for independent, strong-CAS production object storage.
+The local vind RustFS Deployment also uses `emptyDir`; it simulates S3
+compatibility but is not production durability evidence.
 
 The runtime uses the generic `object_store` boundary. The deployment
 template is S3-shaped for RustFS, AWS S3, or another compatible endpoint;
@@ -416,9 +506,19 @@ kubectl -n "$RHIZA_K8S_NAMESPACE" create secret generic rhiza-sql-c1-bundle \
   | yq eval '.immutable = true' - \
   | kubectl -n "$RHIZA_K8S_NAMESPACE" create -f -
 scripts/k8s-object-job.sh 1 config-c1.json init-checkpoint
+kubectl -n "$RHIZA_K8S_NAMESPACE" apply -f deploy/k8s/rhiza-client-services.yaml
 scripts/render-k8s-config.sh 1 3 config-c1.json target/rhiza-sql-c1.yaml
 kubectl -n "$RHIZA_K8S_NAMESPACE" create -f target/rhiza-sql-c1.yaml
 ```
+
+`rhiza-sql-client` is the single stable SQL client Service. It is installed
+once from the static manifest, is never emitted or mutated by the
+configuration renderer, and selects only Pods labeled
+`rhiza.dev/member-role=voter`. The rendered, config-scoped headless Service
+remains the peer and direct admin path; it deliberately has no role selector so
+an awaiting-activation learner can be inspected without becoming a client
+endpoint. Configuration replacement verifies the live stable Service has this
+exact selector and client port before it performs any transition action.
 
 The renderer derives the local image default from SQL
 (`RHIZA_EXECUTION_PROFILE=sql` defaults to `rhiza-sql:dev`). Set `RHIZA_IMAGE`
@@ -426,19 +526,18 @@ to override it with a registry-qualified artifact and tag. Also set
 `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`, `RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`,
 and Secret-name overrides as needed. `RHIZA_EXECUTION_PROFILE` must be `sql`.
 The example assumes `rhiza-auth` and `rhiza-object-store` Secrets already
-exist in the same `rhiza` namespace; replace the image, endpoint, and Secret
-name with deployment-specific values.
+exist in the same `rhiza` namespace. `rhiza-auth` must contain distinct
+`client-token`, `admin-token`, and `tail-token` values; replace the image,
+endpoint, and Secret names with deployment-specific values.
 The renderer accepts only an unset or explicit `rejoin`
 `RHIZA_STARTUP_MODE`; bootstrap and disaster-recovery startup modes are not
 valid for the reference StatefulSet.
 
-The rendered StatefulSet uses `Parallel`, `OnDelete`, stable ordinals, and
-per-Pod `emptyDir` data. If one Pod is deleted or lost, Kubernetes recreates
-the same ordinal automatically; a container-only crash restarts in the
-existing Pod. A replacement Pod starts with the same node and membership
-identity, restores the initialized official checkpoint plus its committed
-suffix, and rejoins while the other replicas retain their local state. No
-scale, configuration, or recovery command is part of this same-membership
+The ordinary rendered StatefulSet uses `Parallel`, `OnDelete`, stable ordinals,
+and per-Pod `emptyDir` data. If one Pod is deleted or lost, Kubernetes
+recreates the same ordinal; a container-only crash restarts in the existing
+Pod. A replacement restores the initialized official checkpoint plus its
+committed suffix. No scale, configuration, or recovery command is part of this same-membership
 repair.
 
 The matching PodDisruptionBudget sets `maxUnavailable: 1` to limit cooperating
@@ -477,21 +576,40 @@ Membership replacement is intentionally stop-the-world. There is no mixed
 rolling transition between configurations. Client writes are unavailable from
 Stop(S) until every successor reports Active(S+1). The bounded operator flow is:
 
-1. Prepare a v1 successor draft with config ID S+1 and 3 through 7 members.
-2. Confirm no successor StatefulSet already exists.
-3. Call old live admin `membership/stop` with the admin bearer token.
-4. Poll every old node until its exact state is `Stopped(S)`.
-5. Bind the returned Stop entry, decision certificate, and old membership into
-   the successor bundle.
-6. Call old live admin checkpoint compaction and require format 2, then inspect
-   the object-store checkpoint and independently require format 2.
-7. Scale the stopped old StatefulSet to zero and verify zero replicas.
-8. Create the immutable successor bundle Secret and config-scoped resources.
-   Each fresh successor restores the official object-store checkpoint and
-   installs the predecessor certificate before opening the runtime.
-9. Require every successor to report `awaiting_activation`, activate S+1 once,
-   then poll every node until it reports `Active(S+1)`.
-10. Only after Active(S+1), permit GC planning and application.
+1. Prepare a successor draft with config ID S+1 and 3 through 7 members.
+2. Create the successor PVCs and learner-labeled Pods before Stop. Their init
+   containers restore Active(S), continuously consume authenticated certified
+   tail pages, and expose no client or Recorder service.
+3. Call old live admin `membership/stop`, poll every old node to exact
+   `Stopped(S)`, and bind the returned Stop proof into an immutable transition
+   Secret. The projected Secret lets each init container finalize only after
+   its durable and applied anchors equal the exact Stop.
+4. Let the normal successor containers start from the same PVC and use the
+   config-scoped headless admin path to require
+   `awaiting_activation` (or an idempotently resumed `active` state). Learners
+   intentionally need not pass client readiness. If that direct learner admin
+   status path is unavailable, the workflow fails closed rather than treating
+   Pod phase as activation proof. Require every successor to report
+   `awaiting_activation`, activate S+1 once, and poll every node until it
+   reports exact `Active(S+1)`.
+5. Promote exact Active successor Pods to voter, relabel the stopped
+   predecessor Pods as sealed, and require the stable client Service
+   EndpointSlices to contain exactly the Ready successor Pod UIDs.
+6. Publish and inspect the first Active(S+1) checkpoint. Only after that proof
+   scale the sealed predecessor StatefulSet to zero and permit GC.
+
+The temporary coexistence is safe because successor init containers have no
+runtime, proposer, Recorder, or client endpoint, while predecessor Pods cannot
+write after exact `Stopped(S)`. Keeping those sealed Pods until the first
+Active(S+1) checkpoint preserves rollback evidence without admitting them to
+the stable voter-only client Service.
+
+For a first upgrade from a manifest that predates member-role labels, the
+replacement preflight first proves every exact old node is `Active(S)`. It then
+validates the old StatefulSet and complete owned Running Pod set before
+idempotently adopting the voter label. Missing labels are accepted only through
+this evidence-backed path; learner or foreign labels, owners, identities, or
+Pod replacements fail closed before UID evidence is captured.
 
 Run the guarded workflow with:
 
@@ -544,10 +662,10 @@ OpenSSL:
 scripts/e2e-vind-rustfs.sh
 ```
 
-It creates a fresh namespace and RustFS bucket, asserts zero PVCs, boots config
-1, writes snapshot and suffix data, compacts to checkpoint V2, performs a 3-to-3
-stop-and-replace, proves fresh `emptyDir` restore by missing local markers and
-successful reads, then plans, inspects, and applies old-object GC with exact
+It creates a fresh namespace and RustFS bucket, boots config 1 on `emptyDir`,
+writes snapshot and suffix data, compacts to checkpoint V2, performs a 3-to-3
+PVC-prestaged stop-and-replace, proves recovery by successful reads, then
+plans, inspects, and applies old-object GC with exact
 hash confirmation after stopping publishers and observing lease expiry. It
 restarts the three nodes and verifies the retained generation afterward.
 Cleanup is automatic by default. Set

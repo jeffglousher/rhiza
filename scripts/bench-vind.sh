@@ -1131,9 +1131,11 @@ vcluster node load-image "$node" --image "$image" >/dev/null
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
+tail_token="$(openssl rand -hex 24)"
 peer_tokens="$(for _ in 1 2 3; do openssl rand -hex 24; done | jq -Rsc 'split("\n")[:-1]')"
 k create secret generic rhiza-auth --from-literal=client-token="$client_token" \
-  --from-literal=admin-token="$admin_token" >/dev/null
+  --from-literal=admin-token="$admin_token" \
+  --from-literal=tail-token="$tail_token" >/dev/null
 sed -e "s|__RUSTFS_IMAGE__|$rustfs_image|g" -e "s|__AWS_CLI_IMAGE__|$aws_image|g" \
   deploy/k8s/rustfs-e2e.yaml > "$rendered_rustfs"
 yq eval '.' "$rendered_rustfs" >/dev/null
@@ -1178,7 +1180,7 @@ k wait --for=condition=complete job/rustfs-create-bucket --timeout=240s >/dev/nu
 bundle="$target/config-c1.json"
 jq -n --argjson tokens "$peer_tokens" --arg recorder_transport "$recorder_transport" \
   --arg recorder_tls "$recorder_tls" '
-  {version:1,config_id:1,members:[range(3) as $n | {
+  {config_id:1,members:[range(3) as $n | {
     node_id:("node-" + ($n + 1 | tostring)),
     url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8081"),
     log_url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8080"), token:$tokens[$n]

@@ -14,7 +14,7 @@ use rhiza_quepaxa::{
     AcceptedValue, CertifiedDecisionInspection, ConfigChange, DecisionProof, DriveOutcome, Error,
     IsrState, Membership, Proposal, ProposalPriority, ProposerProgress, ReadFenceObservation,
     ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary, RecorderFileStore,
-    RecorderRequest, RecorderRpc, RecorderSummary, RejectReason, ThreeNodeConsensus,
+    RecorderRpc, RecorderSummary, RejectReason, ThreeNodeConsensus,
 };
 
 fn value(byte: u8) -> AcceptedValue {
@@ -1600,7 +1600,7 @@ fn hedged_proposer_finishes_another_proposers_exact_h_quorum() {
 fn hedged_proposer_installs_an_adopted_config_change_on_a_quorum() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let config_command = ConfigChange::bound_stop(
+    let config_command = ConfigChange::stop(
         "cluster",
         1,
         membership.digest(),
@@ -1674,59 +1674,20 @@ fn hedged_proposer_installs_an_adopted_config_change_on_a_quorum() {
 }
 
 #[test]
-fn production_store_rejects_arbitrary_legacy_decide() {
-    let root = tempfile::tempdir().unwrap();
-    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let store = RecorderFileStore::new_with_membership(
-        root.path().join("n1"),
-        "n1",
-        "cluster",
-        1,
-        1,
-        membership.clone(),
-    )
-    .unwrap();
-    let command = StoredCommand::new(EntryType::Command, b"arbitrary".to_vec());
-    let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
-    store.store_command(command.hash(), command).unwrap();
-    let decision = rhiza_quepaxa::DecisionCertificate {
-        slot: 1,
-        epoch: 1,
-        config_id: 1,
-        config_digest: membership.digest(),
-        ballot: rhiza_quepaxa::Ballot::new(1, 1, "attacker"),
-        value,
-        recorder_ids: vec!["n1".into(), "n2".into()],
-    };
-    assert_eq!(
-        store.apply(RecorderRequest::Decide {
-            cluster_id: "cluster".into(),
-            epoch: 1,
-            config_id: 1,
-            config_digest: membership.digest(),
-            slot: 1,
-            decision,
-        }),
-        Err(Error::Rejected(RejectReason::InvalidRequest))
-    );
-}
-
-#[test]
-fn old_qrec_state_fails_closed() {
+fn noncurrent_recorder_state_fails_closed_without_rewrite() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("slot-00000000000000000001.rec");
     let mut bytes = b"QREC".to_vec();
     bytes.extend_from_slice(&3_u16.to_be_bytes());
     let digest = LogHash::digest(&[&bytes]);
     bytes.extend_from_slice(digest.as_bytes());
-    std::fs::write(path, bytes).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
     assert!(matches!(
         RecorderFileStore::new_with_id(root.path(), "n1", "cluster", 1, 1),
-        Err(Error::MigrationRequired {
-            format: "recorder durable head",
-            version: 2,
-        })
+        Err(Error::Decode(message))
+            if message == "recorder directory is not a current durable layout"
     ));
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
 
 #[derive(Default)]

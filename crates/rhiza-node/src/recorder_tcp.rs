@@ -1540,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_client_bounds_partial_response_drip_by_sender_deadline() {
+    fn framed_client_bounds_partial_response_drip_by_sender_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (advertised_tx, advertised_rx) = mpsc::channel();
@@ -1595,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_read_fence_uses_the_short_control_deadline() {
+    fn framed_read_fence_uses_the_short_control_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1628,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_record_transport_failure_releases_the_quorum_attempt_promptly() {
+    fn framed_record_transport_failure_releases_the_quorum_attempt_promptly() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {

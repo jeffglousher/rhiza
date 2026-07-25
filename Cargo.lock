@@ -2022,6 +2022,7 @@ dependencies = [
  "rhiza-obj-store",
  "rhiza-quepaxa",
  "rhiza-sql",
+ "rhizadb",
  "serde",
  "serde_json",
  "tempfile",
@@ -2157,12 +2158,16 @@ dependencies = [
 name = "rhizadb"
 version = "0.1.1"
 dependencies = [
+ "axum",
  "rhiza-archive",
  "rhiza-core",
+ "rhiza-log",
  "rhiza-node",
  "rhiza-obj-store",
  "rhiza-quepaxa",
  "rhiza-sql",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

@@ -56,6 +56,7 @@ const CREATE_PENDING_APPLY_SQL: &str = r#"CREATE TABLE pending_apply (
 );"#;
 const CREATE_EMBEDDED_LOG_SQL: &str = r#"CREATE TABLE embedded_qlog (
     log_index INTEGER PRIMARY KEY CHECK(log_index > 0),
+    initial_configuration BLOB NOT NULL,
     entry_bytes BLOB NOT NULL
 ) WITHOUT ROWID;"#;
 
@@ -100,6 +101,7 @@ const PENDING_APPLY_COLUMNS: &[ExpectedColumn] = &[
 ];
 const EMBEDDED_LOG_COLUMNS: &[ExpectedColumn] = &[
     ("log_index", "INTEGER", true, 1),
+    ("initial_configuration", "BLOB", true, 0),
     ("entry_bytes", "BLOB", true, 0),
 ];
 
@@ -554,33 +556,52 @@ impl ControlStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT log_index,entry_bytes FROM embedded_qlog
+                "SELECT log_index,initial_configuration,entry_bytes FROM embedded_qlog
                  WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index",
             )
             .map_err(sqlite_error)?;
         let rows = statement
             .query_map(
                 params![u64_to_sql(from_index)?, u64_to_sql(through_index)?],
-                |row| Ok((u64_from_sql(row.get(0)?)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| {
+                    Ok((
+                        u64_from_sql(row.get(0)?)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
             )
             .map_err(sqlite_error)?;
         let cluster_id = meta_text(&self.conn, "cluster_id")?;
         let mut expected = from_index;
+        let mut expected_configuration = None;
         let mut entries = Vec::new();
         for row in rows {
-            let (index, encoded) = row.map_err(sqlite_error)?;
+            let (index, initial_configuration, encoded) = row.map_err(sqlite_error)?;
             if index != expected {
                 return Err(Error::InvalidEntry(format!(
                     "embedded qlog is missing index {expected}"
                 )));
             }
-            let entry = decode_embedded_log_entry(&encoded, &cluster_id)?;
+            let initial_configuration =
+                decode_configuration_bytes(&initial_configuration, "embedded qlog")?;
+            if expected_configuration
+                .as_ref()
+                .is_some_and(|expected| expected != &initial_configuration)
+            {
+                return Err(Error::InvalidEntry(
+                    "embedded qlog configuration chain is discontinuous".into(),
+                ));
+            }
+            let (entry, resulting_configuration) =
+                decode_embedded_log_entry(&encoded, &cluster_id, initial_configuration)?;
             if entry.index != index {
                 return Err(Error::InvalidEntry(
                     "embedded qlog key does not match its entry index".into(),
                 ));
             }
             entries.push(entry);
+            expected_configuration = Some(resulting_configuration);
             expected = expected
                 .checked_add(1)
                 .ok_or_else(|| Error::InvalidEntry("embedded qlog index overflow".into()))?;
@@ -1367,14 +1388,18 @@ fn insert_or_validate_embedded_entry(conn: &Connection, entry: &LogEntry) -> Res
     let index = u64_to_sql(entry.index)?;
     let existing = conn
         .query_row(
-            "SELECT entry_bytes FROM embedded_qlog WHERE log_index=?1",
+            "SELECT initial_configuration,entry_bytes FROM embedded_qlog WHERE log_index=?1",
             params![index],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    if let Some(existing) = existing {
-        if decode_embedded_log_entry(&existing, &cluster_id)? == *entry {
+    if let Some((initial_configuration, existing)) = existing {
+        let initial_configuration =
+            decode_configuration_bytes(&initial_configuration, "embedded qlog")?;
+        if initial_configuration == configuration
+            && decode_embedded_log_entry(&existing, &cluster_id, initial_configuration)?.0 == *entry
+        {
             return Ok(());
         }
         return Err(Error::InvalidEntry(
@@ -1382,23 +1407,34 @@ fn insert_or_validate_embedded_entry(conn: &Connection, entry: &LogEntry) -> Res
         ));
     }
     let encoded = rhiza_log::encode_segment(std::slice::from_ref(entry));
+    let initial_configuration =
+        serde_json::to_vec(&configuration).map_err(|error| Error::Sqlite(error.to_string()))?;
     conn.execute(
-        "INSERT INTO embedded_qlog(log_index,entry_bytes) VALUES(?1,?2)",
-        params![index, encoded],
+        "INSERT INTO embedded_qlog(log_index,initial_configuration,entry_bytes) VALUES(?1,?2,?3)",
+        params![index, initial_configuration, encoded],
     )
     .map_err(sqlite_error)?;
     Ok(())
 }
 
-fn decode_embedded_log_entry(encoded: &[u8], cluster_id: &str) -> Result<LogEntry> {
-    let entries = rhiza_log::decode_segment_for_cluster(encoded, cluster_id)
+fn decode_embedded_log_entry(
+    encoded: &[u8],
+    cluster_id: &str,
+    initial_configuration: ConfigurationState,
+) -> Result<(LogEntry, ConfigurationState)> {
+    let (entries, resulting_configuration) =
+        rhiza_log::decode_segment_for_cluster_with_configuration(
+            encoded,
+            cluster_id,
+            initial_configuration,
+        )
         .map_err(|error| Error::InvalidEntry(error.to_string()))?;
     let [entry] = entries.as_slice() else {
         return Err(Error::InvalidEntry(
             "embedded qlog value must contain exactly one entry".into(),
         ));
     };
-    Ok(entry.clone())
+    Ok((entry.clone(), resulting_configuration))
 }
 
 fn pending_from(conn: &Connection) -> Result<Option<PendingApply>> {
@@ -1538,8 +1574,11 @@ fn put_configuration(conn: &Connection, value: &ConfigurationState) -> Result<()
     put_meta(conn, "configuration_state", &encoded)
 }
 fn meta_configuration(conn: &Connection) -> Result<ConfigurationState> {
-    serde_json::from_slice(&get_meta(conn, "configuration_state")?)
-        .map_err(|error| Error::Sqlite(format!("invalid control configuration: {error}")))
+    decode_configuration_bytes(&get_meta(conn, "configuration_state")?, "control")
+}
+fn decode_configuration_bytes(encoded: &[u8], source: &str) -> Result<ConfigurationState> {
+    serde_json::from_slice(encoded)
+        .map_err(|error| Error::Sqlite(format!("invalid {source} configuration: {error}")))
 }
 fn put_anchor(conn: &Connection, key: &str, value: LogAnchor) -> Result<()> {
     put_meta(conn, key, &anchor_bytes(value))
@@ -1788,6 +1827,64 @@ mod tests {
             store.lookup_request("request-1", hash(b"request")).unwrap(),
             Some(receipt)
         );
+    }
+
+    #[test]
+    fn bound_stop_embedded_log_survives_control_reopen_with_its_initial_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.control");
+        let original = identity("node-a");
+        let stop_change = rhiza_core::ConfigChange::stop(
+            original.cluster_id(),
+            original.configuration_state().config_id(),
+            original.configuration_state().digest(),
+            original.configuration_state().config_id() + 1,
+            vec!["node-a".into(), "node-b".into(), "node-c".into()],
+        )
+        .unwrap();
+        let command = stop_change.to_stored_command();
+        let entry = LogEntry {
+            cluster_id: original.cluster_id().into(),
+            epoch: original.epoch(),
+            config_id: original.configuration_state().config_id(),
+            index: 1,
+            entry_type: command.entry_type,
+            payload: command.payload,
+            prev_hash: LogHash::ZERO,
+            hash: LogHash::ZERO,
+        };
+        let entry = LogEntry {
+            hash: entry.recompute_hash(),
+            ..entry
+        };
+        let stopped = original
+            .configuration_state()
+            .validate_entry(&entry)
+            .unwrap();
+        let pending = PendingApply::new(
+            LogAnchor::new(0, LogHash::ZERO),
+            LogAnchor::new(entry.index, entry.hash),
+            original.user_state(),
+            state(b"target-db"),
+        );
+
+        let store = ControlStore::create(&path, &original).unwrap();
+        store
+            .commit_rebuildable_apply(&pending, &entry, &stopped, &[])
+            .unwrap();
+        drop(store);
+
+        let reopened_identity = ControlIdentity::new(
+            original.cluster_id(),
+            original.node_id(),
+            original.epoch(),
+            stopped,
+            original.recovery_generation(),
+            original.materializer_fingerprint(),
+            pending.target_state(),
+        );
+        let reopened = ControlStore::open_existing(&path, &reopened_identity).unwrap();
+        assert_eq!(reopened.embedded_log_entries(1, 1).unwrap(), [entry]);
     }
 
     #[test]

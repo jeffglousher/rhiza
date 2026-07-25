@@ -21,7 +21,8 @@ use rhiza_archive::{
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::SnapshotIdentity;
 use rhiza_core::{
-    ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor,
+    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex,
+    RecoveryAnchor,
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
@@ -34,20 +35,26 @@ use rhiza_kv::{
     restore_snapshot_file as restore_kv_snapshot_file, RedbStateMachine,
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore};
+use rhiza_quepaxa::Membership;
 #[cfg(feature = "sql")]
 use rhiza_sql::{restore_recovery_snapshot_file, sql_executor_fingerprint};
 use serde::{Deserialize, Serialize};
 
-use crate::{Materializer, NodeConfig, NodeRuntime};
+use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore-v2.json";
-const LEGACY_RESTORE_INTENT_FILE: &str = ".rhiza-restore-v1";
+const RESTORE_INTENT_PREFIX: &str = ".rhiza-restore-";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
 const SUCCESSOR_RESTORE_INTENT_FILE: &str = ".successor-restore.intent";
 const SUCCESSOR_RESTORE_COMPLETE_FILE: &str = ".successor-restore.complete";
+const SUCCESSOR_PRESTAGE_LOCK_FILE: &str = ".successor-prestage.lock";
+pub(crate) const SUCCESSOR_PRESTAGE_INTENT_FILE: &str = ".successor-prestage.intent";
+pub(crate) const SUCCESSOR_PRESTAGE_READY_FILE: &str = ".successor-prestage.ready";
+const SUCCESSOR_PRESTAGE_PUBLISHED_FILE: &str = ".successor-prestage.published";
+const SUCCESSOR_PRESTAGE_FINALIZED_FILE: &str = ".successor-prestage.finalized";
 const REPAIR_ARTIFACT_OWNER_FILE: &str = ".rhiza-recovery-owner.json";
 pub const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity-v2.json";
 static RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -55,7 +62,6 @@ static RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreIntentIdentity {
-    version: u32,
     cluster_id: String,
     node_id: String,
     execution_profile: ExecutionProfile,
@@ -69,7 +75,7 @@ struct RestoreIntentIdentity {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
 enum RecoveryArtifactIdentity {
-    Successor(SuccessorRestoreReceipt),
+    Prestage(SuccessorPrestageIdentity),
     Restore(RestoreIntentIdentity),
 }
 
@@ -91,7 +97,6 @@ struct RepairArtifactOwnership {
 
 #[derive(Serialize)]
 struct SuccessorRestoreIdentity<'a> {
-    version: u32,
     cluster_id: &'a str,
     epoch: u64,
     target_config_id: u64,
@@ -101,14 +106,11 @@ struct SuccessorRestoreIdentity<'a> {
     predecessor_config_id: u64,
     stop_index: LogIndex,
     stop_hash: String,
-    checkpoint_index: LogIndex,
-    checkpoint_hash: String,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SuccessorRestoreReceipt {
-    version: u32,
     cluster_id: String,
     epoch: u64,
     target_config_id: u64,
@@ -118,8 +120,108 @@ struct SuccessorRestoreReceipt {
     predecessor_config_id: u64,
     stop_index: LogIndex,
     stop_hash: String,
-    checkpoint_index: LogIndex,
-    checkpoint_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuccessorPrestageIdentity {
+    cluster_id: String,
+    epoch: u64,
+    predecessor_config_id: u64,
+    predecessor_membership_digest: String,
+    predecessor_recovery_generation: u64,
+    node_id: String,
+    execution_profile: ExecutionProfile,
+    target_config_id: u64,
+    target_membership_digest: String,
+    seed_index: LogIndex,
+    seed_hash: String,
+}
+
+impl SuccessorPrestageIdentity {
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn predecessor_config_id(&self) -> u64 {
+        self.predecessor_config_id
+    }
+
+    pub fn predecessor_membership_digest(&self) -> LogHash {
+        LogHash::from_hex(&self.predecessor_membership_digest)
+            .expect("validated predecessor membership digest")
+    }
+
+    pub const fn predecessor_recovery_generation(&self) -> u64 {
+        self.predecessor_recovery_generation
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub const fn execution_profile(&self) -> ExecutionProfile {
+        self.execution_profile
+    }
+
+    pub const fn target_config_id(&self) -> u64 {
+        self.target_config_id
+    }
+
+    pub fn target_membership_digest(&self) -> LogHash {
+        LogHash::from_hex(&self.target_membership_digest)
+            .expect("validated successor prestage membership digest")
+    }
+
+    pub fn seed_anchor(&self) -> LogAnchor {
+        LogAnchor::new(
+            self.seed_index,
+            LogHash::from_hex(&self.seed_hash).expect("validated successor prestage seed hash"),
+        )
+    }
+
+    fn checkpoint_identity(&self) -> CheckpointIdentity {
+        CheckpointIdentity::new(
+            self.cluster_id.clone(),
+            self.epoch,
+            self.predecessor_config_id,
+            self.predecessor_recovery_generation,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuccessorPrestageState {
+    Preparing,
+    Ready,
+    Published,
+    Finalized,
+}
+
+#[derive(Debug)]
+pub struct SuccessorPrestage {
+    path: PathBuf,
+    identity: SuccessorPrestageIdentity,
+    state: SuccessorPrestageState,
+    _lock: fs::File,
+}
+
+impl SuccessorPrestage {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub const fn identity(&self) -> &SuccessorPrestageIdentity {
+        &self.identity
+    }
+
+    pub const fn state(&self) -> SuccessorPrestageState {
+        self.state
+    }
 }
 
 pub struct SuccessorRestorePreparation {
@@ -143,33 +245,40 @@ impl SuccessorRestorePreparation {
         if !self.requires_recorder_install {
             return Ok(self.tip);
         }
-        let intent = self.data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE);
-        let actual = read_regular_successor_control_file(&intent)?.ok_or_else(|| {
-            DurabilityError::SnapshotVerification("successor restore intent is missing".into())
-        })?;
-        if parse_successor_restore_receipt(&actual).is_none()
-            || parse_successor_restore_receipt(&self.identity).is_none()
-            || actual != self.identity
-        {
-            return Err(DurabilityError::SnapshotVerification(
-                "successor restore intent changed before completion".into(),
-            ));
-        }
-        let complete = self.data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE);
-        match fs::symlink_metadata(&complete) {
-            Ok(_) => {
-                return Err(DurabilityError::SnapshotVerification(
-                    "successor restore completion target already exists".into(),
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        fs::rename(intent, complete)?;
-        sync_directory(&self.data_dir)?;
+        complete_adopted_successor_prestage(&self.data_dir, &self.identity)?;
         self.requires_recorder_install = false;
         Ok(self.tip)
     }
+}
+
+pub fn complete_adopted_successor_prestage(
+    data_dir: &Path,
+    expected_identity: &[u8],
+) -> Result<(), DurabilityError> {
+    let intent = data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE);
+    let actual = read_regular_successor_control_file(&intent)?.ok_or_else(|| {
+        DurabilityError::SnapshotVerification("successor restore intent is missing".into())
+    })?;
+    if parse_successor_restore_receipt(&actual).is_none()
+        || parse_successor_restore_receipt(expected_identity).is_none()
+        || actual != expected_identity
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor restore intent changed before completion".into(),
+        ));
+    }
+    let complete = data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE);
+    match fs::symlink_metadata(&complete) {
+        Ok(_) => {
+            return Err(DurabilityError::SnapshotVerification(
+                "successor restore completion target already exists".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::rename(intent, complete)?;
+    sync_directory(data_dir)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,8 +297,7 @@ pub enum DurabilityHealth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointRestoreState {
     None,
-    IdentityBoundV2,
-    LegacyV1,
+    IdentityBound,
 }
 
 impl DurabilityMode {
@@ -403,7 +511,7 @@ impl CheckpointCoordinator {
             .await?;
         let loaded = publisher.cached_checkpoint().await;
         let durable_tip = *loaded.manifest().tip();
-        let restored = store.restore_checkpoint_v2().await?;
+        let restored = store.restore_checkpoint_state().await?;
         let restored_tip = *restored.tip();
         if restored_tip != durable_tip {
             return Err(DurabilityError::Archive(
@@ -648,9 +756,9 @@ impl CheckpointCoordinator {
         self.publisher
             .publish_checkpoint_snapshot(anchor.clone(), &snapshot.archive_bytes)
             .await?;
-        let restored = self.store.restore_checkpoint_v2().await?;
+        let restored = self.store.restore_checkpoint_state().await?;
         let published = restored.snapshot().ok_or_else(|| {
-            DurabilityError::SnapshotVerification("published V2 root has no snapshot".into())
+            DurabilityError::SnapshotVerification("published checkpoint has no snapshot".into())
         })?;
         if published.anchor() != &anchor || published.bytes() != snapshot.archive_bytes {
             return Err(DurabilityError::SnapshotVerification(
@@ -850,7 +958,7 @@ fn engine_recovery_anchor(
     let size_bytes = u64::try_from(archive_bytes.len()).map_err(|_| {
         DurabilityError::SnapshotVerification("snapshot envelope size exceeds u64".into())
     })?;
-    Ok(RecoveryAnchor::new_with_configuration(
+    Ok(RecoveryAnchor::new(
         runtime.config().cluster_id(),
         runtime.config().epoch(),
         configuration.clone(),
@@ -860,8 +968,8 @@ fn engine_recovery_anchor(
             format!("snapshot-{applied_index:020}"),
             LogHash::digest(&[archive_bytes]),
             size_bytes,
-        )
-        .with_executor_fingerprint(materializer_fingerprint),
+            materializer_fingerprint,
+        ),
     ))
 }
 
@@ -912,8 +1020,7 @@ pub async fn restore_checkpoint_to_fresh_data_dir(
     store: ObjectArchiveStore,
     data_dir: impl AsRef<Path>,
 ) -> Result<CheckpointTip, DurabilityError> {
-    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None, false)
-        .await
+    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None).await
 }
 
 pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
@@ -931,7 +1038,6 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
         data_dir.as_ref(),
         Some(target_node_id),
         None,
-        false,
     )
     .await
 }
@@ -942,7 +1048,6 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
     target_node_id: &str,
     marker_name: &str,
     marker_contents: &[u8],
-    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
@@ -955,7 +1060,6 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
         data_dir.as_ref(),
         Some(target_node_id),
         Some((marker_name, marker_contents)),
-        resume_legacy_v1_intent,
     )
     .await
 }
@@ -967,7 +1071,6 @@ fn restore_intent_identity(
     checkpoint_root: LogAnchor,
 ) -> RestoreIntentIdentity {
     RestoreIntentIdentity {
-        version: 2,
         cluster_id: identity.cluster_id().to_owned(),
         node_id: node_id.to_owned(),
         execution_profile,
@@ -996,8 +1099,7 @@ fn encode_restore_intent(
 
 fn parse_restore_intent_identity(bytes: &[u8]) -> Option<RestoreIntentIdentity> {
     let intent = serde_json::from_slice::<RestoreIntentIdentity>(bytes).ok()?;
-    (intent.version == 2
-        && !intent.cluster_id.is_empty()
+    (!intent.cluster_id.is_empty()
         && !intent.node_id.is_empty()
         && LogHash::from_hex(&intent.checkpoint_hash).is_some())
     .then_some(intent)
@@ -1009,43 +1111,15 @@ pub fn checkpoint_restore_in_progress(
     node_id: &str,
     execution_profile: ExecutionProfile,
     checkpoint_root: LogAnchor,
-    legacy_v1_authorized_by_exact_marker: bool,
 ) -> Result<CheckpointRestoreState, DurabilityError> {
     let data_dir = data_dir.as_ref();
-    let legacy = data_dir.join(LEGACY_RESTORE_INTENT_FILE);
+    reject_unsupported_restore_intent_artifacts(data_dir)?;
     let intent = data_dir.join(RESTORE_INTENT_FILE);
-    let legacy_metadata = match fs::symlink_metadata(&legacy) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
     let metadata = match fs::symlink_metadata(&intent) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if legacy_metadata.is_some() && metadata.is_some() {
-        return Err(DurabilityError::SnapshotVerification(
-            "both legacy and identity-bound checkpoint restore intents exist".into(),
-        ));
-    }
-    if let Some(metadata) = legacy_metadata {
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || read_bounded_regular_file(&legacy, 4096)?.as_deref()
-                != Some(b"rhiza restore in progress\n")
-        {
-            return Err(DurabilityError::SnapshotVerification(
-                "legacy local checkpoint restore intent is invalid".into(),
-            ));
-        }
-        if !legacy_v1_authorized_by_exact_marker {
-            return Err(DurabilityError::SnapshotVerification(
-                "legacy local checkpoint restore intent requires an exact node-bound v2 identity marker".into(),
-            ));
-        }
-        return Ok(CheckpointRestoreState::LegacyV1);
-    }
     let Some(metadata) = metadata else {
         return Ok(CheckpointRestoreState::None);
     };
@@ -1061,8 +1135,7 @@ pub fn checkpoint_restore_in_progress(
         DurabilityError::SnapshotVerification("local checkpoint restore intent is invalid".into())
     })?;
     let expected = restore_intent_identity(identity, node_id, execution_profile, checkpoint_root);
-    if actual.version != expected.version
-        || actual.cluster_id != expected.cluster_id
+    if actual.cluster_id != expected.cluster_id
         || actual.node_id != expected.node_id
         || actual.execution_profile != expected.execution_profile
         || actual.epoch != expected.epoch
@@ -1076,7 +1149,7 @@ pub fn checkpoint_restore_in_progress(
                 .into(),
         ));
     }
-    Ok(CheckpointRestoreState::IdentityBoundV2)
+    Ok(CheckpointRestoreState::IdentityBound)
 }
 
 pub fn validate_local_recovery_view(
@@ -1093,7 +1166,6 @@ pub fn validate_local_recovery_view(
         target_node_id,
         execution_profile,
         checkpoint_root,
-        false,
     )? != CheckpointRestoreState::None
     {
         return Err(DurabilityError::SnapshotVerification(
@@ -1195,7 +1267,6 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
     execution_profile: ExecutionProfile,
     marker_name: &str,
     marker_contents: &[u8],
-    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
@@ -1212,7 +1283,7 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
             "rejoin recovery only replaces matching SQL or KV recovery views".into(),
         ));
     }
-    let restored = store.restore_checkpoint_v2().await?;
+    let restored = store.restore_checkpoint_state().await?;
     let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
     let intent = encode_restore_intent(
         &identity,
@@ -1226,11 +1297,14 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
         execution_profile,
         checkpoint_root,
     ));
+    checkpoint_restore_in_progress(
+        data_dir,
+        &identity,
+        target_node_id,
+        execution_profile,
+        checkpoint_root,
+    )?;
     cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
-    if resume_legacy_v1_intent {
-        fs::remove_file(data_dir.join(LEGACY_RESTORE_INTENT_FILE))?;
-        sync_directory(data_dir)?;
-    }
     publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
     install_restored_checkpoint(
         &identity,
@@ -1251,14 +1325,13 @@ async fn restore_checkpoint_to_fresh_data_dir_with_target(
     data_dir: &Path,
     target_node_id: Option<&str>,
     completion_marker: Option<(&str, &[u8])>,
-    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     let identity = store.checkpoint_identity()?.clone();
     store
         .load_checkpoint()
         .await?
         .ok_or(DurabilityError::MissingCheckpoint)?;
-    let restored = store.restore_checkpoint_v2().await?;
+    let restored = store.restore_checkpoint_state().await?;
     let target_node_id = target_node_id.unwrap_or("<unbound-restore>");
     let profile = snapshot_profile(identity.cluster_id())?;
     let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
@@ -1269,12 +1342,7 @@ async fn restore_checkpoint_to_fresh_data_dir_with_target(
         profile,
         checkpoint_root,
     ));
-    prepare_fresh_restore_data_dir(
-        data_dir,
-        completion_marker.map(|(name, _)| name),
-        &intent,
-        resume_legacy_v1_intent,
-    )?;
+    prepare_fresh_restore_data_dir(data_dir, completion_marker.map(|(name, _)| name), &intent)?;
     publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
     install_restored_checkpoint(
         &identity,
@@ -1298,19 +1366,59 @@ struct RestoreInstallOptions<'a> {
     completion_marker: Option<(&'a str, &'a [u8])>,
 }
 
+struct RestoredCheckpointStaging {
+    path: PathBuf,
+    tip: CheckpointTip,
+}
+
 fn install_restored_checkpoint(
     identity: &CheckpointIdentity,
     restored: &RestoredCheckpoint,
     data_dir: &Path,
     options: RestoreInstallOptions<'_>,
 ) -> Result<CheckpointTip, DurabilityError> {
+    let staged = stage_restored_checkpoint(
+        identity,
+        restored,
+        data_dir,
+        options.target_node_id,
+        options.recovery_identity,
+    )?;
+    let tip = staged.tip;
+    let staging = staged.path;
+    let profile = snapshot_profile(identity.cluster_id())?;
+    let result = (|| -> Result<(), DurabilityError> {
+        if options.replace_rebuildable {
+            quarantine_rebuildable_view(data_dir, profile, options.recovery_identity)?;
+        }
+        publish_restore_staging(
+            &staging,
+            data_dir,
+            options.remove_generic_intent,
+            options.completion_marker,
+        )
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result?;
+    Ok(tip)
+}
+
+fn stage_restored_checkpoint(
+    identity: &CheckpointIdentity,
+    restored: &RestoredCheckpoint,
+    staging_parent: &Path,
+    target_node_id: Option<&str>,
+    recovery_identity: Option<&RecoveryArtifactIdentity>,
+) -> Result<RestoredCheckpointStaging, DurabilityError> {
     let tip = *restored.tip();
     let profile = snapshot_profile(identity.cluster_id())?;
     validate_restored_suffix(profile, restored.suffix())?;
-    let staging = create_restore_staging_dir(data_dir, options.recovery_identity)?;
+    let staging = create_restore_staging_dir(staging_parent, recovery_identity)?;
     let result = (|| -> Result<(), DurabilityError> {
         if let Some(snapshot) = restored.snapshot() {
-            install_profile_snapshot(identity, snapshot, &staging, options.target_node_id)?;
+            install_profile_snapshot(identity, snapshot, &staging, target_node_id)?;
         }
 
         if restored.snapshot().is_some() || !restored.suffix().is_empty() {
@@ -1343,21 +1451,13 @@ fn install_restored_checkpoint(
                 ));
             }
         }
-        if options.replace_rebuildable {
-            quarantine_rebuildable_view(data_dir, profile, options.recovery_identity)?;
-        }
-        publish_restore_staging(
-            &staging,
-            data_dir,
-            options.remove_generic_intent,
-            options.completion_marker,
-        )
+        sync_directory(&staging)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
     result?;
-    Ok(tip)
+    Ok(RestoredCheckpointStaging { path: staging, tip })
 }
 
 fn validate_restored_suffix(
@@ -1376,6 +1476,20 @@ fn validate_local_qlog(
     identity: &CheckpointIdentity,
     checkpoint_root: LogAnchor,
 ) -> Result<LogAnchor, DurabilityError> {
+    validate_local_qlog_with_configuration(
+        data_dir,
+        identity,
+        checkpoint_root,
+        ConfigurationState::active(identity.config_id(), LogHash::ZERO),
+    )
+}
+
+fn validate_local_qlog_with_configuration(
+    data_dir: &Path,
+    identity: &CheckpointIdentity,
+    checkpoint_root: LogAnchor,
+    initial_configuration: ConfigurationState,
+) -> Result<LogAnchor, DurabilityError> {
     let path = data_dir.join("consensus/log");
     if !path_has_state(&path)? {
         if checkpoint_root == LogAnchor::new(0, LogHash::ZERO) {
@@ -1385,11 +1499,11 @@ fn validate_local_qlog(
             "local qlog is missing or empty".into(),
         ));
     }
-    let log = FileLogStore::open(
+    let log = FileLogStore::open_with_configuration(
         path,
         identity.cluster_id(),
         identity.epoch(),
-        identity.config_id(),
+        initial_configuration,
     )?;
     let state = log.logical_state()?;
     let tip = state
@@ -1534,7 +1648,7 @@ fn validate_anchor_fingerprint(
     anchor: &RecoveryAnchor,
     expected: LogHash,
 ) -> Result<(), DurabilityError> {
-    if anchor.executor_fingerprint() != Some(expected) {
+    if anchor.executor_fingerprint() != expected {
         return Err(DurabilityError::SnapshotVerification(
             "snapshot executor fingerprint does not match this binary".into(),
         ));
@@ -1566,140 +1680,377 @@ fn validate_decoded_snapshot_anchor(
     Ok(())
 }
 
-pub async fn restore_successor_checkpoint_to_fresh_data_dir(
+pub async fn prestage_successor_checkpoint(
     store: ObjectArchiveStore,
-    config: &NodeConfig,
-) -> Result<SuccessorRestorePreparation, DurabilityError> {
-    let identity = store.checkpoint_identity()?;
+    prestage_dir: impl AsRef<Path>,
+    predecessor_configuration: ConfigurationState,
+    target_node_id: &str,
+    execution_profile: ExecutionProfile,
+    target_config_id: u64,
+    target_membership_digest: LogHash,
+) -> Result<SuccessorPrestage, DurabilityError> {
+    if target_node_id.is_empty() {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage target node_id is empty".into(),
+        ));
+    }
+    let identity = store.checkpoint_identity()?.clone();
+    if !predecessor_configuration.is_active()
+        || predecessor_configuration.config_id() != identity.config_id()
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage predecessor configuration does not match the checkpoint".into(),
+        ));
+    }
+    if snapshot_profile(identity.cluster_id())? != execution_profile {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage profile does not match checkpoint identity".into(),
+        ));
+    }
+    if identity
+        .config_id()
+        .checked_add(1)
+        .filter(|next| *next == target_config_id)
+        .is_none()
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage target config_id is not the next configuration".into(),
+        ));
+    }
     let loaded = store
         .load_checkpoint()
         .await?
         .ok_or(DurabilityError::MissingCheckpoint)?;
-    let transition = loaded.manifest().successor_transition().ok_or_else(|| {
-        DurabilityError::SnapshotVerification(
-            "successor startup requires transition provenance".into(),
-        )
-    })?;
-    let stop = LogAnchor::new(transition.stop_entry().index, transition.stop_entry().hash);
-    let expected_stopped = ConfigurationState::stopped(
-        transition.predecessor().config_id(),
-        transition.successor().predecessor_config_digest(),
-        stop,
-    );
-    let expected_initial = ConfigurationState::active(
-        transition.predecessor().config_id(),
-        transition.successor().predecessor_config_digest(),
-    );
-    if identity.cluster_id() != config.cluster_id()
-        || identity.epoch() != config.epoch()
-        || identity.config_id() != transition.successor().config_id()
-        || identity.recovery_generation() != config.recovery_generation()
-        || transition.successor().cluster_id() != config.cluster_id()
-        || transition.successor().members() != config.membership().members()
-        || transition.successor().digest() != config.membership().digest()
-        || config.configuration_state() != &expected_stopped
-        || config.log_initial_configuration() != &expected_initial
-    {
+    if loaded.manifest().identity() != &identity {
         return Err(DurabilityError::SnapshotVerification(
-            "successor checkpoint does not match target node configuration".into(),
+            "successor prestage checkpoint identity changed while loading".into(),
         ));
     }
+    let expected = SuccessorPrestageIdentity {
+        cluster_id: identity.cluster_id().to_owned(),
+        epoch: identity.epoch(),
+        predecessor_config_id: identity.config_id(),
+        predecessor_membership_digest: predecessor_configuration.digest().to_hex(),
+        predecessor_recovery_generation: identity.recovery_generation(),
+        node_id: target_node_id.to_owned(),
+        execution_profile,
+        target_config_id,
+        target_membership_digest: target_membership_digest.to_hex(),
+        seed_index: loaded.manifest().tip().index(),
+        seed_hash: loaded.manifest().tip().hash().to_hex(),
+    };
+    validate_successor_prestage_identity(&expected)?;
+    let prestage_dir = prestage_dir.as_ref();
+    let mut prestage =
+        prepare_successor_prestage_root(prestage_dir, Some(&expected), &predecessor_configuration)?;
+    match prestage.state {
+        SuccessorPrestageState::Ready
+        | SuccessorPrestageState::Published
+        | SuccessorPrestageState::Finalized => return Ok(prestage),
+        SuccessorPrestageState::Preparing => {}
+    }
+
+    cleanup_preparing_successor_prestage(prestage_dir, &expected)?;
+    let restored = store.restore_checkpoint_state().await?;
+    if restored.tip() != loaded.manifest().tip() {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage checkpoint changed during restore".into(),
+        ));
+    }
+    let recovery_identity = RecoveryArtifactIdentity::Prestage(expected.clone());
+    let staged = stage_restored_checkpoint(
+        &identity,
+        &restored,
+        prestage_dir,
+        Some(target_node_id),
+        Some(&recovery_identity),
+    )?;
+    if let Err(error) = publish_restore_staging(&staged.path, prestage_dir, false, None) {
+        let _ = fs::remove_dir_all(&staged.path);
+        return Err(error);
+    }
+    fs::rename(
+        prestage_dir.join(SUCCESSOR_PRESTAGE_INTENT_FILE),
+        prestage_dir.join(SUCCESSOR_PRESTAGE_READY_FILE),
+    )?;
+    sync_directory(prestage_dir)?;
+    prestage.state = SuccessorPrestageState::Ready;
+    Ok(prestage)
+}
+
+pub fn inspect_successor_prestage(
+    prestage_dir: impl AsRef<Path>,
+    predecessor_configuration: ConfigurationState,
+) -> Result<SuccessorPrestage, DurabilityError> {
+    prepare_successor_prestage_root(prestage_dir.as_ref(), None, &predecessor_configuration)
+}
+
+pub fn publish_successor_prestage(
+    mut prestage: SuccessorPrestage,
+    data_dir: impl AsRef<Path>,
+) -> Result<SuccessorPrestage, DurabilityError> {
+    let data_dir = data_dir.as_ref();
+    match prestage.state {
+        SuccessorPrestageState::Published if prestage.path == data_dir => return Ok(prestage),
+        SuccessorPrestageState::Ready => {}
+        _ => return Err(DurabilityError::PreconditionFailed),
+    }
+    if prestage.path != data_dir {
+        match fs::symlink_metadata(data_dir) {
+            Ok(_) => return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let source_parent = prestage.path.parent().ok_or_else(|| {
+            DurabilityError::SnapshotVerification(
+                "successor prestage path has no parent directory".into(),
+            )
+        })?;
+        let target_parent = data_dir.parent().ok_or_else(|| {
+            DurabilityError::SnapshotVerification(
+                "successor data path has no parent directory".into(),
+            )
+        })?;
+        fs::create_dir_all(target_parent)?;
+        #[cfg(unix)]
+        if fs::metadata(source_parent)?.dev() != fs::metadata(target_parent)?.dev() {
+            return Err(DurabilityError::SnapshotVerification(
+                "successor prestage and final data directory must share a filesystem".into(),
+            ));
+        }
+        fs::rename(&prestage.path, data_dir)?;
+        sync_directory(source_parent)?;
+        if target_parent != source_parent {
+            sync_directory(target_parent)?;
+        }
+        prestage.path = data_dir.to_path_buf();
+    }
+    fs::rename(
+        prestage.path.join(SUCCESSOR_PRESTAGE_READY_FILE),
+        prestage.path.join(SUCCESSOR_PRESTAGE_PUBLISHED_FILE),
+    )?;
+    sync_directory(&prestage.path)?;
+    prestage.state = SuccessorPrestageState::Published;
+    Ok(prestage)
+}
+
+fn validate_successor_prestage_stop(
+    identity: &SuccessorPrestageIdentity,
+    stop: &StopInformation,
+    predecessor_membership: &Membership,
+) -> Result<rhiza_core::SuccessorDescriptor, DurabilityError> {
+    if stop.entry.cluster_id != identity.cluster_id()
+        || stop.entry.epoch != identity.epoch()
+        || stop.entry.config_id != identity.predecessor_config_id()
+        || stop.entry.recompute_hash() != stop.entry.hash
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage requires the exact bound Stop".into(),
+        ));
+    }
+    let change = ConfigChange::recognize_parts(stop.entry.entry_type, &stop.entry.payload)
+        .map_err(|_| {
+            DurabilityError::SnapshotVerification(
+                "successor prestage Stop entry is not a bound configuration change".into(),
+            )
+        })?;
+    let ConfigChange::Stop { successor } = change else {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage requires a bound Stop entry".into(),
+        ));
+    };
+    if successor.cluster_id() != identity.cluster_id()
+        || successor.predecessor_config_id() != identity.predecessor_config_id()
+        || successor.predecessor_config_digest() != predecessor_membership.digest()
+        || successor.config_id() != identity.target_config_id()
+        || successor.digest() != identity.target_membership_digest()
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage Stop binding conflicts with the prestage target".into(),
+        ));
+    }
+    stop.proof
+        .validate_for_cluster(
+            identity.cluster_id(),
+            stop.entry.index,
+            identity.epoch(),
+            identity.predecessor_config_id(),
+            predecessor_membership,
+        )
+        .map_err(|error| {
+            DurabilityError::SnapshotVerification(format!(
+                "successor prestage Stop proof is not quorum-certified: {error:?}"
+            ))
+        })?;
+    let command = rhiza_core::StoredCommand::new(stop.entry.entry_type, stop.entry.payload.clone());
+    let expected_value = rhiza_quepaxa::AcceptedValue::from_command(
+        identity.cluster_id(),
+        stop.entry.index,
+        identity.epoch(),
+        identity.predecessor_config_id(),
+        stop.entry.prev_hash,
+        &command,
+    );
+    if stop.proof.proposal().value.as_ref() != Some(&expected_value) {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage Stop proof value does not match the exact Stop entry".into(),
+        ));
+    }
+    Ok(successor)
+}
+
+pub fn finalize_successor_prestage_for_stop(
+    mut prestage: SuccessorPrestage,
+    stop: &StopInformation,
+    predecessor_membership: &Membership,
+) -> Result<SuccessorPrestage, DurabilityError> {
+    if !matches!(
+        prestage.state,
+        SuccessorPrestageState::Published | SuccessorPrestageState::Finalized
+    ) {
+        return Err(DurabilityError::PreconditionFailed);
+    }
+    let successor =
+        validate_successor_prestage_stop(&prestage.identity, stop, predecessor_membership)?;
+    let expected_stop = LogAnchor::new(stop.entry.index, stop.entry.hash);
+    let local_tip = validate_local_qlog_with_configuration(
+        &prestage.path,
+        &prestage.identity.checkpoint_identity(),
+        prestage.identity.seed_anchor(),
+        ConfigurationState::active(
+            prestage.identity.predecessor_config_id(),
+            successor.predecessor_config_digest(),
+        ),
+    )?;
+    if local_tip != expected_stop {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage final qlog tip does not exactly match the bound Stop".into(),
+        ));
+    }
+    if prestage.state == SuccessorPrestageState::Published {
+        fs::rename(
+            prestage.path.join(SUCCESSOR_PRESTAGE_PUBLISHED_FILE),
+            prestage.path.join(SUCCESSOR_PRESTAGE_FINALIZED_FILE),
+        )?;
+        sync_directory(&prestage.path)?;
+        prestage.state = SuccessorPrestageState::Finalized;
+    }
+    Ok(prestage)
+}
+
+pub fn adopt_finalized_successor_prestage(
+    prestage: SuccessorPrestage,
+    config: &NodeConfig,
+    stop: &StopInformation,
+    predecessor_membership: &Membership,
+) -> Result<SuccessorRestorePreparation, DurabilityError> {
+    if prestage.state != SuccessorPrestageState::Finalized
+        || prestage.path.as_path() != config.data_dir().as_path()
+        || prestage.identity.cluster_id() != config.cluster_id()
+        || prestage.identity.epoch() != config.epoch()
+        || prestage.identity.predecessor_recovery_generation() != config.recovery_generation()
+        || prestage.identity.node_id() != config.node_id()
+        || prestage.identity.execution_profile() != config.execution_profile()
+        || prestage.identity.target_membership_digest() != config.membership().digest()
+        || stop.entry.cluster_id != config.cluster_id()
+        || stop.entry.epoch != config.epoch()
+        || stop.entry.config_id != prestage.identity.predecessor_config_id()
+        || stop.entry.recompute_hash() != stop.entry.hash
+        || config.predecessor_stop_entry.as_ref() != Some(&stop.entry)
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "finalized successor prestage does not match the target configuration and Stop".into(),
+        ));
+    }
+    let successor =
+        validate_successor_prestage_stop(&prestage.identity, stop, predecessor_membership)?;
+    let predecessor_digest = successor.predecessor_config_digest();
+    let expected_stop = LogAnchor::new(stop.entry.index, stop.entry.hash);
+    if successor.cluster_id() != config.cluster_id()
+        || successor.predecessor_config_id() != prestage.identity.predecessor_config_id()
+        || successor.config_id() != prestage.identity.target_config_id()
+        || successor.digest() != prestage.identity.target_membership_digest()
+        || successor.members() != config.membership().members()
+        || config.log_initial_configuration()
+            != &ConfigurationState::active(
+                prestage.identity.predecessor_config_id(),
+                predecessor_digest,
+            )
+        || config.configuration_state()
+            != &ConfigurationState::stopped(
+                prestage.identity.predecessor_config_id(),
+                predecessor_digest,
+                expected_stop,
+                successor.clone(),
+                rhiza_core::StoredCommand::new(stop.entry.entry_type, stop.entry.payload.clone())
+                    .hash(),
+            )
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "finalized successor prestage Stop binding conflicts with the target configuration"
+                .into(),
+        ));
+    }
+    let local_tip = validate_local_qlog_with_configuration(
+        &prestage.path,
+        &prestage.identity.checkpoint_identity(),
+        prestage.identity.seed_anchor(),
+        ConfigurationState::active(
+            prestage.identity.predecessor_config_id(),
+            predecessor_digest,
+        ),
+    )?;
+    if local_tip != expected_stop {
+        return Err(DurabilityError::SnapshotVerification(
+            "finalized successor prestage qlog does not end at the exact Stop".into(),
+        ));
+    }
+
     let receipt = serde_json::to_vec(&SuccessorRestoreIdentity {
-        version: 1,
         cluster_id: config.cluster_id(),
         epoch: config.epoch(),
-        target_config_id: identity.config_id(),
+        target_config_id: prestage.identity.target_config_id(),
         recovery_generation: config.recovery_generation(),
         node_id: config.node_id(),
         membership_digest: config.membership().digest().to_hex(),
-        predecessor_config_id: transition.predecessor().config_id(),
-        stop_index: transition.stop_entry().index,
-        stop_hash: transition.stop_entry().hash.to_hex(),
-        checkpoint_index: loaded.manifest().tip().index(),
-        checkpoint_hash: loaded.manifest().tip().hash().to_hex(),
+        predecessor_config_id: prestage.identity.predecessor_config_id(),
+        stop_index: stop.entry.index,
+        stop_hash: stop.entry.hash.to_hex(),
     })
     .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
-    let intent_identity =
-        RecoveryArtifactIdentity::Successor(parse_successor_restore_receipt(&receipt).ok_or_else(
-            || DurabilityError::SnapshotVerification("successor restore receipt is invalid".into()),
-        )?);
-    let (lock, state, complete_marker) =
-        prepare_successor_restore_root(config.data_dir(), &receipt)?;
-    if state == SuccessorRestoreRootState::Complete {
-        let checkpoint_root = LogAnchor::new(
-            loaded.manifest().tip().index(),
-            loaded.manifest().tip().hash(),
-        );
-        if let Err(error) = validate_local_recovery_view(
-            config.data_dir(),
-            identity,
-            config.node_id(),
-            config.execution_profile(),
-            checkpoint_root,
-        ) {
-            if config.execution_profile() == ExecutionProfile::Graph {
-                return Err(error);
-            }
-            let restored = store.restore_checkpoint_v2().await?;
-            if restored.tip() != loaded.manifest().tip() {
-                return Err(DurabilityError::SnapshotVerification(
-                    "successor checkpoint changed during repair".into(),
-                ));
-            }
-            install_restored_checkpoint(
-                identity,
-                &restored,
-                config.data_dir(),
-                RestoreInstallOptions {
-                    target_node_id: Some(config.node_id()),
-                    remove_generic_intent: false,
-                    replace_rebuildable: true,
-                    recovery_identity: Some(&RecoveryArtifactIdentity::Successor(
-                        complete_marker
-                            .as_ref()
-                            .expect("Complete state has a validated identity")
-                            .clone(),
-                    )),
-                    completion_marker: None,
-                },
-            )?;
+    let successor_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(prestage.path.join(SUCCESSOR_RESTORE_LOCK_FILE))?;
+    successor_lock
+        .try_lock()
+        .map_err(|_| DurabilityError::PreconditionFailed)?;
+    let intent = prestage.path.join(SUCCESSOR_RESTORE_INTENT_FILE);
+    let complete = prestage.path.join(SUCCESSOR_RESTORE_COMPLETE_FILE);
+    match (
+        read_regular_successor_control_file(&intent)?,
+        read_regular_successor_control_file(&complete)?,
+    ) {
+        (None, None) => {
+            publish_restore_marker(&prestage.path, SUCCESSOR_RESTORE_INTENT_FILE, &receipt)?
         }
-        return Ok(SuccessorRestorePreparation {
-            tip: *loaded.manifest().tip(),
-            data_dir: config.data_dir().clone(),
-            identity: receipt,
-            requires_recorder_install: false,
-            _lock: lock,
-        });
+        (Some(actual), None) if actual == receipt => {}
+        _ => {
+            return Err(DurabilityError::DataDirNotFresh(
+                prestage.path.to_path_buf(),
+            ))
+        }
     }
-
-    let restored = store.restore_checkpoint_v2().await?;
-    if restored.tip() != loaded.manifest().tip() {
-        return Err(DurabilityError::SnapshotVerification(
-            "successor checkpoint changed during restore".into(),
-        ));
-    }
-    if state == SuccessorRestoreRootState::Fresh {
-        publish_restore_marker(config.data_dir(), SUCCESSOR_RESTORE_INTENT_FILE, &receipt)?;
-    }
-    install_restored_checkpoint(
-        identity,
-        &restored,
-        config.data_dir(),
-        RestoreInstallOptions {
-            target_node_id: Some(config.node_id()),
-            remove_generic_intent: false,
-            replace_rebuildable: false,
-            recovery_identity: Some(&intent_identity),
-            completion_marker: None,
-        },
-    )?;
+    fs::remove_file(prestage.path.join(SUCCESSOR_PRESTAGE_FINALIZED_FILE))?;
+    sync_directory(&prestage.path)?;
     Ok(SuccessorRestorePreparation {
-        tip: *restored.tip(),
-        data_dir: config.data_dir().clone(),
+        tip: CheckpointTip::new(stop.entry.index, stop.entry.hash),
+        data_dir: prestage.path.clone(),
         identity: receipt,
         requires_recorder_install: true,
-        _lock: lock,
+        _lock: successor_lock,
     })
 }
 
@@ -1903,13 +2254,6 @@ fn validate_restore_marker_name(marker_name: &str) -> Result<(), DurabilityError
     Ok(())
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SuccessorRestoreRootState {
-    Fresh,
-    Intent,
-    Complete,
-}
-
 fn is_owned_generated_recovery_name(name: &str, prefix: &str) -> bool {
     let Some(suffix) = name.strip_prefix(prefix) else {
         return false;
@@ -2095,179 +2439,244 @@ fn read_regular_successor_control_file(path: &Path) -> Result<Option<Vec<u8>>, D
 
 fn parse_successor_restore_receipt(bytes: &[u8]) -> Option<SuccessorRestoreReceipt> {
     let receipt = serde_json::from_slice::<SuccessorRestoreReceipt>(bytes).ok()?;
-    (receipt.version == 1
-        && !receipt.cluster_id.is_empty()
+    (!receipt.cluster_id.is_empty()
         && !receipt.node_id.is_empty()
         && LogHash::from_hex(&receipt.membership_digest).is_some()
-        && LogHash::from_hex(&receipt.stop_hash).is_some()
-        && LogHash::from_hex(&receipt.checkpoint_hash).is_some())
+        && LogHash::from_hex(&receipt.stop_hash).is_some())
     .then_some(receipt)
 }
 
-fn prepare_successor_restore_root(
-    data_dir: &Path,
-    expected_identity: &[u8],
-) -> Result<
-    (
-        fs::File,
-        SuccessorRestoreRootState,
-        Option<SuccessorRestoreReceipt>,
-    ),
-    DurabilityError,
-> {
-    fs::create_dir_all(data_dir)?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(data_dir.join(SUCCESSOR_RESTORE_LOCK_FILE))?;
-    lock.lock()?;
-
-    let intent = data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE);
-    let complete = data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE);
-    let intent_contents = read_regular_successor_control_file(&intent)
-        .map_err(|_| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?;
-    let complete_contents = read_regular_successor_control_file(&complete)
-        .map_err(|_| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?;
-    let (state, complete_marker) = match (intent_contents, complete_contents) {
-        (Some(actual), None) => {
-            if actual != expected_identity || parse_successor_restore_receipt(&actual).is_none() {
-                return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
-            }
-            (SuccessorRestoreRootState::Intent, None)
-        }
-        (None, Some(actual)) => {
-            if !completed_successor_identity_matches(&actual, expected_identity) {
-                return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
-            }
-            let receipt = parse_successor_restore_receipt(&actual)
-                .ok_or_else(|| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?;
-            (SuccessorRestoreRootState::Complete, Some(receipt))
-        }
-        (None, None) => (SuccessorRestoreRootState::Fresh, None),
-        _ => return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf())),
-    };
-
-    if state == SuccessorRestoreRootState::Complete {
-        let recovery_identity = RecoveryArtifactIdentity::Successor(
-            complete_marker
-                .as_ref()
-                .expect("Complete state has a validated identity")
-                .clone(),
-        );
-        cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
-    } else if state == SuccessorRestoreRootState::Intent {
-        let recovery_identity = RecoveryArtifactIdentity::Successor(
-            parse_successor_restore_receipt(expected_identity)
-                .ok_or_else(|| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?,
-        );
-        cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
-    }
-
-    for entry in fs::read_dir(data_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let marker_tmp = is_safe_restore_marker_tmp(&entry.path(), &name)?;
-        if name.starts_with(RESTORE_MARKER_TMP_PREFIX) && !marker_tmp {
-            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
-        }
-        let common = name == SUCCESSOR_RESTORE_LOCK_FILE || marker_tmp;
-        let allowed = match state {
-            SuccessorRestoreRootState::Fresh => common,
-            SuccessorRestoreRootState::Intent => {
-                common
-                    || name == SUCCESSOR_RESTORE_INTENT_FILE
-                    || name == LOCAL_CHECKPOINT_IDENTITY_FILE
-                    || name == "sqlite"
-                    || name == "ladybug"
-                    || name == "kv"
-                    || name == "consensus"
-                    || name == "recorder"
-            }
-            SuccessorRestoreRootState::Complete => {
-                common
-                    || name == SUCCESSOR_RESTORE_COMPLETE_FILE
-                    || name == LOCAL_CHECKPOINT_IDENTITY_FILE
-                    || name == ".node.lock"
-                    || name == "sqlite"
-                    || name == "ladybug"
-                    || name == "kv"
-                    || name == "consensus"
-                    || name == "recorder"
-            }
-        };
-        if !allowed {
-            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
-        }
-    }
-
-    for entry in fs::read_dir(data_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if is_safe_restore_marker_tmp(&entry.path(), &name)? {
-            fs::remove_file(entry.path())?;
-        }
-    }
-    if state == SuccessorRestoreRootState::Intent {
-        for name in ["sqlite", "ladybug", "kv", "consensus", "recorder"] {
-            let path = data_dir.join(name);
-            if path.exists() {
-                fs::remove_dir_all(path)?;
-            }
-        }
-        for entry in fs::read_dir(data_dir)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(RESTORE_STAGING_PREFIX)
-            {
-                fs::remove_dir_all(entry.path())?;
-            }
-        }
-        sync_directory(data_dir)?;
-    }
-    Ok((lock, state, complete_marker))
+fn successor_receipt_matches_finalized_prestage(
+    receipt: &SuccessorRestoreReceipt,
+    identity: &SuccessorPrestageIdentity,
+) -> bool {
+    receipt.cluster_id == identity.cluster_id
+        && receipt.epoch == identity.epoch
+        && receipt.target_config_id == identity.target_config_id
+        && receipt.recovery_generation == identity.predecessor_recovery_generation
+        && receipt.node_id == identity.node_id
+        && receipt.membership_digest == identity.target_membership_digest
+        && receipt.predecessor_config_id == identity.predecessor_config_id
 }
 
-fn completed_successor_identity_matches(actual: &[u8], expected: &[u8]) -> bool {
-    let (Ok(mut actual), Ok(mut expected)) = (
-        serde_json::from_slice::<serde_json::Value>(actual),
-        serde_json::from_slice::<serde_json::Value>(expected),
-    ) else {
-        return false;
-    };
-    let Some(actual_index) = actual["checkpoint_index"].as_u64() else {
-        return false;
-    };
-    let Some(expected_index) = expected["checkpoint_index"].as_u64() else {
-        return false;
-    };
-    let (Some(actual_hash), Some(expected_hash)) = (
-        actual["checkpoint_hash"].as_str(),
-        expected["checkpoint_hash"].as_str(),
-    ) else {
-        return false;
-    };
-    if LogHash::from_hex(actual_hash).is_none() || LogHash::from_hex(expected_hash).is_none() {
-        return false;
+fn parse_successor_prestage_identity(bytes: &[u8]) -> Option<SuccessorPrestageIdentity> {
+    let identity = serde_json::from_slice::<SuccessorPrestageIdentity>(bytes).ok()?;
+    validate_successor_prestage_identity(&identity)
+        .is_ok()
+        .then_some(identity)
+}
+
+fn validate_successor_prestage_identity(
+    identity: &SuccessorPrestageIdentity,
+) -> Result<(), DurabilityError> {
+    let valid = !identity.cluster_id.is_empty()
+        && !identity.node_id.is_empty()
+        && snapshot_profile(&identity.cluster_id)? == identity.execution_profile
+        && identity
+            .predecessor_config_id
+            .checked_add(1)
+            .is_some_and(|next| next == identity.target_config_id)
+        && LogHash::from_hex(&identity.predecessor_membership_digest).is_some()
+        && LogHash::from_hex(&identity.target_membership_digest).is_some()
+        && LogHash::from_hex(&identity.seed_hash).is_some();
+    if !valid {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage identity is invalid".into(),
+        ));
     }
-    if actual_index > expected_index
-        || (actual_index == expected_index && actual_hash != expected_hash)
-    {
-        return false;
+    Ok(())
+}
+
+fn prepare_successor_prestage_root(
+    prestage_dir: &Path,
+    expected_identity: Option<&SuccessorPrestageIdentity>,
+    predecessor_configuration: &ConfigurationState,
+) -> Result<SuccessorPrestage, DurabilityError> {
+    if expected_identity.is_some() {
+        fs::create_dir_all(prestage_dir)?;
     }
-    for receipt in [&mut actual, &mut expected] {
-        let Some(receipt) = receipt.as_object_mut() else {
-            return false;
+    let metadata = fs::symlink_metadata(prestage_dir)
+        .map_err(|_| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+    }
+    let lock_path = prestage_dir.join(SUCCESSOR_PRESTAGE_LOCK_FILE);
+    let mut lock_options = fs::OpenOptions::new();
+    lock_options.read(true).write(true);
+    if expected_identity.is_some() {
+        lock_options.create(true).truncate(false);
+    }
+    let lock = lock_options
+        .open(&lock_path)
+        .map_err(|_| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?;
+    lock.try_lock()
+        .map_err(|_| DurabilityError::PreconditionFailed)?;
+
+    let marker_files = [
+        (
+            SUCCESSOR_PRESTAGE_INTENT_FILE,
+            SuccessorPrestageState::Preparing,
+        ),
+        (SUCCESSOR_PRESTAGE_READY_FILE, SuccessorPrestageState::Ready),
+        (
+            SUCCESSOR_PRESTAGE_PUBLISHED_FILE,
+            SuccessorPrestageState::Published,
+        ),
+        (
+            SUCCESSOR_PRESTAGE_FINALIZED_FILE,
+            SuccessorPrestageState::Finalized,
+        ),
+    ];
+    let mut marker = None;
+    for (name, state) in marker_files {
+        let Some(bytes) = read_bounded_regular_file(&prestage_dir.join(name), 16384)
+            .map_err(|_| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?
+        else {
+            continue;
         };
-        receipt.remove("checkpoint_index");
-        receipt.remove("checkpoint_hash");
+        if marker.is_some() {
+            return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+        }
+        let identity = parse_successor_prestage_identity(&bytes)
+            .ok_or_else(|| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?;
+        marker = Some((name, state, identity));
     }
-    actual == expected
+
+    let (marker_name, state, identity) = match marker {
+        Some(marker) => marker,
+        None => {
+            let expected = expected_identity
+                .ok_or_else(|| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?;
+            for entry in fs::read_dir(prestage_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == SUCCESSOR_PRESTAGE_LOCK_FILE {
+                    continue;
+                }
+                if is_safe_restore_marker_tmp(&entry.path(), &name)? {
+                    fs::remove_file(entry.path())?;
+                    continue;
+                }
+                return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+            }
+            let bytes = serde_json::to_vec(expected)
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+            publish_restore_marker(prestage_dir, SUCCESSOR_PRESTAGE_INTENT_FILE, &bytes)?;
+            (
+                SUCCESSOR_PRESTAGE_INTENT_FILE,
+                SuccessorPrestageState::Preparing,
+                expected.clone(),
+            )
+        }
+    };
+    if expected_identity.is_some_and(|expected| expected != &identity) {
+        return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+    }
+    if !predecessor_configuration.is_active()
+        || predecessor_configuration.config_id() != identity.predecessor_config_id()
+        || predecessor_configuration.digest() != identity.predecessor_membership_digest()
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "successor prestage predecessor configuration does not match its identity".into(),
+        ));
+    }
+
+    let recovery_identity = RecoveryArtifactIdentity::Prestage(identity.clone());
+    for entry in fs::read_dir(prestage_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == SUCCESSOR_PRESTAGE_LOCK_FILE || name == marker_name {
+            continue;
+        }
+        if state == SuccessorPrestageState::Finalized && name == SUCCESSOR_RESTORE_INTENT_FILE {
+            let bytes = read_regular_successor_control_file(&entry.path())?
+                .ok_or_else(|| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?;
+            let receipt = parse_successor_restore_receipt(&bytes)
+                .ok_or_else(|| DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()))?;
+            if successor_receipt_matches_finalized_prestage(&receipt, &identity) {
+                continue;
+            }
+            return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+        }
+        if state == SuccessorPrestageState::Finalized
+            && name == SUCCESSOR_RESTORE_LOCK_FILE
+            && fs::symlink_metadata(entry.path())
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            continue;
+        }
+        if is_safe_restore_marker_tmp(&entry.path(), &name)? {
+            if state == SuccessorPrestageState::Preparing {
+                fs::remove_file(entry.path())?;
+                continue;
+            }
+            return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+        }
+        if ["sqlite", "ladybug", "kv", "consensus"].contains(&name.as_ref()) {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+            }
+            continue;
+        }
+        if name.starts_with(RESTORE_STAGING_PREFIX)
+            && state == SuccessorPrestageState::Preparing
+            && is_owned_generated_recovery_name(&name, RESTORE_STAGING_PREFIX)
+            && is_owned_recovery_directory(
+                &entry.path(),
+                &["sqlite", "ladybug", "kv", "consensus"],
+                RepairArtifactRole::Staging,
+                &recovery_identity,
+            )?
+        {
+            continue;
+        }
+        return Err(DurabilityError::DataDirNotFresh(prestage_dir.to_path_buf()));
+    }
+    if !matches!(
+        state,
+        SuccessorPrestageState::Preparing | SuccessorPrestageState::Finalized
+    ) {
+        validate_local_qlog_with_configuration(
+            prestage_dir,
+            &identity.checkpoint_identity(),
+            identity.seed_anchor(),
+            predecessor_configuration.clone(),
+        )?;
+    }
+    Ok(SuccessorPrestage {
+        path: prestage_dir.to_path_buf(),
+        identity,
+        state,
+        _lock: lock,
+    })
+}
+
+fn cleanup_preparing_successor_prestage(
+    prestage_dir: &Path,
+    identity: &SuccessorPrestageIdentity,
+) -> Result<(), DurabilityError> {
+    let recovery_identity = RecoveryArtifactIdentity::Prestage(identity.clone());
+    for entry in fs::read_dir(prestage_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let owned_component = ["sqlite", "ladybug", "kv", "consensus"].contains(&name.as_ref());
+        let owned_staging = name.starts_with(RESTORE_STAGING_PREFIX)
+            && is_owned_generated_recovery_name(&name, RESTORE_STAGING_PREFIX)
+            && is_owned_recovery_directory(
+                &entry.path(),
+                &["sqlite", "ladybug", "kv", "consensus"],
+                RepairArtifactRole::Staging,
+                &recovery_identity,
+            )?;
+        if owned_component || owned_staging {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    sync_directory(prestage_dir)
 }
 
 fn sync_directory(path: &Path) -> Result<(), DurabilityError> {
@@ -2317,42 +2726,19 @@ fn prepare_fresh_restore_data_dir(
     data_dir: &Path,
     completion_marker_name: Option<&str>,
     expected_intent: &[u8],
-    resume_legacy_v1_intent: bool,
 ) -> Result<(), DurabilityError> {
     if !path_has_state(data_dir)? {
         return Ok(());
     }
 
-    let legacy_intent = data_dir.join(LEGACY_RESTORE_INTENT_FILE);
+    reject_unsupported_restore_intent_artifacts(data_dir)?;
     let intent = data_dir.join(RESTORE_INTENT_FILE);
-    let legacy_metadata = match fs::symlink_metadata(&legacy_intent) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
     let intent_metadata = match fs::symlink_metadata(&intent) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if legacy_metadata.is_some() && intent_metadata.is_some() {
-        return Err(DurabilityError::SnapshotVerification(
-            "both legacy and identity-bound checkpoint restore intents exist".into(),
-        ));
-    }
-    let (active_intent, recovery_identity) = if let Some(metadata) = legacy_metadata {
-        if !resume_legacy_v1_intent
-            || metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || read_bounded_regular_file(&legacy_intent, 4096)?.as_deref()
-                != Some(b"rhiza restore in progress\n")
-        {
-            return Err(DurabilityError::SnapshotVerification(
-                "legacy local checkpoint restore intent requires an exact node-bound v2 identity marker".into(),
-            ));
-        }
-        (&legacy_intent, None)
-    } else if let Some(metadata) = intent_metadata {
+    let (active_intent, recovery_identity) = if let Some(metadata) = intent_metadata {
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || read_bounded_regular_file(&intent, 4096)?.as_deref() != Some(expected_intent)
@@ -2439,6 +2825,24 @@ fn prepare_fresh_restore_data_dir(
     Ok(())
 }
 
+fn reject_unsupported_restore_intent_artifacts(data_dir: &Path) -> Result<(), DurabilityError> {
+    let entries = match fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(RESTORE_INTENT_PREFIX) && name != RESTORE_INTENT_FILE {
+            return Err(DurabilityError::SnapshotVerification(
+                "unsupported local checkpoint restore artifact".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2455,15 +2859,17 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
 }
 
 #[cfg(test)]
+#[path = "durability/prestage_tests.rs"]
+mod prestage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
-        completed_successor_identity_matches, mark_durable_state, observe_durable_tip,
-        parse_successor_restore_receipt, prepare_successor_restore_root, snapshot_profile,
-        validate_local_qlog, validate_restored_suffix, write_repair_artifact_ownership,
-        CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth, ExecutionProfile,
-        LogAnchor, LogHash, PendingLag, RecoveryArtifactIdentity, RepairArtifactRole,
-        SuccessorRestorePreparation, SuccessorRestoreRootState, RESTORE_INTENT_FILE,
-        SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
+        mark_durable_state, observe_durable_tip, snapshot_profile, validate_local_qlog,
+        validate_restored_suffix, write_repair_artifact_ownership, CheckpointTip, CoordinatorState,
+        DurabilityError, DurabilityHealth, ExecutionProfile, LogAnchor, LogHash, PendingLag,
+        RecoveryArtifactIdentity, RepairArtifactRole, SuccessorRestorePreparation,
+        RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
         SUCCESSOR_RESTORE_LOCK_FILE,
     };
     #[cfg(feature = "kv")]
@@ -2501,106 +2907,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_successor_prepare_discards_owned_interrupted_repair_artifacts() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
-
-        let staging = root.path().join(".restore-stage-4242-0");
-        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
-        let quarantine = root.path().join(".rebuildable-quarantine-4242-1");
-        std::fs::create_dir_all(quarantine.join("sqlite")).unwrap();
-        std::fs::create_dir_all(quarantine.join("consensus")).unwrap();
-        let complete_marker = parse_successor_restore_receipt(receipt).unwrap();
-        let complete_identity = RecoveryArtifactIdentity::Successor(complete_marker);
-        write_repair_artifact_ownership(&staging, RepairArtifactRole::Staging, &complete_identity)
-            .unwrap();
-        write_repair_artifact_ownership(
-            &quarantine,
-            RepairArtifactRole::Quarantine,
-            &complete_identity,
-        )
-        .unwrap();
-
-        let (lock, state, _) = prepare_successor_restore_root(root.path(), receipt).unwrap();
-        assert!(state == SuccessorRestoreRootState::Complete);
-        drop(lock);
-        assert!(!staging.exists());
-        assert!(!quarantine.exists());
-    }
-
-    #[test]
-    fn completed_successor_prepare_keeps_unowned_repair_artifact_and_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"membership","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
-        let unowned = root.path().join(".rebuildable-quarantine-not-owned");
-        std::fs::create_dir_all(&unowned).unwrap();
-        std::fs::write(unowned.join("keep"), b"do not remove").unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert_eq!(
-            std::fs::read(unowned.join("keep")).unwrap(),
-            b"do not remove"
-        );
-    }
-
-    #[test]
-    fn completed_successor_prepare_keeps_exact_shaped_lookalike_without_ownership_record() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"membership","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
-        let lookalike = root.path().join(".rebuildable-quarantine-4242-1");
-        std::fs::create_dir_all(lookalike.join("sqlite")).unwrap();
-        std::fs::create_dir_all(lookalike.join("consensus")).unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert!(lookalike.join("sqlite").is_dir());
-        assert!(lookalike.join("consensus").is_dir());
-    }
-
-    #[test]
-    fn intent_successor_prepare_keeps_ownerless_staging_and_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_INTENT_FILE), receipt).unwrap();
-        let staging = root.path().join(".restore-stage-4242-1");
-        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert!(staging.join("sqlite").is_dir());
-    }
-
-    #[test]
-    fn intent_successor_prepare_discards_exactly_owned_staging_after_interruption() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_INTENT_FILE), receipt).unwrap();
-        let staging = root.path().join(".restore-stage-4242-1");
-        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
-        write_repair_artifact_ownership(
-            &staging,
-            RepairArtifactRole::Staging,
-            &RecoveryArtifactIdentity::Successor(parse_successor_restore_receipt(receipt).unwrap()),
-        )
-        .unwrap();
-
-        let (lock, state, _) = prepare_successor_restore_root(root.path(), receipt).unwrap();
-        assert!(state == SuccessorRestoreRootState::Intent);
-        drop(lock);
-        assert!(!staging.exists());
-    }
-
-    #[test]
     fn generic_restore_prepare_keeps_prefix_spoofed_staging_and_fails_closed() {
         let root = tempfile::tempdir().unwrap();
         let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
@@ -2616,48 +2922,10 @@ mod tests {
         std::fs::create_dir_all(staging.join("sqlite")).unwrap();
 
         assert!(matches!(
-            super::prepare_fresh_restore_data_dir(root.path(), None, &intent, false),
+            super::prepare_fresh_restore_data_dir(root.path(), None, &intent),
             Err(DurabilityError::DataDirNotFresh(_))
         ));
         assert!(staging.join("sqlite").is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn successor_intent_symlink_fails_without_following_target() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        let target = root.path().join("target");
-        std::fs::write(&target, receipt).unwrap();
-        let intent = root.path().join(SUCCESSOR_RESTORE_INTENT_FILE);
-        symlink(&target, &intent).unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert_eq!(std::fs::read(&target).unwrap(), receipt);
-        assert!(std::fs::symlink_metadata(&intent)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-    }
-
-    #[test]
-    fn successor_prepare_keeps_spoofed_restore_marker_tmp_directory_and_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
-        let spoof = root.path().join(".restore-marker-tmp-not-generated");
-        std::fs::create_dir(&spoof).unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert!(spoof.is_dir());
     }
 
     #[test]
@@ -2718,7 +2986,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let receipt = br#"{"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
         let intent = root.path().join(SUCCESSOR_RESTORE_INTENT_FILE);
         std::fs::write(&intent, receipt).unwrap();
         let target = root.path().join("target");
@@ -2750,56 +3018,8 @@ mod tests {
     }
 
     #[test]
-    fn completed_successor_prepare_keeps_artifact_bound_to_a_different_complete_marker() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        let foreign_receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"other-node","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
-        let artifact = root.path().join(".rebuildable-quarantine-4242-1");
-        std::fs::create_dir_all(artifact.join("sqlite")).unwrap();
-        write_repair_artifact_ownership(
-            &artifact,
-            RepairArtifactRole::Quarantine,
-            &RecoveryArtifactIdentity::Successor(
-                parse_successor_restore_receipt(foreign_receipt).unwrap(),
-            ),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert!(artifact.join("sqlite").is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn completed_successor_prepare_keeps_symlinked_repair_lookalike_and_fails_closed() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
-        let target = root.path().join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        let lookalike = root.path().join(".rebuildable-quarantine-4242-1");
-        symlink(&target, &lookalike).unwrap();
-
-        assert!(matches!(
-            prepare_successor_restore_root(root.path(), receipt),
-            Err(DurabilityError::DataDirNotFresh(_))
-        ));
-        assert!(target.is_dir());
-        assert!(std::fs::symlink_metadata(&lookalike)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-    }
-
-    #[test]
-    fn sqlite_restore_suffix_rejects_legacy_commands_during_preflight() {
-        let payload = b"put\tlegacy\tkey\tvalue".to_vec();
+    fn sqlite_restore_suffix_rejects_noncanonical_commands_during_preflight() {
+        let payload = b"put\tnoncanonical\tkey\tvalue".to_vec();
         let entry = LogEntry {
             cluster_id: "rhiza:sql:cluster-a".into(),
             epoch: 1,
@@ -3034,7 +3254,6 @@ mod tests {
             ExecutionProfile::Kv,
             "identity.json",
             b"identity-fixture",
-            false,
         )
         .await
         .unwrap();
@@ -3055,7 +3274,6 @@ mod tests {
             ExecutionProfile::Kv,
             "identity.json",
             b"identity-fixture",
-            false,
         )
         .await
         .unwrap();
@@ -3063,53 +3281,6 @@ mod tests {
             std::fs::read(target.join("recorder/sentinel")).unwrap(),
             b"keep-me"
         );
-    }
-
-    fn successor_receipt(index: u64, hash_byte: char, generation: u64) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "cluster_id": "cluster-a",
-            "epoch": 1,
-            "target_config_id": 2,
-            "recovery_generation": generation,
-            "node_id": "node-1",
-            "membership_digest": "digest",
-            "predecessor_config_id": 1,
-            "stop_index": 4,
-            "stop_hash": "stop",
-            "checkpoint_index": index,
-            "checkpoint_hash": hash_byte.to_string().repeat(64),
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn completed_successor_receipt_allows_only_forward_checkpoint_progress() {
-        let expected = successor_receipt(8, '8', 1);
-
-        assert!(completed_successor_identity_matches(
-            &successor_receipt(4, '4', 1),
-            &expected
-        ));
-        assert!(!completed_successor_identity_matches(
-            &successor_receipt(8, '9', 1),
-            &expected
-        ));
-        assert!(!completed_successor_identity_matches(
-            &successor_receipt(9, '9', 1),
-            &expected
-        ));
-        assert!(!completed_successor_identity_matches(
-            &successor_receipt(4, '4', 2),
-            &expected
-        ));
-        let mut malformed =
-            serde_json::from_slice::<serde_json::Value>(&successor_receipt(4, '4', 1)).unwrap();
-        malformed["checkpoint_hash"] = serde_json::json!(7);
-        assert!(!completed_successor_identity_matches(
-            &serde_json::to_vec(&malformed).unwrap(),
-            &expected
-        ));
     }
 
     #[test]

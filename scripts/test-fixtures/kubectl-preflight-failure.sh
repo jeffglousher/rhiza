@@ -6,6 +6,18 @@ printf '%s\n' "$*" >> "$RHIZA_KUBECTL_FIXTURE_LOG"
 
 case " $* " in
   *" get statefulset rhiza-${profile}-c"*) exit 0 ;;
+  *" get service rhiza-${profile}-client -o json "*)
+    [ "$RHIZA_KUBECTL_FIXTURE_PROFILE" != stable-service-missing ] || exit 1
+    role=voter
+    [ "$RHIZA_KUBECTL_FIXTURE_PROFILE" != stable-service-mismatch ] || role=learner
+    jq -cn --arg profile "$profile" --arg role "$role" '
+      {metadata:{name:("rhiza-" + $profile + "-client")},
+       spec:{selector:{
+         "app.kubernetes.io/name":"rhiza",
+         "rhiza.dev/execution-profile":$profile,
+         "rhiza.dev/member-role":$role},
+       ports:[{name:"client",port:8080,targetPort:"client"}]}}'
+    ;;
   *" get service rhiza-${profile}-c"*" -o json "*)
     arguments=("$@")
     for ((index=0; index + 2 < ${#arguments[@]}; index++)); do

@@ -1,7 +1,6 @@
 use rhiza_core::{
-    ConfigChange, ConfigId, ConfigurationState, Epoch, LogAnchor, LogEntry, LogHash, LogIndex,
-    RecoveryAnchor, Snapshot, SnapshotManifest, StoredCommand, SuccessorDescriptor,
-    RECOVERY_ANCHOR_FORMAT_VERSION, RECOVERY_ANCHOR_V1_FORMAT_VERSION,
+    ConfigId, Epoch, LogEntry, LogHash, LogIndex, RecoveryAnchor, Snapshot, SnapshotManifest,
+    RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 use rhiza_log::{decode_segment_for_cluster, encode_segment, SegmentFile};
 use std::{
@@ -18,7 +17,6 @@ use serde::{Deserialize, Serialize};
 
 pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
-const CHECKPOINT_V1_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_SEGMENT_FORMAT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_CAS_ATTEMPTS: usize = 16;
 const MAX_GC_CONTROL_CAS_ATTEMPTS: usize = 128;
@@ -169,7 +167,7 @@ impl std::fmt::Display for Error {
             ),
             Self::SnapshotBaseRequiresStructuredRestore => write!(
                 f,
-                "checkpoint has a snapshot base; use restore_checkpoint_v2 to restore snapshot state and its log suffix"
+                "checkpoint has a snapshot base; use restore_checkpoint_state to restore snapshot state and its log suffix"
             ),
             Self::CheckpointBaseRegression { current, proposed } => write!(
                 f,
@@ -681,8 +679,7 @@ pub struct CheckpointSnapshotBase {
     object_key: String,
     digest: LogHash,
     size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_fingerprint: Option<LogHash>,
+    executor_fingerprint: LogHash,
 }
 
 impl CheckpointSnapshotBase {
@@ -702,15 +699,14 @@ impl CheckpointSnapshotBase {
         self.size_bytes
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.executor_fingerprint
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointBase {
-    #[default]
     Genesis,
     Snapshot(Box<CheckpointSnapshotBase>),
 }
@@ -773,9 +769,6 @@ impl CheckpointSegmentRecord {
 pub struct CheckpointManifest {
     format_version: u32,
     identity: CheckpointIdentity,
-    #[serde(default)]
-    successor_transition: Option<CheckpointSuccessorTransition>,
-    #[serde(default)]
     base: CheckpointBase,
     segments: Vec<CheckpointSegmentRecord>,
     tip: CheckpointTip,
@@ -786,7 +779,6 @@ impl CheckpointManifest {
         Self {
             format_version: CHECKPOINT_FORMAT_VERSION,
             identity,
-            successor_transition: None,
             base: CheckpointBase::Genesis,
             segments: Vec::new(),
             tip: CheckpointTip::new(0, LogHash::ZERO),
@@ -801,10 +793,6 @@ impl CheckpointManifest {
         &self.identity
     }
 
-    pub const fn successor_transition(&self) -> Option<&CheckpointSuccessorTransition> {
-        self.successor_transition.as_ref()
-    }
-
     pub fn segments(&self) -> &[CheckpointSegmentRecord] {
         &self.segments
     }
@@ -815,28 +803,6 @@ impl CheckpointManifest {
 
     pub const fn tip(&self) -> &CheckpointTip {
         &self.tip
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CheckpointSuccessorTransition {
-    predecessor: CheckpointIdentity,
-    stop_entry: LogEntry,
-    successor: SuccessorDescriptor,
-}
-
-impl CheckpointSuccessorTransition {
-    pub const fn predecessor(&self) -> &CheckpointIdentity {
-        &self.predecessor
-    }
-
-    pub const fn stop_entry(&self) -> &LogEntry {
-        &self.stop_entry
-    }
-
-    pub const fn successor(&self) -> &SuccessorDescriptor {
-        &self.successor
     }
 }
 
@@ -1221,6 +1187,8 @@ impl ObjectArchiveStore {
                 "publisher holder and lease duration must be non-empty".into(),
             ));
         }
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let opened_at_ms = now_ms();
         let lease_id = format!(
             "{holder}-{}-{opened_at_ms}-{}",
@@ -1258,6 +1226,8 @@ impl ObjectArchiveStore {
     }
 
     pub async fn initialize_checkpoint(&self) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1298,9 +1268,6 @@ impl ObjectArchiveStore {
             }
             Err(error) => return Err(error.into()),
         };
-        let loaded = self
-            .migrate_checkpoint_manifest(loaded, lease_id, lease_duration_ms)
-            .await?;
         self.renew_gc_lease(
             GcLeaseKind::Publisher,
             lease_id,
@@ -1310,62 +1277,6 @@ impl ObjectArchiveStore {
         .await?;
         self.register_generation(now_ms()).await?;
         Ok(loaded)
-    }
-
-    async fn migrate_checkpoint_manifest(
-        &self,
-        mut loaded: LoadedCheckpointManifest,
-        lease_id: &str,
-        lease_duration_ms: u64,
-    ) -> Result<LoadedCheckpointManifest> {
-        for _ in 0..MAX_CHECKPOINT_CAS_ATTEMPTS {
-            if loaded.manifest.format_version == CHECKPOINT_FORMAT_VERSION {
-                return Ok(loaded);
-            }
-            if loaded.manifest.format_version != CHECKPOINT_V1_FORMAT_VERSION
-                || loaded.manifest.base != CheckpointBase::Genesis
-            {
-                return Err(Error::UnsupportedFormatVersion {
-                    object: "checkpoint manifest",
-                    version: loaded.manifest.format_version,
-                });
-            }
-            let mut migrated = loaded.manifest.clone();
-            migrated.format_version = CHECKPOINT_FORMAT_VERSION;
-            self.validate_checkpoint_manifest(&migrated)?;
-            self.renew_gc_lease(
-                GcLeaseKind::Publisher,
-                lease_id,
-                now_ms(),
-                lease_duration_ms,
-            )
-            .await?;
-            match self
-                .store
-                .update(
-                    &self.checkpoint_manifest_key()?,
-                    serialize_json(&migrated)?,
-                    loaded.version.clone(),
-                )
-                .await
-            {
-                Ok(version) => {
-                    return Ok(LoadedCheckpointManifest {
-                        manifest: migrated,
-                        version,
-                    });
-                }
-                Err(ObjStoreError::Precondition { .. }) => {
-                    loaded = self.load_checkpoint_unleased().await?.ok_or_else(|| {
-                        Error::InvalidCheckpoint("manifest disappeared during migration".into())
-                    })?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(Error::CompareAndSwapRetriesExhausted {
-            attempts: MAX_CHECKPOINT_CAS_ATTEMPTS,
-        })
     }
 
     pub async fn load_checkpoint(&self) -> Result<Option<LoadedCheckpointManifest>> {
@@ -1395,6 +1306,8 @@ impl ObjectArchiveStore {
         &self,
         entries: &[LogEntry],
     ) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1509,6 +1422,8 @@ impl ObjectArchiveStore {
         anchor: RecoveryAnchor,
         snapshot_bytes: &[u8],
     ) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1698,7 +1613,7 @@ impl ObjectArchiveStore {
         }
     }
 
-    pub async fn restore_checkpoint_v2(&self) -> Result<RestoredCheckpoint> {
+    pub async fn restore_checkpoint_state(&self) -> Result<RestoredCheckpoint> {
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1730,125 +1645,17 @@ impl ObjectArchiveStore {
                     .into(),
             ));
         }
-        self.copy_checkpoint_to(target, None).await
-    }
-
-    pub async fn fork_stopped_successor(
-        &self,
-        target: &ObjectArchiveStore,
-        stop_entry: &LogEntry,
-    ) -> Result<LoadedCheckpointManifest> {
-        let source_identity = self.checkpoint_identity()?;
-        let target_identity = target.checkpoint_identity()?;
-        validate_entry_identity(source_identity, stop_entry)?;
-        if stop_entry.recompute_hash() != stop_entry.hash {
-            return Err(Error::InvalidCheckpoint(
-                "predecessor Stop entry hash is invalid".into(),
-            ));
-        }
-        let command = StoredCommand::new(stop_entry.entry_type, stop_entry.payload.clone());
-        let successor = ConfigChange::recognize(&command)
-            .ok()
-            .and_then(|change| change.successor().cloned())
-            .ok_or_else(|| {
-                Error::InvalidCheckpoint(
-                    "predecessor Stop entry is not bound to an exact successor".into(),
-                )
-            })?;
-        if source_identity.cluster_id != target_identity.cluster_id
-            || source_identity.epoch != target_identity.epoch
-            || source_identity.config_id.checked_add(1) != Some(target_identity.config_id)
-            || successor.cluster_id() != target_identity.cluster_id
-            || successor.predecessor_config_id() != source_identity.config_id
-            || successor.config_id() != target_identity.config_id
-        {
-            return Err(Error::InvalidCheckpoint(
-                "bound successor does not match the target checkpoint identity".into(),
-            ));
-        }
-
-        let source = self
-            .load_checkpoint()
-            .await?
-            .ok_or_else(|| Error::InvalidCheckpoint("source checkpoint is missing".into()))?;
-        if source.manifest.format_version != CHECKPOINT_FORMAT_VERSION {
-            return Err(Error::InvalidCheckpoint(
-                "successor fork requires a format-2 source checkpoint".into(),
-            ));
-        }
-        let restored = self.restore_checkpoint_v2().await?;
-        let snapshot = restored.snapshot().ok_or_else(|| {
-            Error::InvalidCheckpoint("successor fork requires a stopped snapshot base".into())
-        })?;
-        let expected_stop = LogAnchor::new(stop_entry.index, stop_entry.hash);
-        let expected_state = ConfigurationState::active(
-            source_identity.config_id,
-            successor.predecessor_config_digest(),
-        )
-        .validate_entry(stop_entry)
-        .map_err(|_| Error::InvalidCheckpoint("predecessor Stop state is invalid".into()))?;
-        if snapshot.anchor().configuration_state() != &expected_state
-            || snapshot.anchor().compacted() != &expected_stop
-            || restored.tip() != &CheckpointTip::new(stop_entry.index, stop_entry.hash)
-            || !restored.suffix().is_empty()
-        {
-            return Err(Error::InvalidCheckpoint(
-                "source checkpoint is not the exact bound stopped root".into(),
-            ));
-        }
-        let transition = CheckpointSuccessorTransition {
-            predecessor: source_identity.clone(),
-            stop_entry: stop_entry.clone(),
-            successor,
-        };
-        if let Some(advanced) = target
-            .load_valid_advanced_successor(&transition, stop_entry.index)
-            .await?
-        {
-            return Ok(advanced);
-        }
-        match self
-            .copy_checkpoint_to(target, Some(transition.clone()))
-            .await
-        {
-            Err(Error::CheckpointTargetConflict) => target
-                .load_valid_advanced_successor(&transition, stop_entry.index)
-                .await?
-                .ok_or(Error::CheckpointTargetConflict),
-            result => result,
-        }
-    }
-
-    async fn load_valid_advanced_successor(
-        &self,
-        transition: &CheckpointSuccessorTransition,
-        stop_index: u64,
-    ) -> Result<Option<LoadedCheckpointManifest>> {
-        let Some(loaded) = self.load_checkpoint().await? else {
-            return Ok(None);
-        };
-        if loaded.manifest.successor_transition.as_ref() != Some(transition)
-            || loaded.manifest.tip.index() <= stop_index
-        {
-            return Ok(None);
-        }
-        self.restore_checkpoint_v2().await?;
-        let reloaded = self.load_checkpoint().await?.ok_or_else(|| {
-            Error::InvalidCheckpoint("advanced successor checkpoint disappeared".into())
-        })?;
-        if reloaded.manifest.successor_transition.as_ref() != Some(transition)
-            || reloaded.manifest.tip.index() <= stop_index
-        {
-            return Err(Error::CheckpointTargetConflict);
-        }
-        Ok(Some(reloaded))
+        self.copy_checkpoint_to(target).await
     }
 
     async fn copy_checkpoint_to(
         &self,
         target: &ObjectArchiveStore,
-        successor_transition: Option<CheckpointSuccessorTransition>,
     ) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        target.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
+        target.load_checkpoint().await?;
         let source_lease = self
             .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1863,12 +1670,7 @@ impl ObjectArchiveStore {
             }
         };
         let result = self
-            .copy_checkpoint_to_unleased(
-                target,
-                successor_transition,
-                &source_lease.lease_id,
-                &target_lease.lease_id,
-            )
+            .copy_checkpoint_to_unleased(target, &source_lease.lease_id, &target_lease.lease_id)
             .await;
         let source_release = self.release_gc_lease(&source_lease.lease_id).await;
         let target_release = target.release_gc_lease(&target_lease.lease_id).await;
@@ -1881,7 +1683,6 @@ impl ObjectArchiveStore {
     async fn copy_checkpoint_to_unleased(
         &self,
         target: &ObjectArchiveStore,
-        successor_transition: Option<CheckpointSuccessorTransition>,
         source_lease_id: &str,
         target_lease_id: &str,
     ) -> Result<LoadedCheckpointManifest> {
@@ -1893,11 +1694,9 @@ impl ObjectArchiveStore {
             .ok_or_else(|| Error::InvalidCheckpoint("source checkpoint is missing".into()))?;
         if source.manifest.format_version != CHECKPOINT_FORMAT_VERSION {
             return Err(Error::InvalidCheckpoint(
-                "checkpoint copy requires a format-2 source".into(),
+                "checkpoint copy requires the canonical checkpoint format".into(),
             ));
         }
-        let successor_transition =
-            successor_transition.or_else(|| source.manifest.successor_transition.clone());
         self.restore_checkpoint_unleased(source_lease_id).await?;
         let target_identity = target.checkpoint_identity()?.clone();
         let base = match &source.manifest.base {
@@ -1910,7 +1709,7 @@ impl ObjectArchiveStore {
                         &snapshot.digest.to_hex(),
                     )
                     .await?;
-                let anchor = RecoveryAnchor::new_with_configuration(
+                let anchor = RecoveryAnchor::new(
                     snapshot.anchor.cluster_id(),
                     snapshot.anchor.epoch(),
                     snapshot.anchor.configuration_state().clone(),
@@ -1972,7 +1771,6 @@ impl ObjectArchiveStore {
         let manifest = CheckpointManifest {
             format_version: CHECKPOINT_FORMAT_VERSION,
             identity: target_identity,
-            successor_transition,
             base,
             segments,
             tip: source.manifest.tip,
@@ -2918,7 +2716,11 @@ impl ObjectArchiveStore {
 
     async fn ensure_generation_not_retired(&self) -> Result<()> {
         let identity = self.checkpoint_identity()?;
-        let loaded = self.load_gc_control().await?;
+        let loaded = match self.load_gc_control().await {
+            Ok(loaded) => loaded,
+            Err(Error::ObjectStore(ObjStoreError::NotFound { .. })) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if let Some(GenerationCatalogEntry {
             lifecycle:
                 GenerationLifecycle::Retired {
@@ -3279,40 +3081,16 @@ impl ObjectArchiveStore {
     }
 
     fn validate_checkpoint_manifest(&self, manifest: &CheckpointManifest) -> Result<()> {
-        if manifest.format_version != CHECKPOINT_FORMAT_VERSION
-            && manifest.format_version != CHECKPOINT_V1_FORMAT_VERSION
-        {
+        if manifest.format_version != CHECKPOINT_FORMAT_VERSION {
             return Err(Error::UnsupportedFormatVersion {
                 object: "checkpoint manifest",
                 version: manifest.format_version,
             });
         }
-        if manifest.format_version == CHECKPOINT_V1_FORMAT_VERSION
-            && (manifest.base != CheckpointBase::Genesis || manifest.successor_transition.is_some())
-        {
-            return Err(Error::InvalidCheckpoint(
-                "V1 checkpoint manifest cannot have a snapshot base or successor transition".into(),
-            ));
-        }
         validate_checkpoint_identity(self.checkpoint_identity()?, &manifest.identity)?;
 
-        if let Some(transition) = &manifest.successor_transition {
-            self.validate_successor_transition(transition, &manifest.base)?;
-        }
-
         if let CheckpointBase::Snapshot(snapshot) = &manifest.base {
-            if manifest
-                .successor_transition
-                .as_ref()
-                .is_some_and(|transition| {
-                    snapshot.anchor.configuration_state().config_id()
-                        == transition.predecessor.config_id
-                })
-            {
-                self.validate_transition_snapshot_base(snapshot)?;
-            } else {
-                self.validate_checkpoint_snapshot_base(snapshot)?;
-            }
+            self.validate_checkpoint_snapshot_base(snapshot)?;
         }
 
         let base_tip = manifest.base.tip();
@@ -3389,76 +3167,8 @@ impl ObjectArchiveStore {
         Ok(())
     }
 
-    fn validate_successor_transition(
-        &self,
-        transition: &CheckpointSuccessorTransition,
-        base: &CheckpointBase,
-    ) -> Result<()> {
-        let identity = self.checkpoint_identity()?;
-        if transition.predecessor.cluster_id != identity.cluster_id
-            || transition.predecessor.epoch != identity.epoch
-            || transition.predecessor.config_id.checked_add(1) != Some(identity.config_id)
-            || transition.successor.cluster_id() != identity.cluster_id
-            || transition.successor.predecessor_config_id() != transition.predecessor.config_id
-            || transition.successor.config_id() != identity.config_id
-        {
-            return Err(Error::InvalidCheckpoint(
-                "successor transition identity is invalid".into(),
-            ));
-        }
-        validate_entry_identity(&transition.predecessor, &transition.stop_entry)?;
-        let command = StoredCommand::new(
-            transition.stop_entry.entry_type,
-            transition.stop_entry.payload.clone(),
-        );
-        let recognized = ConfigChange::recognize(&command)
-            .ok()
-            .and_then(|change| change.successor().cloned());
-        if transition.stop_entry.recompute_hash() != transition.stop_entry.hash
-            || recognized.as_ref() != Some(&transition.successor)
-        {
-            return Err(Error::InvalidCheckpoint(
-                "successor transition Stop entry is invalid".into(),
-            ));
-        }
-        match base {
-            CheckpointBase::Snapshot(snapshot) => {
-                if snapshot.anchor.configuration_state().config_id()
-                    != transition.predecessor.config_id
-                {
-                    return Ok(());
-                }
-                let stop = LogAnchor::new(transition.stop_entry.index, transition.stop_entry.hash);
-                let expected = ConfigurationState::active(
-                    transition.predecessor.config_id,
-                    transition.successor.predecessor_config_digest(),
-                )
-                .validate_entry(&transition.stop_entry)
-                .map_err(|_| {
-                    Error::InvalidCheckpoint("successor transition Stop state is invalid".into())
-                })?;
-                if snapshot.anchor.configuration_state() != &expected
-                    || snapshot.anchor.compacted() != &stop
-                {
-                    return Err(Error::InvalidCheckpoint(
-                        "successor transition snapshot is not the exact predecessor Stop".into(),
-                    ));
-                }
-            }
-            CheckpointBase::Genesis => {
-                return Err(Error::InvalidCheckpoint(
-                    "successor transition requires a stopped snapshot base".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_recovery_anchor(&self, anchor: &RecoveryAnchor) -> Result<()> {
-        if !matches!(
-            anchor.format_version(),
-            RECOVERY_ANCHOR_V1_FORMAT_VERSION | RECOVERY_ANCHOR_FORMAT_VERSION
-        ) {
+        if anchor.format_version() != RECOVERY_ANCHOR_FORMAT_VERSION {
             return Err(Error::UnsupportedFormatVersion {
                 object: "recovery anchor",
                 version: anchor.format_version(),
@@ -3526,35 +3236,6 @@ impl ObjectArchiveStore {
             ));
         }
         let expected_key = checkpoint_snapshot_key(self.checkpoint_identity()?, &snapshot.anchor);
-        if snapshot.object_key != expected_key {
-            return Err(Error::InvalidCheckpoint(format!(
-                "snapshot object key mismatch: expected {expected_key}, got {}",
-                snapshot.object_key
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_transition_snapshot_base(&self, snapshot: &CheckpointSnapshotBase) -> Result<()> {
-        let identity = self.checkpoint_identity()?;
-        if snapshot.anchor.cluster_id() != identity.cluster_id()
-            || snapshot.anchor.epoch() != identity.epoch()
-            || snapshot.anchor.recovery_generation() != identity.recovery_generation()
-        {
-            return Err(Error::InvalidCheckpoint(
-                "successor transition snapshot identity is invalid".into(),
-            ));
-        }
-        if snapshot.digest != snapshot.anchor.snapshot().digest()
-            || snapshot.executor_fingerprint != snapshot.anchor.executor_fingerprint()
-            || snapshot.size_bytes == 0
-            || snapshot.size_bytes != snapshot.anchor.snapshot().size_bytes()
-        {
-            return Err(Error::InvalidCheckpoint(
-                "successor transition snapshot metadata is invalid".into(),
-            ));
-        }
-        let expected_key = checkpoint_snapshot_key(identity, &snapshot.anchor);
         if snapshot.object_key != expected_key {
             return Err(Error::InvalidCheckpoint(format!(
                 "snapshot object key mismatch: expected {expected_key}, got {}",
@@ -3761,12 +3442,10 @@ fn checkpoint_snapshot_key(identity: &CheckpointIdentity, anchor: &RecoveryAncho
         anchor.compacted().hash().to_hex(),
         anchor.snapshot().digest().to_hex()
     );
-    match anchor.executor_fingerprint() {
-        Some(executor_fingerprint) => {
-            format!("{prefix}-{}.snapshot", executor_fingerprint.to_hex())
-        }
-        None => format!("{prefix}.snapshot"),
-    }
+    format!(
+        "{prefix}-{}.snapshot",
+        anchor.executor_fingerprint().to_hex()
+    )
 }
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>> {
@@ -3784,12 +3463,10 @@ fn snapshot_object_key(manifest: &SnapshotManifest) -> String {
         manifest.epoch(),
         manifest.index()
     );
-    match manifest.executor_fingerprint() {
-        Some(executor_fingerprint) => {
-            format!("{prefix}-{}.snapshot", executor_fingerprint.to_hex())
-        }
-        None => format!("{prefix}.snapshot"),
-    }
+    format!(
+        "{prefix}-{}.snapshot",
+        manifest.executor_fingerprint().to_hex()
+    )
 }
 
 fn gc_candidate(
