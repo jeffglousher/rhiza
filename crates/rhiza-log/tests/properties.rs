@@ -1,7 +1,9 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use proptest::prelude::*;
-use rhiza_core::{EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity};
+use rhiza_core::{
+    ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
+};
 use rhiza_log::{
     decode_segment_for_cluster, encode_open_segment, encode_segment, FileLogStore, IndexRange,
     LogStore, QLOG_HEADER_LEN,
@@ -137,13 +139,14 @@ proptest! {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             1,
-            1,
+            ConfigurationState::active(1, LogHash::ZERO),
             1,
             LogAnchor::new(entry.index, entry.hash),
             SnapshotIdentity::new(
                 format!("snapshot-{:015}", entry.index),
                 LogHash::digest(&[b"snapshot", &entry.index.to_be_bytes()]),
                 payloads.iter().map(Vec::len).sum::<usize>() as u64 + 1,
+                LogHash::from_bytes([6; 32]),
             ),
         );
 

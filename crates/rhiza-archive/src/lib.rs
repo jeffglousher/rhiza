@@ -1,7 +1,7 @@
 use rhiza_core::{
     ConfigChange, ConfigId, ConfigurationState, Epoch, LogAnchor, LogEntry, LogHash, LogIndex,
     RecoveryAnchor, Snapshot, SnapshotManifest, StoredCommand, SuccessorDescriptor,
-    RECOVERY_ANCHOR_FORMAT_VERSION, RECOVERY_ANCHOR_V1_FORMAT_VERSION,
+    RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 use rhiza_log::{decode_segment_for_cluster, encode_segment, SegmentFile};
 use std::{
@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 
 pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
-const CHECKPOINT_V1_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_SEGMENT_FORMAT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_CAS_ATTEMPTS: usize = 16;
 const MAX_GC_CONTROL_CAS_ATTEMPTS: usize = 128;
@@ -681,8 +680,7 @@ pub struct CheckpointSnapshotBase {
     object_key: String,
     digest: LogHash,
     size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_fingerprint: Option<LogHash>,
+    executor_fingerprint: LogHash,
 }
 
 impl CheckpointSnapshotBase {
@@ -702,15 +700,14 @@ impl CheckpointSnapshotBase {
         self.size_bytes
     }
 
-    pub const fn executor_fingerprint(&self) -> Option<LogHash> {
+    pub const fn executor_fingerprint(&self) -> LogHash {
         self.executor_fingerprint
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointBase {
-    #[default]
     Genesis,
     Snapshot(Box<CheckpointSnapshotBase>),
 }
@@ -773,9 +770,7 @@ impl CheckpointSegmentRecord {
 pub struct CheckpointManifest {
     format_version: u32,
     identity: CheckpointIdentity,
-    #[serde(default)]
     successor_transition: Option<CheckpointSuccessorTransition>,
-    #[serde(default)]
     base: CheckpointBase,
     segments: Vec<CheckpointSegmentRecord>,
     tip: CheckpointTip,
@@ -1221,6 +1216,8 @@ impl ObjectArchiveStore {
                 "publisher holder and lease duration must be non-empty".into(),
             ));
         }
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let opened_at_ms = now_ms();
         let lease_id = format!(
             "{holder}-{}-{opened_at_ms}-{}",
@@ -1258,6 +1255,8 @@ impl ObjectArchiveStore {
     }
 
     pub async fn initialize_checkpoint(&self) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1298,9 +1297,6 @@ impl ObjectArchiveStore {
             }
             Err(error) => return Err(error.into()),
         };
-        let loaded = self
-            .migrate_checkpoint_manifest(loaded, lease_id, lease_duration_ms)
-            .await?;
         self.renew_gc_lease(
             GcLeaseKind::Publisher,
             lease_id,
@@ -1310,62 +1306,6 @@ impl ObjectArchiveStore {
         .await?;
         self.register_generation(now_ms()).await?;
         Ok(loaded)
-    }
-
-    async fn migrate_checkpoint_manifest(
-        &self,
-        mut loaded: LoadedCheckpointManifest,
-        lease_id: &str,
-        lease_duration_ms: u64,
-    ) -> Result<LoadedCheckpointManifest> {
-        for _ in 0..MAX_CHECKPOINT_CAS_ATTEMPTS {
-            if loaded.manifest.format_version == CHECKPOINT_FORMAT_VERSION {
-                return Ok(loaded);
-            }
-            if loaded.manifest.format_version != CHECKPOINT_V1_FORMAT_VERSION
-                || loaded.manifest.base != CheckpointBase::Genesis
-            {
-                return Err(Error::UnsupportedFormatVersion {
-                    object: "checkpoint manifest",
-                    version: loaded.manifest.format_version,
-                });
-            }
-            let mut migrated = loaded.manifest.clone();
-            migrated.format_version = CHECKPOINT_FORMAT_VERSION;
-            self.validate_checkpoint_manifest(&migrated)?;
-            self.renew_gc_lease(
-                GcLeaseKind::Publisher,
-                lease_id,
-                now_ms(),
-                lease_duration_ms,
-            )
-            .await?;
-            match self
-                .store
-                .update(
-                    &self.checkpoint_manifest_key()?,
-                    serialize_json(&migrated)?,
-                    loaded.version.clone(),
-                )
-                .await
-            {
-                Ok(version) => {
-                    return Ok(LoadedCheckpointManifest {
-                        manifest: migrated,
-                        version,
-                    });
-                }
-                Err(ObjStoreError::Precondition { .. }) => {
-                    loaded = self.load_checkpoint_unleased().await?.ok_or_else(|| {
-                        Error::InvalidCheckpoint("manifest disappeared during migration".into())
-                    })?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(Error::CompareAndSwapRetriesExhausted {
-            attempts: MAX_CHECKPOINT_CAS_ATTEMPTS,
-        })
     }
 
     pub async fn load_checkpoint(&self) -> Result<Option<LoadedCheckpointManifest>> {
@@ -1395,6 +1335,8 @@ impl ObjectArchiveStore {
         &self,
         entries: &[LogEntry],
     ) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1509,6 +1451,8 @@ impl ObjectArchiveStore {
         anchor: RecoveryAnchor,
         snapshot_bytes: &[u8],
     ) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1849,6 +1793,10 @@ impl ObjectArchiveStore {
         target: &ObjectArchiveStore,
         successor_transition: Option<CheckpointSuccessorTransition>,
     ) -> Result<LoadedCheckpointManifest> {
+        self.ensure_generation_not_retired().await?;
+        target.ensure_generation_not_retired().await?;
+        self.load_checkpoint().await?;
+        target.load_checkpoint().await?;
         let source_lease = self
             .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
             .await?;
@@ -1910,7 +1858,7 @@ impl ObjectArchiveStore {
                         &snapshot.digest.to_hex(),
                     )
                     .await?;
-                let anchor = RecoveryAnchor::new_with_configuration(
+                let anchor = RecoveryAnchor::new(
                     snapshot.anchor.cluster_id(),
                     snapshot.anchor.epoch(),
                     snapshot.anchor.configuration_state().clone(),
@@ -2918,7 +2866,11 @@ impl ObjectArchiveStore {
 
     async fn ensure_generation_not_retired(&self) -> Result<()> {
         let identity = self.checkpoint_identity()?;
-        let loaded = self.load_gc_control().await?;
+        let loaded = match self.load_gc_control().await {
+            Ok(loaded) => loaded,
+            Err(Error::ObjectStore(ObjStoreError::NotFound { .. })) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if let Some(GenerationCatalogEntry {
             lifecycle:
                 GenerationLifecycle::Retired {
@@ -3279,20 +3231,11 @@ impl ObjectArchiveStore {
     }
 
     fn validate_checkpoint_manifest(&self, manifest: &CheckpointManifest) -> Result<()> {
-        if manifest.format_version != CHECKPOINT_FORMAT_VERSION
-            && manifest.format_version != CHECKPOINT_V1_FORMAT_VERSION
-        {
+        if manifest.format_version != CHECKPOINT_FORMAT_VERSION {
             return Err(Error::UnsupportedFormatVersion {
                 object: "checkpoint manifest",
                 version: manifest.format_version,
             });
-        }
-        if manifest.format_version == CHECKPOINT_V1_FORMAT_VERSION
-            && (manifest.base != CheckpointBase::Genesis || manifest.successor_transition.is_some())
-        {
-            return Err(Error::InvalidCheckpoint(
-                "V1 checkpoint manifest cannot have a snapshot base or successor transition".into(),
-            ));
         }
         validate_checkpoint_identity(self.checkpoint_identity()?, &manifest.identity)?;
 
@@ -3455,10 +3398,7 @@ impl ObjectArchiveStore {
     }
 
     fn validate_recovery_anchor(&self, anchor: &RecoveryAnchor) -> Result<()> {
-        if !matches!(
-            anchor.format_version(),
-            RECOVERY_ANCHOR_V1_FORMAT_VERSION | RECOVERY_ANCHOR_FORMAT_VERSION
-        ) {
+        if anchor.format_version() != RECOVERY_ANCHOR_FORMAT_VERSION {
             return Err(Error::UnsupportedFormatVersion {
                 object: "recovery anchor",
                 version: anchor.format_version(),
@@ -3761,12 +3701,10 @@ fn checkpoint_snapshot_key(identity: &CheckpointIdentity, anchor: &RecoveryAncho
         anchor.compacted().hash().to_hex(),
         anchor.snapshot().digest().to_hex()
     );
-    match anchor.executor_fingerprint() {
-        Some(executor_fingerprint) => {
-            format!("{prefix}-{}.snapshot", executor_fingerprint.to_hex())
-        }
-        None => format!("{prefix}.snapshot"),
-    }
+    format!(
+        "{prefix}-{}.snapshot",
+        anchor.executor_fingerprint().to_hex()
+    )
 }
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>> {
@@ -3784,12 +3722,10 @@ fn snapshot_object_key(manifest: &SnapshotManifest) -> String {
         manifest.epoch(),
         manifest.index()
     );
-    match manifest.executor_fingerprint() {
-        Some(executor_fingerprint) => {
-            format!("{prefix}-{}.snapshot", executor_fingerprint.to_hex())
-        }
-        None => format!("{prefix}.snapshot"),
-    }
+    format!(
+        "{prefix}-{}.snapshot",
+        manifest.executor_fingerprint().to_hex()
+    )
 }
 
 fn gc_candidate(

@@ -11,7 +11,6 @@ use std::{
 use rhiza_core::{
     ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor,
     SnapshotIdentity, StopBinding, SuccessorDescriptor, RECOVERY_ANCHOR_FORMAT_VERSION,
-    RECOVERY_ANCHOR_V1_FORMAT_VERSION,
 };
 
 pub const QLOG_MAGIC: [u8; 4] = *b"QLOG";
@@ -33,9 +32,6 @@ const TRUNCATE_INTENT_REPLACEMENT: u16 = 1;
 const ANCHOR_FILE_NAME: &str = "recovery.anchor";
 const ANCHOR_MAGIC: [u8; 4] = *b"QANC";
 const ANCHOR_VERSION: u16 = 4;
-const ANCHOR_V3_VERSION: u16 = 3;
-const ANCHOR_V2_VERSION: u16 = 2;
-const ANCHOR_V1_VERSION: u16 = 1;
 const COMPACT_INTENT_FILE_NAME: &str = ".compact-intent";
 const COMPACT_INTENT_MAGIC: [u8; 4] = *b"QCMP";
 const COMPACT_INTENT_VERSION: u16 = 1;
@@ -1650,10 +1646,7 @@ fn validate_anchor_identity(
 }
 
 fn validate_anchor(anchor: &RecoveryAnchor) -> Result<()> {
-    if !matches!(
-        anchor.format_version(),
-        RECOVERY_ANCHOR_V1_FORMAT_VERSION | RECOVERY_ANCHOR_FORMAT_VERSION
-    ) {
+    if anchor.format_version() != RECOVERY_ANCHOR_FORMAT_VERSION {
         return Err(Error::Decode("unsupported recovery anchor version".into()));
     }
     if anchor.cluster_id().is_empty()
@@ -1681,14 +1674,7 @@ fn encode_anchor(anchor: &RecoveryAnchor) -> Result<Vec<u8>> {
     validate_anchor(anchor)?;
     let mut out = Vec::new();
     out.extend_from_slice(&ANCHOR_MAGIC);
-    put_u16(
-        &mut out,
-        if anchor.format_version() == RECOVERY_ANCHOR_V1_FORMAT_VERSION {
-            ANCHOR_V1_VERSION
-        } else {
-            ANCHOR_VERSION
-        },
-    );
+    put_u16(&mut out, ANCHOR_VERSION);
     put_u16(&mut out, 0);
     put_u64(&mut out, anchor.epoch());
     put_u64(&mut out, anchor.config_id());
@@ -1697,19 +1683,9 @@ fn encode_anchor(anchor: &RecoveryAnchor) -> Result<Vec<u8>> {
     out.extend_from_slice(anchor.compacted().hash().as_bytes());
     out.extend_from_slice(anchor.snapshot().digest().as_bytes());
     put_u64(&mut out, anchor.snapshot().size_bytes());
-    match anchor.executor_fingerprint() {
-        Some(fingerprint) => {
-            out.push(1);
-            out.extend_from_slice(fingerprint.as_bytes());
-        }
-        None => {
-            out.push(0);
-            out.extend_from_slice(LogHash::ZERO.as_bytes());
-        }
-    }
-    if anchor.format_version() == RECOVERY_ANCHOR_FORMAT_VERSION {
-        encode_configuration_state(&mut out, anchor.configuration_state())?;
-    }
+    out.push(1);
+    out.extend_from_slice(anchor.executor_fingerprint().as_bytes());
+    encode_configuration_state(&mut out, anchor.configuration_state())?;
     put_string(&mut out, anchor.cluster_id(), "anchor cluster_id")?;
     put_string(
         &mut out,
@@ -1730,71 +1706,39 @@ fn decode_anchor(bytes: &[u8]) -> Result<RecoveryAnchor> {
         return Err(Error::Decode("recovery anchor crc mismatch".into()));
     }
     let version = read_u16(bytes, 4)?;
-    if !matches!(
-        version,
-        ANCHOR_V1_VERSION | ANCHOR_V2_VERSION | ANCHOR_V3_VERSION | ANCHOR_VERSION
-    ) || read_u16(bytes, 6)? != 0
-    {
+    if version != ANCHOR_VERSION || read_u16(bytes, 6)? != 0 {
         return Err(Error::Decode("unsupported recovery anchor version".into()));
     }
-    let executor_fingerprint = if matches!(version, ANCHOR_V3_VERSION | ANCHOR_VERSION) {
-        let present = *bytes
-            .get(112)
-            .ok_or_else(|| Error::Decode("truncated executor fingerprint flag".into()))?;
-        let fingerprint = read_hash(bytes, 113)?;
-        match present {
-            0 if fingerprint == LogHash::ZERO => None,
-            1 => Some(fingerprint),
-            _ => {
-                return Err(Error::Decode(
-                    "invalid executor fingerprint encoding".into(),
-                ))
-            }
-        }
-    } else {
-        None
-    };
-    let mut cursor = if matches!(version, ANCHOR_V3_VERSION | ANCHOR_VERSION) {
-        145
-    } else {
-        112
-    };
+    if bytes.get(112) != Some(&1) {
+        return Err(Error::Decode(
+            "invalid executor fingerprint encoding".into(),
+        ));
+    }
+    let executor_fingerprint = read_hash(bytes, 113)?;
+    let mut cursor = 145;
     let config_id = read_u64(bytes, 16)?;
-    let configuration_state = if version != ANCHOR_V1_VERSION {
-        decode_configuration_state(bytes, &mut cursor, crc_offset, config_id, version)?
-    } else {
-        ConfigurationState::active(config_id, LogHash::ZERO)
-    };
+    let configuration_state =
+        decode_configuration_state(bytes, &mut cursor, crc_offset, config_id)?;
     let cluster_id = read_string(bytes, &mut cursor, crc_offset, "anchor cluster_id")?;
     let snapshot_id = read_string(bytes, &mut cursor, crc_offset, "anchor snapshot_id")?;
     if cursor != crc_offset {
         return Err(Error::Decode("trailing recovery anchor bytes".into()));
     }
     let compacted = LogAnchor::new(read_u64(bytes, 32)?, read_hash(bytes, 40)?);
-    let mut snapshot =
-        SnapshotIdentity::new(snapshot_id, read_hash(bytes, 72)?, read_u64(bytes, 104)?);
-    if let Some(fingerprint) = executor_fingerprint {
-        snapshot = snapshot.with_executor_fingerprint(fingerprint);
-    }
-    let anchor = if version == ANCHOR_V1_VERSION {
-        RecoveryAnchor::from_v1(
-            cluster_id,
-            read_u64(bytes, 8)?,
-            config_id,
-            read_u64(bytes, 24)?,
-            compacted,
-            snapshot,
-        )
-    } else {
-        RecoveryAnchor::new_with_configuration(
-            cluster_id,
-            read_u64(bytes, 8)?,
-            configuration_state,
-            read_u64(bytes, 24)?,
-            compacted,
-            snapshot,
-        )
-    };
+    let snapshot = SnapshotIdentity::new(
+        snapshot_id,
+        read_hash(bytes, 72)?,
+        read_u64(bytes, 104)?,
+        executor_fingerprint,
+    );
+    let anchor = RecoveryAnchor::new(
+        cluster_id,
+        read_u64(bytes, 8)?,
+        configuration_state,
+        read_u64(bytes, 24)?,
+        compacted,
+        snapshot,
+    );
     validate_anchor(&anchor)?;
     Ok(anchor)
 }
@@ -1816,7 +1760,6 @@ fn encode_configuration_state(out: &mut Vec<u8>, state: &ConfigurationState) -> 
             put_u64(out, stop.index());
             out.extend_from_slice(stop.hash().as_bytes());
             match binding {
-                StopBinding::Unknown => out.push(0),
                 StopBinding::Unbound => out.push(1),
                 StopBinding::Bound {
                     successor,
@@ -1837,7 +1780,6 @@ fn decode_configuration_state(
     cursor: &mut usize,
     end: usize,
     config_id: u64,
-    version: u16,
 ) -> Result<ConfigurationState> {
     let kind = *bytes
         .get(*cursor)
@@ -1850,11 +1792,7 @@ fn decode_configuration_state(
         2 => {
             let stop_index = read_state_u64(bytes, cursor, end)?;
             let stop_hash = read_state_hash(bytes, cursor, end)?;
-            let binding = if version == ANCHOR_VERSION {
-                decode_stop_binding(bytes, cursor, end)?
-            } else {
-                StopBinding::Unknown
-            };
+            let binding = decode_stop_binding(bytes, cursor, end)?;
             Ok(ConfigurationState::Stopped {
                 config_id,
                 digest,
@@ -1884,7 +1822,6 @@ fn encode_successor_descriptor(out: &mut Vec<u8>, successor: &SuccessorDescripto
 fn decode_stop_binding(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<StopBinding> {
     let kind = read_state_u8(bytes, cursor, end)?;
     match kind {
-        0 => Ok(StopBinding::Unknown),
         1 => Ok(StopBinding::Unbound),
         2 => {
             let cluster_id = read_string(bytes, cursor, end, "successor cluster_id")?;
@@ -2622,50 +2559,26 @@ fn sync_directory(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rhiza_core::{ConfigChange, StopBinding};
-
     const INJECTED_CRASH: &str = "injected crash";
 
     #[test]
-    fn legacy_stopped_anchor_decodes_with_unknown_binding() {
-        let digest = LogHash::from_bytes([4; 32]);
-        let stop = LogAnchor::new(10, LogHash::from_bytes([5; 32]));
-        let bound_stop = ConfigChange::bound_stop(
-            "cluster-a",
-            4,
-            digest,
-            5,
-            vec!["node-a".into(), "node-b".into(), "node-c".into()],
-        )
-        .unwrap();
-        let anchor = RecoveryAnchor::new_with_configuration(
-            "cluster-a",
-            1,
-            ConfigurationState::Stopped {
-                config_id: 4,
-                digest,
-                stop,
-                binding: StopBinding::Bound {
-                    successor: bound_stop.successor().unwrap().clone(),
-                    stop_command_hash: bound_stop.to_stored_command().hash(),
-                },
-            },
-            7,
-            stop,
-            SnapshotIdentity::new("snapshot-stop", LogHash::from_bytes([9; 32]), 4096),
-        );
+    fn legacy_anchor_binary_version_is_rejected() {
+        let entry = chain(&[b"one"]).pop().unwrap();
+        let anchor = recovery_anchor(&entry);
+        let mut bytes = encode_anchor(&anchor).unwrap();
+        bytes[4..6].copy_from_slice(&3_u16.to_be_bytes());
+        let crc_offset = bytes.len() - 4;
+        let crc = crc32c(&bytes[..crc_offset]);
+        bytes[crc_offset..].copy_from_slice(&crc.to_be_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ANCHOR_FILE_NAME);
+        fs::write(&path, &bytes).unwrap();
 
-        let decoded = decode_anchor(&encode_legacy_v3_anchor(&anchor)).unwrap();
-
-        assert_eq!(
-            decoded.configuration_state(),
-            &ConfigurationState::Stopped {
-                config_id: 4,
-                digest,
-                stop,
-                binding: StopBinding::Unknown,
-            }
-        );
+        assert!(matches!(
+            FileLogStore::open(dir.path(), "cluster-a", 1, 1),
+            Err(Error::Decode(_))
+        ));
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
@@ -2907,52 +2820,6 @@ mod tests {
         out
     }
 
-    fn encode_legacy_v3_anchor(anchor: &RecoveryAnchor) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&ANCHOR_MAGIC);
-        put_u16(&mut out, 3);
-        put_u16(&mut out, 0);
-        put_u64(&mut out, anchor.epoch());
-        put_u64(&mut out, anchor.config_id());
-        put_u64(&mut out, anchor.recovery_generation());
-        put_u64(&mut out, anchor.compacted().index());
-        out.extend_from_slice(anchor.compacted().hash().as_bytes());
-        out.extend_from_slice(anchor.snapshot().digest().as_bytes());
-        put_u64(&mut out, anchor.snapshot().size_bytes());
-        match anchor.executor_fingerprint() {
-            Some(fingerprint) => {
-                out.push(1);
-                out.extend_from_slice(fingerprint.as_bytes());
-            }
-            None => {
-                out.push(0);
-                out.extend_from_slice(LogHash::ZERO.as_bytes());
-            }
-        }
-        match anchor.configuration_state() {
-            ConfigurationState::Active { digest, .. } => {
-                out.push(1);
-                out.extend_from_slice(digest.as_bytes());
-            }
-            ConfigurationState::Stopped { digest, stop, .. } => {
-                out.push(2);
-                out.extend_from_slice(digest.as_bytes());
-                put_u64(&mut out, stop.index());
-                out.extend_from_slice(stop.hash().as_bytes());
-            }
-        }
-        put_string(&mut out, anchor.cluster_id(), "anchor cluster_id").unwrap();
-        put_string(
-            &mut out,
-            anchor.snapshot().snapshot_id(),
-            "anchor snapshot_id",
-        )
-        .unwrap();
-        let crc = crc32c(&out);
-        put_u32(&mut out, crc);
-        out
-    }
-
     fn chain(payloads: &[&[u8]]) -> Vec<LogEntry> {
         let mut entries = Vec::new();
         let mut prev_hash = LogHash::ZERO;
@@ -2986,13 +2853,14 @@ mod tests {
         RecoveryAnchor::new(
             entry.cluster_id.clone(),
             entry.epoch,
-            entry.config_id,
+            ConfigurationState::active(entry.config_id, LogHash::ZERO),
             1,
             LogAnchor::new(entry.index, entry.hash),
             SnapshotIdentity::new(
                 format!("snapshot-{:015}", entry.index),
                 LogHash::digest(&[b"snapshot", &entry.index.to_be_bytes()]),
                 4096,
+                LogHash::from_bytes([6; 32]),
             ),
         )
     }
