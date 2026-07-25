@@ -840,10 +840,8 @@ impl LearnerStore {
             prestage,
             log,
             materializer,
-            apply_lock,
             ..
         } = self;
-        drop(apply_lock);
         drop(materializer);
         drop(log);
         let finalized =
