@@ -10,10 +10,10 @@ The workspace retains SQL, graph, and KV materialization crates. The released
 runtime and product documentation cover SQL only; graph and KV are not wired
 into the SQL release surface.
 
-The current crates.io product, `rhizadb` v0.2.0, is SQL-only and uses SQLite.
+The current crates.io product, `rhizadb` v0.3.0, is SQL-only and uses SQLite.
 Its registry dependency closure is `rhiza-core`, `rhiza-obj-store`,
 `rhiza-log`, `rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and
-`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.2.0
+`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.3.0
 features or part of the SQL-only supported release.
 
 ## Workspace Components
@@ -58,7 +58,7 @@ see [RELEASING.md](RELEASING.md) for the registry procedure.
 
 ## Embedded Rust API
 
-The published `rhizadb` v0.2.0 crate exposes an SQL-only embedded owner. It
+The published `rhizadb` v0.3.0 crate exposes an SQL-only embedded owner. It
 does not offer graph or KV Cargo features, re-exports, or embedded methods;
 those remain outside the initial registry product.
 

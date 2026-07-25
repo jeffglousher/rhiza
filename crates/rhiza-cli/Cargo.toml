@@ -20,14 +20,14 @@ recorder-postcard-rpc = [
 [dependencies]
 axum.workspace = true
 rhiza-client = { version = "0.1.0", path = "../rhiza-client", default-features = false }
-rhiza-archive = { version = "0.2.0", path = "../rhiza-archive" }
-rhiza-core = { version = "0.2.0", path = "../rhiza-core" }
-rhiza-log = { version = "0.2.0", path = "../rhiza-log" }
-rhiza-node = { version = "0.2.0", path = "../rhiza-node" }
-rhiza-obj-store = { version = "0.2.0", path = "../rhiza-obj-store" }
-rhiza-quepaxa = { version = "0.2.0", path = "../rhiza-quepaxa" }
-rhiza-sql = { version = "0.2.0", path = "../rhiza-sql", optional = true }
-rhizadb = { version = "0.2.0", path = "../rhiza" }
+rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
+rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
+rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
+rhiza-node = { version = "0.3.0", path = "../rhiza-node" }
+rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
+rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
+rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
+rhizadb = { version = "0.3.0", path = "../rhiza" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
