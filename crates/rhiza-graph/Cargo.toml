@@ -9,7 +9,7 @@ description = "LadybugDB materialized state machine for rhiza graph"
 
 [dependencies]
 lbug = "=0.18.1"
-rhiza-core = { version = "0.2.0", path = "../rhiza-core" }
+rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 tempfile.workspace = true
 
 [dev-dependencies]

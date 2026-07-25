@@ -1,10 +1,12 @@
 use std::{
     fmt, fs,
+    future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -21,14 +23,14 @@ use rhiza_node::{
         adopt_finalized_successor_prestage, complete_adopted_successor_prestage,
         inspect_successor_prestage, prestage_successor_checkpoint, publish_successor_prestage,
         DurabilityError, SuccessorPrestage, SuccessorPrestageIdentity, SuccessorPrestageState,
-        SuccessorRestorePreparation,
     },
     node_router_with_checkpoint, node_router_with_checkpoint_and_admin_tasks,
     recorder_router_for_generation, recover_successor_recorder_after_checkpoint,
     rehydrate_recorder_after_checkpoint, serve_recorder_tcp, serve_recorder_tcp_tls, AdminConfig,
     AdminTaskTracker, CertifiedTailRequest, CertifiedTailResponse, CheckpointCoordinator,
     DurabilityMode, LearnerProgress, LearnerStore, LogPeer, NodeConfig, NodeError, NodeRuntime,
-    RecorderTlsServerConfig, StopInformation, TailReaderConfig, MAX_CERTIFIED_TAIL_ENTRIES,
+    RecorderTlsServerConfig, StartupIoContext, StopInformation, TailReaderConfig,
+    DEFAULT_CERTIFIED_TAIL_ENTRIES, LIVEZ_PATH, MAX_CERTIFIED_TAIL_ENTRIES, READYZ_PATH,
 };
 #[cfg(feature = "recorder-postcard-rpc")]
 use rhiza_node::{
@@ -51,8 +53,8 @@ const SUCCESSOR_RESTORE_COMPLETE_FILE: &str = ".successor-restore.complete";
 const MAX_SUCCESSOR_RESTORE_CONTROL_BYTES: u64 = 16 * 1024;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(100);
 const HA_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SUCCESSOR_TAIL_RETRY_DELAY: Duration = Duration::from_millis(250);
 const HA_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
-const HA_STARTUP_CLEANUP_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HaStartupMode {
@@ -114,6 +116,10 @@ impl HaServeConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HaNodeStatus {
     Starting,
+    Restoring,
+    CatchingUp,
+    PreStopReady,
+    Transitioning,
     AwaitingActivation,
     Ready,
     Degraded,
@@ -125,9 +131,13 @@ pub enum HaNodeStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HaNodeError {
     Startup(HaStartupError),
+    CertifiedTail(HaCertifiedTailError),
     RecorderServer(String),
     ServiceServer(String),
     WorkerFailure(ErrorClassification),
+    StartupIoDeadlineExceeded {
+        stage: String,
+    },
     Shutdown(String),
     Cleanup {
         primary: Box<HaNodeError>,
@@ -140,6 +150,7 @@ impl fmt::Display for HaNodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Startup(error) => write!(formatter, "HA startup failed: {error}"),
+            Self::CertifiedTail(error) => write!(formatter, "certified tail failed: {error}"),
             Self::RecorderServer(error) => write!(formatter, "recorder server failed: {error}"),
             Self::ServiceServer(error) => write!(formatter, "service server failed: {error}"),
             Self::WorkerFailure(classification) => write!(
@@ -147,6 +158,12 @@ impl fmt::Display for HaNodeError {
                 "HA worker failed with code {}",
                 classification.code()
             ),
+            Self::StartupIoDeadlineExceeded { stage } => {
+                write!(
+                    formatter,
+                    "HA startup I/O exceeded the shutdown deadline during {stage}"
+                )
+            }
             Self::Shutdown(error) => write!(formatter, "HA shutdown failed: {error}"),
             Self::Cleanup { primary, cleanup } => {
                 write!(formatter, "{primary}; cleanup also failed: {cleanup}")
@@ -173,6 +190,9 @@ struct HaNodeSnapshot {
 
 pub struct HaNode {
     shutdown: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+    recorder_shutdown: tokio::sync::watch::Sender<bool>,
+    service_shutdown: tokio::sync::watch::Sender<bool>,
+    startup: StartupIoContext,
     state: tokio::sync::watch::Receiver<HaNodeSnapshot>,
     supervisor: Option<tokio::task::JoinHandle<Result<(), HaNodeError>>>,
 }
@@ -233,12 +253,19 @@ impl HaNode {
         }
     }
 
-    pub async fn shutdown(mut self) -> Result<(), HaNodeError> {
-        request_ha_shutdown(&self.shutdown, || {
+    pub async fn shutdown(self) -> Result<(), HaNodeError> {
+        self.shutdown_with_timeout(HA_SERVER_SHUTDOWN_TIMEOUT).await
+    }
+
+    pub async fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<(), HaNodeError> {
+        let deadline = request_ha_shutdown(&self.shutdown, timeout, || {
             if let Some(handle) = self.state.borrow().handle.as_ref() {
                 handle.close_admission();
             }
         });
+        self.service_shutdown.send_replace(true);
+        self.recorder_shutdown.send_replace(true);
+        self.startup.cancel(deadline.into_std());
         let supervisor = self
             .supervisor
             .take()
@@ -254,22 +281,217 @@ impl HaNode {
 
 impl Drop for HaNode {
     fn drop(&mut self) {
-        request_ha_shutdown(&self.shutdown, || {
+        let deadline = request_ha_shutdown(&self.shutdown, HA_SERVER_SHUTDOWN_TIMEOUT, || {
             if let Some(handle) = self.state.borrow().handle.as_ref() {
                 handle.close_admission();
             }
         });
+        self.service_shutdown.send_replace(true);
+        self.recorder_shutdown.send_replace(true);
+        self.startup.cancel(deadline.into_std());
+    }
+}
+
+/// One public owner for a live successor from prestage through active service.
+pub struct HaSuccessorNode {
+    shutdown: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+    predecessor: tokio::sync::mpsc::UnboundedSender<HaPredecessor>,
+    predecessor_binding: Mutex<Option<HaPredecessor>>,
+    state: tokio::sync::watch::Receiver<HaNodeSnapshot>,
+    supervisor: Option<tokio::task::JoinHandle<Result<(), HaNodeError>>>,
+}
+
+impl HaSuccessorNode {
+    fn start(
+        prestage: HaSuccessorPrestageConfig,
+        startup: HaStartupConfig,
+        serve: HaServeConfig,
+        tail_source: Arc<dyn HaCertifiedTailSource>,
+    ) -> Result<Self, HaStartupError> {
+        validate_live_successor_draft(&prestage, &startup)?;
+        let HaServeConfig {
+            recorder_listener,
+            service_listener,
+            recorder_transport,
+            recorders,
+            log_peers,
+            admin,
+            tail_token,
+        } = serve;
+        let (staging_listener, service_listener) =
+            split_ha_listener(service_listener).map_err(error)?;
+        let serve = HaServeConfig {
+            recorder_listener,
+            service_listener,
+            recorder_transport,
+            recorders,
+            log_peers,
+            admin,
+            tail_token,
+        };
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(None);
+        let (predecessor, predecessor_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (state_tx, state) = tokio::sync::watch::channel(HaNodeSnapshot {
+            status: HaNodeStatus::Restoring,
+            handle: None,
+            terminal_error: None,
+        });
+        let supervisor_state = state_tx.clone();
+        let supervisor = tokio::spawn(async move {
+            let result = supervise_live_successor(
+                prestage,
+                startup,
+                serve,
+                staging_listener,
+                tail_source,
+                shutdown_rx,
+                predecessor_rx,
+                state_tx,
+            )
+            .await;
+            if let Err(error) = &result {
+                publish_ha_failure(&supervisor_state, error.clone());
+            }
+            result
+        });
+        Ok(Self {
+            shutdown,
+            predecessor,
+            predecessor_binding: Mutex::new(None),
+            state,
+            supervisor: Some(supervisor),
+        })
+    }
+
+    /// Supplies the one immutable predecessor Stop proof observed by the embedding application.
+    pub fn bind_predecessor(&self, predecessor: HaPredecessor) -> Result<(), HaNodeError> {
+        let mut binding = self
+            .predecessor_binding
+            .lock()
+            .map_err(|_| HaNodeError::Startup(fail("predecessor binding mutex is poisoned")))?;
+        match binding.as_ref() {
+            Some(bound) if bound == &predecessor => return Ok(()),
+            Some(_) => {
+                return Err(HaNodeError::Startup(fail(
+                    "live successor predecessor binding changed after first observation",
+                )))
+            }
+            None => {}
+        }
+        self.predecessor.send(predecessor.clone()).map_err(|_| {
+            self.state
+                .borrow()
+                .terminal_error
+                .clone()
+                .unwrap_or(HaNodeError::Cancelled)
+        })?;
+        *binding = Some(predecessor);
+        Ok(())
+    }
+
+    pub async fn ready(&self) -> Result<RhizaHandle, HaNodeError> {
+        wait_for_ha_ready(&self.shutdown, self.state.clone()).await
+    }
+
+    pub fn status(&self) -> HaNodeStatus {
+        self.state.borrow().status
+    }
+
+    pub fn is_prestop_ready(&self) -> bool {
+        self.status() == HaNodeStatus::PreStopReady
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.shutdown.borrow().is_none() && self.status() == HaNodeStatus::Ready
+    }
+
+    pub async fn monitor(&self) -> Result<(), HaNodeError> {
+        monitor_ha_state(self.state.clone()).await
+    }
+
+    pub async fn shutdown(self) -> Result<(), HaNodeError> {
+        self.shutdown_with_timeout(HA_SERVER_SHUTDOWN_TIMEOUT).await
+    }
+
+    pub async fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<(), HaNodeError> {
+        request_ha_shutdown(&self.shutdown, timeout, || {});
+        let supervisor = self
+            .supervisor
+            .take()
+            .ok_or_else(|| HaNodeError::Shutdown("live successor supervisor is missing".into()))?;
+        match supervisor.await {
+            Ok(result) => result,
+            Err(error) => Err(HaNodeError::Shutdown(format!(
+                "live successor supervisor task failed: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for HaSuccessorNode {
+    fn drop(&mut self) {
+        request_ha_shutdown(&self.shutdown, HA_SERVER_SHUTDOWN_TIMEOUT, || {});
+    }
+}
+
+async fn wait_for_ha_ready(
+    shutdown: &tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+    mut state: tokio::sync::watch::Receiver<HaNodeSnapshot>,
+) -> Result<RhizaHandle, HaNodeError> {
+    loop {
+        let (shutdown, snapshot) = {
+            let shutdown = *shutdown.borrow();
+            let snapshot = state.borrow().clone();
+            (shutdown, snapshot)
+        };
+        if let Some(error) = snapshot.terminal_error {
+            return Err(error);
+        }
+        if shutdown.is_some() {
+            return Err(HaNodeError::Cancelled);
+        }
+        if snapshot.status == HaNodeStatus::Ready {
+            return snapshot.handle.ok_or_else(|| {
+                HaNodeError::Startup(fail("ready HA node has no application handle"))
+            });
+        }
+        if matches!(
+            snapshot.status,
+            HaNodeStatus::ShuttingDown | HaNodeStatus::Stopped
+        ) {
+            return Err(HaNodeError::Cancelled);
+        }
+        state.changed().await.map_err(|_| HaNodeError::Cancelled)?;
+    }
+}
+
+async fn monitor_ha_state(
+    mut state: tokio::sync::watch::Receiver<HaNodeSnapshot>,
+) -> Result<(), HaNodeError> {
+    loop {
+        let snapshot = state.borrow().clone();
+        if let Some(error) = snapshot.terminal_error {
+            return Err(error);
+        }
+        if snapshot.status == HaNodeStatus::Stopped {
+            return Ok(());
+        }
+        state
+            .changed()
+            .await
+            .map_err(|_| HaNodeError::Shutdown("HA node supervisor state channel closed".into()))?;
     }
 }
 
 fn request_ha_shutdown<F>(
     shutdown: &tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+    timeout: Duration,
     close_admission: F,
 ) -> tokio::time::Instant
 where
     F: FnOnce(),
 {
-    let requested = tokio::time::Instant::now() + HA_SERVER_SHUTDOWN_TIMEOUT;
+    let requested = tokio::time::Instant::now() + timeout;
     shutdown.send_if_modified(|deadline| {
         if deadline.is_none() {
             *deadline = Some(requested);
@@ -282,7 +504,7 @@ where
     shutdown.borrow().unwrap_or(requested)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HaPredecessor {
     membership: Membership,
     stop: StopInformation,
@@ -292,6 +514,43 @@ impl HaPredecessor {
     pub fn new(membership: Membership, stop: StopInformation) -> Self {
         Self { membership, stop }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HaCertifiedTailError {
+    Unavailable(String),
+    RebaseRequired(LogAnchor),
+    Rejected(String),
+}
+
+impl fmt::Display for HaCertifiedTailError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(message) => write!(formatter, "source unavailable: {message}"),
+            Self::RebaseRequired(anchor) => write!(
+                formatter,
+                "source requires a newer checkpoint at index {} with hash {}",
+                anchor.index(),
+                anchor.hash().to_hex()
+            ),
+            Self::Rejected(message) => write!(formatter, "source rejected the request: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for HaCertifiedTailError {}
+
+/// Transport boundary for a certified predecessor tail.
+///
+/// The facade owns request cadence, validation, application, Stop matching, and retries.
+/// Embedders only provide a transport for one immutable predecessor identity.
+pub trait HaCertifiedTailSource: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        request: &'a CertifiedTailRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CertifiedTailResponse, HaCertifiedTailError>> + Send + 'a>,
+    >;
 }
 
 pub struct HaSuccessorPrestageConfig {
@@ -401,6 +660,20 @@ impl HaSuccessorPrestageConfig {
             identity,
             tail_config,
         })
+    }
+
+    /// Starts a live successor owner that keeps the same process and listeners through cutover.
+    ///
+    /// The target startup must describe the unactivated successor draft. The returned owner
+    /// restores and tails before Stop, accepts one exact predecessor binding, then starts and
+    /// activates the successor without returning listener ownership to the embedding application.
+    pub fn start_live(
+        self,
+        startup: HaStartupConfig,
+        serve: HaServeConfig,
+        tail_source: Arc<dyn HaCertifiedTailSource>,
+    ) -> Result<HaSuccessorNode, HaStartupError> {
+        HaSuccessorNode::start(self, startup, serve, tail_source)
     }
 }
 
@@ -554,12 +827,11 @@ impl PublishedHaSuccessorPrestage {
         self.learner.apply_page(request, response).map_err(error)
     }
 
-    /// Requires the exact bound Stop, adopts the detached stage without recopying its
-    /// checkpoint, and hands the result to the existing successor prepare/open lifecycle.
-    pub async fn finalize(
-        self,
-        startup: HaStartupConfig,
-    ) -> Result<PreparedHaStartup, HaStartupError> {
+    /// Requires the exact bound Stop and leaves a durable adoption intent for [`HaNode`].
+    ///
+    /// Recorder installation, archive initialization, and active runtime opening remain owned by
+    /// the later [`HaStartupConfig::start`] lifecycle.
+    pub fn finalize(self, startup: HaStartupConfig) -> Result<HaStartupConfig, HaStartupError> {
         if startup.mode != HaStartupMode::Rejoin {
             return Err(fail("successor prestage finalization requires rejoin mode"));
         }
@@ -573,53 +845,9 @@ impl PublishedHaSuccessorPrestage {
             .learner
             .finalize(&startup.node_config, &predecessor.stop)
             .map_err(error)?;
-        finish_successor_prestage_adoption(startup, predecessor, target_config_id, restore).await
+        drop(restore);
+        Ok(startup)
     }
-}
-
-async fn finish_successor_prestage_adoption(
-    startup: HaStartupConfig,
-    predecessor: HaPredecessor,
-    target_config_id: u64,
-    restore: SuccessorRestorePreparation,
-) -> Result<PreparedHaStartup, HaStartupError> {
-    if restore.requires_recorder_install() {
-        install_successor_recorder_for_startup(
-            &startup.node_config,
-            target_config_id,
-            &predecessor,
-        )?;
-        restore.complete().map_err(error)?;
-    }
-    let initialized = startup
-        .archive
-        .initialize_checkpoint()
-        .await
-        .map_err(error)?;
-    if initialized.manifest().tip().index() != 0 || !initialized.manifest().segments().is_empty() {
-        return Err(fail(
-            "successor target checkpoint namespace must be empty before activation",
-        ));
-    }
-    let identity = startup
-        .archive
-        .checkpoint_identity()
-        .map_err(error)?
-        .clone();
-    validate_archive_identity(&startup.node_config, &identity, target_config_id)?;
-    write_local_checkpoint_identity_marker(
-        startup.node_config.data_dir(),
-        startup.node_config.execution_profile(),
-        &identity,
-        startup.node_config.node_id(),
-    )?;
-    startup.finish_prepare(
-        identity,
-        target_config_id,
-        StartupPreparation::RecorderFirst {
-            open_policy: RecorderOpenPolicy::MustExist,
-        },
-    )
 }
 
 fn tail_request(from: LogAnchor, max_entries: u32) -> Result<CertifiedTailRequest, HaStartupError> {
@@ -638,6 +866,19 @@ pub struct HaStartupConfig {
     lease_duration_ms: u64,
     mode: HaStartupMode,
     predecessor: Option<HaPredecessor>,
+    auto_activate_stop: Option<LogAnchor>,
+}
+
+impl fmt::Debug for HaStartupConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HaStartupConfig")
+            .field("node_id", &self.node_config.node_id())
+            .field("mode", &self.mode)
+            .field("predecessor", &self.predecessor)
+            .field("auto_activate_stop", &self.auto_activate_stop)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HaStartupConfig {
@@ -655,6 +896,7 @@ impl HaStartupConfig {
             lease_duration_ms,
             mode,
             predecessor: None,
+            auto_activate_stop: None,
         }
     }
 
@@ -663,44 +905,94 @@ impl HaStartupConfig {
         self
     }
 
-    /// Resumes exact-Stop successor adoption across finalized-marker, intent, and completion
-    /// crash windows.
-    pub async fn resume_finalized_successor_prestage(
-        self,
-    ) -> Result<PreparedHaStartup, HaStartupError> {
-        if self.mode != HaStartupMode::Rejoin {
+    fn bind_live_predecessor(mut self, predecessor: HaPredecessor) -> Result<Self, HaStartupError> {
+        if self.predecessor.is_some() {
             return Err(fail(
-                "finalized successor prestage resume requires rejoin mode",
+                "live successor startup is already bound to a predecessor",
             ));
         }
-        let predecessor = self
-            .predecessor
-            .clone()
-            .ok_or_else(|| fail("finalized successor prestage resume requires a predecessor"))?;
-        let target_config_id = self.target_config_id()?;
+        let stop_anchor = LogAnchor::new(predecessor.stop.entry.index, predecessor.stop.entry.hash);
+        self.node_config = self
+            .node_config
+            .bind_predecessor_stop(&predecessor.membership, predecessor.stop.entry.clone())
+            .map_err(error)?;
+        let target_config_id = predecessor
+            .stop
+            .entry
+            .config_id
+            .checked_add(1)
+            .ok_or_else(|| fail("successor config_id cannot advance"))?;
         validate_predecessor_binding(&self.node_config, target_config_id, &predecessor)?;
-        let prestage = match inspect_successor_prestage(
-            self.node_config.data_dir(),
-            self.node_config.log_initial_configuration().clone(),
-        ) {
-            Ok(prestage) => prestage,
-            Err(DurabilityError::DataDirNotFresh(_)) => return self.prepare().await,
-            Err(cause) => return Err(error(cause)),
-        };
-        let restore = adopt_finalized_successor_prestage(
-            prestage,
-            &self.node_config,
-            &predecessor.stop,
-            &predecessor.membership,
-        )
-        .map_err(error)?;
-        finish_successor_prestage_adoption(self, predecessor, target_config_id, restore).await
+        self.predecessor = Some(predecessor);
+        self.auto_activate_stop = Some(stop_anchor);
+        Ok(self)
     }
 
-    pub async fn prepare(self) -> Result<PreparedHaStartup, HaStartupError> {
+    /// Starts the complete HA lifecycle under one public owner.
+    ///
+    /// Preparation, recorder ingress, runtime recovery, readiness, and shutdown all remain
+    /// owned by the returned [`HaNode`].
+    pub fn start(self, serve: HaServeConfig) -> HaNode {
+        self.start_with_incumbent(serve, None)
+    }
+
+    fn start_with_incumbent(
+        self,
+        serve: HaServeConfig,
+        incumbent_service: Option<IncumbentHaService>,
+    ) -> HaNode {
+        let startup = StartupIoContext::new();
+        let supervisor_startup = startup.clone();
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(None);
+        let (recorder_shutdown, recorder_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (service_shutdown, service_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (state_tx, state) = tokio::sync::watch::channel(HaNodeSnapshot {
+            status: HaNodeStatus::Starting,
+            handle: None,
+            terminal_error: None,
+        });
+        let supervisor_shutdown = shutdown.clone();
+        let supervisor_recorder_shutdown = recorder_shutdown.clone();
+        let supervisor_service_shutdown = service_shutdown.clone();
+        let supervisor = tokio::spawn(async move {
+            supervise_ha_node(
+                self,
+                serve,
+                incumbent_service,
+                supervisor_startup,
+                supervisor_shutdown,
+                shutdown_rx,
+                supervisor_recorder_shutdown,
+                recorder_shutdown_rx,
+                supervisor_service_shutdown,
+                service_shutdown_rx,
+                state_tx,
+            )
+            .await
+        });
+        HaNode {
+            shutdown,
+            recorder_shutdown,
+            service_shutdown,
+            startup,
+            state,
+            supervisor: Some(supervisor),
+        }
+    }
+
+    async fn prepare(
+        self,
+        startup: &StartupIoContext,
+    ) -> Result<PreparedHaStartup, HaStartupError> {
+        startup
+            .check("HA startup configuration validation")
+            .map_err(error)?;
         if self.predecessor.is_none() && !self.node_config.configuration_state().is_active() {
             return Err(fail("stopped configuration requires a predecessor"));
         }
+        startup
+            .check("checkpoint identity inspection")
+            .map_err(error)?;
         let identity = self.archive.checkpoint_identity().map_err(error)?.clone();
         let target_config_id = self.target_config_id()?;
         validate_archive_identity(&self.node_config, &identity, target_config_id)?;
@@ -712,6 +1004,7 @@ impl HaStartupConfig {
                     self.mode,
                     target_config_id,
                     predecessor,
+                    startup,
                 )
                 .await?
             }
@@ -721,10 +1014,12 @@ impl HaStartupConfig {
                     &self.archive,
                     self.mode,
                     self.node_config.membership(),
+                    startup,
                 )
                 .await?
             }
         };
+        startup.check("local recorder open").map_err(error)?;
         self.finish_prepare(identity, target_config_id, preparation)
     }
 
@@ -773,7 +1068,7 @@ impl HaStartupConfig {
     }
 }
 
-pub struct PreparedHaStartup {
+struct PreparedHaStartup {
     config: HaStartupConfig,
     authoritative_identity: CheckpointIdentity,
     target_config_id: u64,
@@ -793,79 +1088,22 @@ impl fmt::Debug for PreparedHaStartup {
 }
 
 impl PreparedHaStartup {
-    pub async fn start(self, serve: HaServeConfig) -> Result<HaNode, HaNodeError> {
-        let HaServeConfig {
-            recorder_listener,
-            service_listener,
-            recorder_transport,
-            recorders,
-            log_peers,
-            admin,
-            tail_token,
-        } = serve;
-        let peers = self.config.node_config.peers().to_vec();
-        let recovery_generation = self.config.node_config.recovery_generation();
-        let recorder = self.recorder_hook.clone();
-        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(None);
-        let (recorder_shutdown, recorder_shutdown_rx) = tokio::sync::watch::channel(false);
-        let (recorder_started, recorder_started_rx) = tokio::sync::oneshot::channel();
-        let recorder_task = spawn_ha_recorder_server(
-            recorder_listener,
-            recorder,
-            recorder_transport,
-            peers,
-            recovery_generation,
-            recorder_shutdown_rx,
-            recorder_started,
-        );
-        recorder_started_rx.await.map_err(|_| {
-            HaNodeError::RecorderServer(
-                "recorder ingress stopped before reporting startup".to_string(),
-            )
-        })?;
-
-        let (state_tx, state) = tokio::sync::watch::channel(HaNodeSnapshot {
-            status: HaNodeStatus::Starting,
-            handle: None,
-            terminal_error: None,
-        });
-        let supervisor_shutdown = shutdown.clone();
-        let supervisor = tokio::spawn(async move {
-            supervise_ha_node(
-                self,
-                service_listener,
-                recorders,
-                log_peers,
-                admin,
-                tail_token,
-                supervisor_shutdown,
-                shutdown_rx,
-                recorder_shutdown,
-                recorder_task,
-                state_tx,
-            )
-            .await
-        });
-        Ok(HaNode {
-            shutdown,
-            state,
-            supervisor: Some(supervisor),
-        })
-    }
-
     async fn open_cancellable(
         self,
         recorders: Vec<(String, Box<dyn RecorderRpc>)>,
         log_peers: Vec<Arc<dyn LogPeer>>,
+        startup: StartupIoContext,
         shutdown: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
     ) -> Result<HaOpenNode, HaOpenError> {
-        self.open_inner(recorders, log_peers, shutdown).await
+        self.open_inner(recorders, log_peers, startup, shutdown)
+            .await
     }
 
     async fn open_inner(
         self,
         recorders: Vec<(String, Box<dyn RecorderRpc>)>,
         log_peers: Vec<Arc<dyn LogPeer>>,
+        startup: StartupIoContext,
         mut shutdown: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
     ) -> Result<HaOpenNode, HaOpenError> {
         let direct_recorder = !matches!(
@@ -894,6 +1132,7 @@ impl PreparedHaStartup {
             } else {
                 Vec::new()
             },
+            &startup,
             &mut shutdown,
         )
         .await?;
@@ -921,6 +1160,7 @@ impl PreparedHaStartup {
                     pending.runtime().clone(),
                     self.recorder.clone(),
                     checkpoint_root.index(),
+                    &startup,
                     &mut shutdown,
                 )
                 .await
@@ -932,6 +1172,11 @@ impl PreparedHaStartup {
             StartupPreparation::RecorderFirst { .. } => {}
         }
 
+        let auto_activate_stop = self.config.auto_activate_stop;
+        let successor_stop = self.config.predecessor.as_ref().map(|predecessor| {
+            LogAnchor::new(predecessor.stop.entry.index, predecessor.stop.entry.hash)
+        });
+        let target_config_id = self.target_config_id;
         let coordinator_open = CheckpointCoordinator::open_with_holder_and_options(
             self.config.archive,
             self.config.durability,
@@ -952,7 +1197,13 @@ impl PreparedHaStartup {
                 }
                 result = &mut coordinator_open => {
                     match result {
-                        Ok(coordinator) => break Arc::new(coordinator),
+                        Ok(coordinator) => {
+                            let coordinator = Arc::new(coordinator);
+                            if successor_stop.is_some() && coordinator.durable_tip().index() == 0 {
+                                coordinator.require_successor_checkpoint_baseline();
+                            }
+                            break coordinator;
+                        }
                         Err(cause) => return Err(pending.fail(error(cause)).await),
                     }
                 }
@@ -973,6 +1224,9 @@ impl PreparedHaStartup {
             coordinator,
             recorder: self.recorder,
             recorder_hook: self.recorder_hook,
+            auto_activate_stop,
+            successor_stop,
+            target_config_id,
         })
     }
 }
@@ -982,6 +1236,9 @@ struct HaOpenNode {
     coordinator: Arc<CheckpointCoordinator>,
     recorder: RecorderFileStore,
     recorder_hook: HaRecorder,
+    auto_activate_stop: Option<LogAnchor>,
+    successor_stop: Option<LogAnchor>,
+    target_config_id: u64,
 }
 
 enum HaOpenError {
@@ -1106,7 +1363,7 @@ impl HaOpenNode {
         let tail_config = TailReaderConfig::new(
             config.cluster_id(),
             config.epoch(),
-            config.config_id(),
+            self.target_config_id,
             config.membership().clone(),
             config.recovery_generation(),
             tail_token,
@@ -1125,6 +1382,53 @@ impl HaOpenNode {
 }
 
 type HaServerTask = tokio::task::JoinHandle<Result<(), HaNodeError>>;
+
+struct AbortHaServerOnDrop(Option<HaServerTask>);
+
+impl AbortHaServerOnDrop {
+    fn new(task: HaServerTask) -> Self {
+        Self(Some(task))
+    }
+
+    fn into_inner(mut self) -> HaServerTask {
+        self.0
+            .take()
+            .expect("abort-on-drop HA server task is present")
+    }
+}
+
+impl std::ops::Deref for AbortHaServerOnDrop {
+    type Target = HaServerTask;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("abort-on-drop HA server task is present")
+    }
+}
+
+impl std::ops::DerefMut for AbortHaServerOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("abort-on-drop HA server task is present")
+    }
+}
+
+impl Drop for AbortHaServerOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.as_ref() {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+    }
+}
+
+struct IncumbentHaService {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: AbortHaServerOnDrop,
+}
 
 fn spawn_ha_recorder_server(
     listener: tokio::net::TcpListener,
@@ -1212,22 +1516,744 @@ async fn wait_for_ha_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) 
     }
 }
 
+fn split_ha_listener(
+    listener: tokio::net::TcpListener,
+) -> io::Result<(tokio::net::TcpListener, tokio::net::TcpListener)> {
+    let retained = listener.into_std()?;
+    retained.set_nonblocking(true)?;
+    let staging = retained.try_clone()?;
+    Ok((
+        tokio::net::TcpListener::from_std(staging)?,
+        tokio::net::TcpListener::from_std(retained)?,
+    ))
+}
+
+#[derive(Clone)]
+struct SuccessorStagingState {
+    ready: Arc<AtomicBool>,
+}
+
+async fn successor_staging_livez() -> axum::http::StatusCode {
+    axum::http::StatusCode::OK
+}
+
+async fn successor_staging_readyz(
+    axum::extract::State(state): axum::extract::State<SuccessorStagingState>,
+) -> axum::http::StatusCode {
+    if state.ready.load(Ordering::Acquire) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+fn spawn_successor_staging_server(
+    listener: tokio::net::TcpListener,
+    ready: Arc<AtomicBool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    started: tokio::sync::oneshot::Sender<()>,
+) -> HaServerTask {
+    tokio::spawn(async move {
+        let router = axum::Router::new()
+            .route(LIVEZ_PATH, axum::routing::get(successor_staging_livez))
+            .route(READYZ_PATH, axum::routing::get(successor_staging_readyz))
+            .with_state(SuccessorStagingState { ready });
+        let _ = started.send(());
+        axum::serve(listener, router)
+            .with_graceful_shutdown(wait_for_ha_shutdown(shutdown))
+            .await
+            .map_err(|error| HaNodeError::ServiceServer(error.to_string()))
+    })
+}
+
+enum LiveSuccessorPrestage {
+    Published(Box<PublishedHaSuccessorPrestage>),
+    Finalized,
+    TargetCheckpoint,
+}
+
+fn validate_live_successor_draft(
+    prestage: &HaSuccessorPrestageConfig,
+    startup: &HaStartupConfig,
+) -> Result<(), HaStartupError> {
+    if startup.mode != HaStartupMode::Rejoin
+        || startup.predecessor.is_some()
+        || !startup.node_config.configuration_state().is_active()
+    {
+        return Err(fail(
+            "live successor requires an unbound active draft in rejoin mode",
+        ));
+    }
+    let source = prestage.archive.checkpoint_identity().map_err(error)?;
+    let target = startup.archive.checkpoint_identity().map_err(error)?;
+    if source.cluster_id() != startup.node_config.cluster_id()
+        || target.cluster_id() != startup.node_config.cluster_id()
+        || source.epoch() != startup.node_config.epoch()
+        || target.epoch() != startup.node_config.epoch()
+        || source.config_id().checked_add(1) != Some(target.config_id())
+        || target.config_id() != startup.node_config.config_id()
+        || source.recovery_generation() != target.recovery_generation()
+        || target.recovery_generation() != startup.node_config.recovery_generation()
+        || prestage.target_node_id != startup.node_config.node_id()
+        || prestage.execution_profile != startup.node_config.execution_profile()
+        || prestage.target_membership != *startup.node_config.membership()
+    {
+        return Err(fail(
+            "live successor draft, source checkpoint, and target checkpoint identities differ",
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_live_successor(
+    prestage: HaSuccessorPrestageConfig,
+    startup: &HaStartupConfig,
+) -> Result<LiveSuccessorPrestage, HaStartupError> {
+    let target_checkpoint = startup
+        .archive
+        .initialize_checkpoint()
+        .await
+        .map_err(error)?;
+    let complete = read_optional_bounded_regular_file_no_follow(
+        &startup
+            .node_config
+            .data_dir()
+            .join(SUCCESSOR_RESTORE_COMPLETE_FILE),
+        MAX_SUCCESSOR_RESTORE_CONTROL_BYTES,
+        "successor restore completion",
+    )?;
+    if complete.is_some() {
+        // A completed live successor can restart before its first target checkpoint. The child
+        // startup validates the exact receipt and predecessor Stop before it opens the runtime.
+        return Ok(LiveSuccessorPrestage::Finalized);
+    }
+    let target_manifest = target_checkpoint.manifest();
+    let target_checkpoint_empty =
+        target_manifest.tip().index() == 0 && target_manifest.segments().is_empty();
+    if !target_checkpoint_empty {
+        let active_target_snapshot = target_manifest.base().snapshot().is_some_and(|snapshot| {
+            let anchor = snapshot.anchor();
+            anchor.configuration_state().is_active()
+                && anchor.config_id() == startup.node_config.config_id()
+        });
+        if !active_target_snapshot {
+            return Err(fail(
+                "non-empty live successor checkpoint is not an active target snapshot",
+            ));
+        }
+        return Ok(LiveSuccessorPrestage::TargetCheckpoint);
+    }
+    let data_dir = startup.node_config.data_dir().clone();
+    let predecessor_config_id = prestage
+        .archive
+        .checkpoint_identity()
+        .map_err(error)?
+        .config_id();
+    match HaSuccessorPrestageConfig::resume(
+        &data_dir,
+        predecessor_config_id,
+        prestage.predecessor_membership.clone(),
+        prestage.tail_token.clone(),
+    ) {
+        Ok(prepared) => prepared
+            .publish(&data_dir)
+            .map(Box::new)
+            .map(LiveSuccessorPrestage::Published),
+        Err(resume_error) => {
+            let predecessor_configuration = rhiza_core::ConfigurationState::active(
+                predecessor_config_id,
+                prestage.predecessor_membership.digest(),
+            );
+            match inspect_successor_prestage(&data_dir, predecessor_configuration) {
+                Ok(existing) if existing.state() == SuccessorPrestageState::Finalized => {
+                    drop(existing);
+                    Ok(LiveSuccessorPrestage::Finalized)
+                }
+                Ok(existing) => {
+                    drop(existing);
+                    Err(resume_error)
+                }
+                Err(DurabilityError::DataDirNotFresh(_)) if local_data_is_fresh(&data_dir)? => {
+                    prestage
+                        .prepare()
+                        .await?
+                        .publish(&data_dir)
+                        .map(Box::new)
+                        .map(LiveSuccessorPrestage::Published)
+                }
+                Err(DurabilityError::DataDirNotFresh(_)) => Err(fail(format!(
+                    "cannot resume live successor prestage ({resume_error}); local data is not fresh"
+                ))),
+                Err(cause) => Err(error(cause)),
+            }
+        }
+    }
+}
+
+fn accept_live_predecessor(
+    bound: &mut Option<HaPredecessor>,
+    predecessor: HaPredecessor,
+) -> Result<(), HaNodeError> {
+    match bound {
+        None => {
+            *bound = Some(predecessor);
+            Ok(())
+        }
+        Some(existing) if existing == &predecessor => Ok(()),
+        Some(_) => Err(HaNodeError::Startup(fail(
+            "live successor predecessor binding changed after first observation",
+        ))),
+    }
+}
+
+fn live_successor_reached_stop(
+    learner: &PublishedHaSuccessorPrestage,
+    predecessor: &HaPredecessor,
+) -> Result<bool, HaNodeError> {
+    let durable = learner.durable_anchor().map_err(HaNodeError::Startup)?;
+    let stop = LogAnchor::new(predecessor.stop.entry.index, predecessor.stop.entry.hash);
+    if durable.index() > stop.index()
+        || (durable.index() == stop.index() && durable.hash() != stop.hash())
+    {
+        return Err(HaNodeError::Startup(fail(
+            "live successor diverged from the exact predecessor Stop",
+        )));
+    }
+    Ok(durable == stop)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_live_successor(
+    prestage: HaSuccessorPrestageConfig,
+    startup: HaStartupConfig,
+    serve: HaServeConfig,
+    staging_listener: tokio::net::TcpListener,
+    tail_source: Arc<dyn HaCertifiedTailSource>,
+    mut shutdown: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    mut predecessor_rx: tokio::sync::mpsc::UnboundedReceiver<HaPredecessor>,
+    state: tokio::sync::watch::Sender<HaNodeSnapshot>,
+) -> Result<(), HaNodeError> {
+    let staging_ready = Arc::new(AtomicBool::new(false));
+    let (staging_shutdown, staging_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (staging_started, staging_started_rx) = tokio::sync::oneshot::channel();
+    let mut staging_task = AbortHaServerOnDrop::new(spawn_successor_staging_server(
+        staging_listener,
+        Arc::clone(&staging_ready),
+        staging_shutdown_rx,
+        staging_started,
+    ));
+    let mut staging_started_rx = staging_started_rx;
+    tokio::select! {
+        biased;
+        _changed = shutdown.changed() => {
+            let deadline = shutdown.borrow().unwrap_or_else(tokio::time::Instant::now);
+            let cleanup = stop_ha_server_before(
+                &staging_shutdown,
+                &mut staging_task,
+                "successor staging service",
+                deadline,
+            ).await;
+            return finish_cancelled_live_successor(&state, cleanup);
+        }
+        result = &mut *staging_task => {
+            let error = unexpected_server_exit(result, "successor staging service");
+            publish_ha_failure(&state, error.clone());
+            return Err(error);
+        }
+        result = &mut staging_started_rx => {
+            result.map_err(|_| HaNodeError::ServiceServer(
+                "successor staging service stopped before reporting startup".into()
+            ))?;
+        }
+    }
+
+    publish_ha_state(&state, HaNodeStatus::Restoring, None, None);
+    let staged = {
+        let preparation = prepare_live_successor(prestage, &startup);
+        tokio::pin!(preparation);
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                let deadline = shutdown.borrow().unwrap_or_else(tokio::time::Instant::now);
+                let cleanup = stop_ha_server_before(
+                    &staging_shutdown,
+                    &mut staging_task,
+                    "successor staging service",
+                    deadline,
+                ).await;
+                return finish_cancelled_live_successor(&state, cleanup);
+            }
+            result = &mut *staging_task => {
+                let error = unexpected_server_exit(result, "successor staging service");
+                publish_ha_failure(&state, error.clone());
+                return Err(error);
+            }
+            result = &mut preparation => match result {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let error = HaNodeError::Startup(error);
+                    publish_ha_failure(&state, error.clone());
+                    let cleanup = stop_ha_server(
+                        &staging_shutdown,
+                        &mut staging_task,
+                        "successor staging service",
+                    ).await;
+                    return combine_ha_results(Some(error), cleanup);
+                }
+            }
+        }
+    };
+
+    if matches!(staged, LiveSuccessorPrestage::TargetCheckpoint) {
+        publish_ha_state(&state, HaNodeStatus::CatchingUp, None, None);
+        let child = startup.start_with_incumbent(
+            serve,
+            Some(IncumbentHaService {
+                shutdown: staging_shutdown,
+                task: AbortHaServerOnDrop::new(staging_task.into_inner()),
+            }),
+        );
+        return supervise_live_successor_child(child, shutdown, state).await;
+    }
+
+    let mut learner = match staged {
+        LiveSuccessorPrestage::Published(learner) => Some(*learner),
+        LiveSuccessorPrestage::Finalized => None,
+        LiveSuccessorPrestage::TargetCheckpoint => unreachable!("handled above"),
+    };
+    let finalized = learner.is_none();
+    let mut startup = Some(startup);
+    let mut bound = None;
+    publish_ha_state(&state, HaNodeStatus::CatchingUp, None, None);
+
+    let startup = loop {
+        if let Some(predecessor) = bound.as_ref() {
+            let reached = match learner.as_ref() {
+                Some(learner) => live_successor_reached_stop(learner, predecessor)?,
+                None => finalized,
+            };
+            if reached {
+                staging_ready.store(false, Ordering::Release);
+                publish_ha_state(&state, HaNodeStatus::Transitioning, None, None);
+                let configured = startup
+                    .take()
+                    .expect("live successor startup is present")
+                    .bind_live_predecessor(predecessor.clone())
+                    .map_err(HaNodeError::Startup)?;
+                let configured = match learner.take() {
+                    Some(learner) => learner.finalize(configured).map_err(HaNodeError::Startup)?,
+                    None => configured,
+                };
+                break configured;
+            }
+        }
+
+        if learner.is_none() {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    let deadline = shutdown.borrow().unwrap_or_else(tokio::time::Instant::now);
+                    let cleanup = stop_ha_server_before(
+                        &staging_shutdown,
+                        &mut staging_task,
+                        "successor staging service",
+                        deadline,
+                    ).await;
+                    return finish_cancelled_live_successor(&state, cleanup);
+                }
+                result = &mut *staging_task => {
+                    let error = unexpected_server_exit(result, "successor staging service");
+                    publish_ha_failure(&state, error.clone());
+                    return Err(error);
+                }
+                predecessor = predecessor_rx.recv() => {
+                    let predecessor = predecessor.ok_or(HaNodeError::Cancelled)?;
+                    accept_live_predecessor(&mut bound, predecessor)?;
+                }
+            }
+            continue;
+        }
+
+        let request = learner
+            .as_ref()
+            .expect("published live successor learner is present")
+            .tail_request(DEFAULT_CERTIFIED_TAIL_ENTRIES)
+            .map_err(HaNodeError::Startup)?;
+        let fetch = tail_source.fetch(&request);
+        tokio::pin!(fetch);
+        let response = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                let deadline = shutdown.borrow().unwrap_or_else(tokio::time::Instant::now);
+                let cleanup = stop_ha_server_before(
+                    &staging_shutdown,
+                    &mut staging_task,
+                    "successor staging service",
+                    deadline,
+                ).await;
+                return finish_cancelled_live_successor(&state, cleanup);
+            }
+            result = &mut *staging_task => {
+                let error = unexpected_server_exit(result, "successor staging service");
+                publish_ha_failure(&state, error.clone());
+                return Err(error);
+            }
+            predecessor = predecessor_rx.recv() => {
+                let predecessor = predecessor.ok_or(HaNodeError::Cancelled)?;
+                accept_live_predecessor(&mut bound, predecessor)?;
+                continue;
+            }
+            result = &mut fetch => result,
+        };
+        match response {
+            Ok(response) => {
+                let progress = learner
+                    .as_ref()
+                    .expect("published live successor learner is present")
+                    .apply_page(&request, &response)
+                    .map_err(HaNodeError::Startup)?;
+                let caught_up = progress.durable == progress.observed_source_tip;
+                staging_ready.store(caught_up && bound.is_none(), Ordering::Release);
+                publish_ha_state(
+                    &state,
+                    if caught_up && bound.is_none() {
+                        HaNodeStatus::PreStopReady
+                    } else {
+                        HaNodeStatus::CatchingUp
+                    },
+                    None,
+                    None,
+                );
+                if response.records.is_empty() {
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            let _ = changed;
+                            let deadline = shutdown
+                                .borrow()
+                                .unwrap_or_else(tokio::time::Instant::now);
+                            let cleanup = stop_ha_server_before(
+                                &staging_shutdown,
+                                &mut staging_task,
+                                "successor staging service",
+                                deadline,
+                            ).await;
+                            return finish_cancelled_live_successor(&state, cleanup);
+                        }
+                        result = &mut *staging_task => {
+                            let error = unexpected_server_exit(
+                                result,
+                                "successor staging service",
+                            );
+                            publish_ha_failure(&state, error.clone());
+                            return Err(error);
+                        }
+                        predecessor = predecessor_rx.recv() => {
+                            let predecessor = predecessor.ok_or(HaNodeError::Cancelled)?;
+                            accept_live_predecessor(&mut bound, predecessor)?;
+                        }
+                        () = tokio::time::sleep(SUCCESSOR_TAIL_RETRY_DELAY) => {}
+                    }
+                }
+            }
+            Err(HaCertifiedTailError::Unavailable(_)) => {
+                staging_ready.store(false, Ordering::Release);
+                publish_ha_state(&state, HaNodeStatus::CatchingUp, None, None);
+                tokio::time::sleep(SUCCESSOR_TAIL_RETRY_DELAY).await;
+            }
+            Err(
+                error @ (HaCertifiedTailError::RebaseRequired(_)
+                | HaCertifiedTailError::Rejected(_)),
+            ) => {
+                let error = HaNodeError::CertifiedTail(error);
+                publish_ha_failure(&state, error.clone());
+                let cleanup = stop_ha_server(
+                    &staging_shutdown,
+                    &mut staging_task,
+                    "successor staging service",
+                )
+                .await;
+                return combine_ha_results(Some(error), cleanup);
+            }
+        }
+    };
+
+    let child = startup.start_with_incumbent(
+        serve,
+        Some(IncumbentHaService {
+            shutdown: staging_shutdown,
+            task: AbortHaServerOnDrop::new(staging_task.into_inner()),
+        }),
+    );
+    supervise_live_successor_child(child, shutdown, state).await
+}
+
+fn finish_cancelled_live_successor(
+    state: &tokio::sync::watch::Sender<HaNodeSnapshot>,
+    cleanup: Result<(), HaNodeError>,
+) -> Result<(), HaNodeError> {
+    match cleanup {
+        Ok(()) => {
+            publish_ha_state(state, HaNodeStatus::Stopped, None, None);
+            Ok(())
+        }
+        Err(error) => {
+            publish_ha_failure(state, error.clone());
+            Err(error)
+        }
+    }
+}
+
+async fn supervise_live_successor_child(
+    child: HaNode,
+    mut shutdown: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    state: tokio::sync::watch::Sender<HaNodeSnapshot>,
+) -> Result<(), HaNodeError> {
+    let mut child_state = child.state.clone();
+    loop {
+        let snapshot = child_state.borrow().clone();
+        publish_ha_state(
+            &state,
+            snapshot.status,
+            snapshot.handle.clone(),
+            snapshot.terminal_error.clone(),
+        );
+        if let Some(error) = snapshot.terminal_error {
+            let _ = child.shutdown().await;
+            publish_ha_failure(&state, error.clone());
+            return Err(error);
+        }
+        if snapshot.status == HaNodeStatus::Stopped {
+            let result = child.shutdown().await;
+            return match result {
+                Ok(()) => {
+                    publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+                    Ok(())
+                }
+                Err(error) => {
+                    publish_ha_failure(&state, error.clone());
+                    Err(error)
+                }
+            };
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                let deadline = shutdown.borrow().unwrap_or_else(tokio::time::Instant::now);
+                publish_ha_state(&state, HaNodeStatus::ShuttingDown, None, None);
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let result = child.shutdown_with_timeout(remaining).await;
+                return match result {
+                    Ok(()) => {
+                        publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        publish_ha_failure(&state, error.clone());
+                        Err(error)
+                    }
+                };
+            }
+            changed = child_state.changed() => {
+                if changed.is_err() {
+                    let error = HaNodeError::Shutdown(
+                        "HA child supervisor state channel closed".into(),
+                    );
+                    let _ = child.shutdown().await;
+                    publish_ha_failure(&state, error.clone());
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supervise_ha_node(
+    startup_config: HaStartupConfig,
+    serve: HaServeConfig,
+    incumbent_service: Option<IncumbentHaService>,
+    startup_io: StartupIoContext,
+    shutdown: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    recorder_shutdown: tokio::sync::watch::Sender<bool>,
+    recorder_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    service_shutdown: tokio::sync::watch::Sender<bool>,
+    service_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    state: tokio::sync::watch::Sender<HaNodeSnapshot>,
+) -> Result<(), HaNodeError> {
+    let preparation_startup = startup_io.clone();
+    let preparation = startup_config.prepare(&preparation_startup);
+    tokio::pin!(preparation);
+    let prepared = loop {
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || shutdown_rx.borrow().is_some() {
+                    let deadline = shutdown_rx
+                        .borrow()
+                        .unwrap_or_else(tokio::time::Instant::now);
+                    startup_io.cancel(deadline.into_std());
+                    let missed_deadline = tokio::time::timeout_at(deadline, &mut preparation)
+                        .await
+                        .is_err();
+                    if missed_deadline {
+                        let stage = startup_io.unfinished_stage().to_owned();
+                        let _ = preparation.await;
+                        let error = HaNodeError::StartupIoDeadlineExceeded { stage };
+                        publish_ha_failure(&state, error.clone());
+                        return Err(error);
+                    }
+                    publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+                    return Ok(());
+                }
+            }
+            result = &mut preparation => {
+                break match result {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let error = HaNodeError::Startup(error);
+                        publish_ha_failure(&state, error.clone());
+                        return Err(error);
+                    }
+                };
+            }
+        }
+    };
+
+    let HaServeConfig {
+        recorder_listener,
+        service_listener,
+        recorder_transport,
+        recorders,
+        log_peers,
+        admin,
+        tail_token,
+    } = serve;
+    if let Some(deadline) = *shutdown_rx.borrow() {
+        startup_io.cancel(deadline.into_std());
+        if tokio::time::Instant::now() >= deadline {
+            let error = HaNodeError::StartupIoDeadlineExceeded {
+                stage: startup_io.unfinished_stage().to_owned(),
+            };
+            publish_ha_failure(&state, error.clone());
+            return Err(error);
+        }
+        publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+        return Ok(());
+    }
+    let peers = prepared.config.node_config.peers().to_vec();
+    let recovery_generation = prepared.config.node_config.recovery_generation();
+    let recorder = prepared.recorder_hook.clone();
+    let (recorder_started, recorder_started_rx) = tokio::sync::oneshot::channel();
+    let recorder_task = {
+        let shutdown_guard = shutdown_rx.borrow();
+        if let Some(deadline) = *shutdown_guard {
+            startup_io.cancel(deadline.into_std());
+            publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+            return Ok(());
+        }
+        spawn_ha_recorder_server(
+            recorder_listener,
+            recorder,
+            recorder_transport,
+            peers,
+            recovery_generation,
+            recorder_shutdown_rx,
+            recorder_started,
+        )
+    };
+    let mut recorder_task = recorder_task;
+    let mut recorder_started_rx = recorder_started_rx;
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || shutdown_rx.borrow().is_some() {
+                    let deadline = shutdown_rx
+                        .borrow()
+                        .unwrap_or_else(tokio::time::Instant::now);
+                    startup_io.cancel(deadline.into_std());
+                    publish_ha_state(&state, HaNodeStatus::ShuttingDown, None, None);
+                    let cleanup = stop_ha_server_before(
+                        &recorder_shutdown,
+                        &mut recorder_task,
+                        "recorder server",
+                        deadline,
+                    )
+                    .await;
+                    return match cleanup {
+                        Ok(()) => {
+                            publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            publish_ha_failure(&state, error.clone());
+                            Err(error)
+                        }
+                    };
+                }
+            }
+            result = &mut recorder_started_rx => {
+                result.map_err(|_| {
+                    HaNodeError::RecorderServer(
+                        "recorder ingress stopped before reporting startup".to_owned(),
+                    )
+                })?;
+                break;
+            }
+        }
+    }
+
+    supervise_prepared_ha_node(
+        prepared,
+        service_listener,
+        incumbent_service,
+        recorders,
+        log_peers,
+        admin,
+        tail_token,
+        startup_io,
+        shutdown,
+        shutdown_rx,
+        recorder_shutdown,
+        recorder_task,
+        service_shutdown,
+        service_shutdown_rx,
+        state,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_prepared_ha_node(
     prepared: PreparedHaStartup,
     service_listener: tokio::net::TcpListener,
+    mut incumbent_service: Option<IncumbentHaService>,
     recorders: Vec<(String, Box<dyn RecorderRpc>)>,
     log_peers: Vec<Arc<dyn LogPeer>>,
     admin: Option<AdminConfig>,
     tail_token: Option<String>,
+    startup_io: StartupIoContext,
     shutdown: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
     shutdown_rx: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
     recorder_shutdown: tokio::sync::watch::Sender<bool>,
     mut recorder_task: HaServerTask,
+    service_shutdown: tokio::sync::watch::Sender<bool>,
+    service_shutdown_rx: tokio::sync::watch::Receiver<bool>,
     state: tokio::sync::watch::Sender<HaNodeSnapshot>,
 ) -> Result<(), HaNodeError> {
     let opened = {
-        let startup = prepared.open_cancellable(recorders, log_peers, shutdown_rx.clone());
+        let startup = prepared.open_cancellable(
+            recorders,
+            log_peers,
+            startup_io.clone(),
+            shutdown_rx.clone(),
+        );
         tokio::pin!(startup);
         tokio::select! {
             result = &mut startup => match result {
@@ -1243,18 +2269,11 @@ async fn supervise_ha_node(
                         deadline,
                     )
                     .await;
-                    let cleanup = combine_ha_errors(
-                        startup_cleanup
-                            .err()
-                            .into_iter()
-                            .chain(recorder_cleanup.err())
-                            .collect(),
-                    );
+                    let cleanup = match startup_cleanup {
+                        Ok(()) => recorder_cleanup,
+                        Err(primary) => combine_ha_results(Some(primary), recorder_cleanup),
+                    };
                     if let Err(error) = cleanup {
-                        let error = HaNodeError::Cleanup {
-                            primary: Box::new(HaNodeError::Cancelled),
-                            cleanup: Box::new(error),
-                        };
                         publish_ha_failure(&state, error.clone());
                         return Err(error);
                     }
@@ -1286,8 +2305,45 @@ async fn supervise_ha_node(
                 }
             },
             result = &mut recorder_task => {
+                let requested_shutdown = *shutdown_rx.borrow();
+                if let Some(deadline) = requested_shutdown {
+                    let _ = result;
+                    publish_ha_state(&state, HaNodeStatus::ShuttingDown, None, None);
+                    let cleanup = match startup.await {
+                        Ok(opened) => {
+                            shutdown_opened_ha_startup_before(
+                                opened,
+                                &recorder_shutdown,
+                                &mut recorder_task,
+                                false,
+                                deadline,
+                            )
+                            .await
+                        }
+                        Err(HaOpenError::Cancelled { cleanup, .. }) => cleanup,
+                        Err(HaOpenError::Startup {
+                            error: startup_error,
+                            cleanup,
+                        }) => combine_ha_results(
+                            Some(HaNodeError::Startup(startup_error)),
+                            cleanup,
+                        ),
+                    };
+                    return match cleanup {
+                        Ok(()) => {
+                            publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            publish_ha_failure(&state, error.clone());
+                            Err(error)
+                        }
+                    };
+                }
                 let error = unexpected_server_exit(result, "recorder server");
-                let deadline = request_ha_shutdown(&shutdown, || {});
+                let deadline =
+                    request_ha_shutdown(&shutdown, HA_SERVER_SHUTDOWN_TIMEOUT, || {});
+                startup_io.cancel(deadline.into_std());
                 publish_ha_failure(&state, error.clone());
                 let cleanup = match tokio::time::timeout_at(deadline, &mut startup).await {
                     Ok(Ok(opened)) => {
@@ -1307,9 +2363,33 @@ async fn supervise_ha_node(
                     })) => {
                         combine_ha_results(Some(HaNodeError::Startup(startup_error)), cleanup)
                     }
-                    Err(_) => Err(HaNodeError::Shutdown(
-                        "HA startup did not stop before the shutdown deadline".into(),
-                    )),
+                    Err(_) => {
+                        let stage = startup_io.unfinished_stage().to_owned();
+                        let late_cleanup = match startup.await {
+                            Ok(opened) => {
+                                shutdown_opened_ha_startup_before(
+                                    opened,
+                                    &recorder_shutdown,
+                                    &mut recorder_task,
+                                    false,
+                                    deadline,
+                                )
+                                .await
+                            }
+                            Err(HaOpenError::Cancelled { cleanup, .. }) => cleanup,
+                            Err(HaOpenError::Startup {
+                                error: startup_error,
+                                cleanup,
+                            }) => combine_ha_results(
+                                Some(HaNodeError::Startup(startup_error)),
+                                cleanup,
+                            ),
+                        };
+                        combine_ha_results(
+                            Some(HaNodeError::StartupIoDeadlineExceeded { stage }),
+                            late_cleanup,
+                        )
+                    }
                 };
                 return combine_ha_results(Some(error), cleanup);
             }
@@ -1320,6 +2400,9 @@ async fn supervise_ha_node(
     let coordinator = opened.coordinator();
     let recorder = opened.local_recorder();
     let recorder_hook = opened.recorder_hook.clone();
+    let auto_activate_stop = opened.auto_activate_stop;
+    let successor_stop = opened.successor_stop;
+    let target_config_id = opened.target_config_id;
     let router = match admin {
         Some(admin) => node_router_with_checkpoint_and_admin_tasks(
             runtime.clone(),
@@ -1380,16 +2463,72 @@ async fn supervise_ha_node(
             }
         };
     }
+    if let Some(mut incumbent) = incumbent_service.take() {
+        if let Err(error) = stop_ha_server(
+            &incumbent.shutdown,
+            &mut incumbent.task,
+            "successor staging service",
+        )
+        .await
+        {
+            publish_ha_failure(&state, error.clone());
+            let cleanup =
+                shutdown_opened_ha_startup(opened, &recorder_shutdown, &mut recorder_task, true)
+                    .await;
+            return combine_ha_results(Some(error), cleanup);
+        }
+    }
     let owner = opened.into_rhiza();
     let handle = owner.handle();
-    let (service_shutdown, service_shutdown_rx) = tokio::sync::watch::channel(false);
     let (service_started, service_started_rx) = tokio::sync::oneshot::channel();
-    let mut service_task = spawn_ha_service_server(
-        service_listener,
-        router.clone(),
-        service_shutdown_rx,
-        service_started,
-    );
+    let (service_task, pre_service_deadline) = {
+        let shutdown_guard = shutdown_rx.borrow();
+        match *shutdown_guard {
+            Some(deadline) => (None, Some(deadline)),
+            None => (
+                Some(spawn_ha_service_server(
+                    service_listener,
+                    router.clone(),
+                    service_shutdown_rx,
+                    service_started,
+                )),
+                None,
+            ),
+        }
+    };
+    if let Some(deadline) = pre_service_deadline {
+        publish_ha_state(&state, HaNodeStatus::ShuttingDown, None, None);
+        let mut service_task = tokio::spawn(async { Ok(()) });
+        let _ = (&mut service_task).await;
+        let cleanup = shutdown_ha_runtime_before(
+            owner,
+            runtime,
+            admin_tasks.as_ref(),
+            &service_shutdown,
+            &mut service_task,
+            false,
+            &recorder_shutdown,
+            &mut recorder_task,
+            true,
+            deadline,
+        )
+        .await;
+        return match cleanup {
+            Ok(()) => {
+                publish_ha_state(&state, HaNodeStatus::Stopped, None, None);
+                Ok(())
+            }
+            Err(cleanup) => {
+                let error = HaNodeError::Cleanup {
+                    primary: Box::new(HaNodeError::Cancelled),
+                    cleanup: Box::new(cleanup),
+                };
+                publish_ha_failure(&state, error.clone());
+                Err(error)
+            }
+        };
+    }
+    let mut service_task = service_task.expect("service task is present without shutdown");
     let mut service_start_shutdown = shutdown_rx.clone();
     match wait_for_service_start_or_shutdown(service_started_rx, &mut service_start_shutdown).await
     {
@@ -1472,14 +2611,27 @@ async fn supervise_ha_node(
             }
         };
     }
-    update_ha_readiness(&state, &handle, &coordinator, &shutdown_rx).await;
+    let initial_readiness = update_ha_readiness(
+        &state,
+        &handle,
+        &runtime,
+        &coordinator,
+        auto_activate_stop,
+        successor_stop,
+        target_config_id,
+        &startup_io,
+        &shutdown_rx,
+    )
+    .await;
 
     let mut shutdown_rx = shutdown_rx;
     let mut status_tick = tokio::time::interval(HA_STATUS_POLL_INTERVAL);
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut recorder_running = true;
     let mut service_running = true;
-    let terminal = {
+    let terminal = if let Err(error) = initial_readiness {
+        Some(error)
+    } else {
         let worker_failure = owner.wait_for_worker_failure();
         tokio::pin!(worker_failure);
         loop {
@@ -1507,22 +2659,42 @@ async fn supervise_ha_node(
                     });
                 }
                 _ = status_tick.tick() => {
-                    update_ha_readiness(&state, &handle, &coordinator, &shutdown_rx).await;
+                    if let Err(error) = update_ha_readiness(
+                        &state,
+                        &handle,
+                        &runtime,
+                        &coordinator,
+                        auto_activate_stop,
+                        successor_stop,
+                        target_config_id,
+                        &startup_io,
+                        &shutdown_rx,
+                    )
+                    .await
+                    {
+                        break Some(error);
+                    }
                 }
             }
         }
     };
 
     let deadline = if let Some(error) = &terminal {
-        let deadline = request_ha_shutdown(&shutdown, || handle.close_admission());
+        let deadline = request_ha_shutdown(&shutdown, HA_SERVER_SHUTDOWN_TIMEOUT, || {
+            handle.close_admission()
+        });
+        startup_io.cancel(deadline.into_std());
         publish_ha_failure(&state, error.clone());
         deadline
     } else {
         publish_ha_state(&state, HaNodeStatus::ShuttingDown, None, None);
-        shutdown_rx
-            .borrow()
-            .unwrap_or_else(|| request_ha_shutdown(&shutdown, || handle.close_admission()))
+        shutdown_rx.borrow().unwrap_or_else(|| {
+            request_ha_shutdown(&shutdown, HA_SERVER_SHUTDOWN_TIMEOUT, || {
+                handle.close_admission()
+            })
+        })
     };
+    startup_io.cancel(deadline.into_std());
     let cleanup = shutdown_ha_runtime_before(
         owner,
         runtime,
@@ -1584,24 +2756,143 @@ async fn wait_for_service_start_or_shutdown(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_ha_readiness(
     state: &tokio::sync::watch::Sender<HaNodeSnapshot>,
     handle: &RhizaHandle,
+    runtime: &Arc<NodeRuntime>,
     coordinator: &CheckpointCoordinator,
+    auto_activate_stop: Option<LogAnchor>,
+    successor_stop: Option<LogAnchor>,
+    target_config_id: u64,
+    startup: &StartupIoContext,
     shutdown: &tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
-) {
-    let status = handle.status().await;
+) -> Result<(), HaNodeError> {
+    if let Err(error) = startup.check("activation status") {
+        if shutdown.borrow().is_some() {
+            return Ok(());
+        }
+        return Err(HaNodeError::Startup(fail(error.to_string())));
+    }
+    let attempt_runtime = Arc::clone(runtime);
+    let mut attempt = tokio::task::spawn_blocking(move || {
+        let status = attempt_runtime.status()?;
+        let Some(expected_stop) = auto_activate_stop else {
+            return Ok(status);
+        };
+        if status.configuration_state.is_active() {
+            return Ok(status);
+        }
+        if status.configuration_state.stop().copied() != Some(expected_stop) {
+            return Err(NodeError::PreconditionFailed(
+                "live successor activation Stop anchor changed".into(),
+            ));
+        }
+        match attempt_runtime.activate_successor_if(target_config_id) {
+            Ok(_) => attempt_runtime.status(),
+            Err(activation_error) => {
+                let current = attempt_runtime.status()?;
+                if current.configuration_state.is_active()
+                    || activation_error.classification().retryable()
+                {
+                    Ok(current)
+                } else {
+                    Err(activation_error)
+                }
+            }
+        }
+    });
+    let status = loop {
+        let mut shutdown = shutdown.clone();
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown.borrow().is_some() {
+                    let deadline = shutdown
+                        .borrow()
+                        .unwrap_or_else(tokio::time::Instant::now);
+                    startup.cancel(deadline.into_std());
+                    match tokio::time::timeout_at(deadline, &mut attempt).await {
+                        Ok(result) => {
+                            let _ = result.map_err(|error| {
+                                HaNodeError::Shutdown(format!(
+                                    "activation status task failed during shutdown: {error}"
+                                ))
+                            })?;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            let stage = startup.unfinished_stage().to_owned();
+                            let _ = attempt.await;
+                            return Err(HaNodeError::StartupIoDeadlineExceeded { stage });
+                        }
+                    }
+                }
+            }
+            result = &mut attempt => {
+                break result.map_err(|error| {
+                    HaNodeError::Shutdown(format!("activation status task failed: {error}"))
+                })?;
+            }
+        }
+    };
+    if status
+        .as_ref()
+        .is_ok_and(|status| status.configuration_state.is_active())
+        && coordinator.successor_checkpoint_baseline_required()
+    {
+        let predecessor_stop = successor_stop.ok_or_else(|| {
+            HaNodeError::Startup(fail(
+                "successor checkpoint baseline is missing its predecessor Stop capability",
+            ))
+        })?;
+        let baseline =
+            coordinator.establish_successor_checkpoint_baseline(runtime, predecessor_stop);
+        tokio::pin!(baseline);
+        let mut baseline_shutdown = shutdown.clone();
+        let result = tokio::select! {
+            biased;
+            changed = baseline_shutdown.changed() => {
+                if changed.is_err() || baseline_shutdown.borrow().is_some() {
+                    return Ok(());
+                }
+                return Ok(());
+            }
+            result = &mut baseline => result,
+        };
+        if let Err(error) = result {
+            if matches!(
+                error,
+                DurabilityError::Unavailable
+                    | DurabilityError::Archive(
+                        rhiza_archive::Error::ObjectStore(_)
+                            | rhiza_archive::Error::CompareAndSwapRetriesExhausted { .. }
+                            | rhiza_archive::Error::GcBarrierActive { .. }
+                            | rhiza_archive::Error::GcBarrierBusy { .. }
+                    )
+            ) {
+                publish_ha_state(state, HaNodeStatus::Degraded, Some(handle.clone()), None);
+                return Ok(());
+            }
+            return Err(HaNodeError::Startup(fail(error.to_string())));
+        }
+    }
     let phase = match status {
         Ok(status) if !status.configuration_state.is_active() => HaNodeStatus::AwaitingActivation,
         Ok(status) if status.ready && coordinator.write_allowed().is_ok() => HaNodeStatus::Ready,
-        Ok(_) | Err(_) => HaNodeStatus::Degraded,
+        Ok(_) => HaNodeStatus::Degraded,
+        Err(error) if auto_activate_stop.is_none() || error.classification().retryable() => {
+            HaNodeStatus::Degraded
+        }
+        Err(error) => return Err(HaNodeError::Startup(fail(error.to_string()))),
     };
     let shutdown_guard = shutdown.borrow();
     if shutdown_guard.is_some() {
-        return;
+        return Ok(());
     }
     publish_ha_state(state, phase, Some(handle.clone()), None);
     drop(shutdown_guard);
+    Ok(())
 }
 
 fn publish_ha_state(
@@ -1792,6 +3083,7 @@ async fn wait_for_ha_server(
         ))),
         Err(_) => {
             task.abort();
+            let _ = (&mut *task).await;
             Err(HaNodeError::Shutdown(format!(
                 "{name} did not stop before the shutdown deadline"
             )))
@@ -2041,12 +3333,16 @@ async fn prepare_standard(
     archive: &ObjectArchiveStore,
     mode: HaStartupMode,
     membership: &Membership,
+    startup: &StartupIoContext,
 ) -> Result<StartupPreparation, HaStartupError> {
     let data_dir = config.data_dir();
     let node_id = config.node_id();
     let execution_profile = config.execution_profile();
     match mode {
         HaStartupMode::Bootstrap => {
+            startup
+                .check("bootstrap local data inspection")
+                .map_err(error)?;
             if !local_data_is_fresh(data_dir)? {
                 return Err(fail("bootstrap requires a fresh local data directory"));
             }
@@ -2055,6 +3351,9 @@ async fn prepare_standard(
                 .await
                 .map_err(error)?
                 .ok_or_else(|| fail("bootstrap requires an initialized empty checkpoint"))?;
+            startup
+                .check("bootstrap checkpoint validation")
+                .map_err(error)?;
             if loaded.manifest().tip().index() != 0 || !loaded.manifest().segments().is_empty() {
                 return Err(fail("bootstrap requires an initialized empty checkpoint"));
             }
@@ -2069,6 +3368,7 @@ async fn prepare_standard(
             })
         }
         HaStartupMode::Rejoin if local_data_is_fresh(data_dir)? => {
+            startup.check("rejoin checkpoint restore").map_err(error)?;
             let identity = archive.checkpoint_identity().map_err(error)?;
             let marker =
                 encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
@@ -2082,6 +3382,9 @@ async fn prepare_standard(
                 )
                 .await
                 .map_err(error)?;
+            startup
+                .check("rejoin checkpoint marker validation")
+                .map_err(error)?;
             read_and_validate_local_checkpoint_identity_marker(
                 data_dir,
                 execution_profile,
@@ -2094,11 +3397,17 @@ async fn prepare_standard(
             })
         }
         HaStartupMode::Rejoin => {
+            startup
+                .check("rejoin checkpoint inspection")
+                .map_err(error)?;
             let loaded = archive
                 .load_checkpoint()
                 .await
                 .map_err(error)?
                 .ok_or_else(|| fail("rejoin requires an initialized checkpoint"))?;
+            startup
+                .check("recorder preflight and recovery")
+                .map_err(error)?;
             let identity = loaded.manifest().identity();
             let checkpoint_root = LogAnchor::new(
                 loaded.manifest().tip().index(),
@@ -2127,6 +3436,9 @@ async fn prepare_standard(
                 membership,
             )?;
             if restore_state != rhiza_node::durability::CheckpointRestoreState::None {
+                startup
+                    .check("rejoin interrupted checkpoint restore")
+                    .map_err(error)?;
                 let marker =
                     encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
                 let tip = if execution_profile == ExecutionProfile::Graph {
@@ -2150,6 +3462,9 @@ async fn prepare_standard(
                     .await
                 }
                 .map_err(error)?;
+                startup
+                    .check("rejoin restored checkpoint validation")
+                    .map_err(error)?;
                 read_and_validate_local_checkpoint_identity_marker(
                     data_dir,
                     execution_profile,
@@ -2174,6 +3489,9 @@ async fn prepare_standard(
                 execution_profile,
                 checkpoint_root,
             ) {
+                startup
+                    .check("rejoin recovery-view restore")
+                    .map_err(error)?;
                 eprintln!(
                     "local recovery view is not trustworthy ({view_error}); quarantining rebuildable state and restoring the verified checkpoint"
                 );
@@ -2193,6 +3511,9 @@ async fn prepare_standard(
                         "rebuildable local recovery view was quarantined but verified checkpoint restore failed: {restore_error}"
                     ))
                 })?;
+                startup
+                    .check("rejoin recovery-view validation")
+                    .map_err(error)?;
                 read_and_validate_local_checkpoint_identity_marker(
                     data_dir,
                     execution_profile,
@@ -2216,12 +3537,18 @@ async fn prepare_standard(
             })
         }
         HaStartupMode::Disaster => {
+            startup
+                .check("disaster checkpoint inspection")
+                .map_err(error)?;
             let identity = archive.checkpoint_identity().map_err(error)?;
             let checkpoint = archive
                 .load_checkpoint()
                 .await
                 .map_err(error)?
                 .ok_or_else(|| fail("disaster startup requires an initialized checkpoint"))?;
+            startup
+                .check("disaster restore preparation")
+                .map_err(error)?;
             let checkpoint_root = LogAnchor::new(
                 checkpoint.manifest().tip().index(),
                 checkpoint.manifest().tip().hash(),
@@ -2254,6 +3581,9 @@ async fn prepare_standard(
             )
             .await
             .map_err(error)?;
+            startup
+                .check("disaster checkpoint validation")
+                .map_err(error)?;
             read_and_validate_local_checkpoint_identity_marker(
                 data_dir,
                 execution_profile,
@@ -2273,20 +3603,47 @@ async fn prepare_successor(
     mode: HaStartupMode,
     target_config_id: u64,
     predecessor: &HaPredecessor,
+    startup: &StartupIoContext,
 ) -> Result<StartupPreparation, HaStartupError> {
+    startup
+        .check("successor binding validation")
+        .map_err(error)?;
     if mode != HaStartupMode::Rejoin {
         return Err(fail("successor startup requires rejoin mode"));
     }
     validate_predecessor_binding(config, target_config_id, predecessor)?;
-    let initialized = archive.initialize_checkpoint().await.map_err(error)?;
-    if initialized.manifest().tip().index() != 0 || !initialized.manifest().segments().is_empty() {
-        return Err(fail(
-            "successor target checkpoint namespace must be empty before activation",
-        ));
+    match inspect_successor_prestage(
+        config.data_dir(),
+        config.log_initial_configuration().clone(),
+    ) {
+        Ok(prestage) => {
+            startup
+                .check("finalized successor prestage adoption")
+                .map_err(error)?;
+            let restore = adopt_finalized_successor_prestage(
+                prestage,
+                config,
+                &predecessor.stop,
+                &predecessor.membership,
+            )
+            .map_err(error)?;
+            drop(restore);
+        }
+        Err(DurabilityError::DataDirNotFresh(_)) => {}
+        Err(cause) => return Err(error(cause)),
     }
+    startup
+        .check("successor checkpoint initialization")
+        .map_err(error)?;
+    let initialized = archive.initialize_checkpoint().await.map_err(error)?;
+    startup
+        .check("successor restore inspection")
+        .map_err(error)?;
+    let target_checkpoint_empty =
+        initialized.manifest().tip().index() == 0 && initialized.manifest().segments().is_empty();
     let identity = archive.checkpoint_identity().map_err(error)?;
     let data_dir = config.data_dir();
-    let _exact_marker_exists = exact_checkpoint_marker_exists(
+    let exact_marker_exists = exact_checkpoint_marker_exists(
         data_dir,
         config.execution_profile(),
         identity,
@@ -2299,6 +3656,35 @@ async fn prepare_successor(
             "successor startup requires a finalized local prestage receipt",
         ));
     }
+    if !target_checkpoint_empty {
+        let minimum_activation_index = predecessor
+            .stop
+            .entry
+            .index
+            .checked_add(1)
+            .ok_or_else(|| fail("successor Activate index cannot advance"))?;
+        let active_target_baseline =
+            initialized
+                .manifest()
+                .base()
+                .snapshot()
+                .is_some_and(|snapshot| {
+                    let anchor = snapshot.anchor();
+                    anchor.configuration_state().is_active()
+                        && anchor.config_id() == target_config_id
+                        && anchor.compacted().index() >= minimum_activation_index
+                });
+        if !active_target_baseline
+            || (controls == SuccessorRestoreControlState::Complete && !exact_marker_exists)
+        {
+            return Err(fail(
+                "non-empty successor checkpoint requires an active target snapshot and exact completed local identity",
+            ));
+        }
+    }
+    startup
+        .check("recorder preflight and recovery")
+        .map_err(error)?;
     let recorder_state = preflight_local_recorder(data_dir, identity, config.membership())?;
     let recorder_state = recover_local_recorder_before_view_recovery(
         recorder_state,
@@ -2308,11 +3694,20 @@ async fn prepare_successor(
         config.membership(),
     )?;
     if recorder_state == LocalRecorderState::Missing {
+        startup
+            .check("successor recorder installation")
+            .map_err(error)?;
         install_successor_recorder_for_startup(config, target_config_id, predecessor)?;
     }
     if controls == SuccessorRestoreControlState::Intent {
+        startup
+            .check("successor restore completion")
+            .map_err(error)?;
         complete_adopted_successor_prestage(data_dir, &expected).map_err(error)?;
     }
+    startup
+        .check("successor checkpoint marker publication")
+        .map_err(error)?;
     write_local_checkpoint_identity_marker(
         data_dir,
         config.execution_profile(),
@@ -2644,6 +4039,7 @@ async fn open_runtime_with_retry(
     config: NodeConfig,
     consensus: Arc<ThreeNodeConsensus>,
     peers: Vec<Arc<dyn LogPeer>>,
+    startup: &StartupIoContext,
     shutdown: &mut tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<Arc<NodeRuntime>, HaOpenError> {
     let mut last_retry_error = None;
@@ -2657,12 +4053,18 @@ async fn open_runtime_with_retry(
         let attempt_config = config.clone();
         let attempt_consensus = consensus.clone();
         let attempt_peers = peers.clone();
+        let attempt_startup = startup.clone();
         let mut attempt = tokio::task::spawn_blocking(move || {
             let peer_refs = attempt_peers
                 .iter()
                 .map(|peer| peer.as_ref())
                 .collect::<Vec<_>>();
-            NodeRuntime::open(attempt_config, attempt_consensus, &peer_refs)
+            NodeRuntime::open_cancellable(
+                attempt_config,
+                attempt_consensus,
+                &peer_refs,
+                &attempt_startup,
+            )
         });
         let result = loop {
             tokio::select! {
@@ -2673,8 +4075,9 @@ async fn open_runtime_with_retry(
                             .borrow()
                             .unwrap_or_else(tokio::time::Instant::now);
                         let cleanup = cancel_runtime_open_attempt(
-                            &mut attempt,
+                            attempt,
                             &consensus,
+                            startup,
                             deadline,
                         )
                         .await;
@@ -2706,25 +4109,19 @@ async fn open_runtime_with_retry(
 }
 
 async fn cancel_runtime_open_attempt(
-    attempt: &mut tokio::task::JoinHandle<Result<NodeRuntime, NodeError>>,
+    mut attempt: tokio::task::JoinHandle<Result<NodeRuntime, NodeError>>,
     consensus: &Arc<ThreeNodeConsensus>,
+    startup: &StartupIoContext,
     deadline: tokio::time::Instant,
 ) -> Result<(), HaNodeError> {
-    let attempt_deadline = deadline
-        .checked_sub(HA_STARTUP_CLEANUP_GRACE)
-        .unwrap_or(deadline);
-    match tokio::time::timeout_at(attempt_deadline, &mut *attempt).await {
+    startup.cancel(deadline.into_std());
+    match tokio::time::timeout_at(deadline, &mut attempt).await {
         Ok(result) => cleanup_completed_runtime_open(result, consensus, deadline),
         Err(_) => {
-            attempt.abort();
-            let mut errors = vec![HaNodeError::Shutdown(
-                "runtime startup task did not stop before the shutdown deadline".into(),
-            )];
-            if !finish_ha_pending_consensus_rpcs(consensus, Duration::ZERO) {
-                errors.push(HaNodeError::Shutdown(
-                    "pending consensus RPCs did not drain before the shutdown deadline".into(),
-                ));
-            }
+            let stage = startup.unfinished_stage().to_owned();
+            let result = attempt.await;
+            let mut errors = vec![HaNodeError::StartupIoDeadlineExceeded { stage }];
+            errors.extend(cleanup_completed_runtime_open_quiescent(result, consensus).err());
             combine_ha_errors(errors)
         }
     }
@@ -2752,6 +4149,22 @@ fn cleanup_completed_runtime_open(
     combine_ha_errors(errors)
 }
 
+fn cleanup_completed_runtime_open_quiescent(
+    result: Result<Result<NodeRuntime, NodeError>, tokio::task::JoinError>,
+    consensus: &Arc<ThreeNodeConsensus>,
+) -> Result<(), HaNodeError> {
+    let mut errors = Vec::new();
+    match result {
+        Ok(Ok(runtime)) => runtime.cancel_operations(),
+        Ok(Err(_)) => {}
+        Err(error) => errors.push(HaNodeError::Shutdown(format!(
+            "runtime startup task failed during cancellation: {error}"
+        ))),
+    }
+    finish_ha_pending_consensus_rpcs(consensus, Duration::MAX);
+    combine_ha_errors(errors)
+}
+
 fn finish_ha_pending_consensus_rpcs(consensus: &ThreeNodeConsensus, timeout: Duration) -> bool {
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
@@ -2767,17 +4180,20 @@ async fn rehydrate_recorder_with_retry(
     runtime: Arc<NodeRuntime>,
     recorder: RecorderFileStore,
     checkpoint_index: u64,
+    startup: &StartupIoContext,
     shutdown: &mut tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), HaOpenError> {
     loop {
         require_startup_active(shutdown)?;
         let attempt_runtime = runtime.clone();
         let attempt_recorder = recorder.clone();
+        let attempt_startup = startup.clone();
         let mut attempt = tokio::task::spawn_blocking(move || {
             rehydrate_recorder_after_checkpoint(
                 &attempt_runtime,
                 &attempt_recorder,
                 checkpoint_index,
+                &attempt_startup,
             )
         });
         let result = loop {
@@ -2789,8 +4205,9 @@ async fn rehydrate_recorder_with_retry(
                             .borrow()
                             .unwrap_or_else(tokio::time::Instant::now);
                         let cleanup = cancel_rehydrate_attempt(
-                            &mut attempt,
+                            attempt,
                             &runtime,
+                            startup,
                             deadline,
                         )
                         .await;
@@ -2820,26 +4237,20 @@ async fn rehydrate_recorder_with_retry(
 }
 
 async fn cancel_rehydrate_attempt(
-    attempt: &mut tokio::task::JoinHandle<Result<(), NodeError>>,
+    mut attempt: tokio::task::JoinHandle<Result<(), NodeError>>,
     runtime: &Arc<NodeRuntime>,
+    startup: &StartupIoContext,
     deadline: tokio::time::Instant,
 ) -> Result<(), HaNodeError> {
     runtime.cancel_operations();
-    let attempt_deadline = deadline
-        .checked_sub(HA_STARTUP_CLEANUP_GRACE)
-        .unwrap_or(deadline);
-    match tokio::time::timeout_at(attempt_deadline, &mut *attempt).await {
+    startup.cancel(deadline.into_std());
+    match tokio::time::timeout_at(deadline, &mut attempt).await {
         Ok(result) => cleanup_completed_rehydrate(result, runtime, deadline),
         Err(_) => {
-            attempt.abort();
-            let mut errors = vec![HaNodeError::Shutdown(
-                "recorder rehydration task did not stop before the shutdown deadline".into(),
-            )];
-            if !finish_ha_pending_consensus_rpcs(runtime.consensus(), Duration::ZERO) {
-                errors.push(HaNodeError::Shutdown(
-                    "pending consensus RPCs did not drain before the shutdown deadline".into(),
-                ));
-            }
+            let stage = startup.unfinished_stage().to_owned();
+            let result = attempt.await;
+            let mut errors = vec![HaNodeError::StartupIoDeadlineExceeded { stage }];
+            errors.extend(cleanup_completed_rehydrate_quiescent(result, runtime).err());
             combine_ha_errors(errors)
         }
     }
@@ -2862,6 +4273,20 @@ fn cleanup_completed_rehydrate(
             "pending consensus RPCs did not drain before the shutdown deadline".into(),
         ));
     }
+    combine_ha_errors(errors)
+}
+
+fn cleanup_completed_rehydrate_quiescent(
+    result: Result<Result<(), NodeError>, tokio::task::JoinError>,
+    runtime: &Arc<NodeRuntime>,
+) -> Result<(), HaNodeError> {
+    let mut errors = Vec::new();
+    if let Err(error) = result {
+        errors.push(HaNodeError::Shutdown(format!(
+            "recorder rehydration task failed during cancellation: {error}"
+        )));
+    }
+    finish_ha_pending_consensus_rpcs(runtime.consensus(), Duration::MAX);
     combine_ha_errors(errors)
 }
 
@@ -3419,13 +4844,16 @@ mod tests {
         });
         let node = HaNode {
             shutdown,
+            recorder_shutdown: tokio::sync::watch::channel(false).0,
+            service_shutdown: tokio::sync::watch::channel(false).0,
+            startup: StartupIoContext::new(),
             state,
             supervisor: None,
         };
         fn assert_send<T: Send>(_: T) {}
         assert_send(node.ready());
 
-        request_ha_shutdown(&node.shutdown, || {});
+        request_ha_shutdown(&node.shutdown, HA_SERVER_SHUTDOWN_TIMEOUT, || {});
 
         assert!(matches!(node.ready().await, Err(HaNodeError::Cancelled)));
     }

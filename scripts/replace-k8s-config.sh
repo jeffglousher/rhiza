@@ -22,7 +22,6 @@ work_dir="${RHIZA_RECONFIG_WORK_DIR:-target/rhiza-reconfigure-${profile}}"
 status_path="${RHIZA_ADMIN_STATUS_PATH:-/v1/admin/membership/status}"
 stop_path="${RHIZA_ADMIN_STOP_PATH:-/v1/admin/membership/stop}"
 compact_path="${RHIZA_ADMIN_COMPACT_PATH:-/v1/admin/checkpoint/compact}"
-activate_path="${RHIZA_ADMIN_ACTIVATE_PATH:-/v1/admin/membership/activate}"
 cluster_id="${RHIZA_CLUSTER_ID:-rhiza-vind}"
 effective_cluster_id="rhiza:${profile}:${cluster_id}"
 epoch="${RHIZA_EPOCH:-1}"
@@ -526,6 +525,33 @@ if ! "$durable_resume"; then
   "$stopped_resume" || "${k[@]}" apply -f "$successor_yaml" >/dev/null
 fi
 
+if ! "$resume"; then
+  echo "waiting for every successor to reach pre-Stop readiness"
+  for ((attempt=1; attempt<=210; attempt++)); do
+    if successor_pods_json="$("${k[@]}" get pod \
+      -l "rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=${new_id}" \
+      -o json 2>/dev/null)" &&
+      jq -e --arg profile "$profile" --argjson id "$new_id" \
+        --argjson replicas "$new_replicas" --arg role_label "$member_role_label" '
+        (.items | length) == $replicas and
+        all(.items[];
+          .status.phase == "Running" and
+          any(.status.conditions[]?;
+            .type == "Ready" and .status == "True") and
+          .metadata.labels["rhiza.dev/execution-profile"] == $profile and
+          .metadata.labels["rhiza.dev/config-id"] == ($id | tostring) and
+          .metadata.labels[$role_label] == "learner")
+      ' <<< "$successor_pods_json" >/dev/null; then
+      break
+    fi
+    [ "$attempt" -lt 210 ] || {
+      echo "successor quorum did not reach pre-Stop readiness; refusing to Stop" >&2
+      exit 1
+    }
+    sleep 2
+  done
+fi
+
 echo "stopping configuration $old_id"
 if [ -s "$stop_json" ]; then
   jq -e --argjson successor "$stop_successor" '.successor == $successor' \
@@ -658,47 +684,6 @@ for ((attempt=1; attempt<=60; attempt++)); do
   sleep 1
 done
 
-successor_already_active=false
-for ((attempt=1; attempt<=60; attempt++)); do
-  all_ready=true
-  all_active=true
-  for ((ordinal=0; ordinal<new_replicas; ordinal++)); do
-    admin "$new_name" "${new_name}-${ordinal}" GET "$status_path" \
-      > "$status_json" || { all_ready=false; all_active=false; break; }
-    phase="$(jq -er --argjson id "$new_id" '
-      select(.node.active_config_id == $id) | .node.configuration_status
-    ' "$status_json")" || { all_ready=false; all_active=false; break; }
-    case "$phase" in
-      active) ;;
-      awaiting_activation) all_active=false ;;
-      *) all_ready=false; all_active=false; break ;;
-    esac
-  done
-  if "$all_ready"; then
-    "$all_active" && successor_already_active=true
-    break
-  fi
-  [ "$attempt" -lt 60 ] || {
-    echo "successor learner admin status prerequisite is unavailable or did not reach awaiting_activation/active" >&2
-    exit 1
-  }
-  sleep 1
-done
-
-if ! "$successor_already_active"; then
-  for ((ordinal=0; ordinal<new_replicas; ordinal++)); do
-    if ! "${k[@]}" get pod "${new_name}-${ordinal}" -o json |
-      jq -e --arg role_label "$member_role_label" \
-        '.metadata.labels[$role_label] == "learner"' >/dev/null; then
-      echo "successor Pod ${new_name}-${ordinal} became voter before Active(S+1)" >&2
-      exit 65
-    fi
-  done
-  echo "activating configuration $new_id"
-  activate_request="$(jq -cn --arg op "activate-c${new_id}-${stop_operation}" --argjson id "$new_id" \
-    '{operation_id:$op, expected_config_id:$id}')"
-  admin "$new_name" "${new_name}-0" POST "$activate_path" "$activate_request" >/dev/null
-fi
 for ((attempt=1; attempt<=60; attempt++)); do
   all_active=true
   for ((ordinal=0; ordinal<new_replicas; ordinal++)); do
@@ -709,7 +694,18 @@ for ((attempt=1; attempt<=60; attempt++)); do
       "$status_json" >/dev/null || { all_active=false; break; }
   done
   "$all_active" && break
-  [ "$attempt" -lt 60 ] || { echo "not every successor node reached Active(S+1)" >&2; exit 1; }
+  for ((ordinal=0; ordinal<new_replicas; ordinal++)); do
+    if ! "${k[@]}" get pod "${new_name}-${ordinal}" -o json |
+      jq -e --arg role_label "$member_role_label" \
+        '.metadata.labels[$role_label] == "learner"' >/dev/null; then
+      echo "successor Pod ${new_name}-${ordinal} became voter before Active(S+1)" >&2
+      exit 65
+    fi
+  done
+  [ "$attempt" -lt 60 ] || {
+    echo "not every successor node auto-activated to Active(S+1)" >&2
+    exit 1
+  }
   sleep 1
 done
 

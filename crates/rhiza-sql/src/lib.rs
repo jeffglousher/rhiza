@@ -599,6 +599,21 @@ impl SqliteStateMachine {
         Ok(())
     }
 
+    /// Closes a detached state machine so another owner can reopen the canonical database.
+    ///
+    /// SQLite may retain empty WAL sidecars after the last connection closes on some
+    /// filesystems. Once the WAL is checkpointed and the connection is closed, those sidecars
+    /// are owned crash artifacts and must be removed before the strict reopen validation.
+    pub fn close_for_handoff(self) -> Result<()> {
+        let _lifecycle = self.lock_lifecycle()?;
+        self.ensure_no_pending_apply()?;
+        self.with_connection(checkpoint_truncate)?;
+        self.close_connection()?;
+        cleanup_empty_wal_sidecars_after_owner_fence(&self.path)?;
+        validate_control_database_pair(&self.path, &self.control)?;
+        Ok(())
+    }
+
     fn reopen_connection(&self) -> Result<()> {
         let reopened = open_connection(&self.path)?;
         let mut guard = self
@@ -2224,6 +2239,48 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut sidecar = path.as_os_str().to_os_string();
     sidecar.push(suffix);
     PathBuf::from(sidecar)
+}
+
+/// Removes sidecars that cannot contain committed WAL frames after the caller has fenced every
+/// possible database owner.
+///
+/// A non-empty WAL or a non-regular sidecar is rejected and preserved for recovery inspection.
+pub fn cleanup_empty_wal_sidecars_after_owner_fence(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    let wal = sqlite_sidecar_path(path, "-wal");
+    let shm = sqlite_sidecar_path(path, "-shm");
+    let wal_metadata = symlink_metadata_if_exists(&wal)?;
+    let shm_metadata = symlink_metadata_if_exists(&shm)?;
+    for (name, metadata) in [
+        ("WAL", wal_metadata.as_ref()),
+        ("SHM", shm_metadata.as_ref()),
+    ] {
+        if metadata.is_some_and(|metadata| !metadata.file_type().is_file()) {
+            return Err(Error::InvalidEntry(format!(
+                "SQLite {name} sidecar is not a regular file"
+            )));
+        }
+    }
+    if wal_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.len() != 0)
+    {
+        return Err(Error::InvalidEntry(
+            "SQLite WAL sidecar contains uncheckpointed frames".into(),
+        ));
+    }
+    let mut changed = false;
+    for sidecar in [&wal, &shm] {
+        match fs::remove_file(sidecar) {
+            Ok(()) => changed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    if changed {
+        sync_parent(parent_dir(path))?;
+    }
+    Ok(())
 }
 
 fn sqlite_sidecars_absent(path: &Path) -> Result<bool> {
@@ -4606,6 +4663,13 @@ mod query_policy_tests {
             SqliteStateMachine::open_existing(&path),
             Err(Error::InvalidEntry(message)) if message.contains("sidecars")
         ));
+        assert!(cleanup_empty_wal_sidecars_after_owner_fence(&path).is_err());
+        assert!(
+            fs::metadata(sqlite_sidecar_path(&path, "-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
         drop(external);
     }
 
@@ -5067,6 +5131,54 @@ mod query_policy_tests {
                 outcome.sql_result().cloned()
             )
         );
+    }
+
+    #[test]
+    fn detached_owner_closes_canonical_database_for_strict_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let command = SqlCommand {
+            request_id: "handoff".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE handed_off(value INTEGER NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let payload =
+            prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
+        let entry = command_entry(1, LogHash::ZERO, payload);
+        database.apply_entry(&entry).unwrap();
+
+        database.close_for_handoff().unwrap();
+
+        assert!(sqlite_sidecars_absent(&path).unwrap());
+        let reopened = SqliteStateMachine::open_existing(&path).unwrap();
+        assert_eq!(
+            reopened.applied_tip_value().unwrap(),
+            (entry.index, entry.hash)
+        );
+    }
+
+    #[test]
+    fn fenced_reopen_removes_only_empty_wal_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        drop(database);
+        let wal = sqlite_sidecar_path(&path, "-wal");
+        let shm = sqlite_sidecar_path(&path, "-shm");
+        File::create(&wal).unwrap();
+        File::create(&shm)
+            .unwrap()
+            .write_all(b"empty-wal-shm")
+            .unwrap();
+
+        cleanup_empty_wal_sidecars_after_owner_fence(&path).unwrap();
+
+        assert!(sqlite_sidecars_absent(&path).unwrap());
+        SqliteStateMachine::open_existing(&path).unwrap();
     }
 
     #[test]

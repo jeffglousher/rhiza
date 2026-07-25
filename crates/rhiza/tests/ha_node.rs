@@ -13,8 +13,8 @@ use rhiza_node::HttpRecorderClient;
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{Membership, RecordSummary, RecorderFileStore, RecorderRpc};
 use rhizadb::{
-    DurabilityMode, Error, ExecutionProfile, HaRecorderTransport, HaServeConfig, HaStartupConfig,
-    HaStartupMode, LogPeer, NodeConfig, PeerConfig,
+    DurabilityMode, Error, ExecutionProfile, HaNodeError, HaRecorderTransport, HaServeConfig,
+    HaStartupConfig, HaStartupMode, LogPeer, NodeConfig, PeerConfig,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -122,13 +122,48 @@ async fn listeners() -> (Vec<TcpListener>, Vec<SocketAddr>) {
 }
 
 #[tokio::test]
+async fn immediate_shutdown_cancels_owned_preparation_without_publishing_or_mutating() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = archive(&root.path().join("archive"));
+    archive.initialize_checkpoint().await.unwrap();
+    let (mut recorder_listeners, recorder_addresses) = listeners().await;
+    let (mut service_listeners, service_addresses) = listeners().await;
+    let data_dir = root.path().join("node-1");
+    let recorder_address = recorder_addresses[0];
+    let service_address = service_addresses[0];
+    let node = HaStartupConfig::new(
+        node_config(&data_dir, 0, &recorder_addresses, &service_addresses),
+        archive,
+        DurabilityMode::Sync,
+        60_000,
+        HaStartupMode::Bootstrap,
+    )
+    .start(HaServeConfig::new(
+        recorder_listeners.remove(0),
+        service_listeners.remove(0),
+        HaRecorderTransport::Http,
+        file_recorder_clients(&root.path().join("recorders")),
+        Vec::new(),
+    ));
+
+    node.shutdown_with_timeout(Duration::from_millis(100))
+        .await
+        .unwrap();
+
+    assert!(!data_dir.exists());
+    let recorder = TcpListener::bind(recorder_address).await.unwrap();
+    let service = TcpListener::bind(service_address).await.unwrap();
+    drop((recorder, service));
+}
+
+#[tokio::test]
 async fn shutdown_request_immediately_closes_ready_handle_admission() {
     let root = tempfile::tempdir().unwrap();
     let archive = archive(&root.path().join("archive"));
     archive.initialize_checkpoint().await.unwrap();
     let (mut recorder_listeners, recorder_addresses) = listeners().await;
     let (mut service_listeners, service_addresses) = listeners().await;
-    let prepared = HaStartupConfig::new(
+    let node = HaStartupConfig::new(
         node_config(
             &root.path().join("node-1"),
             0,
@@ -140,19 +175,13 @@ async fn shutdown_request_immediately_closes_ready_handle_admission() {
         60_000,
         HaStartupMode::Bootstrap,
     )
-    .prepare()
-    .await
-    .unwrap();
-    let node = prepared
-        .start(HaServeConfig::new(
-            recorder_listeners.remove(0),
-            service_listeners.remove(0),
-            HaRecorderTransport::Http,
-            file_recorder_clients(&root.path().join("recorders")),
-            Vec::<Arc<dyn LogPeer>>::new(),
-        ))
-        .await
-        .unwrap();
+    .start(HaServeConfig::new(
+        recorder_listeners.remove(0),
+        service_listeners.remove(0),
+        HaRecorderTransport::Http,
+        file_recorder_clients(&root.path().join("recorders")),
+        Vec::<Arc<dyn LogPeer>>::new(),
+    ));
     let handle = tokio::time::timeout(HANG_GUARD, node.ready())
         .await
         .expect("HA node must become ready")
@@ -185,7 +214,7 @@ async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_the
     let mut nodes = Vec::with_capacity(3);
 
     for (node_index, node_id) in NODE_IDS.iter().enumerate() {
-        let prepared = HaStartupConfig::new(
+        let node = HaStartupConfig::new(
             node_config(
                 &root.path().join(node_id),
                 node_index,
@@ -198,10 +227,7 @@ async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_the
             },
             60_000,
             HaStartupMode::Rejoin,
-        )
-        .prepare()
-        .await
-        .unwrap();
+        );
         let serve = HaServeConfig::new(
             recorder_listeners.remove(0),
             service_listeners.remove(0),
@@ -210,7 +236,7 @@ async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_the
             Vec::<Arc<dyn LogPeer>>::new(),
         )
         .with_tail_token("tail-token");
-        nodes.push(prepared.start(serve).await.unwrap());
+        nodes.push(node.start(serve));
 
         if node_index == 0 {
             let probe = HttpRecorderClient::new(
@@ -297,7 +323,7 @@ async fn monitor_reports_a_terminal_startup_failure() {
     archive.initialize_checkpoint().await.unwrap();
     let (mut recorder_listeners, recorder_addresses) = listeners().await;
     let (mut service_listeners, service_addresses) = listeners().await;
-    let prepared = HaStartupConfig::new(
+    let node = HaStartupConfig::new(
         node_config(
             &root.path().join("node-1"),
             0,
@@ -309,22 +335,16 @@ async fn monitor_reports_a_terminal_startup_failure() {
         60_000,
         HaStartupMode::Bootstrap,
     )
-    .prepare()
-    .await
-    .unwrap();
-    let node = prepared
-        .start(
-            HaServeConfig::new(
-                recorder_listeners.remove(0),
-                service_listeners.remove(0),
-                HaRecorderTransport::Http,
-                file_recorder_clients(&root.path().join("recorders")),
-                Vec::<Arc<dyn LogPeer>>::new(),
-            )
-            .with_tail_token(""),
+    .start(
+        HaServeConfig::new(
+            recorder_listeners.remove(0),
+            service_listeners.remove(0),
+            HaRecorderTransport::Http,
+            file_recorder_clients(&root.path().join("recorders")),
+            Vec::<Arc<dyn LogPeer>>::new(),
         )
-        .await
-        .unwrap();
+        .with_tail_token(""),
+    );
 
     let error = tokio::time::timeout(HANG_GUARD, node.monitor())
         .await
@@ -338,7 +358,7 @@ async fn monitor_reports_a_terminal_startup_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_open_failure_cleans_the_runtime_and_releases_recorder_ingress() {
+async fn archive_startup_failure_releases_owned_resources() {
     let root = tempfile::tempdir().unwrap();
     let broken_archive_root = root.path().join("broken-archive");
     let broken_archive = archive(&broken_archive_root);
@@ -357,24 +377,18 @@ async fn coordinator_open_failure_cleans_the_runtime_and_releases_recorder_ingre
         DurabilityMode::Sync,
         60_000,
         HaStartupMode::Bootstrap,
-    )
-    .prepare()
-    .await
-    .unwrap();
+    );
     std::fs::remove_dir_all(&broken_archive_root).unwrap();
     std::fs::write(&broken_archive_root, b"not an object-store directory").unwrap();
 
     let recorder_address = first_recorder_addresses[0];
-    let node = failing
-        .start(HaServeConfig::new(
-            first_recorder_listeners.remove(0),
-            first_service_listeners.remove(0),
-            HaRecorderTransport::Http,
-            file_recorder_clients(&root.path().join("failing-recorders")),
-            Vec::<Arc<dyn LogPeer>>::new(),
-        ))
-        .await
-        .unwrap();
+    let node = failing.start(HaServeConfig::new(
+        first_recorder_listeners.remove(0),
+        first_service_listeners.remove(0),
+        HaRecorderTransport::Http,
+        file_recorder_clients(&root.path().join("failing-recorders")),
+        Vec::<Arc<dyn LogPeer>>::new(),
+    ));
     let error = tokio::time::timeout(HANG_GUARD, node.monitor())
         .await
         .expect("coordinator failure must be terminal")
@@ -388,17 +402,20 @@ async fn coordinator_open_failure_cleans_the_runtime_and_releases_recorder_ingre
     let _ = node.shutdown().await;
     assert!(TcpStream::connect(recorder_address).await.is_err());
     drop(TcpListener::bind(recorder_address).await.unwrap());
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(data_dir.join(".node.lock"))
-        .unwrap();
-    lock.try_lock()
-        .expect("coordinator failure must release the runtime data lock");
+    let lock_path = data_dir.join(".node.lock");
+    if lock_path.exists() {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.try_lock()
+            .expect("startup failure must release the runtime data lock");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shutdown_bounds_a_blocked_runtime_open_and_releases_recorder_ingress() {
+async fn shutdown_reports_the_unfinished_startup_io_and_blocks_late_publication() {
     let root = tempfile::tempdir().unwrap();
     let archive = archive(&root.path().join("archive"));
     archive.initialize_checkpoint().await.unwrap();
@@ -415,41 +432,65 @@ async fn shutdown_bounds_a_blocked_runtime_open_and_releases_recorder_ingress() 
         DurabilityMode::Sync,
         60_000,
         HaStartupMode::Bootstrap,
-    )
-    .prepare()
-    .await
-    .unwrap();
+    );
     let (recorders, startup_blocked, release) =
         blocking_file_recorder_clients(&root.path().join("recorders"));
     let recorder_address = recorder_addresses[0];
-    let node = prepared
-        .start(HaServeConfig::new(
-            recorder_listeners.remove(0),
-            service_listeners.remove(0),
-            HaRecorderTransport::Http,
-            recorders,
-            Vec::<Arc<dyn LogPeer>>::new(),
-        ))
-        .await
-        .unwrap();
+    let service_address = service_addresses[0];
+    let node = prepared.start(HaServeConfig::new(
+        recorder_listeners.remove(0),
+        service_listeners.remove(0),
+        HaRecorderTransport::Http,
+        recorders,
+        Vec::<Arc<dyn LogPeer>>::new(),
+    ));
 
     tokio::task::spawn_blocking(move || startup_blocked.recv().unwrap())
         .await
         .unwrap();
-    let shutdown_error = tokio::time::timeout(SHUTDOWN_HANG_GUARD, node.shutdown())
-        .await
-        .expect("shutdown must honor the HA shutdown budget")
-        .unwrap_err();
+    let mut shutdown = Box::pin(node.shutdown_with_timeout(Duration::from_millis(100)));
+    let first_poll = poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(first_poll.is_pending());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_deadline = poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
     assert!(
-        shutdown_error.to_string().contains("pending consensus")
-            || shutdown_error.to_string().contains("deadline"),
-        "{shutdown_error}"
+        after_deadline.is_pending(),
+        "shutdown must retain the blocked startup task after the deadline"
+    );
+    assert!(TcpStream::connect(recorder_address).await.is_err());
+
+    release.release();
+    let shutdown_error = tokio::time::timeout(SHUTDOWN_HANG_GUARD, shutdown)
+        .await
+        .expect("shutdown must complete after the noncooperative RPC exits")
+        .unwrap_err();
+    assert_eq!(
+        shutdown_error,
+        HaNodeError::StartupIoDeadlineExceeded {
+            stage: "recorder decision inspection".to_owned(),
+        }
     );
     assert!(TcpStream::connect(recorder_address).await.is_err());
     let rebound = TcpListener::bind(recorder_address).await.unwrap();
-    drop(rebound);
+    let rebound_service = TcpListener::bind(service_address).await.unwrap();
+    drop((rebound, rebound_service));
 
-    release.release();
+    let lock_path = root.path().join("node-1/.node.lock");
+    tokio::time::timeout(SHUTDOWN_HANG_GUARD, async {
+        loop {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            if lock.try_lock().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled runtime startup must eventually release the data lock");
 }
 
 type BlockingRecorderClients = (

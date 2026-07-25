@@ -18,7 +18,7 @@ use rhiza_node::{
     ClientErrorResponse, ConfigError, FetchLogError, FetchLogRequest, FetchLogResponse,
     HttpLogPeer, HttpRecorderClient, InMemoryLogPeer, LogPeer, NodeConfig, NodeError, NodeRuntime,
     PeerConfig, ReadConsistency, ReadRequest, SqlExecuteRequest, SqlExecuteResponse,
-    SqlQueryRequest, SqlQueryResponse, WriteRequest, DEFAULT_WRITER_BATCH_MAX,
+    SqlQueryRequest, SqlQueryResponse, StartupIoContext, WriteRequest, DEFAULT_WRITER_BATCH_MAX,
     DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_COMMAND_BYTES, MAX_FETCH_ENTRIES,
     MAX_HTTP_BODY_BYTES, NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH, RECORDER_IDENTITY_PATH,
     RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, SQL_EXECUTE_PATH, SQL_QUERY_PATH,
@@ -2818,6 +2818,47 @@ async fn log_fetch_saturation_does_not_consume_recorder_capacity() {
     server.abort();
 }
 
+#[test]
+fn cancelled_peer_recovery_is_joined_before_open_returns_without_persisting() {
+    let root = tempfile::tempdir().unwrap();
+    let config = node_config(&root.path().join("node"));
+    let consensus = consensus(&root.path().join("consensus"));
+    let gate = Arc::new(Gate::default());
+    let peer = BlockingLogPeer {
+        gate: Arc::clone(&gate),
+    };
+    let startup = StartupIoContext::new();
+    let attempt_startup = startup.clone();
+    let attempt = std::thread::spawn(move || {
+        NodeRuntime::open_cancellable(config, consensus, &[&peer], &attempt_startup)
+    });
+
+    gate.wait_until_started();
+    startup.cancel(Instant::now() + Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !attempt.is_finished(),
+        "noncooperative peer recovery must remain owned until the call exits"
+    );
+    gate.release();
+
+    let error = attempt.join().unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("startup cancelled during peer log fetch"),
+        "{error}"
+    );
+    let log = FileLogStore::open_with_configuration(
+        root.path().join("node/consensus/log"),
+        "rhiza:sql:cluster-a",
+        1,
+        ConfigurationState::active(1, test_config_digest()),
+    )
+    .unwrap();
+    assert_eq!(log.last_index().unwrap(), None);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn recorder_backend_errors_return_non_success_statuses() {
     let failures = [
@@ -2922,6 +2963,37 @@ async fn log_backend_errors_are_non_success_and_preserved_by_http_peer() {
         assert_eq!(returned, expected_error);
         server.abort();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_json_non_success_log_response_is_transient_transport() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(|| async {
+                (axum::http::StatusCode::NOT_FOUND, "peer is still starting")
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let peer = HttpLogPeer::new(format!("http://{addr}"), "node-1", "peer-token-1").unwrap();
+    let returned = tokio::task::spawn_blocking(move || {
+        peer.fetch_log(FetchLogRequest {
+            from_index: 1,
+            max_entries: 1,
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        returned,
+        FetchLogError::Transport { message } if message.contains("HTTP 404")
+    ));
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

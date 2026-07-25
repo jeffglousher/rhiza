@@ -1271,7 +1271,9 @@ pub trait RecorderRpc: Send + Sync {
     ///
     /// Network implementations must enforce a finite deadline and return an
     /// error when it expires. The same bounded-call requirement applies to all
-    /// process-bound methods on this trait.
+    /// process-bound methods on this trait. Lifecycle owners retain and join
+    /// admitted calls after their shutdown deadline, so a non-returning custom
+    /// implementation intentionally prevents a false quiescent shutdown.
     fn record(&self, _request: RecordRequest) -> Result<RecordSummary> {
         Err(Error::TypedRecordRequired)
     }
@@ -2018,6 +2020,16 @@ impl RecorderFileStore {
         if !configuration.activated && change.is_none() {
             return Err(Error::Rejected(RejectReason::ActivationRequired));
         }
+        let state = self.load_unlocked(request.slot, request.config_digest)?;
+        if let Some(proof) = state.decision_proof() {
+            if proof.proposal().value.as_ref() == Some(value) {
+                return Ok(record_summary(
+                    &self.recorder_id,
+                    &state,
+                    Some(proof.clone()),
+                ));
+            }
+        }
         self.validate_slot_gate(&configuration, request.slot, change.as_ref())?;
         if request.command.is_none() {
             self.validate_resolved_command_for_value(
@@ -2027,7 +2039,6 @@ impl RecorderFileStore {
                 &command,
             )?;
         }
-        let state = self.load_unlocked(request.slot, request.config_digest)?;
         if let Some(proof) = state.decision_proof() {
             return Ok(record_summary(
                 &self.recorder_id,
@@ -3358,12 +3369,7 @@ impl RecordWorker {
     fn shutdown(&mut self) {
         self.sender.take();
         if let Some(handle) = self.handle.take() {
-            // Recorder RPCs are deadline-bounded, but Drop must not wait for a
-            // blocked minority. Idle workers are joined; an in-flight worker
-            // observes the disconnected queue and exits after its RPC returns.
-            if self.pending.load(Ordering::Acquire) == 0 || handle.is_finished() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
     }
 }
@@ -3692,9 +3698,7 @@ impl ControlWorker {
             queue.available.notify_one();
         }
         if let Some(handle) = self.handle.take() {
-            if self.pending.load(Ordering::Acquire) == 0 || handle.is_finished() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
     }
 }
@@ -10071,10 +10075,13 @@ mod tests {
             drop(consensus);
             dropped_tx.send(()).unwrap();
         });
-        let dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+        assert_eq!(
+            dropped_rx.recv_timeout(Duration::from_millis(10)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
         release_tx.send(()).unwrap();
+        assert_eq!(dropped_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
         dropper.join().unwrap();
-        assert_eq!(dropped, Ok(()));
     }
 
     #[test]

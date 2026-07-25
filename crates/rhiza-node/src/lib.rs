@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -396,6 +396,7 @@ pub enum ConfigError {
     DuplicatePeerNodeId(String),
     LocalNodeMissing,
     PeerMembershipMismatch,
+    InvalidPredecessorTransition(String),
     EmptyClientToken,
     ClientTokenConflictsWithPeer,
     EmptyAdminToken,
@@ -453,6 +454,9 @@ impl fmt::Display for ConfigError {
                     f,
                     "peer identities must exactly match the canonical membership"
                 )
+            }
+            Self::InvalidPredecessorTransition(message) => {
+                write!(f, "invalid predecessor transition: {message}")
             }
             Self::EmptyClientToken => write!(f, "client token must not be empty"),
             Self::ClientTokenConflictsWithPeer => {
@@ -564,7 +568,94 @@ impl fmt::Display for FetchLogError {
 impl std::error::Error for FetchLogError {}
 
 pub trait LogPeer: Send + Sync {
+    /// Fetches one bounded page.
+    ///
+    /// Process-bound implementations must use a finite deadline. HA shutdown
+    /// retains and joins an admitted call even after its deadline is reported,
+    /// so a non-returning custom implementation prevents quiescent shutdown.
     fn fetch_log(&self, request: FetchLogRequest) -> Result<FetchLogResponse, FetchLogError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct StartupIoContext {
+    cancelled: Arc<AtomicBool>,
+    deadline: Arc<OnceLock<Instant>>,
+    stage: Arc<Mutex<&'static str>>,
+    mutation_admission: Arc<Mutex<()>>,
+}
+
+impl Default for StartupIoContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StartupIoContext {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Arc::new(OnceLock::new()),
+            stage: Arc::new(Mutex::new("runtime initialization")),
+            mutation_admission: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn cancel(&self, deadline: Instant) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.deadline.set(deadline);
+    }
+
+    pub fn unfinished_stage(&self) -> &'static str {
+        *self.lock_stage()
+    }
+
+    pub fn check(&self, stage: &'static str) -> Result<(), NodeError> {
+        *self.lock_stage() = stage;
+        if self.cancelled.load(Ordering::Acquire)
+            || self
+                .deadline
+                .get()
+                .is_some_and(|deadline| Instant::now() >= *deadline)
+        {
+            return Err(NodeError::Unavailable(format!(
+                "startup cancelled during {stage}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn persist<T>(
+        &self,
+        stage: &'static str,
+        operation: impl FnOnce() -> Result<T, NodeError>,
+    ) -> Result<T, NodeError> {
+        *self.lock_stage() = stage;
+        let _permit = self
+            .mutation_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancelled.load(Ordering::Acquire)
+            || self
+                .deadline
+                .get()
+                .is_some_and(|deadline| Instant::now() >= *deadline)
+        {
+            return Err(NodeError::Unavailable(format!(
+                "startup cancelled before {stage}"
+            )));
+        }
+        operation()
+    }
+
+    fn cancellation_flag(&self) -> &AtomicBool {
+        self.cancelled.as_ref()
+    }
+
+    fn lock_stage(&self) -> std::sync::MutexGuard<'_, &'static str> {
+        self.stage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -958,15 +1049,20 @@ impl LogPeer for HttpLogPeer {
                 message: err.to_string(),
             })?;
         let status = response.status();
+        if !status.is_success() {
+            return match response.json::<FetchLogHttpResponse>() {
+                Ok(FetchLogHttpResponse::Failed(error)) => Err(error),
+                Ok(FetchLogHttpResponse::Fetched(_)) | Err(_) => Err(FetchLogError::Transport {
+                    message: format!("log rpc returned HTTP {status}"),
+                }),
+            };
+        }
         match response
             .json::<FetchLogHttpResponse>()
             .map_err(|err| FetchLogError::Decode {
                 message: err.to_string(),
             })? {
-            FetchLogHttpResponse::Fetched(response) if status.is_success() => Ok(response),
-            FetchLogHttpResponse::Fetched(_) => Err(FetchLogError::Transport {
-                message: format!("log rpc returned HTTP {status}"),
-            }),
+            FetchLogHttpResponse::Fetched(response) => Ok(response),
             FetchLogHttpResponse::Failed(error) => Err(error),
         }
     }
@@ -4191,6 +4287,55 @@ impl NodeConfig {
         self
     }
 
+    /// Binds an unactivated successor draft to the exact predecessor Stop it will adopt.
+    pub fn bind_predecessor_stop(
+        mut self,
+        predecessor_membership: &Membership,
+        entry: LogEntry,
+    ) -> Result<Self, ConfigError> {
+        let target_config_id = self.config_id();
+        if entry.cluster_id != self.cluster_id
+            || entry.epoch != self.epoch
+            || entry.config_id.checked_add(1) != Some(target_config_id)
+            || entry.recompute_hash() != entry.hash
+        {
+            return Err(ConfigError::InvalidPredecessorTransition(
+                "Stop identity does not match the successor draft".into(),
+            ));
+        }
+        let ConfigChange::BoundStop { successor } =
+            ConfigChange::recognize_parts(entry.entry_type, &entry.payload).map_err(|_| {
+                ConfigError::InvalidPredecessorTransition(
+                    "predecessor entry is not a bound Stop".into(),
+                )
+            })?
+        else {
+            return Err(ConfigError::InvalidPredecessorTransition(
+                "predecessor entry is not a bound Stop".into(),
+            ));
+        };
+        if successor.cluster_id() != self.cluster_id
+            || successor.predecessor_config_id() != entry.config_id
+            || successor.predecessor_config_digest() != predecessor_membership.digest()
+            || successor.config_id() != target_config_id
+            || successor.digest() != self.membership.digest()
+            || successor.members() != self.membership.members()
+        {
+            return Err(ConfigError::InvalidPredecessorTransition(
+                "Stop successor descriptor does not match the successor draft".into(),
+            ));
+        }
+        let predecessor =
+            ConfigurationState::active(entry.config_id, predecessor_membership.digest());
+        let stopped = predecessor
+            .validate_entry(&entry)
+            .map_err(|error| ConfigError::InvalidPredecessorTransition(error.to_string()))?;
+        self.log_initial_configuration = predecessor;
+        self.configuration_state = stopped;
+        self.predecessor_stop_entry = Some(entry);
+        Ok(self)
+    }
+
     pub fn with_recovery_generation(
         mut self,
         recovery_generation: u64,
@@ -5418,6 +5563,19 @@ impl std::ops::Deref for SqlMaterializerGuard<'_> {
 }
 
 impl Materializer {
+    fn close_for_handoff(self) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "sql")]
+            Self::Sql(state) => state.close_for_handoff().map_err(|error| error.to_string()),
+            #[cfg(feature = "graph")]
+            Self::Graph(_) => Ok(()),
+            #[cfg(feature = "kv")]
+            Self::Kv(_) => Ok(()),
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => Ok(()),
+        }
+    }
+
     fn ensure_profile_available(profile: ExecutionProfile) -> Result<(), NodeError> {
         if execution_profile_compiled(profile) {
             Ok(())
@@ -5441,6 +5599,7 @@ impl Materializer {
                 {
                     let path = config.data_dir().join("sqlite/db.sqlite");
                     let open = || {
+                        rhiza_sql::cleanup_empty_wal_sidecars_after_owner_fence(&path)?;
                         SqliteStateMachine::open_with_configuration(
                             &path,
                             config.cluster_id(),
@@ -5451,9 +5610,12 @@ impl Materializer {
                     };
                     let state = match open() {
                         Ok(state) => state,
-                        Err(_) => match recovery_anchor {
+                        Err(open_error) => match recovery_anchor {
                             Some(anchor) => {
-                                return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())))
+                                eprintln!(
+                                    "SQL materializer strict reopen failed before snapshot recovery: {open_error}"
+                                );
+                                return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())));
                             }
                             None => {
                                 quarantine_materializer(config.data_dir(), "sqlite")?;
@@ -6175,12 +6337,24 @@ impl NodeRuntime {
         consensus: Arc<ThreeNodeConsensus>,
         peer_candidates: &[&dyn LogPeer],
     ) -> Result<Self, NodeError> {
+        Self::open_cancellable(config, consensus, peer_candidates, &StartupIoContext::new())
+    }
+
+    pub fn open_cancellable(
+        config: NodeConfig,
+        consensus: Arc<ThreeNodeConsensus>,
+        peer_candidates: &[&dyn LogPeer],
+        startup: &StartupIoContext,
+    ) -> Result<Self, NodeError> {
+        startup.check("runtime configuration validation")?;
         if config.ack_mode == AckMode::DrStrong {
             return Err(NodeError::UnsupportedAckMode(AckMode::DrStrong));
         }
         Materializer::ensure_profile_available(config.execution_profile())?;
+        startup.check("runtime data directory creation")?;
         fs::create_dir_all(&config.data_dir)
             .map_err(|error| NodeError::Storage(error.to_string()))?;
+        startup.check("runtime data lock acquisition")?;
         let lock_path = config.data_dir.join(".node.lock");
         let data_root_lock = fs::OpenOptions::new()
             .read(true)
@@ -6199,6 +6373,7 @@ impl NodeRuntime {
             }
         }
 
+        startup.check("qlog open and recovery")?;
         let log_store = FileLogStore::open_with_configuration(
             config.data_dir.join("consensus/log"),
             &config.cluster_id,
@@ -6213,17 +6388,27 @@ impl NodeRuntime {
             .logical_state()
             .map_err(|error| NodeError::Storage(error.to_string()))?
             .anchor;
+        startup.check("materializer open and reconciliation")?;
         let materializer =
             Materializer::open(&config, &persisted_configuration, recovery_anchor.as_ref())?;
         reconcile_local_storage(&config, &log_store, &materializer)?;
+        startup.check("peer recovery")?;
         recover_peer_candidates(
             &config,
             consensus.as_ref(),
             &log_store,
             &materializer,
             peer_candidates,
+            startup,
         )?;
-        recover_startup_decisions(&config, consensus.as_ref(), &log_store, &materializer)?;
+        recover_startup_decisions(
+            &config,
+            consensus.as_ref(),
+            &log_store,
+            &materializer,
+            startup,
+        )?;
+        startup.check("runtime readiness publication")?;
 
         Ok(Self {
             #[cfg(feature = "sql")]
@@ -8599,9 +8784,7 @@ impl NodeRuntime {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-            && !self.fatal.load(Ordering::Acquire)
-            && !self.checkpointing.load(Ordering::Acquire)
+        self.ready.load(Ordering::Acquire) && !self.fatal.load(Ordering::Acquire)
     }
 
     pub fn is_fatal(&self) -> bool {
@@ -9195,11 +9378,6 @@ impl NodeRuntime {
         if !self.ready.load(Ordering::Acquire) {
             return Err(NodeError::Unavailable("runtime is not ready".into()));
         }
-        if self.checkpointing.load(Ordering::Acquire) {
-            return Err(NodeError::Unavailable(
-                "runtime checkpoint transition is in progress".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -9360,7 +9538,9 @@ pub fn rehydrate_recorder_after_checkpoint(
     runtime: &NodeRuntime,
     recorder: &RecorderFileStore,
     checkpoint_index: LogIndex,
+    startup: &StartupIoContext,
 ) -> Result<(), NodeError> {
+    startup.check("recorder rehydration anchor validation")?;
     if let Some(anchor) = runtime
         .log_store()
         .logical_state()
@@ -9379,6 +9559,7 @@ pub fn rehydrate_recorder_after_checkpoint(
     }
 
     for index in checkpoint_index.saturating_add(1)..=applied_index {
+        startup.check("recorder rehydration qlog read")?;
         let entry = runtime
             .log_store()
             .read(index)
@@ -9388,6 +9569,7 @@ pub fn rehydrate_recorder_after_checkpoint(
                     "qlog entry {index} is missing during recorder rehydration"
                 ))
             })?;
+        startup.check("recorder rehydration decision inspection")?;
         let certified = match runtime
             .consensus()
             .inspect_certified_decision_at(index, entry.prev_hash)
@@ -9410,27 +9592,30 @@ pub fn rehydrate_recorder_after_checkpoint(
                 )))
             }
         };
+        startup.check("recorder rehydration decision inspection")?;
         if certified.entry != entry {
             return Err(NodeError::Reconciliation(format!(
                 "recorder decision certificate differs from qlog entry {index}"
             )));
         }
         let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
-        recorder
-            .store_command(command.hash(), command)
-            .map_err(|error| {
-                NodeError::Reconciliation(format!(
-                    "cannot restore recorder command at qlog index {index}: {error}"
-                ))
-            })?;
         let proof = certified.proof.clone();
-        recorder
-            .install_decision_proof_record(proof, runtime.consensus().membership())
-            .map_err(|error| {
-                NodeError::Reconciliation(format!(
-                    "cannot install recorder decision at qlog index {index}: {error}"
-                ))
-            })?;
+        startup.persist("recorder rehydration persistence", || {
+            recorder
+                .store_command(command.hash(), command)
+                .map_err(|error| {
+                    NodeError::Reconciliation(format!(
+                        "cannot restore recorder command at qlog index {index}: {error}"
+                    ))
+                })?;
+            recorder
+                .install_decision_proof_record(proof, runtime.consensus().membership())
+                .map_err(|error| {
+                    NodeError::Reconciliation(format!(
+                        "cannot install recorder decision at qlog index {index}: {error}"
+                    ))
+                })
+        })?;
     }
     Ok(())
 }
@@ -9449,11 +9634,12 @@ mod tests {
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
     use rhiza_quepaxa::{
-        AcceptedValue, Membership, Proposal, ProposalPriority, RecordRequest, ThreeNodeConsensus,
+        AcceptedValue, Membership, Proposal, ProposalPriority, RecordRequest, RecordSummary,
+        RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
     };
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Arc, Barrier,
+        mpsc, Arc, Barrier, Condvar, Mutex,
     };
 
     #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
@@ -9463,12 +9649,203 @@ mod tests {
     use super::ReadBarrierRounds;
     use super::{
         client_authenticated, next_sync_flush_retry, run_read_operation, sql_query_http_response,
-        valid_recorder_record, Duration, HeaderMap, NodeError, ReadConsistency, SqlCommand,
-        SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
-        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
-        VERSION_HEADER,
+        valid_recorder_record, Duration, FileLogStore, HeaderMap, Instant, NodeError,
+        ReadConsistency, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler,
+        MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC,
+        SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
     };
-    use super::{ConfigError, NodeConfig, NodeRuntime, NodeService};
+    use super::{ConfigError, NodeConfig, NodeRuntime, NodeService, StartupIoContext};
+
+    struct BlockingStartupInspection {
+        recorder: RecorderFileStore,
+        started: mpsc::SyncSender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecorderRpc for BlockingStartupInspection {
+        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+            self.recorder.recorder_id()
+        }
+
+        fn inspect_record_summary(
+            &self,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            self.started.send(()).unwrap();
+            let (released, condition) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            self.recorder.inspect_record_summary(slot)
+        }
+
+        fn fetch_command_for(
+            &self,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            self.recorder.fetch_command_for(
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
+    }
+
+    #[test]
+    fn runtime_open_does_not_persist_a_decision_returned_after_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:sql:startup-cancel-test",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed_consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:startup-cancel-test",
+            "n1",
+            1,
+            1,
+            recorders
+                .iter()
+                .map(|(id, recorder)| {
+                    (
+                        id.clone(),
+                        Box::new(recorder.clone()) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        seed_consensus
+            .propose_at(
+                1,
+                LogHash::ZERO,
+                Command::new(CommandKind::ReadBarrier, Vec::new()),
+            )
+            .unwrap();
+        assert!(seed_consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        drop(seed_consensus);
+
+        let (started, blocked) = mpsc::sync_channel(3);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:sql:startup-cancel-test",
+                "n1",
+                1,
+                1,
+                recorders
+                    .into_iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id,
+                            Box::new(BlockingStartupInspection {
+                                recorder,
+                                started: started.clone(),
+                                gate: Arc::clone(&gate),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "startup-cancel-test",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap();
+        let startup = StartupIoContext::new();
+        let attempt_startup = startup.clone();
+        let attempt_config = config.clone();
+        let attempt = std::thread::spawn(move || {
+            NodeRuntime::open_cancellable(attempt_config, consensus, &[], &attempt_startup)
+        });
+
+        blocked.recv().unwrap();
+        startup.cancel(Instant::now() + Duration::from_secs(1));
+        let (released, condition) = &*gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+
+        let error = attempt.join().unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("startup cancelled during recorder decision inspection"),
+            "{error}"
+        );
+        let log_store = FileLogStore::open_with_configuration(
+            config.data_dir.join("consensus/log"),
+            &config.cluster_id,
+            config.epoch,
+            config.log_initial_configuration.clone(),
+        )
+        .unwrap();
+        assert_eq!(log_store.last_index().unwrap(), None);
+    }
+
+    #[test]
+    fn startup_cancellation_closes_mutation_admission_after_an_active_write_finishes() {
+        let startup = StartupIoContext::new();
+        let attempt_startup = startup.clone();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let attempt_writes = Arc::clone(&writes);
+        let (entered, active) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let attempt_gate = Arc::clone(&gate);
+        let attempt = std::thread::spawn(move || {
+            attempt_startup.persist("test persistence", || {
+                entered.send(()).unwrap();
+                let (released, condition) = &*attempt_gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+                attempt_writes.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        });
+
+        active.recv().unwrap();
+        startup.cancel(Instant::now() + Duration::from_secs(1));
+        let (released, condition) = &*gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        attempt.join().unwrap().unwrap();
+
+        assert!(startup
+            .persist("late persistence", || {
+                writes.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn embedded_config_accepts_matching_canonical_profile_ids() {
@@ -9990,6 +10367,22 @@ mod tests {
         assert_eq!(read.value.as_deref(), Some("one"));
         assert_eq!(read.applied_index, write.applied_index);
         assert_eq!(read.hash, write.hash);
+    }
+
+    #[test]
+    fn checkpoint_publication_does_not_close_runtime_readiness_or_writes() {
+        let (_dir, runtime) = sql_test_runtime();
+        runtime.checkpointing.store(true, Ordering::Release);
+
+        assert!(runtime.is_ready());
+        runtime.ensure_ready().unwrap();
+        let write = runtime.write("request-1", "alpha", "one").unwrap();
+
+        assert_eq!(write.applied_index, 1);
+        assert_eq!(
+            runtime.read("alpha", ReadConsistency::Local).unwrap().value,
+            Some("one".into())
+        );
     }
 
     #[cfg(feature = "graph")]
@@ -12607,9 +13000,11 @@ fn recover_peer_candidates(
     log_store: &FileLogStore,
     materializer: &Materializer,
     peer_candidates: &[&dyn LogPeer],
+    startup: &StartupIoContext,
 ) -> Result<(), NodeError> {
     for peer in peer_candidates {
         let (last_index, last_hash) = static_log_tip(log_store)?;
+        startup.check("peer log fetch")?;
         let candidates = match peer.fetch_log(FetchLogRequest {
             from_index: last_index.saturating_add(1),
             max_entries: MAX_FETCH_ENTRIES,
@@ -12637,17 +13032,20 @@ fn recover_peer_candidates(
                 )));
             }
         };
+        startup.check("peer log fetch")?;
 
         let mut expected_index = last_index.checked_add(1).ok_or_else(|| {
             NodeError::Reconciliation("qlog index is exhausted during peer catch-up".into())
         })?;
         let mut expected_prev_hash = last_hash;
         for candidate in candidates {
+            startup.check("peer decision inspection")?;
             match consensus
                 .inspect_decision_at(expected_index, expected_prev_hash)
                 .map_err(startup_consensus_error)?
             {
                 DecisionInspection::Committed(committed) if committed == candidate => {
+                    startup.check("peer decision inspection")?;
                     persist_startup_entry(
                         config,
                         log_store,
@@ -12655,6 +13053,7 @@ fn recover_peer_candidates(
                         &candidate,
                         expected_index,
                         expected_prev_hash,
+                        startup,
                     )?;
                     expected_prev_hash = candidate.hash;
                     expected_index = expected_index.checked_add(1).ok_or_else(|| {
@@ -12689,28 +13088,49 @@ fn recover_startup_decisions(
     consensus: &ThreeNodeConsensus,
     log_store: &FileLogStore,
     materializer: &Materializer,
+    startup: &StartupIoContext,
 ) -> Result<(), NodeError> {
     for _ in 0..MAX_STARTUP_RECOVERY_ENTRIES {
         let (last_index, last_hash) = static_log_tip(log_store)?;
         let slot = last_index.checked_add(1).ok_or_else(|| {
             NodeError::Reconciliation("qlog index is exhausted during startup".into())
         })?;
+        startup.check("recorder decision inspection")?;
         match consensus
             .inspect_decision_at(slot, last_hash)
             .map_err(startup_consensus_error)?
         {
             DecisionInspection::Committed(entry) => {
-                persist_startup_entry(config, log_store, materializer, &entry, slot, last_hash)?;
+                startup.check("recorder decision inspection")?;
+                persist_startup_entry(
+                    config,
+                    log_store,
+                    materializer,
+                    &entry,
+                    slot,
+                    last_hash,
+                    startup,
+                )?;
             }
             DecisionInspection::Pending => {
                 let entry = consensus
-                    .propose_at(
+                    .propose_at_cancellable(
                         slot,
                         last_hash,
                         Command::new(CommandKind::ReadBarrier, Vec::new()),
+                        startup.cancellation_flag(),
                     )
                     .map_err(startup_consensus_error)?;
-                persist_startup_entry(config, log_store, materializer, &entry, slot, last_hash)?;
+                startup.check("recorder pending decision recovery")?;
+                persist_startup_entry(
+                    config,
+                    log_store,
+                    materializer,
+                    &entry,
+                    slot,
+                    last_hash,
+                    startup,
+                )?;
             }
             DecisionInspection::Empty => return Ok(()),
             DecisionInspection::Unavailable => {
@@ -12732,24 +13152,27 @@ fn persist_startup_entry(
     entry: &LogEntry,
     expected_index: LogIndex,
     expected_prev_hash: LogHash,
+    startup: &StartupIoContext,
 ) -> Result<(), NodeError> {
-    let configuration_state = log_store
-        .configuration_state()
-        .map_err(|error| NodeError::Storage(error.to_string()))?;
-    validate_runtime_entry(
-        config,
-        &configuration_state,
-        entry,
-        expected_index,
-        expected_prev_hash,
-    )?;
-    log_store
-        .append(entry)
-        .map_err(|error| NodeError::Storage(error.to_string()))?;
-    materializer
-        .apply_entry(entry)
-        .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
-    Ok(())
+    startup.persist("startup qlog and materializer persistence", || {
+        let configuration_state = log_store
+            .configuration_state()
+            .map_err(|error| NodeError::Storage(error.to_string()))?;
+        validate_runtime_entry(
+            config,
+            &configuration_state,
+            entry,
+            expected_index,
+            expected_prev_hash,
+        )?;
+        log_store
+            .append(entry)
+            .map_err(|error| NodeError::Storage(error.to_string()))?;
+        materializer
+            .apply_entry(entry)
+            .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+        Ok(())
+    })
 }
 
 fn static_log_tip(log_store: &FileLogStore) -> Result<(LogIndex, LogHash), NodeError> {
@@ -12842,6 +13265,7 @@ fn startup_consensus_error(error: rhiza_quepaxa::Error) -> NodeError {
     match error {
         rhiza_quepaxa::Error::NoQuorum
         | rhiza_quepaxa::Error::CommandUnavailable
+        | rhiza_quepaxa::Error::Cancelled
         | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
         other => NodeError::Reconciliation(other.to_string()),
     }

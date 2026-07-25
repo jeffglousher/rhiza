@@ -291,6 +291,10 @@ fn successor_is_bound_by_stop_proof_and_activation_barrier() {
     .unwrap();
     let barrier = successor.propose_activation_for_stop_at(&proof).unwrap();
     assert_eq!(barrier.index, 8);
+    assert_eq!(
+        successor.propose_activation_for_stop_at(&proof).unwrap(),
+        barrier
+    );
     assert!(
         stores
             .iter()

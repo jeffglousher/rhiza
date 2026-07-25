@@ -329,70 +329,38 @@ fi
 if "$successor_flag"; then
   export PRESTAGE_SOURCE_SECRET="$prestage_source_secret"
   export PRESTAGE_DRAFT_SECRET="${name}-prestage"
-  export PRESTAGE_DATA_SIZE="$data_size_limit"
   # shellcheck disable=SC2016
   yq eval --inplace '
-    (select(.kind == "StatefulSet") |
-      .spec.template.metadata.labels["rhiza.dev/member-role"]) = "learner" |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.volumes[] | select(.name == "config") |
-      .secret.optional) = true |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.volumes) += [
+    with(select(.kind == "StatefulSet");
+      .spec.template.metadata.labels["rhiza.dev/member-role"] = "learner" |
+      with(.spec.template.spec.volumes[] | select(.name == "config");
+        .secret.optional = true
+      ) |
+      .spec.template.spec.volumes += [
         {"name":"prestage-draft","secret":{"secretName":strenv(PRESTAGE_DRAFT_SECRET)}},
         {"name":"prestage-source","secret":{"secretName":strenv(PRESTAGE_SOURCE_SECRET)}}
       ] |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.volumes) |= map(select(.name != "data")) |
-    (select(.kind == "StatefulSet") |
-      .spec.volumeClaimTemplates) = [{
-        "metadata":{"name":"data"},
-        "spec":{
-          "accessModes":["ReadWriteOnce"],
-          "resources":{"requests":{"storage":strenv(PRESTAGE_DATA_SIZE)}}
-        }
-      }] |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.containers[] | select(.name == "rhiza") |
-      .env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") |
-      .value) = "/etc/rhiza/transition/config.json" |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.containers[] | select(.name == "rhiza") |
-      .volumeMounts[] | select(.name == "config") |
-      .mountPath) = "/etc/rhiza/transition" |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.initContainers) = [
-        ((select(.kind == "StatefulSet") |
-          .spec.template.spec.containers[] | select(.name == "rhiza") |
-          to_json | from_json) |
-          .name = "prestage" |
-          .command = ["/bin/sh","-ec"] |
-          .args = ["ordinal=\"${HOSTNAME##*-}\"; case \"$ordinal\" in \"\"|*[!0-9]*) exit 64;; esac; export RHIZA_NODE_ID=\"node-$((ordinal + 1))\"; exec rhiza prestage serve"] |
-          del(.ports, .startupProbe, .livenessProbe, .readinessProbe) |
-          (.env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") |
-            .value) = "/etc/rhiza/prestage/config.json" |
-          .env += [
-            {"name":"RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE","value":"/etc/rhiza/source/config.json"},
-            {"name":"RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE","value":"/etc/rhiza/transition/config.json"},
-            {"name":"RHIZA_PRESTAGE_DIR","value":"/var/lib/rhiza/.prestage"}
-          ] |
-          .volumeMounts = (
-            [.volumeMounts[] | select(.name != "config")] + [
-              {"name":"prestage-draft","mountPath":"/etc/rhiza/prestage","readOnly":true},
-              {"name":"prestage-source","mountPath":"/etc/rhiza/source","readOnly":true},
-              {"name":"config","mountPath":"/etc/rhiza/transition","readOnly":true}
-            ]
-          )
+      with(.spec.template.spec.containers[] | select(.name == "rhiza");
+        with(.env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE");
+          .value = "/etc/rhiza/prestage/config.json"
+        ) |
+        .command = ["/bin/sh","-ec"] |
+        .args = ["ordinal=\"${HOSTNAME##*-}\"; case \"$ordinal\" in \"\"|*[!0-9]*) exit 64;; esac; export RHIZA_NODE_ID=\"node-$((ordinal + 1))\"; exec rhiza prestage serve"] |
+        .env += [
+          {"name":"RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE","value":"/etc/rhiza/source/config.json"},
+          {"name":"RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE","value":"/etc/rhiza/transition/config.json"},
+          {"name":"RHIZA_PRESTAGE_DIR","value":"/var/lib/rhiza/.prestage"}
+        ] |
+        .volumeMounts = (
+          [.volumeMounts[] | select(.name != "config")] + [
+            {"name":"prestage-draft","mountPath":"/etc/rhiza/prestage","readOnly":true},
+            {"name":"prestage-source","mountPath":"/etc/rhiza/source","readOnly":true},
+            {"name":"config","mountPath":"/etc/rhiza/transition","readOnly":true}
+          ]
         )
-      ] |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.containers[] | select(.name == "rhiza") |
-      .env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") |
-      .value) = "/etc/rhiza/transition/config.json" |
-    (select(.kind == "StatefulSet") |
-      .spec.template.spec.containers[] | select(.name == "rhiza") |
-      .volumeMounts[] | select(.name == "config") |
-      .mountPath) = "/etc/rhiza/transition"
+      ) |
+      del(.spec.template.spec.initContainers)
+    )
   ' "$output"
 fi
 yq eval --inplace '

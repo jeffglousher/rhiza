@@ -32,10 +32,10 @@ pub use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc};
 pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
 pub use ha::{
-    HaNode, HaNodeError, HaNodeStatus, HaPredecessor, HaRecorderTransport, HaServeConfig,
-    HaStartupConfig, HaStartupError, HaStartupMode, HaSuccessorPrestageConfig,
-    HaSuccessorPrestageIdentity, PreparedHaStartup, PreparedHaSuccessorPrestage,
-    PublishedHaSuccessorPrestage,
+    HaCertifiedTailError, HaCertifiedTailSource, HaNode, HaNodeError, HaNodeStatus, HaPredecessor,
+    HaRecorderTransport, HaServeConfig, HaStartupConfig, HaStartupError, HaStartupMode,
+    HaSuccessorNode, HaSuccessorPrestageConfig, HaSuccessorPrestageIdentity,
+    PreparedHaSuccessorPrestage, PublishedHaSuccessorPrestage,
 };
 
 const MATERIALIZER_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -417,11 +417,7 @@ impl Rhiza {
         });
         let mut workers = JoinSet::new();
         spawn_materializer(&inner, &mut workers);
-        if inner
-            .coordinator
-            .as_ref()
-            .is_some_and(|coordinator| !matches!(coordinator.mode(), DurabilityMode::Sync))
-        {
+        if inner.coordinator.is_some() {
             spawn_coordinator(&inner, &mut workers);
         }
 
@@ -829,6 +825,9 @@ async fn flush_applied_tip(inner: &Inner) -> Result<(), Error> {
     let Some(coordinator) = &inner.coordinator else {
         return Ok(());
     };
+    if !inner.runtime.configuration_state()?.is_active() {
+        return Ok(());
+    }
     let applied_tip = inner.runtime.applied_index()?;
     coordinator.note_committed(applied_tip);
     coordinator

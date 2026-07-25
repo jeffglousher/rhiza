@@ -842,7 +842,9 @@ impl LearnerStore {
             materializer,
             ..
         } = self;
-        drop(materializer);
+        materializer
+            .close_for_handoff()
+            .map_err(LearnerStoreError::Storage)?;
         drop(log);
         let finalized =
             finalize_successor_prestage_for_stop(prestage, stop, &predecessor_membership)

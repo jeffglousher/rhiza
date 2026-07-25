@@ -1066,6 +1066,31 @@ impl CheckpointPublisher {
                 &self.lease_id,
                 self.options.lease_duration_ms,
                 loaded,
+                false,
+            )
+            .await?;
+        self.state.lock().await.loaded = published.clone();
+        Ok(published)
+    }
+
+    /// Establishes a non-genesis snapshot as the first content in an empty checkpoint namespace.
+    #[doc(hidden)]
+    pub async fn publish_initial_checkpoint_snapshot(
+        &self,
+        anchor: RecoveryAnchor,
+        snapshot_bytes: &[u8],
+    ) -> Result<LoadedCheckpointManifest> {
+        let _operation = self.operation.lock().await;
+        let loaded = self.state.lock().await.loaded.clone();
+        let published = self
+            .store
+            .publish_checkpoint_snapshot_from_loaded_unleased(
+                anchor,
+                snapshot_bytes,
+                &self.lease_id,
+                self.options.lease_duration_ms,
+                loaded,
+                true,
             )
             .await?;
         self.state.lock().await.loaded = published.clone();
@@ -1458,6 +1483,7 @@ impl ObjectArchiveStore {
             lease_id,
             lease_duration_ms,
             loaded,
+            false,
         )
         .await
     }
@@ -1469,6 +1495,7 @@ impl ObjectArchiveStore {
         lease_id: &str,
         lease_duration_ms: u64,
         mut loaded: LoadedCheckpointManifest,
+        allow_empty_baseline: bool,
     ) -> Result<LoadedCheckpointManifest> {
         self.ensure_generation_not_retired().await?;
         self.validate_recovery_anchor(&anchor)?;
@@ -1537,27 +1564,35 @@ impl ObjectArchiveStore {
                 });
             }
 
-            let boundary = loaded
-                .manifest
-                .segments
-                .iter()
-                .find(|record| record.end_index == proposed_tip.index)
-                .ok_or_else(|| {
-                    Error::InvalidCheckpoint(format!(
-                        "snapshot anchor {} is not an exact segment boundary",
-                        proposed_tip.index
-                    ))
-                })?;
-            if boundary.last_hash != proposed_tip.hash {
-                return Err(Error::CheckpointBaseConflict {
-                    index: proposed_tip.index,
-                });
-            }
-
             let mut next = loaded.manifest.clone();
-            next.base = proposed.clone();
-            next.segments
-                .retain(|record| record.start_index > proposed_tip.index);
+            let empty_baseline = allow_empty_baseline
+                && matches!(&loaded.manifest.base, CheckpointBase::Genesis)
+                && loaded.manifest.segments.is_empty()
+                && loaded.manifest.tip == CheckpointTip::new(0, LogHash::ZERO);
+            if empty_baseline {
+                next.base = proposed.clone();
+                next.tip = proposed_tip;
+            } else {
+                let boundary = loaded
+                    .manifest
+                    .segments
+                    .iter()
+                    .find(|record| record.end_index == proposed_tip.index)
+                    .ok_or_else(|| {
+                        Error::InvalidCheckpoint(format!(
+                            "snapshot anchor {} is not an exact segment boundary",
+                            proposed_tip.index
+                        ))
+                    })?;
+                if boundary.last_hash != proposed_tip.hash {
+                    return Err(Error::CheckpointBaseConflict {
+                        index: proposed_tip.index,
+                    });
+                }
+                next.base = proposed.clone();
+                next.segments
+                    .retain(|record| record.start_index > proposed_tip.index);
+            }
             self.validate_checkpoint_manifest(&next)?;
             self.renew_gc_lease(
                 GcLeaseKind::Publisher,
@@ -3579,7 +3614,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rhiza_core::EntryType;
+    use rhiza_core::{ConfigurationState, EntryType, LogAnchor, SnapshotIdentity};
     use rhiza_obj_store::{Error as ObjStoreError, ObjStoreConfig};
 
     #[tokio::test]
@@ -3597,6 +3632,49 @@ mod tests {
 
         let loaded = publisher.publish_committed(&[entry()]).await.unwrap();
         assert_eq!(loaded.manifest().tip().index(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_can_seed_only_an_empty_checkpoint_namespace() {
+        let (_dir, _store, archive) = fixture();
+        let publisher = archive
+            .open_checkpoint_publisher("successor", CheckpointPublisherOptions::default())
+            .await
+            .unwrap();
+        let bytes = b"active successor snapshot";
+        let compacted = LogAnchor::new(3, LogHash::digest(&[b"activate"]));
+        let anchor = RecoveryAnchor::new(
+            "cluster-a",
+            7,
+            ConfigurationState::active(3, LogHash::digest(&[b"target-membership"])),
+            1,
+            compacted,
+            SnapshotIdentity::new(
+                "successor-baseline",
+                LogHash::digest(&[bytes]),
+                bytes.len() as u64,
+                LogHash::digest(&[b"executor"]),
+            ),
+        );
+
+        assert!(publisher
+            .publish_checkpoint_snapshot(anchor.clone(), bytes)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not an exact segment boundary"));
+        let loaded = publisher
+            .publish_initial_checkpoint_snapshot(anchor.clone(), bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            *loaded.manifest().tip(),
+            CheckpointTip::new(3, compacted.hash())
+        );
+        assert!(loaded.manifest().segments().is_empty());
+        let restored = archive.restore_checkpoint_state().await.unwrap();
+        assert_eq!(restored.snapshot().unwrap().anchor(), &anchor);
+        assert_eq!(restored.snapshot().unwrap().bytes(), bytes);
     }
 
     #[tokio::test]

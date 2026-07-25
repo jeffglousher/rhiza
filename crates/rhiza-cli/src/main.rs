@@ -27,9 +27,9 @@ use rhiza_node::{
     PeerConfig, ReadConsistency, RecorderTlsClientConfig, RecorderTlsServerConfig, StopInformation,
     TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH,
     ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH, CERTIFIED_TAIL_PATH,
-    DEFAULT_CERTIFIED_TAIL_ENTRIES, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH,
-    RECOVERY_GENERATION_HEADER, TAIL_CLUSTER_ID_HEADER, TAIL_CONFIG_ID_HEADER, TAIL_EPOCH_HEADER,
-    TAIL_MEMBERSHIP_DIGEST_HEADER, TAIL_PROTOCOL_VERSION, TAIL_VERSION_HEADER, VERSION_HEADER,
+    LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, RECOVERY_GENERATION_HEADER, TAIL_CLUSTER_ID_HEADER,
+    TAIL_CONFIG_ID_HEADER, TAIL_EPOCH_HEADER, TAIL_MEMBERSHIP_DIGEST_HEADER, TAIL_PROTOCOL_VERSION,
+    TAIL_VERSION_HEADER, VERSION_HEADER,
 };
 #[cfg(feature = "sql")]
 use rhiza_node::{
@@ -57,8 +57,9 @@ use rhiza_quepaxa::{
 #[cfg(feature = "sql")]
 use rhiza_sql::{SqlStatement, SqlValue};
 use rhizadb::{
-    HaNode, HaNodeError, HaPredecessor, HaRecorderTransport, HaServeConfig, HaStartupConfig,
-    HaStartupMode, HaSuccessorPrestageConfig, PublishedHaSuccessorPrestage,
+    HaCertifiedTailError, HaCertifiedTailSource, HaNode, HaNodeError, HaPredecessor,
+    HaRecorderTransport, HaServeConfig, HaStartupConfig, HaStartupMode, HaSuccessorNode,
+    HaSuccessorPrestageConfig,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -2309,125 +2310,94 @@ async fn serve(config: ServeConfig) -> Result<(), String> {
 }
 
 async fn run_prestage_serve(config: PrestageServeConfig) -> Result<(), String> {
-    let prepared = match HaSuccessorPrestageConfig::resume(
-        &config.target.data_dir,
-        config.source_bundle.config_id,
+    let startup = prestage_startup_config(&config.target)?;
+    let recorder_clients = build_recorder_clients(&config.target)?;
+    let log_peers = build_log_peers(&config.target)?
+        .into_iter()
+        .map(|peer| Arc::new(peer) as Arc<dyn LogPeer>)
+        .collect();
+    let (recorder_listener, recorder_transport) = bind_ha_recorder_listener(&config.target).await?;
+    let service_listener = bind_client_listener(&config.target).await?;
+    let mut serve = HaServeConfig::new(
+        recorder_listener,
+        service_listener,
+        recorder_transport,
+        recorder_clients,
+        log_peers,
+    );
+    if let Some(admin) = config.target.admin_config()? {
+        serve = serve.with_admin(admin);
+    }
+    if let Some(tail_token) = config.target.tail_token.clone() {
+        serve = serve.with_tail_token(tail_token);
+    }
+    let tail_source = Arc::new(HttpCertifiedTailSource::new(&config)?);
+    let prestage = HaSuccessorPrestageConfig::new(
+        config.source_archive.clone(),
+        &config.prestage_dir,
+        config.target.node_id.clone(),
+        config.target.execution_profile,
         config.source_bundle.membership.clone(),
+        config.target.bundle.membership.clone(),
         config.tail_token.clone(),
-    ) {
-        Ok(prepared) => prepared,
-        Err(_resume_error) if data_directory_is_empty(&config.target.data_dir)? => {
-            HaSuccessorPrestageConfig::new(
-                config.source_archive.clone(),
-                &config.prestage_dir,
-                config.target.node_id.clone(),
-                config.target.execution_profile,
-                config.source_bundle.membership.clone(),
-                config.target.bundle.membership.clone(),
-                config.tail_token.clone(),
-            )
-            .prepare()
-            .await
-            .map_err(|error| error.to_string())?
-        }
-        Err(error) => match transition_serve_config(&config)? {
-            Some(final_config) => {
-                let stop = final_config.bundle.require_predecessor()?.stop.clone();
-                let prepared = prestage_startup_config(&final_config)?
-                    .resume_finalized_successor_prestage()
-                    .await
-                    .map_err(|final_error| {
-                        format!(
-                            "cannot resume successor prestage ({error}) or finalized successor ({final_error})"
-                        )
-                    })?;
-                drop(prepared);
-                println!(
-                    "{{\"state\":\"finalized\",\"node_id\":{},\"target_config_id\":{},\"stop_index\":{},\"resumed\":true}}",
-                    serde_json::to_string(&config.target.node_id)
-                        .map_err(|error| error.to_string())?,
-                    final_config.bundle.config_id,
-                    stop.entry.index
-                );
-                return Ok(());
-            }
-            None => {
-                return Err(format!(
-                    "cannot resume successor prestage ({error}); local data is not fresh"
-                ))
-            }
-        },
-    };
-    let learner = prepared
-        .publish(&config.target.data_dir)
+    );
+    let node = prestage
+        .start_live(startup, serve, tail_source)
         .map_err(|error| error.to_string())?;
     println!(
-        "{{\"state\":\"prestage\",\"node_id\":{},\"source_config_id\":{},\"target_config_id\":{},\"seed_index\":{}}}",
+        "{{\"state\":\"prestage\",\"node_id\":{},\"source_config_id\":{},\"target_config_id\":{},\"same_process\":true}}",
         serde_json::to_string(&config.target.node_id).map_err(|error| error.to_string())?,
         config.source_bundle.config_id,
-        config.target.bundle.config_id,
-        learner.identity().seed_anchor().index()
+        config.target.bundle.config_id
     );
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut transition_poll = tokio::time::interval(Duration::from_millis(250));
+    transition_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut predecessor_bound = false;
     loop {
-        if let Some(final_config) = ready_transition_config(&config, &learner)? {
-            let stop = final_config.bundle.require_predecessor()?.stop.clone();
-            let startup = prestage_startup_config(&final_config)?;
-            let prepared = learner
-                .finalize(startup)
-                .await
-                .map_err(|error| error.to_string())?;
-            drop(prepared);
-            println!(
-                "{{\"state\":\"finalized\",\"node_id\":{},\"target_config_id\":{},\"stop_index\":{}}}",
-                serde_json::to_string(&config.target.node_id)
-                    .map_err(|error| error.to_string())?,
-                final_config.bundle.config_id,
-                stop.entry.index
-            );
-            return Ok(());
-        }
-
         tokio::select! {
-            () = &mut shutdown => return Ok(()),
-            result = prestage_tail_once(&config, &learner) => {
-                result?;
+            biased;
+            () = &mut shutdown => return shutdown_ha_successor(node, Ok(())).await,
+            result = node.ready() => {
+                result.map_err(|error| error.to_string())?;
+                break;
+            }
+            result = node.monitor() => {
+                return shutdown_ha_successor(node, result).await;
+            }
+            _ = transition_poll.tick(), if !predecessor_bound => {
+                if let Some(final_config) = transition_serve_config(&config)? {
+                    let predecessor = final_config.bundle.require_predecessor()?;
+                    node.bind_predecessor(HaPredecessor::new(
+                        predecessor.membership.clone(),
+                        predecessor.stop.clone(),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                    predecessor_bound = true;
+                    println!(
+                        "{{\"state\":\"transitioning\",\"node_id\":{},\"target_config_id\":{},\"stop_index\":{}}}",
+                        serde_json::to_string(&config.target.node_id)
+                            .map_err(|error| error.to_string())?,
+                        final_config.bundle.config_id,
+                        predecessor.stop.entry.index
+                    );
+                }
             }
         }
     }
-}
-
-fn data_directory_is_empty(path: &std::path::Path) -> Result<bool, String> {
-    match fs::read_dir(path) {
-        Ok(mut entries) => Ok(entries.next().is_none()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(format!("cannot inspect prestage data directory: {error}")),
+    println!(
+        "rhiza successor serving client={} recorder={} recovery_generation={}",
+        config.target.client_listen,
+        active_recorder_listen(&config.target)?,
+        config.target.recovery_generation
+    );
+    tokio::select! {
+        biased;
+        () = &mut shutdown => shutdown_ha_successor(node, Ok(())).await,
+        result = node.monitor() => shutdown_ha_successor(node, result).await,
     }
-}
-
-fn ready_transition_config(
-    config: &PrestageServeConfig,
-    learner: &PublishedHaSuccessorPrestage,
-) -> Result<Option<ServeConfig>, String> {
-    let Some(final_config) = transition_serve_config(config)? else {
-        return Ok(None);
-    };
-    let predecessor = final_config.bundle.require_predecessor()?;
-    let stop = LogAnchor::new(predecessor.stop.entry.index, predecessor.stop.entry.hash);
-    let durable = learner
-        .durable_anchor()
-        .map_err(|error| error.to_string())?;
-    if durable.index() > stop.index()
-        || (durable.index() == stop.index() && durable.hash() != stop.hash())
-    {
-        return Err("successor prestage diverged from the exact predecessor Stop".into());
-    }
-    if durable != stop {
-        return Ok(None);
-    }
-    Ok(Some(final_config))
 }
 
 fn transition_serve_config(config: &PrestageServeConfig) -> Result<Option<ServeConfig>, String> {
@@ -2472,100 +2442,105 @@ fn prestage_startup_config(config: &ServeConfig) -> Result<HaStartupConfig, Stri
         ),
     )
     .map_err(|error| error.to_string())?;
-    let predecessor = config.bundle.require_predecessor()?;
     Ok(HaStartupConfig::new(
         config.node_config()?,
         archive,
         remote.durability.clone(),
         remote.lease_duration_ms,
         HaStartupMode::Rejoin,
-    )
-    .with_predecessor(HaPredecessor::new(
-        predecessor.membership.clone(),
-        predecessor.stop.clone(),
-    )))
-}
-
-async fn prestage_tail_once(
-    config: &PrestageServeConfig,
-    learner: &PublishedHaSuccessorPrestage,
-) -> Result<(), String> {
-    let request = learner
-        .tail_request(DEFAULT_CERTIFIED_TAIL_ENTRIES)
-        .map_err(|error| error.to_string())?;
-    let client = bounded_http_client(HEALTH_CONNECT_TIMEOUT, HEALTH_REQUEST_TIMEOUT)?;
-    let identity = learner.identity();
-    let mut failures = Vec::new();
-    for peer in &config.source_bundle.peers {
-        let url = endpoint(peer.log_base_url(), CERTIFIED_TAIL_PATH);
-        let response = client
-            .post(&url)
-            .header(
-                header::AUTHORIZATION,
-                format!("Rhiza-Tail {}", config.tail_token),
-            )
-            .header(TAIL_VERSION_HEADER, TAIL_PROTOCOL_VERSION)
-            .header(TAIL_CLUSTER_ID_HEADER, identity.cluster_id())
-            .header(TAIL_EPOCH_HEADER, identity.epoch())
-            .header(TAIL_CONFIG_ID_HEADER, identity.predecessor_config_id())
-            .header(
-                TAIL_MEMBERSHIP_DIGEST_HEADER,
-                config.source_bundle.membership.digest().to_hex(),
-            )
-            .header(
-                RECOVERY_GENERATION_HEADER,
-                identity.predecessor_recovery_generation(),
-            )
-            .json(&request)
-            .send()
-            .await;
-        match response {
-            Ok(response) if response.status().is_success() => {
-                let response: CertifiedTailResponse = response.json().await.map_err(|error| {
-                    format!("invalid certified tail response from {url}: {error}")
-                })?;
-                learner
-                    .apply_page(&request, &response)
-                    .map_err(|error| error.to_string())?;
-                if response.records.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                return Ok(());
-            }
-            Ok(response) if response.status().as_u16() == 409 => {
-                return Err(prestage_rebase_error(&url, response).await?)
-            }
-            Ok(response) if matches!(response.status().as_u16(), 429 | 503 | 504) => {
-                failures.push(format!("{url}: HTTP {}", response.status()))
-            }
-            Ok(response) => {
-                return Err(format!(
-                "predecessor certified-tail endpoint rejected the bound request: {url}: HTTP {}",
-                response.status()
-            ))
-            }
-            Err(error) => failures.push(format!("{url}: {}", request_error(error))),
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    eprintln!(
-        "prestage waiting for a predecessor certified-tail endpoint: {}",
-        failures.join("; ")
-    );
-    Ok(())
-}
-
-async fn prestage_rebase_error(url: &str, response: Response) -> Result<String, String> {
-    let error: CertifiedTailErrorResponse = response
-        .json()
-        .await
-        .map_err(|error| format!("invalid certified tail error response from {url}: {error}"))?;
-    let CertifiedTailErrorResponse::RebaseRequired { checkpoint } = error;
-    Ok(format!(
-        "local prestage/checkpoint is obsolete; prestage must restart from source checkpoint at index {} with hash {}",
-        checkpoint.index(),
-        checkpoint.hash().to_hex()
     ))
+}
+
+struct HttpCertifiedTailSource {
+    client: reqwest::Client,
+    peers: Vec<PeerConfig>,
+    tail_token: String,
+    cluster_id: String,
+    epoch: u64,
+    config_id: u64,
+    membership_digest: String,
+    recovery_generation: u64,
+}
+
+impl HttpCertifiedTailSource {
+    fn new(config: &PrestageServeConfig) -> Result<Self, String> {
+        Ok(Self {
+            client: bounded_http_client(HEALTH_CONNECT_TIMEOUT, HEALTH_REQUEST_TIMEOUT)?,
+            peers: config.source_bundle.peers.clone(),
+            tail_token: config.tail_token.clone(),
+            cluster_id: config.target.cluster_id.clone(),
+            epoch: config.target.epoch,
+            config_id: config.source_bundle.config_id,
+            membership_digest: config.source_bundle.membership.digest().to_hex(),
+            recovery_generation: config.target.recovery_generation,
+        })
+    }
+}
+
+impl HaCertifiedTailSource for HttpCertifiedTailSource {
+    fn fetch<'a>(
+        &'a self,
+        request: &'a rhiza_node::CertifiedTailRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<CertifiedTailResponse, HaCertifiedTailError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut failures = Vec::new();
+            for peer in &self.peers {
+                let url = endpoint(peer.log_base_url(), CERTIFIED_TAIL_PATH);
+                let response = self
+                    .client
+                    .post(&url)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Rhiza-Tail {}", self.tail_token),
+                    )
+                    .header(TAIL_VERSION_HEADER, TAIL_PROTOCOL_VERSION)
+                    .header(TAIL_CLUSTER_ID_HEADER, &self.cluster_id)
+                    .header(TAIL_EPOCH_HEADER, self.epoch)
+                    .header(TAIL_CONFIG_ID_HEADER, self.config_id)
+                    .header(TAIL_MEMBERSHIP_DIGEST_HEADER, &self.membership_digest)
+                    .header(RECOVERY_GENERATION_HEADER, self.recovery_generation)
+                    .json(request)
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        return response.json().await.map_err(|error| {
+                            HaCertifiedTailError::Rejected(format!(
+                                "invalid response from {url}: {error}"
+                            ))
+                        });
+                    }
+                    Ok(response) if response.status().as_u16() == 409 => {
+                        let error: CertifiedTailErrorResponse =
+                            response.json().await.map_err(|error| {
+                                HaCertifiedTailError::Rejected(format!(
+                                    "invalid rebase response from {url}: {error}"
+                                ))
+                            })?;
+                        let CertifiedTailErrorResponse::RebaseRequired { checkpoint } = error;
+                        return Err(HaCertifiedTailError::RebaseRequired(checkpoint));
+                    }
+                    Ok(response) if matches!(response.status().as_u16(), 429 | 503 | 504) => {
+                        failures.push(format!("{url}: HTTP {}", response.status()));
+                    }
+                    Ok(response) => {
+                        return Err(HaCertifiedTailError::Rejected(format!(
+                            "{url}: HTTP {}",
+                            response.status()
+                        )));
+                    }
+                    Err(error) => failures.push(format!("{url}: {}", request_error(error))),
+                }
+            }
+            Err(HaCertifiedTailError::Unavailable(failures.join("; ")))
+        })
+    }
 }
 
 async fn serve_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
@@ -2857,11 +2832,6 @@ where
             predecessor.stop.clone(),
         ));
     }
-    let prepared = tokio::select! {
-        biased;
-        () = &mut shutdown => return Ok(()),
-        result = startup.prepare() => result.map_err(|error| error.to_string())?,
-    };
     let recorder_clients = build_recorder_clients(&config)?;
     let log_peers = build_log_peers(&config)?
         .into_iter()
@@ -2890,11 +2860,7 @@ where
     if let Some(tail_token) = config.tail_token.clone() {
         serve = serve.with_tail_token(tail_token);
     }
-    let node = tokio::select! {
-        biased;
-        () = &mut shutdown => return Ok(()),
-        result = prepared.start(serve) => result.map_err(|error| error.to_string())?,
-    };
+    let node = startup.start(serve);
     let ready = tokio::select! {
         biased;
         () = &mut shutdown => return shutdown_ha_node(node, Ok(())).await,
@@ -2920,6 +2886,16 @@ where
 }
 
 async fn shutdown_ha_node(node: HaNode, observed: Result<(), HaNodeError>) -> Result<(), String> {
+    match node.shutdown().await {
+        Ok(()) => observed.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn shutdown_ha_successor(
+    node: HaSuccessorNode,
+    observed: Result<(), HaNodeError>,
+) -> Result<(), String> {
     match node.shutdown().await {
         Ok(()) => observed.map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
@@ -5051,29 +5027,41 @@ mod tests {
         let checkpoint = LogAnchor::new(41, LogHash::from_bytes([7; 32]));
         let body = CertifiedTailErrorResponse::RebaseRequired { checkpoint };
         let app = Router::new().route(
-            "/",
-            get(move || {
+            CERTIFIED_TAIL_PATH,
+            axum::routing::post(move || {
                 let body = body.clone();
                 async move { (StatusCode::CONFLICT, Json(body)) }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let response = bounded_http_client(Duration::from_millis(20), Duration::from_millis(100))
-            .unwrap()
-            .get(&url)
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            prestage_rebase_error(&url, response).await.unwrap(),
-            format!(
-                "local prestage/checkpoint is obsolete; prestage must restart from source checkpoint at index 41 with hash {}",
-                checkpoint.hash().to_hex()
+        let source = HttpCertifiedTailSource {
+            client: bounded_http_client(Duration::from_millis(20), Duration::from_millis(100))
+                .unwrap(),
+            peers: vec![
+                PeerConfig::new("node-1", format!("http://{address}"), "peer-secret").unwrap(),
+            ],
+            tail_token: "tail-secret".into(),
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            membership_digest: Membership::from_voters(
+                ["node-1", "node-2", "node-3"].map(String::from),
             )
+            .unwrap()
+            .digest()
+            .to_hex(),
+            recovery_generation: 0,
+        };
+        let request = rhiza_node::CertifiedTailRequest {
+            from: LogAnchor::new(0, LogHash::ZERO),
+            max_entries: 8,
+        };
+
+        assert_eq!(
+            source.fetch(&request).await.unwrap_err(),
+            HaCertifiedTailError::RebaseRequired(checkpoint)
         );
         server.abort();
     }
