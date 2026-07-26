@@ -4,7 +4,7 @@ Repository tags and Rust crates have independent versions. A GitHub release is
 a reviewed source snapshot; it does not imply crates.io or OCI publication.
 Each release note must state exactly which channels were published.
 
-## v0.5.0 multi-channel release
+## v0.5.x multi-channel release
 
 KV promotion uses three distinct delivery channels. Do not describe a channel
 as released until its registry or release asset is independently visible.
@@ -38,7 +38,7 @@ rhiza-graph-<tag>-x86_64-unknown-linux-gnu.tar.gz
 rhiza-kv-<tag>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-The same workflow pushes immutable, profile-isolated Linux amd64 images:
+The same workflow pushes immutable, profile-isolated Linux amd64/arm64 images:
 
 ```text
 ghcr.io/mrchypark/rhiza-sql:<tag>
@@ -48,8 +48,8 @@ ghcr.io/mrchypark/rhiza-kv:<tag>
 
 GHCR uses the repository `GITHUB_TOKEN`; no registry password is required.
 After the first push, verify each package is linked to this repository and set
-its visibility to public before advertising it. Additional architectures,
-mutable `latest` tags, signing, and SBOMs are not part of the first release.
+its visibility to public before advertising it. Mutable `latest` tags, signing,
+and SBOMs are not part of the release.
 
 ### Release verification
 

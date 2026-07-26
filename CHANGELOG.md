@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.1
+
+- Publishes profile-isolated GHCR images for both Linux amd64 and arm64.
+
 ## v0.5.0
 
 - Restores KV/redb as an isolated server profile with authenticated put,
