@@ -46,6 +46,8 @@ jobs:
         run: |
           vcpkg install "openssl:$env:VCPKG_TARGET"
           $installed = "$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TARGET"
+          Copy-Item "$installed/lib/libssl.lib" "$installed/lib/ssl.lib"
+          Copy-Item "$installed/lib/libcrypto.lib" "$installed/lib/crypto.lib"
           "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
           "OPENSSL_ROOT_DIR=$installed" >> $env:GITHUB_ENV
           "OPENSSL_BIN=$installed/bin" >> $env:GITHUB_ENV
