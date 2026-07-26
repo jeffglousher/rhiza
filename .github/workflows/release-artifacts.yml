@@ -55,9 +55,15 @@ jobs:
           "VCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET" >> $env:GITHUB_ENV
       - name: Build isolated CLI
         shell: bash
-        run: >-
-          cargo build --release --locked -p rhiza-cli --bin rhiza
-          --no-default-features --features ${{ matrix.profile }},recorder-postcard-rpc
+        env:
+          PROFILE: ${{ matrix.profile }}
+          TARGET: ${{ matrix.platform.target }}
+        run: |
+          if [[ "$PROFILE:$TARGET" == graph:x86_64-apple-darwin ]]; then
+            export LBUG_BUILD_FROM_SOURCE=1
+          fi
+          cargo build --release --locked -p rhiza-cli --bin rhiza \
+            --no-default-features --features "$PROFILE,recorder-postcard-rpc"
       - name: Package CLI (Unix)
         if: runner.os != 'Windows'
         shell: bash
