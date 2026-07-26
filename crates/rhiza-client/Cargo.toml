@@ -7,16 +7,17 @@ repository.workspace = true
 description = "Client library for interacting with rhiza nodes"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("graph", "kv"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("kv"))'] }
 
 [features]
 default = ["sql"]
-sql = ["dep:rhiza-sql"]
+sql = ["rhiza-node/sql", "dep:rhiza-sql"]
+graph = ["rhiza-node/graph"]
 
 [dependencies]
 reqwest.workspace = true
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
-rhiza-node = { version = "0.3.0", path = "../rhiza-node" }
+rhiza-node = { version = "0.3.0", path = "../rhiza-node", default-features = false }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
 serde.workspace = true
 serde_json.workspace = true

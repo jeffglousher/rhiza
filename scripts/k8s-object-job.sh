@@ -20,8 +20,8 @@ emit_command_stdout() { cat "$1"; }
 
 case "$config_id" in ''|*[!0-9]*|0) exit 64;; esac
 case "$profile" in
-  sql) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
+  sql|graph) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph" >&2; exit 65 ;;
 esac
 jq -e --argjson id "$config_id" '.config_id == $id' "$bundle" >/dev/null
 command_json="$(printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]')"

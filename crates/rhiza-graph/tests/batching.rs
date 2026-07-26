@@ -51,6 +51,56 @@ fn ordered_batch_atomically_applies_members_and_distinct_receipts() {
         second.result(),
         &GraphCommandResultV1::PutDocument { created: false }
     );
+    assert_eq!(state.apply_entry(&entry).unwrap(), outcome);
+}
+
+#[test]
+fn batch_tracks_document_existence_in_command_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let put = GraphCommandV1::put_document("put", "document", GraphValueV1::String("one".into()))
+        .unwrap();
+    let delete = GraphCommandV1::delete_document("delete", "document").unwrap();
+    let recreate =
+        GraphCommandV1::put_document("recreate", "document", GraphValueV1::U64(7)).unwrap();
+    let payloads =
+        [&put, &delete, &recreate].map(|command| encode_replicated_graph_command(command).unwrap());
+    let entry = entry(
+        1,
+        LogHash::ZERO,
+        encode_replicated_graph_batch(&[put, delete, recreate]).unwrap(),
+    );
+
+    state.apply_entry(&entry).unwrap();
+
+    assert_eq!(
+        state
+            .check_request("put", &payloads[0])
+            .unwrap()
+            .unwrap()
+            .result(),
+        &GraphCommandResultV1::PutDocument { created: true }
+    );
+    assert_eq!(
+        state
+            .check_request("delete", &payloads[1])
+            .unwrap()
+            .unwrap()
+            .result(),
+        &GraphCommandResultV1::DeleteDocument { existed: true }
+    );
+    assert_eq!(
+        state
+            .check_request("recreate", &payloads[2])
+            .unwrap()
+            .unwrap()
+            .result(),
+        &GraphCommandResultV1::PutDocument { created: true }
+    );
+    assert_eq!(
+        state.get_document("document").unwrap(),
+        Some(GraphValueV1::U64(7))
+    );
 }
 
 #[test]
@@ -136,6 +186,59 @@ fn malformed_duplicate_and_oversized_batches_are_rejected_without_mutation() {
     assert_eq!(state.applied_hash().unwrap(), LogHash::ZERO);
     assert_eq!(state.get_document("document").unwrap(), None);
     assert_eq!(state.get_document("new").unwrap(), None);
+}
+
+#[test]
+#[ignore = "manual release-mode throughput benchmark"]
+fn apply_throughput() {
+    let batch_size = std::env::var("RHIZA_GRAPH_BENCH_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    let operations = std::env::var("RHIZA_GRAPH_BENCH_OPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_024);
+    assert!((1..=MAX_GRAPH_BATCH_MEMBERS).contains(&batch_size));
+    assert!(operations >= batch_size && operations.is_multiple_of(batch_size));
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let mut index = 0;
+    let mut hash = LogHash::ZERO;
+    let run = |start: usize, count: usize, index: &mut u64, hash: &mut LogHash| {
+        for offset in (start..start + count).step_by(batch_size) {
+            let commands = (offset..offset + batch_size)
+                .map(|operation| {
+                    GraphCommandV1::put_document(
+                        format!("request-{operation}"),
+                        format!("document-{}", operation % 256),
+                        GraphValueV1::String("x".repeat(128)),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let payload = if batch_size == 1 {
+                encode_replicated_graph_command(&commands[0]).unwrap()
+            } else {
+                encode_replicated_graph_batch(&commands).unwrap()
+            };
+            *index += 1;
+            let next = entry(*index, *hash, payload);
+            state.apply_entry(&next).unwrap();
+            *hash = next.hash;
+        }
+    };
+
+    run(0, batch_size * 2, &mut index, &mut hash);
+    let started = std::time::Instant::now();
+    run(batch_size * 2, operations, &mut index, &mut hash);
+    let elapsed = started.elapsed();
+    println!(
+        "batch_size={batch_size} operations={operations} elapsed_ms={:.3} operations_per_second={:.3}",
+        elapsed.as_secs_f64() * 1_000.0,
+        operations as f64 / elapsed.as_secs_f64()
+    );
 }
 
 fn state(root: &std::path::Path) -> LadybugStateMachine {

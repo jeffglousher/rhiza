@@ -1,3 +1,5 @@
+#[cfg(feature = "graph")]
+use std::collections::BTreeMap;
 use std::{
     fmt,
     future::Future,
@@ -11,7 +13,9 @@ use std::{
 
 mod ha;
 
-use rhiza_node::{confirm_write_durability, ConfigError, NodeRuntime, NodeService};
+#[cfg(feature = "sql")]
+use rhiza_node::NodeService;
+use rhiza_node::{confirm_write_durability, execution_profile_compiled, ConfigError, NodeRuntime};
 use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
 use tokio::{
     sync::{watch, OwnedRwLockReadGuard, RwLock},
@@ -21,14 +25,26 @@ use tokio::{
 
 pub use rhiza_archive::ObjectArchiveStore;
 pub use rhiza_core::{ErrorCategory, ErrorClassification, ExecutionProfile};
+#[cfg(feature = "graph")]
+pub use rhiza_graph::{
+    CanonicalF64, GraphColumn, GraphCommandResultV1, GraphCommandV1, GraphInternalId,
+    GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
+    GraphValueV1,
+};
 pub use rhiza_node::{
     effective_cluster_id, CertifiedTailRecord, CertifiedTailRequest, CertifiedTailResponse,
     CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode, LearnerProgress,
-    LogPeer, NodeConfig, NodeError, NodeStatus, PeerConfig, ReadConsistency, ReadResponse,
-    SqlExecuteResponse, SqlQueryResponse, SqlStatementResult, StopInformation, WriteRequest,
+    LogPeer, NodeConfig, NodeError, NodeStatus, PeerConfig, ReadConsistency, StopInformation,
+};
+#[cfg(feature = "graph")]
+pub use rhiza_node::{GraphMutationOutcome, GraphReadResponse};
+#[cfg(feature = "sql")]
+pub use rhiza_node::{
+    ReadResponse, SqlExecuteResponse, SqlQueryResponse, SqlStatementResult, WriteRequest,
     WriteResponse,
 };
 pub use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc};
+#[cfg(feature = "sql")]
 pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
 pub use ha::{
@@ -87,7 +103,7 @@ impl EmbeddedConfig {
         root: impl Into<PathBuf>,
         execution_profile: ExecutionProfile,
     ) -> Result<Self, Error> {
-        require_sql_embedded_profile(execution_profile)?;
+        require_embedded_profile(execution_profile)?;
         let logical_cluster_id = logical_cluster_id.into();
         let cluster_id = effective_cluster_id(execution_profile, &logical_cluster_id)?;
         let root = root.into();
@@ -324,6 +340,7 @@ impl From<DurabilityError> for Error {
 
 struct Inner {
     runtime: Arc<NodeRuntime>,
+    #[cfg(feature = "sql")]
     service: NodeService,
     execution_profile: ExecutionProfile,
     coordinator: Option<Arc<CheckpointCoordinator>>,
@@ -366,7 +383,7 @@ impl Rhiza {
             log_peers,
             coordinator,
         } = config;
-        require_sql_embedded_profile(execution_profile)?;
+        require_embedded_profile(execution_profile)?;
         let node_config = NodeConfig::new_embedded(
             identity.cluster_id.clone(),
             identity.node_id.clone(),
@@ -402,11 +419,13 @@ impl Rhiza {
         coordinator: Option<Arc<CheckpointCoordinator>>,
     ) -> Self {
         let execution_profile = runtime.config().execution_profile();
+        #[cfg(feature = "sql")]
         let service = NodeService::new(runtime.clone(), coordinator.clone());
         let (shutdown, _) = watch::channel(false);
         let (worker_monitor, _) = watch::channel(WorkerMonitorState::Running);
         let inner = Arc::new(Inner {
             runtime,
+            #[cfg(feature = "sql")]
             service,
             execution_profile,
             coordinator,
@@ -541,6 +560,7 @@ impl RhizaHandle {
         }
     }
 
+    #[cfg(feature = "sql")]
     pub async fn put(
         &self,
         request_id: &str,
@@ -552,12 +572,14 @@ impl RhizaHandle {
         Ok(inner.service.put(request_id, key, value).await?)
     }
 
+    #[cfg(feature = "sql")]
     pub async fn write(&self, request: WriteRequest) -> Result<WriteResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
         require_profile(&inner, ExecutionProfile::Sqlite)?;
         Ok(inner.service.write(request).await?)
     }
 
+    #[cfg(feature = "sql")]
     pub async fn execute_sql(&self, command: SqlCommand) -> Result<SqlExecuteResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
         require_profile(&inner, ExecutionProfile::Sqlite)?;
@@ -569,6 +591,7 @@ impl RhizaHandle {
     /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
     /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
     /// vector with the same request IDs.
+    #[cfg(feature = "sql")]
     pub async fn execute_sql_batch(
         &self,
         commands: Vec<SqlCommand>,
@@ -581,6 +604,7 @@ impl RhizaHandle {
         .await
     }
 
+    #[cfg(feature = "sql")]
     pub async fn read(
         &self,
         key: &str,
@@ -591,6 +615,7 @@ impl RhizaHandle {
         Ok(inner.service.read(key, consistency).await?)
     }
 
+    #[cfg(feature = "sql")]
     pub async fn query(
         &self,
         statement: SqlStatement,
@@ -603,6 +628,76 @@ impl RhizaHandle {
             .service
             .query(statement, consistency, max_rows)
             .await?)
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn mutate_graph(
+        &self,
+        command: GraphCommandV1,
+    ) -> Result<GraphMutationOutcome, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Graph)?;
+        embedded_write_allowed(&inner)?;
+        let runtime = inner.runtime.clone();
+        let outcome = tokio::task::spawn_blocking(move || runtime.mutate_graph(command))
+            .await
+            .map_err(Error::Worker)??;
+        confirm_embedded_write(&inner, outcome.applied_index()).await?;
+        Ok(outcome)
+    }
+
+    /// Executes an ordered, non-atomic graph batch that may coalesce commands into fewer log entries.
+    ///
+    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
+    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
+    /// vector with the same request IDs.
+    #[cfg(feature = "graph")]
+    pub async fn mutate_graph_batch(
+        &self,
+        commands: Vec<GraphCommandV1>,
+    ) -> Result<Vec<Result<GraphMutationOutcome, NodeError>>, BatchWriteError> {
+        self.execute_typed_batch(
+            ExecutionProfile::Graph,
+            move |runtime| runtime.mutate_graph_batch(commands),
+            GraphMutationOutcome::applied_index,
+        )
+        .await
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn query_graph(
+        &self,
+        statement: impl Into<String>,
+        parameters: BTreeMap<String, GraphParameterValue>,
+        consistency: ReadConsistency,
+        max_rows: u32,
+    ) -> Result<GraphQueryResult, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Graph)?;
+        let runtime = inner.runtime.clone();
+        let statement = statement.into();
+        tokio::task::spawn_blocking(move || {
+            runtime.query_graph(&statement, &parameters, consistency, max_rows)
+        })
+        .await
+        .map_err(Error::Worker)?
+        .map_err(Error::Node)
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn get_graph_document(
+        &self,
+        id: impl Into<String>,
+        consistency: ReadConsistency,
+    ) -> Result<GraphReadResponse, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Graph)?;
+        let runtime = inner.runtime.clone();
+        let id = id.into();
+        tokio::task::spawn_blocking(move || runtime.get_graph_document(&id, consistency))
+            .await
+            .map_err(Error::Worker)?
+            .map_err(Error::Node)
     }
 
     pub async fn status(&self) -> Result<NodeStatus, Error> {
@@ -678,12 +773,20 @@ fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Erro
     }
 }
 
-fn require_sql_embedded_profile(execution_profile: ExecutionProfile) -> Result<(), Error> {
-    if execution_profile == ExecutionProfile::Sqlite {
+fn require_embedded_profile(execution_profile: ExecutionProfile) -> Result<(), Error> {
+    if execution_profile_compiled(execution_profile) {
         Ok(())
     } else {
+        let expected = [
+            ExecutionProfile::Sqlite,
+            ExecutionProfile::Graph,
+            ExecutionProfile::Kv,
+        ]
+        .into_iter()
+        .find(|profile| execution_profile_compiled(*profile))
+        .unwrap_or(ExecutionProfile::Sqlite);
         Err(Error::ExecutionProfileMismatch {
-            expected: ExecutionProfile::Sqlite,
+            expected,
             actual: execution_profile,
         })
     }
@@ -913,6 +1016,7 @@ mod tests {
         assert!(!root.path().join("node").exists());
     }
 
+    #[cfg(not(feature = "graph"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn open_rejects_non_sql_profile_before_creating_runtime_storage() {
         let root = tempfile::tempdir().unwrap();

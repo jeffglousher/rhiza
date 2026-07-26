@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(feature = "sql", feature = "graph", feature = "kv")),
+    allow(dead_code, unreachable_code, unused_imports, unused_variables)
+)]
+
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
@@ -9,15 +14,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "sql")]
+#[cfg(any(feature = "sql", feature = "kv"))]
 use std::collections::VecDeque;
 
-#[cfg(not(feature = "sql"))]
-compile_error!("rhiza-node requires the sql execution profile feature");
+#[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+compile_error!("rhiza-node requires at least one execution profile feature: sql, graph, or kv");
 
 #[cfg(feature = "graph")]
 use std::collections::BTreeMap;
-#[cfg(any(feature = "sql", test))]
+#[cfg(any(feature = "sql", feature = "kv", test))]
 use std::sync::atomic::AtomicUsize;
 
 use axum::{
@@ -3040,9 +3045,11 @@ async fn handle_graph_query(
         Ok(Ok(result)) => {
             let response = GraphQueryResponse::from(result);
             match serde_json::to_vec(&response) {
-                Ok(encoded) if encoded.len() <= MAX_GRAPH_RESPONSE_BYTES => {
-                    Json(response).into_response()
-                }
+                Ok(encoded) if encoded.len() <= MAX_GRAPH_RESPONSE_BYTES => (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    encoded,
+                )
+                    .into_response(),
                 Ok(_) => node_error_response(NodeError::InvalidRequest(format!(
                     "graph response exceeds {MAX_GRAPH_RESPONSE_BYTES} bytes"
                 ))),

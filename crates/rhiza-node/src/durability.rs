@@ -27,7 +27,7 @@ use rhiza_core::{
 #[cfg(feature = "graph")]
 use rhiza_graph::{
     decode_snapshot as decode_graph_snapshot, encode_snapshot as encode_graph_snapshot,
-    restore_snapshot_file as restore_graph_snapshot_file,
+    restore_snapshot_file as restore_graph_snapshot_file, LadybugStateMachine,
 };
 #[cfg(feature = "kv")]
 use rhiza_kv::{
@@ -1428,7 +1428,30 @@ fn validate_local_materializer_identity(
                 "kv execution profile is not compiled in".into(),
             ));
         }
-        ExecutionProfile::Graph => false,
+        ExecutionProfile::Graph => {
+            #[cfg(feature = "graph")]
+            {
+                let path = data_dir.join("ladybug/graph.lbug");
+                if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                    return Err(DurabilityError::SnapshotVerification(
+                        "Graph materializer is missing or is not a regular file".into(),
+                    ));
+                }
+                let _state = LadybugStateMachine::open(
+                    path,
+                    identity.cluster_id(),
+                    target_node_id,
+                    identity.epoch(),
+                    identity.config_id(),
+                )
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+                true
+            }
+            #[cfg(not(feature = "graph"))]
+            return Err(DurabilityError::SnapshotVerification(
+                "graph execution profile is not compiled in".into(),
+            ));
+        }
     })
 }
 
@@ -1448,11 +1471,9 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
     validate_restore_marker_name(marker_name)?;
     let data_dir = data_dir.as_ref();
     let identity = store.checkpoint_identity()?.clone();
-    if snapshot_profile(identity.cluster_id())? != execution_profile
-        || execution_profile == ExecutionProfile::Graph
-    {
+    if snapshot_profile(identity.cluster_id())? != execution_profile {
         return Err(DurabilityError::SnapshotVerification(
-            "rejoin recovery only replaces matching SQL or KV recovery views".into(),
+            "rejoin recovery only replaces a matching recovery view".into(),
         ));
     }
     let restored = store.restore_checkpoint_state().await?;
@@ -2332,11 +2353,7 @@ fn quarantine_rebuildable_view(
     let materializer = match profile {
         ExecutionProfile::Sqlite => "sqlite",
         ExecutionProfile::Kv => "kv",
-        ExecutionProfile::Graph => {
-            return Err(DurabilityError::SnapshotVerification(
-                "graph recovery view replacement is outside this recovery path".into(),
-            ))
-        }
+        ExecutionProfile::Graph => "ladybug",
     };
     let names = [materializer, "consensus"];
     let mut has_rebuildable_view = false;
