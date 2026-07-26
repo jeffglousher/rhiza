@@ -1151,28 +1151,25 @@ impl LadybugStateMachine {
             return Err(Error::IdentityMismatch("config_id".into()));
         }
 
-        let current_index = meta_u64(connection, "applied_index")?;
-        let current_hash = meta_hash(connection, "applied_hash")?;
+        let (current_index, current_hash) = materialized_tip(connection)?;
         if entry.index == current_index {
             if entry.hash != current_hash {
                 return Err(Error::InvalidEntry(
                     "current index was reapplied with a different hash".into(),
                 ));
             }
+            let mut requests = matching_requests(connection, commands)?;
             let mut results = Vec::with_capacity(commands.len());
             for member in commands {
                 results.push(
-                    matching_request(
-                        connection,
-                        member.command.request_id(),
-                        &member.individual_payload,
-                    )?
-                    .ok_or_else(|| {
-                        Error::InvalidEntry(
-                            "applied graph command is missing its request record".into(),
-                        )
-                    })?
-                    .result,
+                    requests
+                        .remove(member.command.request_id())
+                        .ok_or_else(|| {
+                            Error::InvalidEntry(
+                                "applied graph command is missing its request record".into(),
+                            )
+                        })?
+                        .result,
                 );
             }
             let result = (results.len() == 1).then(|| results.remove(0));
@@ -1199,16 +1196,14 @@ impl LadybugStateMachine {
 
         let result = match entry.entry_type {
             EntryType::Command => {
+                let mut requests = matching_requests(connection, commands)?;
+                let mut documents = existing_documents(connection, commands)?;
                 let mut results = Vec::with_capacity(commands.len());
                 for member in commands {
-                    if let Some(record) = matching_request(
-                        connection,
-                        member.command.request_id(),
-                        &member.individual_payload,
-                    )? {
+                    if let Some(record) = requests.remove(member.command.request_id()) {
                         results.push(record.result);
                     } else {
-                        let result = apply_command(connection, &member.command)?;
+                        let result = apply_command(connection, &member.command, &mut documents)?;
                         record_request(
                             connection,
                             &member.command,
@@ -1227,8 +1222,7 @@ impl LadybugStateMachine {
             | EntryType::Noop => None,
         };
 
-        set_meta(connection, "applied_index", &entry.index.to_string())?;
-        set_meta(connection, "applied_hash", &entry.hash.to_hex())?;
+        set_materialized_tip(connection, entry.index, entry.hash)?;
         Ok(ApplyOutcome {
             applied_index: entry.index,
             applied_hash: entry.hash,
@@ -1557,26 +1551,46 @@ fn initialize_or_validate(database: &Database, identity: &Identity) -> Result<()
 }
 
 fn validate_identity(connection: &Connection<'_>, identity: &Identity) -> Result<()> {
-    validate_meta(connection, "cluster_id", &identity.cluster_id)?;
-    validate_meta(connection, "node_id", &identity.node_id)?;
-    validate_meta(connection, "epoch", &identity.epoch.to_string())?;
-    validate_meta(connection, "config_id", &identity.config_id.to_string())?;
-    validate_meta(connection, "schema_version", SCHEMA_VERSION)?;
-    validate_meta(
+    let rows = execute(
         connection,
-        "materializer_fingerprint",
-        &graph_materializer_fingerprint().to_hex(),
-    )
-}
-
-fn validate_meta(connection: &Connection<'_>, key: &str, expected: &str) -> Result<()> {
-    let actual = get_meta(connection, key)?
-        .ok_or_else(|| Error::IdentityMismatch(format!("missing {key}")))?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(Error::IdentityMismatch(key.into()))
+        "MATCH (m:__RhizaMeta) WHERE m.key IN ['cluster_id', 'node_id', 'epoch', 'config_id', 'schema_version', 'materializer_fingerprint'] RETURN m.key, m.value",
+        vec![],
+    )?;
+    let mut actual = BTreeMap::new();
+    for row in rows {
+        if row.len() != 2 {
+            return Err(Error::Ladybug(
+                "identity metadata lookup returned wrong shape".into(),
+            ));
+        }
+        let key = expect_string(&row[0], "identity metadata key")?;
+        let value = expect_string(&row[1], "identity metadata value")?;
+        if actual.insert(key, value).is_some() {
+            return Err(Error::Ladybug(
+                "identity metadata lookup returned a duplicate key".into(),
+            ));
+        }
     }
+    let epoch = identity.epoch.to_string();
+    let config_id = identity.config_id.to_string();
+    let fingerprint = graph_materializer_fingerprint().to_hex();
+    for (key, expected) in [
+        ("cluster_id", identity.cluster_id.as_str()),
+        ("node_id", identity.node_id.as_str()),
+        ("epoch", epoch.as_str()),
+        ("config_id", config_id.as_str()),
+        ("schema_version", SCHEMA_VERSION),
+        ("materializer_fingerprint", fingerprint.as_str()),
+    ] {
+        match actual.get(key) {
+            None => return Err(Error::IdentityMismatch(format!("missing {key}"))),
+            Some(value) if value != expected => {
+                return Err(Error::IdentityMismatch(key.into()));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn transaction<T>(connection: &Connection<'_>, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -3444,19 +3458,21 @@ fn graph_rel(value: &lbug::RelVal, depth: usize) -> Result<GraphRel> {
 fn apply_command(
     connection: &Connection<'_>,
     command: &GraphCommandV1,
+    documents: &mut BTreeSet<String>,
 ) -> Result<GraphCommandResultV1> {
     match &command.operation {
         GraphOperationV1::PutDocument { id, value } => {
-            let created = document(connection, id)?.is_none();
+            let created = !documents.contains(id);
             if created {
                 create_document(connection, id, value)?;
+                documents.insert(id.clone());
             } else {
                 update_document(connection, id, value)?;
             }
             Ok(GraphCommandResultV1::PutDocument { created })
         }
         GraphOperationV1::DeleteDocument { id } => {
-            let existed = document(connection, id)?.is_some();
+            let existed = documents.remove(id);
             if existed {
                 execute(
                     connection,
@@ -3467,6 +3483,51 @@ fn apply_command(
             Ok(GraphCommandResultV1::DeleteDocument { existed })
         }
     }
+}
+
+fn existing_documents(
+    connection: &Connection<'_>,
+    commands: &[DecodedGraphCommand],
+) -> Result<BTreeSet<String>> {
+    let ids = commands
+        .iter()
+        .map(|member| match &member.command.operation {
+            GraphOperationV1::PutDocument { id, .. } | GraphOperationV1::DeleteDocument { id } => {
+                id.as_str()
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    if ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let rows = execute(
+        connection,
+        "MATCH (d:RhizaDocument) WHERE d.id IN $ids RETURN d.id",
+        vec![(
+            "ids",
+            Value::List(
+                LogicalType::String,
+                ids.iter().map(|id| Value::String((*id).into())).collect(),
+            ),
+        )],
+    )?;
+    rows.into_iter()
+        .map(|row| match row.as_slice() {
+            [value] => {
+                let id = expect_string(value, "document id")?;
+                if ids.contains(id.as_str()) {
+                    Ok(id)
+                } else {
+                    Err(Error::Ladybug(
+                        "document lookup returned an unexpected id".into(),
+                    ))
+                }
+            }
+            _ => Err(Error::Ladybug(
+                "document lookup returned wrong shape".into(),
+            )),
+        })
+        .collect()
 }
 
 fn create_document(connection: &Connection<'_>, id: &str, value: &GraphValueV1) -> Result<()> {
@@ -3646,6 +3707,65 @@ fn matching_request(
     let Some(row) = one_or_none(rows, "request lookup")? else {
         return Ok(None);
     };
+    decode_request_record(&row, request_id, command_payload).map(Some)
+}
+
+fn matching_requests(
+    connection: &Connection<'_>,
+    commands: &[DecodedGraphCommand],
+) -> Result<BTreeMap<String, RequestRecord>> {
+    if commands.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let expected = commands
+        .iter()
+        .map(|member| {
+            (
+                member.command.request_id(),
+                member.individual_payload.as_slice(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rows = execute(
+        connection,
+        "MATCH (r:__RhizaRequest) WHERE r.request_id IN $request_ids RETURN r.request_id, r.command_hash, r.original_log_index, r.original_log_hash, r.result",
+        vec![(
+            "request_ids",
+            Value::List(
+                LogicalType::String,
+                expected
+                    .keys()
+                    .map(|request_id| Value::String((*request_id).into()))
+                    .collect(),
+            ),
+        )],
+    )?;
+    let mut matches = BTreeMap::new();
+    for row in rows {
+        if row.len() != 5 {
+            return Err(Error::Ladybug(
+                "batch request lookup returned wrong shape".into(),
+            ));
+        }
+        let request_id = expect_string(&row[0], "request_id")?;
+        let payload = expected.get(request_id.as_str()).ok_or_else(|| {
+            Error::Ladybug("batch request lookup returned an unexpected request id".into())
+        })?;
+        let record = decode_request_record(&row[1..], &request_id, payload)?;
+        if matches.insert(request_id, record).is_some() {
+            return Err(Error::Ladybug(
+                "batch request lookup returned a duplicate request id".into(),
+            ));
+        }
+    }
+    Ok(matches)
+}
+
+fn decode_request_record(
+    row: &[Value],
+    request_id: &str,
+    command_payload: &[u8],
+) -> Result<RequestRecord> {
     if row.len() != 4 {
         return Err(Error::Ladybug("request lookup returned wrong shape".into()));
     }
@@ -3660,11 +3780,11 @@ fn matching_request(
         });
     }
     let result = GraphCommandResultV1::decode(&expect_blob(&row[3], "result")?)?;
-    Ok(Some(RequestRecord {
+    Ok(RequestRecord {
         original_log_index,
         original_log_hash,
         result,
-    }))
+    })
 }
 
 fn command_digest(payload: &[u8]) -> LogHash {
@@ -3699,18 +3819,23 @@ fn create_meta(connection: &Connection<'_>, key: &str, value: &str) -> Result<()
 }
 
 fn set_meta(connection: &Connection<'_>, key: &str, value: &str) -> Result<()> {
-    if get_meta(connection, key)?.is_none() {
-        return Err(Error::IdentityMismatch(format!("missing {key}")));
-    }
-    execute(
+    let rows = execute(
         connection,
-        "MATCH (m:__RhizaMeta) WHERE m.key = $key SET m.value = $value",
+        "MATCH (m:__RhizaMeta) WHERE m.key = $key SET m.value = $value RETURN m.value",
         vec![
             ("key", Value::String(key.into())),
             ("value", Value::String(value.into())),
         ],
     )?;
-    Ok(())
+    let row = one_or_none(rows, "metadata update")?
+        .ok_or_else(|| Error::IdentityMismatch(format!("missing {key}")))?;
+    match row.as_slice() {
+        [Value::String(actual)] if actual == value => Ok(()),
+        [actual] => Err(unexpected_value("updated metadata value", actual)),
+        _ => Err(Error::Ladybug(
+            "metadata update returned wrong shape".into(),
+        )),
+    }
 }
 
 fn meta_u64(connection: &Connection<'_>, key: &str) -> Result<u64> {
@@ -3736,6 +3861,34 @@ fn materialized_tip(connection: &Connection<'_>) -> Result<(LogIndex, LogHash)> 
     let row = one_or_none(rows, "materialized tip lookup")?
         .ok_or_else(|| Error::IdentityMismatch("missing materialized tip".into()))?;
     decode_materialized_tip(&row)
+}
+
+fn set_materialized_tip(
+    connection: &Connection<'_>,
+    applied_index: LogIndex,
+    applied_hash: LogHash,
+) -> Result<()> {
+    let rows = execute(
+        connection,
+        "MATCH (i:__RhizaMeta), (h:__RhizaMeta) WHERE i.key = 'applied_index' AND h.key = 'applied_hash' SET i.value = $applied_index, h.value = $applied_hash RETURN i.value, h.value",
+        vec![
+            (
+                "applied_index",
+                Value::String(applied_index.to_string()),
+            ),
+            ("applied_hash", Value::String(applied_hash.to_hex())),
+        ],
+    )?;
+    let row = one_or_none(rows, "materialized tip update")?
+        .ok_or_else(|| Error::IdentityMismatch("missing materialized tip".into()))?;
+    let actual = decode_materialized_tip(&row)?;
+    if actual == (applied_index, applied_hash) {
+        Ok(())
+    } else {
+        Err(Error::Ladybug(
+            "materialized tip update returned the wrong values".into(),
+        ))
+    }
 }
 
 fn decode_materialized_tip(row: &[Value]) -> Result<(LogIndex, LogHash)> {

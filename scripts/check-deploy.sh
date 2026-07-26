@@ -73,8 +73,8 @@ assert_statefulset_env_values_are_quoted_strings() {
     return 1
   }
 }
-profile=sql
-for replicas in 3 7; do
+for profile in sql graph; do
+  for replicas in 3 7; do
   id="$replicas"
   jq -n --arg profile "$profile" --argjson id "$id" --argjson replicas "$replicas" '
     {config_id:$id, members:[range($replicas) as $n | {
@@ -157,6 +157,7 @@ for replicas in 3 7; do
     echo "provider-chain render retained optional S3 endpoint or credentials" >&2
     exit 1
   fi
+  done
 done
 
 RHIZA_EXECUTION_PROFILE=sql RHIZA_STARTUP_MODE=rejoin \
@@ -174,12 +175,6 @@ for invalid_startup_mode in '' bootstrap disaster recover; do
     exit 1
   fi
 done
-
-if RHIZA_EXECUTION_PROFILE=graph \
-  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" "$tmp/graph-profile.yaml" successor; then
-  echo "render accepted an unsupported graph execution profile" >&2
-  exit 1
-fi
 
 RHIZA_EXECUTION_PROFILE=sql RHIZA_IMAGE=registry.example/rhiza-sql:v1 \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
@@ -320,18 +315,19 @@ for recorder_tls in off on; do
     "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = rhiza-sql:dev ]
 done
 
-# The SQL renderer must select the fixed SQL image and the Docker build must not
-# restore the retired graph, KV, or combined profile matrix.
+# SQL and Graph must remain isolated build profiles; KV stays retired.
 grep -Fq -- 'ARG RHIZA_PROFILE=sql' Dockerfile
-grep -Fq -- 'sql) cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc ;;' Dockerfile
-grep -Fq -- 'RHIZA_PROFILE must be sql' Dockerfile
-# shellcheck disable=SC2016 # The static check must match Cargo's literal profile variable.
-if grep -Eq -- 'RHIZA_PROFILE=(graph|kv|all)|sql\|(graph|kv|all)|--features "\$RHIZA_PROFILE' Dockerfile; then
-  echo "Dockerfile restored a retired execution profile" >&2
+grep -Fq -- 'sql|graph)' Dockerfile
+# shellcheck disable=SC2016 # Match Cargo's literal profile variable.
+grep -Fq -- '--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc"' Dockerfile
+grep -Fq -- 'RHIZA_PROFILE must be sql|graph' Dockerfile
+if grep -Eq -- 'RHIZA_PROFILE=(kv|all)|sql\|(kv|all)|graph\|(kv|all)' Dockerfile; then
+  echo "Dockerfile restored a retired KV or combined profile" >&2
   exit 1
 fi
-grep -Fq -- 'build-args: RHIZA_PROFILE=sql' .github/workflows/ci.yml
-grep -Fq -- '--features recorder-postcard-rpc' .github/workflows/ci.yml
+grep -Fq -- 'profile: [sql, graph]' .github/workflows/ci.yml
+# shellcheck disable=SC2016 # Match the literal GitHub Actions expression.
+grep -Fq -- 'build-args: RHIZA_PROFILE=${{ matrix.profile }}' .github/workflows/ci.yml
 
 RHIZA_CPU_REQUEST=100m RHIZA_MEMORY_REQUEST=256Mi \
 RHIZA_CPU_LIMIT=1 RHIZA_MEMORY_LIMIT=1Gi RHIZA_DATA_SIZE_LIMIT=8Gi \

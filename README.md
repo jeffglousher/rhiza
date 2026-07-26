@@ -6,29 +6,28 @@ is not.
 
 ## Product Status
 
-The workspace retains SQL, graph, and KV materialization crates. The released
-runtime and product documentation cover SQL only; graph and KV are not wired
-into the SQL release surface.
+The source workspace supports isolated SQL and Graph runtime profiles. SQL
+remains the default; Graph is opt-in and uses LadybugDB. KV remains a retained
+workspace component outside the supported runtime surface.
 
 The current crates.io product, `rhizadb` v0.3.0, is SQL-only and uses SQLite.
 Its registry dependency closure is `rhiza-core`, `rhiza-obj-store`,
 `rhiza-log`, `rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and
-`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.3.0
-features or part of the SQL-only supported release.
+`rhizadb`. That published artifact remains SQL-only; the post-v0.3 source tree
+adds an opt-in `graph` feature without changing the historical v0.3.0 package.
 
 ## Workspace Components
 
 The Kubernetes-independent Rust workspace currently contains:
 
-- `rhizadb`: primary embedded SQL Rust facade and lifecycle owner; part of the
-  registry product.
+- `rhizadb`: embedded SQL/Graph Rust facade and lifecycle owner; the published
+  v0.3.0 registry product remains SQL-only.
 - `rhiza-core`: log, configuration, command, and snapshot domain types.
 - `rhiza-quepaxa`: recorder RPC, durable recorder state, and consensus.
 - `rhiza-log`: local binary qlog and compaction anchors.
 - `rhiza-obj-store`: `object_store` adapters for S3, GCS, Azure, and tests.
 - `rhiza-sql`: the `rhiza sql` SQLite materialized-state boundary.
-- `rhiza-graph`: retained LadybugDB state boundary, excluded from the initial
-  SQL-only supported release.
+- `rhiza-graph`: supported opt-in LadybugDB state boundary.
 - `rhiza-kv`: retained redb state boundary, excluded from the initial SQL-only
   supported release.
 - `rhiza-archive`: checkpoint V2, object metadata, and GC plans.
@@ -42,15 +41,19 @@ Only `rhiza-core`, `rhiza-obj-store`, `rhiza-log`, `rhiza-quepaxa`,
 crates.io release. `rhiza-graph`, `rhiza-kv`, `rhiza-client`, `rhiza-cli`,
 `rhiza-testkit`, and `examples/basic-app-server` are excluded from it.
 
-## SQL Runtime and Deployment
+## Runtime Profiles and Deployment
 
-The published runtime serves SQL only. Use a SQL image and set a logical
-cluster ID before serving, checkpointing, recovery, GC, or membership work:
+SQL remains the default. Build an isolated SQL or Graph image and set the
+matching profile before serving, checkpointing, recovery, GC, or membership
+work:
 
 ```bash
 export RHIZA_EXECUTION_PROFILE=sql
 export RHIZA_CLUSTER_ID=cluster-a
 docker build --build-arg RHIZA_PROFILE=sql -t rhiza-sql:dev .
+
+export RHIZA_EXECUTION_PROFILE=graph
+docker build --build-arg RHIZA_PROFILE=graph -t rhiza-graph:dev .
 ```
 
 Image publication and registry tags are separate from the crates.io release;
@@ -58,9 +61,10 @@ see [RELEASING.md](RELEASING.md) for the registry procedure.
 
 ## Embedded Rust API
 
-The published `rhizadb` v0.3.0 crate exposes an SQL-only embedded owner. It
-does not offer graph or KV Cargo features, re-exports, or embedded methods;
-those remain outside the initial registry product.
+The published `rhizadb` v0.3.0 crate exposes an SQL-only embedded owner. The
+post-v0.3 source tree adds an opt-in `graph` feature with Graph commands,
+queries, checkpoint recovery, and embedded lifecycle support. KV remains
+outside the facade.
 
 `Rhiza` owns the node runtime and background workers; cloneable `RhizaHandle`
 values are weak handles that stop working after owner shutdown. Keep the owner
@@ -233,8 +237,8 @@ adapters over the same SQL node service contracts.
 Kubernetes provides stable process identity, DNS, secrets, and orchestration;
 the runtime does not call Kubernetes APIs and receives no service-account
 token.
-Each configuration has its own SQL headless Service and StatefulSet named
-`rhiza-sql-c<config_id>`. Stable ordinals map to `node-1` through `node-N`.
+Each configuration has a profile-scoped headless Service and StatefulSet named
+`rhiza-<profile>-c<config_id>`. Stable ordinals map to `node-1` through `node-N`.
 Membership accepts 3 through 7 members through a JSON bundle:
 
 ```json
@@ -516,11 +520,12 @@ an awaiting-activation learner can be inspected without becoming a client
 endpoint. Configuration replacement verifies the live stable Service has this
 exact selector and client port before it performs any transition action.
 
-The renderer derives the local image default from SQL
-(`RHIZA_EXECUTION_PROFILE=sql` defaults to `rhiza-sql:dev`). Set `RHIZA_IMAGE`
+The renderer derives the local image default from the selected profile
+(`sql` uses `rhiza-sql:dev`; `graph` uses `rhiza-graph:dev`). Set `RHIZA_IMAGE`
 to override it with a registry-qualified artifact and tag. Also set
 `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`, `RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`,
-and Secret-name overrides as needed. `RHIZA_EXECUTION_PROFILE` must be `sql`.
+and Secret-name overrides as needed. `RHIZA_EXECUTION_PROFILE` must be
+`sql|graph`.
 The example assumes `rhiza-auth` and `rhiza-object-store` Secrets already
 exist in the same `rhiza` namespace. `rhiza-auth` must contain distinct
 `client-token`, `admin-token`, and `tail-token` values; replace the image,
@@ -528,6 +533,13 @@ endpoint, and Secret names with deployment-specific values.
 The renderer accepts only an unset or explicit `rejoin`
 `RHIZA_STARTUP_MODE`; bootstrap and disaster-recovery startup modes are not
 valid for the reference StatefulSet.
+
+Graph rendering, checkpoint jobs, readiness checks, and replacement helpers
+use the same profile-scoped contracts. The static stable client Service remains
+SQL-only; Graph clients target the rendered profile-scoped Service directly.
+Graph Kubernetes deployment is beta in v0.4.0 pending a published multi-node
+cluster smoke result, while the Graph runtime, embedded API, checkpoint restore,
+isolated binary, and container build are supported.
 
 The ordinary rendered StatefulSet uses `Parallel`, `OnDelete`, stable ordinals,
 and per-Pod `emptyDir` data. If one Pod is deleted or lost, Kubernetes

@@ -10,18 +10,25 @@ description = "Embeddable facade for rhiza replicated state machines"
 [lib]
 name = "rhizadb"
 
+[[test]]
+name = "graph_embedded"
+required-features = ["graph"]
+
 [features]
-default = []
+default = ["sql"]
+sql = ["dep:rhiza-sql", "rhiza-node/sql"]
+graph = ["dep:rhiza-graph", "rhiza-node/graph"]
 recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
 
 [dependencies]
 axum.workspace = true
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
+rhiza-graph = { version = "0.1.0", path = "../rhiza-graph", optional = true }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
-rhiza-node = { version = "0.3.0", path = "../rhiza-node" }
+rhiza-node = { version = "0.3.0", path = "../rhiza-node", default-features = false }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
-rhiza-sql = { version = "0.3.0", path = "../rhiza-sql" }
+rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

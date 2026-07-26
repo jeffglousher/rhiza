@@ -8,20 +8,22 @@ rust-version.workspace = true
 description = "Network node runtime for rhiza"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("graph", "kv"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("kv"))'] }
 
 [features]
 default = ["sql"]
-sql = []
+sql = ["dep:rhiza-sql"]
+graph = ["dep:rhiza-graph"]
 recorder-postcard-rpc = ["dep:postcard-rpc", "dep:tracing"]
 
 [dependencies]
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
+rhiza-graph = { version = "0.1.0", path = "../rhiza-graph", optional = true }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
-rhiza-sql = { version = "0.3.0", path = "../rhiza-sql" }
+rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
 axum.workspace = true
 postcard.workspace = true
 postcard-rpc = { workspace = true, optional = true }
