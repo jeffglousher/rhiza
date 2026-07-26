@@ -135,4 +135,4 @@ jobs:
             org.opencontainers.image.version=${{ github.event.release.tag_name }}
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=release-rhiza-${{ matrix.profile }}
-          cache-to: type=gha,mode=max,scope=release-rhiza-${{ matrix.profile }}
+          cache-to: type=gha,mode=max,scope=release-rhiza-${{ matrix.profile }},ignore-error=true
