@@ -4,15 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Command-line interface for running and administering rhiza"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("kv"))'] }
+publish = false
 
 [features]
 default = ["sql"]
 sql = ["dep:rhiza-sql", "rhiza-client/sql", "rhiza-node/sql", "rhizadb/sql"]
 graph = ["rhiza-client/graph", "rhiza-node/graph", "rhizadb/graph"]
+kv = ["rhiza-client/kv", "rhiza-node/kv"]
 recorder-postcard-rpc = [
     "rhiza-node/recorder-postcard-rpc",
     "rhizadb/recorder-postcard-rpc",
@@ -24,11 +24,11 @@ rhiza-client = { version = "0.1.0", path = "../rhiza-client", default-features =
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
-rhiza-node = { version = "0.3.0", path = "../rhiza-node", default-features = false }
+rhiza-node = { version = "0.4.0", path = "../rhiza-node", default-features = false }
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
-rhizadb = { version = "0.3.0", path = "../rhiza", default-features = false }
+rhizadb = { version = "0.4.0", path = "../rhiza", default-features = false }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

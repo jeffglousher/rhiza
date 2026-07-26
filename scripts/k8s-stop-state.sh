@@ -3,8 +3,8 @@ set -euo pipefail
 
 profile="${RHIZA_EXECUTION_PROFILE-}"
 case "$profile" in
-  sql|graph) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph" >&2; exit 65 ;;
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
 
 die() {

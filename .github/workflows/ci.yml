@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [sql, graph]
+        profile: [sql, graph, kv]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,6 +32,7 @@ jobs:
           case "$RHIZA_PROFILE" in
             sql) forbidden=(rhiza-graph lbug rhiza-kv redb) ;;
             graph) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-kv redb) ;;
+            kv) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-graph lbug) ;;
             *) exit 64 ;;
           esac
           for dependency in "${forbidden[@]}"; do
@@ -50,6 +51,14 @@ jobs:
             cargo test --locked -p rhizadb --no-default-features --features graph \
               --test graph_embedded --test feature_matrix
           fi
+          if [ "$RHIZA_PROFILE" = kv ]; then
+            cargo test --locked -p rhiza-kv
+            cargo test --locked -p rhiza-node --no-default-features --features kv \
+              --test kv_runtime --test execution_profile_features
+            cargo test --locked -p rhiza-node --features kv \
+              --test durability kv_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node
+            cargo test --locked -p rhiza-client --no-default-features --features kv
+          fi
 
   container-images:
     name: Container image (rhiza-${{ matrix.profile }})
@@ -57,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [sql, graph]
+        profile: [sql, graph, kv]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -92,12 +101,12 @@ jobs:
       - run: |
           cargo clippy --locked --all-targets \
             -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
-            -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-node -p rhizadb \
+            -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-kv -p rhiza-node -p rhizadb \
             -p rhiza-client -p rhiza-cli -- -D warnings
       - run: |
           cargo test --locked --all-targets \
             -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
-            -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-node -p rhizadb \
+            -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-kv -p rhiza-node -p rhizadb \
             -p rhiza-client -p rhiza-cli
       - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings

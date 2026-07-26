@@ -28,8 +28,8 @@ emit_single_json() {
 }
 
 case "$profile" in
-  sql|graph) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph" >&2; exit 65 ;;
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
 case "$service$pod" in *[!a-z0-9-]*) exit 64;; esac
 target_prefix="rhiza-${profile}-c"

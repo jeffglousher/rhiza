@@ -10,9 +10,9 @@ if (( $# != 0 )); then
   exit 64
 fi
 
-# Package the eight crates in the initial SQL-only registry release, with
-# dependencies before consumers. Graph, KV, client, CLI, testkit, and the basic
-# app server are intentionally absent; testkit and the example set `publish = false`.
+# Package the dependency tiers that do not rely on an unpublished workspace
+# version. The protected crates.io workflow publishes these first, then packages
+# and publishes node, facade, and client after each dependency reaches the index.
 cargo package --locked --allow-dirty --no-verify \
   -p rhiza-core \
   -p rhiza-log \
@@ -20,5 +20,5 @@ cargo package --locked --allow-dirty --no-verify \
   -p rhiza-quepaxa \
   -p rhiza-archive \
   -p rhiza-sql \
-  -p rhiza-node \
-  -p rhizadb
+  -p rhiza-graph \
+  -p rhiza-kv

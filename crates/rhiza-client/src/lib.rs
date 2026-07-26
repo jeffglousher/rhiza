@@ -649,6 +649,67 @@ fn safe_transport_detail(error: reqwest::Error) -> String {
     details.join(": ")
 }
 
+#[cfg(all(test, feature = "kv"))]
+mod kv_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+    use rhiza_core::LogHash;
+
+    use super::{wire::*, RhizaClient};
+
+    #[tokio::test]
+    async fn kv_scan_sends_the_typed_request_with_auth() {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route(
+                rhiza_node::KV_SCAN_PATH,
+                post(
+                    |State(captured): State<Arc<Mutex<Option<(HeaderMap, KvScanRequest)>>>>,
+                     headers: HeaderMap,
+                     Json(request): Json<KvScanRequest>| async move {
+                        *captured.lock().unwrap() = Some((headers, request));
+                        Json(KvScanResponse {
+                            entries: Vec::new(),
+                            next_cursor: None,
+                            applied_index: 7,
+                            hash: LogHash::ZERO,
+                        })
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let response = RhizaClient::new([endpoint], "client-secret")
+            .unwrap()
+            .kv_scan(KvScanRequest {
+                start: None,
+                end: None,
+                prefix: Some("/w==".into()),
+                cursor: None,
+                limit: Some(10),
+                consistency: Some(ReadConsistency::Local),
+            })
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(response.applied_index, 7);
+        let captured = captured.lock().unwrap();
+        let (headers, request) = captured.as_ref().unwrap();
+        assert_eq!(headers["authorization"], "Bearer client-secret");
+        assert_eq!(
+            headers[rhiza_node::VERSION_HEADER],
+            rhiza_node::PROTOCOL_VERSION
+        );
+        assert_eq!(request.prefix.as_deref(), Some("/w=="));
+        assert_eq!(request.limit, Some(10));
+    }
+}
+
 #[cfg(all(test, feature = "sql"))]
 mod tests {
     use std::{

@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.0
+
+- Restores KV/redb as an isolated server profile with authenticated put,
+  delete, get, and scan HTTP APIs, typed `rhiza-client` SDK methods, CLI
+  commands, checkpoint recovery, Kubernetes rendering, and CI coverage.
+- Prepares the crates.io dependency chain: `rhiza-kv` 0.1.0,
+  `rhiza-graph` 0.2.0, `rhiza-node` 0.4.0, `rhizadb` 0.4.0, and
+  `rhiza-client` 0.1.0.
+- Adds protected crates.io publication and automatic profile-specific Linux
+  CLI assets and GHCR images for published GitHub releases.
+
 ## v0.4.0
 
 - Restores Graph/LadybugDB as a supported opt-in execution profile while SQL

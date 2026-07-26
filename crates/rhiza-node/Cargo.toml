@@ -1,25 +1,24 @@
 [package]
 name = "rhiza-node"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Network node runtime for rhiza"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("kv"))'] }
-
 [features]
 default = ["sql"]
 sql = ["dep:rhiza-sql"]
 graph = ["dep:rhiza-graph"]
+kv = ["dep:rhiza-kv"]
 recorder-postcard-rpc = ["dep:postcard-rpc", "dep:tracing"]
 
 [dependencies]
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
-rhiza-graph = { version = "0.1.0", path = "../rhiza-graph", optional = true }
+rhiza-graph = { version = "0.2.0", path = "../rhiza-graph", optional = true }
+rhiza-kv = { version = "0.1.0", path = "../rhiza-kv", optional = true }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }

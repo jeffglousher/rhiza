@@ -6,15 +6,16 @@ is not.
 
 ## Product Status
 
-The source workspace supports isolated SQL and Graph runtime profiles. SQL
-remains the default; Graph is opt-in and uses LadybugDB. KV remains a retained
-workspace component outside the supported runtime surface.
+The source workspace supports isolated SQL, Graph, and KV runtime profiles.
+SQL remains the default; Graph uses LadybugDB and KV uses redb.
 
 The current crates.io product, `rhizadb` v0.3.0, is SQL-only and uses SQLite.
 Its registry dependency closure is `rhiza-core`, `rhiza-obj-store`,
 `rhiza-log`, `rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and
-`rhizadb`. That published artifact remains SQL-only; the post-v0.3 source tree
-adds an opt-in `graph` feature without changing the historical v0.3.0 package.
+`rhizadb`. That historical artifact remains SQL-only. The next registry release
+adds the Graph dependency chain and the separately published `rhiza-client`
+Rust SDK with SQL, Graph, and KV HTTP features; KV remains server/SDK-only and
+is not exposed by the embedded `rhizadb` facade.
 
 ## Workspace Components
 
@@ -28,22 +29,21 @@ The Kubernetes-independent Rust workspace currently contains:
 - `rhiza-obj-store`: `object_store` adapters for S3, GCS, Azure, and tests.
 - `rhiza-sql`: the `rhiza sql` SQLite materialized-state boundary.
 - `rhiza-graph`: supported opt-in LadybugDB state boundary.
-- `rhiza-kv`: retained redb state boundary, excluded from the initial SQL-only
-  supported release.
+- `rhiza-kv`: supported redb state boundary for the KV server profile.
 - `rhiza-archive`: checkpoint V2, object metadata, and GC plans.
 - `rhiza-node`: runtime, HTTP RPC, recovery, and authenticated live admin HTTP.
-- `rhiza-client`: workspace remote-client component.
+- `rhiza-client`: typed Rust SDK for the authenticated remote HTTP API.
 - `rhiza-cli`: workspace administration commands.
 - `rhiza-testkit`: internal, non-publishable integration-test support.
 
-Only `rhiza-core`, `rhiza-obj-store`, `rhiza-log`, `rhiza-quepaxa`,
-`rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb` are in the
-crates.io release. `rhiza-graph`, `rhiza-kv`, `rhiza-client`, `rhiza-cli`,
-`rhiza-testkit`, and `examples/basic-app-server` are excluded from it.
+The protected registry workflow publishes the engine dependency crates before
+`rhiza-node`, `rhizadb`, and `rhiza-client`. `rhiza-cli`, `rhiza-testkit`, and
+`examples/basic-app-server` are not crates.io products; the CLI is distributed
+as profile-specific GitHub Release binaries and OCI images.
 
 ## Runtime Profiles and Deployment
 
-SQL remains the default. Build an isolated SQL or Graph image and set the
+SQL remains the default. Build an isolated SQL, Graph, or KV image and set the
 matching profile before serving, checkpointing, recovery, GC, or membership
 work:
 
@@ -54,6 +54,9 @@ docker build --build-arg RHIZA_PROFILE=sql -t rhiza-sql:dev .
 
 export RHIZA_EXECUTION_PROFILE=graph
 docker build --build-arg RHIZA_PROFILE=graph -t rhiza-graph:dev .
+
+export RHIZA_EXECUTION_PROFILE=kv
+docker build --build-arg RHIZA_PROFILE=kv -t rhiza-kv:dev .
 ```
 
 Image publication and registry tags are separate from the crates.io release;
@@ -62,9 +65,9 @@ see [RELEASING.md](RELEASING.md) for the registry procedure.
 ## Embedded Rust API
 
 The published `rhizadb` v0.3.0 crate exposes an SQL-only embedded owner. The
-post-v0.3 source tree adds an opt-in `graph` feature with Graph commands,
-queries, checkpoint recovery, and embedded lifecycle support. KV remains
-outside the facade.
+v0.4.0 crate adds an opt-in `graph` feature with Graph commands, queries,
+checkpoint recovery, and embedded lifecycle support. KV remains outside the
+embedded facade and is consumed through `rhiza-client` or the HTTP API.
 
 `Rhiza` owns the node runtime and background workers; cloneable `RhizaHandle`
 values are weak handles that stop working after owner shutdown. Keep the owner
@@ -327,6 +330,28 @@ security contract. HTTP/JSON remains the production default, and promotion of
 either TCP variant still requires the documented multi-host durability,
 reconnect, rollback, and soak gates.
 
+## rhiza KV API and Rust SDK
+
+The KV server profile exposes authenticated `/v1/kv/put`, `/v1/kv/delete`,
+`/v1/kv/get`, and `/v1/kv/scan` JSON routes. Keys, values, cursors, and range
+bounds use padded standard Base64. Mutations require a stable `request_id`; an
+exact retry replays the stored result, while reuse with different bytes is a
+conflict. Use the same request ID and body after a timeout because a timed-out
+write may still commit.
+
+Rust consumers select the isolated SDK feature:
+
+```toml
+[dependencies]
+rhiza-client = { version = "0.1.0", default-features = false, features = ["kv"] }
+```
+
+`RhizaClient::kv_put`, `kv_delete`, `kv_get`, and `kv_scan` apply the same
+bounded deadlines, exact-body retries, endpoint ordering, protocol version,
+and Bearer authentication as the SQL client. Non-Rust consumers can call the
+HTTP routes directly or use `rhiza kv put|get|scan|delete` from the KV CLI
+release asset.
+
 ## rhiza sql API
 
 `rhiza sql` executes admitted deterministic SQLite DDL and DML as replicated,
@@ -521,11 +546,12 @@ endpoint. Configuration replacement verifies the live stable Service has this
 exact selector and client port before it performs any transition action.
 
 The renderer derives the local image default from the selected profile
-(`sql` uses `rhiza-sql:dev`; `graph` uses `rhiza-graph:dev`). Set `RHIZA_IMAGE`
+(`sql` uses `rhiza-sql:dev`, `graph` uses `rhiza-graph:dev`, and `kv` uses
+`rhiza-kv:dev`). Set `RHIZA_IMAGE`
 to override it with a registry-qualified artifact and tag. Also set
 `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`, `RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`,
 and Secret-name overrides as needed. `RHIZA_EXECUTION_PROFILE` must be
-`sql|graph`.
+`sql|graph|kv`.
 The example assumes `rhiza-auth` and `rhiza-object-store` Secrets already
 exist in the same `rhiza` namespace. `rhiza-auth` must contain distinct
 `client-token`, `admin-token`, and `tail-token` values; replace the image,
@@ -534,12 +560,12 @@ The renderer accepts only an unset or explicit `rejoin`
 `RHIZA_STARTUP_MODE`; bootstrap and disaster-recovery startup modes are not
 valid for the reference StatefulSet.
 
-Graph rendering, checkpoint jobs, readiness checks, and replacement helpers
-use the same profile-scoped contracts. The static stable client Service remains
-SQL-only; Graph clients target the rendered profile-scoped Service directly.
-Graph Kubernetes deployment is beta in v0.4.0 pending a published multi-node
-cluster smoke result, while the Graph runtime, embedded API, checkpoint restore,
-isolated binary, and container build are supported.
+Graph and KV rendering, checkpoint jobs, readiness checks, and replacement
+helpers use the same profile-scoped contracts. The static stable client Service
+remains SQL-only; Graph and KV clients target the rendered profile-scoped
+Service directly. Graph and KV Kubernetes deployment remains beta pending a
+published multi-node cluster smoke result; their runtimes, checkpoint restore,
+isolated binaries, and container builds are supported.
 
 The ordinary rendered StatefulSet uses `Parallel`, `OnDelete`, stable ordinals,
 and per-Pod `emptyDir` data. If one Pod is deleted or lost, Kubernetes
