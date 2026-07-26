@@ -29,13 +29,28 @@ jobs:
             target: aarch64-apple-darwin
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
+            vcpkg: x64-windows
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            vcpkg: arm64-windows
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Graph dependencies (Windows)
+        if: runner.os == 'Windows' && matrix.profile == 'graph'
+        shell: pwsh
+        env:
+          VCPKG_TARGET: ${{ matrix.platform.vcpkg }}
+        run: |
+          vcpkg install "openssl:$env:VCPKG_TARGET"
+          $installed = "$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TARGET"
+          "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+          "OPENSSL_ROOT_DIR=$installed" >> $env:GITHUB_ENV
+          "OPENSSL_BIN=$installed/bin" >> $env:GITHUB_ENV
+          "RUSTFLAGS=-L native=$installed/lib" >> $env:GITHUB_ENV
+          "VCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET" >> $env:GITHUB_ENV
       - name: Build isolated CLI
         shell: bash
         run: >-
@@ -50,7 +65,9 @@ jobs:
           TARGET: ${{ matrix.platform.target }}
         run: |
           asset="rhiza-${PROFILE}-${TAG}-${TARGET}.tar.gz"
-          install -D -m 0755 target/release/rhiza "target/release-assets/rhiza-${PROFILE}"
+          mkdir -p target/release-assets
+          cp target/release/rhiza "target/release-assets/rhiza-${PROFILE}"
+          chmod 0755 "target/release-assets/rhiza-${PROFILE}"
           tar -C target/release-assets -czf "$asset" "rhiza-${PROFILE}"
           if command -v sha256sum >/dev/null; then
             sha256sum "$asset" > "${asset}.sha256"
@@ -69,7 +86,10 @@ jobs:
           $asset = "rhiza-$env:PROFILE-$env:TAG-$env:TARGET.zip"
           New-Item -ItemType Directory -Force target/release-assets | Out-Null
           Copy-Item target/release/rhiza.exe "target/release-assets/rhiza-$env:PROFILE.exe"
-          Compress-Archive -Path "target/release-assets/rhiza-$env:PROFILE.exe" -DestinationPath $asset
+          if ($env:PROFILE -eq 'graph') {
+            Copy-Item "$env:OPENSSL_BIN/libcrypto*.dll", "$env:OPENSSL_BIN/libssl*.dll" target/release-assets
+          }
+          Compress-Archive -Path target/release-assets/* -DestinationPath $asset
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
           "$hash  $asset" | Set-Content "$asset.sha256"
           "ASSET=$asset" >> $env:GITHUB_ENV

@@ -38,6 +38,8 @@ rhiza-<profile>-<tag>-<rust-target>.tar.gz
 rhiza-<profile>-<tag>-<windows-rust-target>.zip
 ```
 
+Windows Graph archives include the OpenSSL runtime DLLs required by LadybugDB.
+
 The same workflow pushes immutable, profile-isolated Linux amd64/arm64 images:
 
 ```text
