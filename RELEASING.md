@@ -4,7 +4,7 @@ Repository tags and Rust crates have independent versions. A GitHub release is
 a reviewed source snapshot; it does not imply crates.io or OCI publication.
 Each release note must state exactly which channels were published.
 
-## v0.5.0 multi-channel release
+## v0.5.x multi-channel release
 
 KV promotion uses three distinct delivery channels. Do not describe a channel
 as released until its registry or release asset is independently visible.
@@ -29,16 +29,16 @@ so protect the environment with required reviewers and use a scoped token.
 
 ### CLI binaries and OCI images
 
-Publishing a GitHub Release triggers `Release artifacts`. It uploads three
-Debian-compatible Linux x86_64 CLI archives plus individual SHA-256 files:
+Publishing a GitHub Release triggers `Release artifacts`. It uploads SQL,
+Graph, and KV CLI archives plus individual SHA-256 files for Linux, macOS, and
+Windows on x64 and arm64:
 
 ```text
-rhiza-sql-<tag>-x86_64-unknown-linux-gnu.tar.gz
-rhiza-graph-<tag>-x86_64-unknown-linux-gnu.tar.gz
-rhiza-kv-<tag>-x86_64-unknown-linux-gnu.tar.gz
+rhiza-<profile>-<tag>-<rust-target>.tar.gz
+rhiza-<profile>-<tag>-<windows-rust-target>.zip
 ```
 
-The same workflow pushes immutable, profile-isolated Linux amd64 images:
+The same workflow pushes immutable, profile-isolated Linux amd64/arm64 images:
 
 ```text
 ghcr.io/mrchypark/rhiza-sql:<tag>
@@ -48,8 +48,8 @@ ghcr.io/mrchypark/rhiza-kv:<tag>
 
 GHCR uses the repository `GITHUB_TOKEN`; no registry password is required.
 After the first push, verify each package is linked to this repository and set
-its visibility to public before advertising it. Additional architectures,
-mutable `latest` tags, signing, and SBOMs are not part of the first release.
+its visibility to public before advertising it. Mutable `latest` tags, signing,
+and SBOMs are not part of the release.
 
 ### Release verification
 
