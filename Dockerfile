@@ -20,11 +20,11 @@ COPY . .
 RUN --mount=type=cache,id=rhiza-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rhiza-cargo-target,target=/src/target,sharing=locked \
     case "$RHIZA_PROFILE" in \
-      sql|graph) \
+      sql|graph|kv) \
         cargo build --release --locked -p rhiza-cli --bin rhiza \
           --no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc" \
         ;; \
-      *) echo "RHIZA_PROFILE must be sql|graph" >&2; \
+      *) echo "RHIZA_PROFILE must be sql|graph|kv" >&2; \
         exit 64 \
         ;; \
     esac \

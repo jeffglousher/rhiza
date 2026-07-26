@@ -1729,7 +1729,7 @@ fn execution_profile(
 ) -> Result<ExecutionProfile, String> {
     let profile = required_env(lookup, "RHIZA_EXECUTION_PROFILE")?
         .parse()
-        .map_err(|_| "RHIZA_EXECUTION_PROFILE must be sql|graph".to_string())?;
+        .map_err(|_| "RHIZA_EXECUTION_PROFILE must be sql|graph|kv".to_string())?;
     if execution_profile_compiled(profile) {
         Ok(profile)
     } else {
@@ -4446,7 +4446,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza prestage serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza health --url <url> [--ready]\n\nServe, prestage, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. prestage serve additionally requires RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE, RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE, and a distinct RHIZA_TAIL_TOKEN. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza prestage serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza kv get|scan|put|delete --url <preferred> [--url <fallback> ...] [--token <token>] [options]\n  rhiza health --url <url> [--ready]\n\nServe, prestage, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. prestage serve additionally requires RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE, RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE, and a distinct RHIZA_TAIL_TOKEN. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -4493,8 +4493,8 @@ mod tests {
         assert!(USAGE.contains("rhiza e2e [options]"));
         assert!(!USAGE.contains("verify-restore"));
         assert!(USAGE.contains("rhiza graph query"));
-        assert!(!USAGE.contains("rhiza kv"));
-        assert!(USAGE.contains("RHIZA_EXECUTION_PROFILE=sql|graph"));
+        assert!(USAGE.contains("rhiza kv get|scan|put|delete"));
+        assert!(USAGE.contains("RHIZA_EXECUTION_PROFILE=sql|graph|kv"));
     }
 
     #[test]
@@ -5708,6 +5708,7 @@ mod tests {
         [
             ("sql", ExecutionProfile::Sqlite, "rhiza:sql:cluster-a"),
             ("graph", ExecutionProfile::Graph, "rhiza:graph:cluster-a"),
+            ("kv", ExecutionProfile::Kv, "rhiza:kv:cluster-a"),
         ]
         .into_iter()
         .find(|(_, profile, _)| execution_profile_compiled(*profile))
@@ -5738,6 +5739,7 @@ mod tests {
         for (value, profile, expected_cluster_id) in [
             ("sql", ExecutionProfile::Sqlite, "rhiza:sql:cluster-a"),
             ("graph", ExecutionProfile::Graph, "rhiza:graph:cluster-a"),
+            ("kv", ExecutionProfile::Kv, "rhiza:kv:cluster-a"),
         ] {
             values.insert("RHIZA_EXECUTION_PROFILE", value);
             if execution_profile_compiled(profile) {
@@ -5756,7 +5758,7 @@ mod tests {
         values.insert("RHIZA_EXECUTION_PROFILE", "sqlite");
         assert_eq!(
             parse_serve_env(&values).unwrap_err(),
-            "RHIZA_EXECUTION_PROFILE must be sql|graph"
+            "RHIZA_EXECUTION_PROFILE must be sql|graph|kv"
         );
 
         let (profile_name, profile, canonical_cluster_id) = compiled_profile_fixture();
@@ -5772,7 +5774,7 @@ mod tests {
         let foreign_cluster_id = match profile {
             ExecutionProfile::Sqlite => "rhiza:graph:cluster-a",
             ExecutionProfile::Graph => "rhiza:sql:cluster-a",
-            ExecutionProfile::Kv => unreachable!("KV is not a supported facade profile"),
+            ExecutionProfile::Kv => "rhiza:sql:cluster-a",
         };
         values.insert("RHIZA_CLUSTER_ID", foreign_cluster_id);
         assert!(parse_serve_env(&values)

@@ -73,7 +73,7 @@ assert_statefulset_env_values_are_quoted_strings() {
     return 1
   }
 }
-for profile in sql graph; do
+for profile in sql graph kv; do
   for replicas in 3 7; do
   id="$replicas"
   jq -n --arg profile "$profile" --argjson id "$id" --argjson replicas "$replicas" '
@@ -315,17 +315,17 @@ for recorder_tls in off on; do
     "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = rhiza-sql:dev ]
 done
 
-# SQL and Graph must remain isolated build profiles; KV stays retired.
+# SQL, Graph, and KV remain isolated build profiles.
 grep -Fq -- 'ARG RHIZA_PROFILE=sql' Dockerfile
-grep -Fq -- 'sql|graph)' Dockerfile
+grep -Fq -- 'sql|graph|kv)' Dockerfile
 # shellcheck disable=SC2016 # Match Cargo's literal profile variable.
 grep -Fq -- '--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc"' Dockerfile
-grep -Fq -- 'RHIZA_PROFILE must be sql|graph' Dockerfile
-if grep -Eq -- 'RHIZA_PROFILE=(kv|all)|sql\|(kv|all)|graph\|(kv|all)' Dockerfile; then
-  echo "Dockerfile restored a retired KV or combined profile" >&2
+grep -Fq -- 'RHIZA_PROFILE must be sql|graph|kv' Dockerfile
+if grep -Eq -- 'RHIZA_PROFILE=all|sql\|graph\|kv\|all' Dockerfile; then
+  echo "Dockerfile added a combined all-engine profile" >&2
   exit 1
 fi
-grep -Fq -- 'profile: [sql, graph]' .github/workflows/ci.yml
+grep -Fq -- 'profile: [sql, graph, kv]' .github/workflows/ci.yml
 # shellcheck disable=SC2016 # Match the literal GitHub Actions expression.
 grep -Fq -- 'build-args: RHIZA_PROFILE=${{ matrix.profile }}' .github/workflows/ci.yml
 

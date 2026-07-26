@@ -13,9 +13,11 @@ use std::{
 
 mod ha;
 
+#[cfg(any(feature = "sql", feature = "graph"))]
+use rhiza_node::confirm_write_durability;
 #[cfg(feature = "sql")]
 use rhiza_node::NodeService;
-use rhiza_node::{confirm_write_durability, execution_profile_compiled, ConfigError, NodeRuntime};
+use rhiza_node::{execution_profile_compiled, ConfigError, NodeRuntime};
 use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
 use tokio::{
     sync::{watch, OwnedRwLockReadGuard, RwLock},
@@ -342,6 +344,7 @@ struct Inner {
     runtime: Arc<NodeRuntime>,
     #[cfg(feature = "sql")]
     service: NodeService,
+    #[cfg(any(feature = "sql", feature = "graph"))]
     execution_profile: ExecutionProfile,
     coordinator: Option<Arc<CheckpointCoordinator>>,
     operations: Arc<RwLock<()>>,
@@ -418,6 +421,7 @@ impl Rhiza {
         runtime: Arc<NodeRuntime>,
         coordinator: Option<Arc<CheckpointCoordinator>>,
     ) -> Self {
+        #[cfg(any(feature = "sql", feature = "graph"))]
         let execution_profile = runtime.config().execution_profile();
         #[cfg(feature = "sql")]
         let service = NodeService::new(runtime.clone(), coordinator.clone());
@@ -427,6 +431,7 @@ impl Rhiza {
             runtime,
             #[cfg(feature = "sql")]
             service,
+            #[cfg(any(feature = "sql", feature = "graph"))]
             execution_profile,
             coordinator,
             operations: Arc::new(RwLock::new(())),
@@ -725,6 +730,7 @@ impl RhizaHandle {
         Ok((inner, operation))
     }
 
+    #[cfg(any(feature = "sql", feature = "graph"))]
     async fn execute_typed_batch<T, F, I>(
         &self,
         profile: ExecutionProfile,
@@ -762,6 +768,7 @@ impl RhizaHandle {
     }
 }
 
+#[cfg(any(feature = "sql", feature = "graph"))]
 fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Error> {
     if inner.execution_profile == expected {
         Ok(())
@@ -792,6 +799,7 @@ fn require_embedded_profile(execution_profile: ExecutionProfile) -> Result<(), E
     }
 }
 
+#[cfg(any(feature = "sql", feature = "graph"))]
 fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
     if let Some(coordinator) = &inner.coordinator {
         coordinator.write_allowed()?;
@@ -799,6 +807,7 @@ fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(any(feature = "sql", feature = "graph"))]
 async fn confirm_embedded_write(
     inner: &Inner,
     applied_index: rhiza_core::LogIndex,

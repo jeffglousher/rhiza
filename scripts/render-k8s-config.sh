@@ -23,8 +23,8 @@ recorder_tls_secret_set="${RHIZA_RECORDER_TLS_SECRET+x}"
 case "$config_id" in ''|*[!0-9]*|0) usage;; esac
 case "$replicas" in 3|4|5|6|7) ;; *) usage;; esac
 case "$profile" in
-  sql|graph) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph" >&2; exit 65 ;;
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
 case "$recorder_transport" in
   http|tcp-postcard|tcp-postcard-rpc) ;;
