@@ -2,7 +2,8 @@
 
 ## v0.5.1
 
-- Publishes profile-isolated GHCR images for both Linux amd64 and arm64.
+- Publishes profile-isolated GHCR images for both Linux amd64 and arm64,
+  plus SQL/Graph/KV CLI binaries for Linux, macOS, and Windows on x64 and arm64.
 
 ## v0.5.0
 

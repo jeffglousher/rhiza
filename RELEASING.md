@@ -29,13 +29,13 @@ so protect the environment with required reviewers and use a scoped token.
 
 ### CLI binaries and OCI images
 
-Publishing a GitHub Release triggers `Release artifacts`. It uploads three
-Debian-compatible Linux x86_64 CLI archives plus individual SHA-256 files:
+Publishing a GitHub Release triggers `Release artifacts`. It uploads SQL,
+Graph, and KV CLI archives plus individual SHA-256 files for Linux, macOS, and
+Windows on x64 and arm64:
 
 ```text
-rhiza-sql-<tag>-x86_64-unknown-linux-gnu.tar.gz
-rhiza-graph-<tag>-x86_64-unknown-linux-gnu.tar.gz
-rhiza-kv-<tag>-x86_64-unknown-linux-gnu.tar.gz
+rhiza-<profile>-<tag>-<rust-target>.tar.gz
+rhiza-<profile>-<tag>-<windows-rust-target>.zip
 ```
 
 The same workflow pushes immutable, profile-isolated Linux amd64/arm64 images:

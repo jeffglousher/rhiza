@@ -10,40 +10,76 @@ concurrency:
 
 jobs:
   cli:
-    name: CLI (${{ matrix.profile }}, linux-amd64)
-    runs-on: ubuntu-latest
+    name: CLI (${{ matrix.profile }}, ${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         profile: [sql, graph, kv]
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Build isolated CLI
+        shell: bash
         run: >-
           cargo build --release --locked -p rhiza-cli --bin rhiza
           --no-default-features --features ${{ matrix.profile }},recorder-postcard-rpc
-      - name: Package CLI
+      - name: Package CLI (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         env:
           PROFILE: ${{ matrix.profile }}
           TAG: ${{ github.event.release.tag_name }}
+          TARGET: ${{ matrix.platform.target }}
         run: |
-          asset="rhiza-${PROFILE}-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          asset="rhiza-${PROFILE}-${TAG}-${TARGET}.tar.gz"
           install -D -m 0755 target/release/rhiza "target/release-assets/rhiza-${PROFILE}"
           tar -C target/release-assets -czf "$asset" "rhiza-${PROFILE}"
-          sha256sum "$asset" > "${asset}.sha256"
-      - name: Upload CLI asset
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "${asset}.sha256"
+          else
+            shasum -a 256 "$asset" > "${asset}.sha256"
+          fi
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+      - name: Package CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
           PROFILE: ${{ matrix.profile }}
           TAG: ${{ github.event.release.tag_name }}
+          TARGET: ${{ matrix.platform.target }}
         run: |
-          asset="rhiza-${PROFILE}-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          gh release upload "$TAG" "$asset" "${asset}.sha256"
+          $asset = "rhiza-$env:PROFILE-$env:TAG-$env:TARGET.zip"
+          New-Item -ItemType Directory -Force target/release-assets | Out-Null
+          Copy-Item target/release/rhiza.exe "target/release-assets/rhiza-$env:PROFILE.exe"
+          Compress-Archive -Path "target/release-assets/rhiza-$env:PROFILE.exe" -DestinationPath $asset
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          "$hash  $asset" | Set-Content "$asset.sha256"
+          "ASSET=$asset" >> $env:GITHUB_ENV
+      - name: Upload CLI asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" "$ASSET" "${ASSET}.sha256"
 
   oci:
     name: OCI (${{ matrix.profile }}, linux-amd64-arm64)
