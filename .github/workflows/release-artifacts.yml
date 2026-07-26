@@ -63,6 +63,9 @@ jobs:
                 "$PROFILE:$TARGET" == graph:aarch64-pc-windows-msvc ]]; then
             export LBUG_BUILD_FROM_SOURCE=1
           fi
+          if [[ "$PROFILE:$TARGET" == graph:x86_64-apple-darwin ]]; then
+            export CXXFLAGS="${CXXFLAGS:-} -D__builtin_cpu_supports(x)=0"
+          fi
           cargo build --release --locked -p rhiza-cli --bin rhiza \
             --no-default-features --features "$PROFILE,recorder-postcard-rpc"
       - name: Package CLI (Unix)
