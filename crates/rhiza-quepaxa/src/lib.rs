@@ -4491,7 +4491,10 @@ impl ThreeNodeConsensus {
                 .fetch_verified_value(proof_context(&proof).0, value)?
                 .ok_or(Error::CommandUnavailable)?,
         };
-        if command.entry_type != EntryType::ConfigChange && !transition_involved {
+        if !matches!(&proof, DecisionProof::Phase2 { .. })
+            && command.entry_type != EntryType::ConfigChange
+            && !transition_involved
+        {
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;
@@ -4943,21 +4946,6 @@ impl ThreeNodeConsensus {
                         epoch: self.epoch,
                         config_id: self.config_id,
                         config_digest: self.config_digest,
-                        proposal,
-                        summaries: proof_summaries.clone(),
-                    })
-            } else if step % 4 == 2 {
-                step_summaries
-                    .iter()
-                    .filter_map(|summary| summary.aggregate_prior.clone())
-                    .max()
-                    .map(|proposal| DecisionProof::Phase2 {
-                        cluster_id: self.cluster_id.clone(),
-                        slot,
-                        epoch: self.epoch,
-                        config_id: self.config_id,
-                        config_digest: self.config_digest,
-                        step,
                         proposal,
                         summaries: proof_summaries.clone(),
                     })
