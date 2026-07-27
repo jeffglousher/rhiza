@@ -1278,6 +1278,10 @@ pub trait RecorderRpc: Send + Sync {
         Err(Error::TypedRecordRequired)
     }
 
+    /// Installs a verified decision proof durably.
+    ///
+    /// An `Ok(())` must mean the proof survives recorder recovery; ordinary
+    /// Phase2 acknowledgements rely on a quorum of these durable successes.
     fn install_decision_proof(
         &self,
         _proof: DecisionProof,

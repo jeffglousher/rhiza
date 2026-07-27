@@ -277,9 +277,9 @@ fn priority_randomness_failure_is_typed_and_fail_stop() {
 #[test]
 fn non_preferred_proposer_uses_leaderless_four_phase_path() {
     let root = tempfile::tempdir().unwrap();
-    let consensus = consensus(root.path(), "n2").with_priority_source(Arc::new(FixedPriority));
+    let engine = consensus(root.path(), "n2").with_priority_source(Arc::new(FixedPriority));
     let command = StoredCommand::new(EntryType::Command, b"slow".to_vec());
-    consensus
+    engine
         .register_command(command.hash(), command.payload.clone())
         .unwrap();
     let mut progress = ProposerProgress::new(
@@ -292,26 +292,37 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
         ),
     );
     let proof = loop {
-        match consensus.drive(progress).unwrap() {
+        match engine.drive(progress).unwrap() {
             DriveOutcome::Progress(next) | DriveOutcome::Pending(next) => progress = next,
             DriveOutcome::Decision(proof) => break proof,
         }
     };
     assert!(matches!(proof, DecisionProof::Phase2 { step, .. } if step % 4 == 2));
-    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     assert!(matches!(
-        consensus.inspect_decision_proof_at(1).unwrap(),
+        engine.inspect_decision_proof_at(1).unwrap(),
         Some(DecisionProof::Phase2 { .. })
     ));
     assert!(matches!(
-        consensus
+        engine
             .inspect_certified_decision_at(1, LogHash::ZERO)
             .unwrap(),
         CertifiedDecisionInspection::Committed(_)
     ));
     assert!(matches!(
-        consensus.recover_decision_at(1, LogHash::ZERO).unwrap(),
+        engine.recover_decision_at(1, LogHash::ZERO).unwrap(),
         rhiza_quepaxa::DecisionInspection::Committed(entry) if entry.payload == b"slow"
+    ));
+    drop(engine);
+
+    let reopened = consensus(root.path(), "n1").with_priority_source(Arc::new(FixedPriority));
+    assert!(matches!(
+        reopened
+            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .unwrap(),
+        CertifiedDecisionInspection::Committed(certified)
+            if matches!(certified.proof, DecisionProof::Phase2 { .. })
+                && certified.entry.payload == b"slow"
     ));
 }
 

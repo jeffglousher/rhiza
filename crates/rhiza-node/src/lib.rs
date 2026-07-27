@@ -9186,7 +9186,7 @@ impl NodeRuntime {
                         .map_err(|error| self.map_consensus_error(error))?;
                     self.persist_entry(&entry, slot, last_hash)?;
                     // Pending may conceal a historical phase-2 Noop whose
-                    // asynchronous proof was never installed. It cannot fence
+                    // durable proof quorum was never installed. It cannot fence
                     // this read, so inspect the following slot before returning.
                 }
                 DecisionInspection::Empty => {
