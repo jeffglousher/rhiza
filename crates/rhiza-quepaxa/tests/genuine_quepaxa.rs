@@ -3,6 +3,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::SyncSender,
         Arc, Condvar, Mutex,
     },
     thread,
@@ -277,9 +278,9 @@ fn priority_randomness_failure_is_typed_and_fail_stop() {
 #[test]
 fn non_preferred_proposer_uses_leaderless_four_phase_path() {
     let root = tempfile::tempdir().unwrap();
-    let consensus = consensus(root.path(), "n2").with_priority_source(Arc::new(FixedPriority));
+    let engine = consensus(root.path(), "n2").with_priority_source(Arc::new(FixedPriority));
     let command = StoredCommand::new(EntryType::Command, b"slow".to_vec());
-    consensus
+    engine
         .register_command(command.hash(), command.payload.clone())
         .unwrap();
     let mut progress = ProposerProgress::new(
@@ -292,22 +293,37 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
         ),
     );
     let proof = loop {
-        match consensus.drive(progress).unwrap() {
+        match engine.drive(progress).unwrap() {
             DriveOutcome::Progress(next) | DriveOutcome::Pending(next) => progress = next,
             DriveOutcome::Decision(proof) => break proof,
         }
     };
     assert!(matches!(proof, DecisionProof::Phase2 { step, .. } if step % 4 == 2));
-    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     assert!(matches!(
-        consensus
+        engine.inspect_decision_proof_at(1).unwrap(),
+        Some(DecisionProof::Phase2 { .. })
+    ));
+    assert!(matches!(
+        engine
             .inspect_certified_decision_at(1, LogHash::ZERO)
             .unwrap(),
         CertifiedDecisionInspection::Committed(_)
     ));
     assert!(matches!(
-        consensus.recover_decision_at(1, LogHash::ZERO).unwrap(),
+        engine.recover_decision_at(1, LogHash::ZERO).unwrap(),
         rhiza_quepaxa::DecisionInspection::Committed(entry) if entry.payload == b"slow"
+    ));
+    drop(engine);
+
+    let reopened = consensus(root.path(), "n1").with_priority_source(Arc::new(FixedPriority));
+    assert!(matches!(
+        reopened
+            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .unwrap(),
+        CertifiedDecisionInspection::Committed(certified)
+            if matches!(certified.proof, DecisionProof::Phase2 { .. })
+                && certified.entry.payload == b"slow"
     ));
 }
 
@@ -698,6 +714,21 @@ impl RecorderRpc for TypedInspectionRecorder {
     }
 }
 
+#[derive(Clone)]
+struct ProofStrippingInspectionRecorder {
+    store: RecorderFileStore,
+}
+
+impl RecorderRpc for ProofStrippingInspectionRecorder {
+    fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
+        let mut summary = self.store.inspect_record_summary(slot)?;
+        if let Some(summary) = &mut summary {
+            summary.decided = None;
+        }
+        Ok(summary)
+    }
+}
+
 fn recorder_stores(root: &Path) -> (Membership, Vec<(String, RecorderFileStore)>) {
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let stores = membership
@@ -744,12 +775,19 @@ fn typed_inspector(
 
 #[derive(Clone)]
 enum SummaryGate {
-    Immediate,
     WaitForStart(Arc<(Mutex<bool>, Condvar)>),
     SignalAndBlock {
+        slot: u64,
         started: Arc<(Mutex<bool>, Condvar)>,
         release: Arc<(Mutex<bool>, Condvar)>,
     },
+}
+
+#[derive(Clone)]
+struct FetchGate {
+    command_hash: LogHash,
+    started: SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 #[derive(Clone)]
@@ -760,6 +798,7 @@ struct QueuedFetchInspectionRecorder {
     summary_gate: SummaryGate,
     command_slots: Vec<u64>,
     fetches: Option<Arc<AtomicUsize>>,
+    fetch_gate: Option<FetchGate>,
 }
 
 impl QueuedFetchInspectionRecorder {
@@ -822,6 +861,17 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
         if let Some(fetches) = &self.fetches {
             fetches.fetch_add(1, Ordering::SeqCst);
         }
+        if let Some(gate) = &self.fetch_gate {
+            if command_hash == gate.command_hash {
+                let _ = gate.started.send(());
+                let (released, condition) = &*gate.release;
+                drop(
+                    condition
+                        .wait_while(released.lock().unwrap(), |released| !*released)
+                        .unwrap(),
+                );
+            }
+        }
         Ok(self.commands.iter().find_map(|(slot, command)| {
             (self.command_slots.contains(slot) && command.hash() == command_hash)
                 .then_some(command.clone())
@@ -830,7 +880,6 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
 
     fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
         match &self.summary_gate {
-            SummaryGate::Immediate => {}
             SummaryGate::WaitForStart(started) => {
                 let (started, condition) = &**started;
                 drop(
@@ -839,7 +888,11 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
                         .unwrap(),
                 );
             }
-            SummaryGate::SignalAndBlock { started, release } => {
+            SummaryGate::SignalAndBlock {
+                slot: blocked_slot,
+                started,
+                release,
+            } if slot == *blocked_slot => {
                 let (started, condition) = &**started;
                 *started.lock().unwrap() = true;
                 condition.notify_all();
@@ -850,6 +903,7 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
                         .unwrap(),
                 );
             }
+            SummaryGate::SignalAndBlock { .. } => {}
         }
         if self.id == "n3" {
             Ok(None)
@@ -860,7 +914,7 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
 }
 
 #[test]
-fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
+fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let commands = vec![
         (1, StoredCommand::new(EntryType::Command, b"first".to_vec())),
@@ -871,7 +925,10 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
     ];
     let summary_started = Arc::new((Mutex::new(false), Condvar::new()));
     let summary_release = Arc::new((Mutex::new(false), Condvar::new()));
-    let minority_fetches = Arc::new(AtomicUsize::new(0));
+    let (fetch_started, fetch_started_receiver) = std::sync::mpsc::sync_channel(1);
+    let fetch_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let blocked_fetches = Arc::new(AtomicUsize::new(0));
+    let second_command_hash = commands[1].1.hash();
     let recorders = vec![
         (
             "n1".into(),
@@ -879,9 +936,14 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
                 id: "n1".into(),
                 membership: membership.clone(),
                 commands: commands.clone(),
-                summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
-                command_slots: vec![1],
-                fetches: None,
+                summary_gate: SummaryGate::SignalAndBlock {
+                    slot: 1,
+                    started: Arc::clone(&summary_started),
+                    release: Arc::clone(&summary_release),
+                },
+                command_slots: vec![2],
+                fetches: Some(Arc::clone(&blocked_fetches)),
+                fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
         ),
         (
@@ -890,9 +952,10 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
                 id: "n2".into(),
                 membership: membership.clone(),
                 commands: commands.clone(),
-                summary_gate: SummaryGate::Immediate,
-                command_slots: Vec::new(),
+                summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
+                command_slots: vec![1],
                 fetches: None,
+                fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
         ),
         (
@@ -901,12 +964,14 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
                 id: "n3".into(),
                 membership,
                 commands,
-                summary_gate: SummaryGate::SignalAndBlock {
-                    started: summary_started,
-                    release: Arc::clone(&summary_release),
-                },
-                command_slots: vec![1, 2],
-                fetches: Some(Arc::clone(&minority_fetches)),
+                summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
+                command_slots: Vec::new(),
+                fetches: None,
+                fetch_gate: Some(FetchGate {
+                    command_hash: second_command_hash,
+                    started: fetch_started,
+                    release: Arc::clone(&fetch_release),
+                }),
             }) as Box<dyn RecorderRpc>,
         ),
     ];
@@ -920,23 +985,30 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
         CertifiedDecisionInspection::Committed(_)
     ));
 
+    let consensus = Arc::new(consensus);
+    let inspecting = Arc::clone(&consensus);
+    let inspection =
+        thread::spawn(move || inspecting.inspect_certified_decision_at(2, LogHash::ZERO));
+
+    let fetch_started = fetch_started_receiver.recv_timeout(Duration::from_secs(1));
     let (released, condition) = &*summary_release;
     *released.lock().unwrap() = true;
     condition.notify_all();
-    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-    assert_eq!(
-        minority_fetches.load(Ordering::SeqCst),
-        0,
-        "the completed inspection must not run its queued minority command fetch"
-    );
+    let (released, condition) = &*fetch_release;
+    *released.lock().unwrap() = true;
+    condition.notify_all();
 
+    let inspected = inspection.join().unwrap().unwrap();
+    assert!(
+        fetch_started.is_ok(),
+        "n3 slot-2 fetch must start after n1 fetch dispatch: {fetch_started:?}"
+    );
     assert!(matches!(
-        consensus
-            .inspect_certified_decision_at(2, LogHash::ZERO)
-            .unwrap(),
+        inspected,
         CertifiedDecisionInspection::Committed(_)
     ));
-    assert_eq!(minority_fetches.load(Ordering::SeqCst), 1);
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    assert_eq!(blocked_fetches.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -982,7 +1054,7 @@ fn typed_inspection_reconstructs_fast_proof_without_a_proof_cache_or_proof_rpc()
 }
 
 #[test]
-fn typed_inspection_reconstructs_phase2_proof_without_a_proof_cache_or_proof_rpc() {
+fn typed_inspection_recovers_phase2_proof_from_durable_quorum_without_a_proof_rpc() {
     let root = tempfile::tempdir().unwrap();
     let (_, stores) = recorder_stores(root.path());
     let recorders = stores
@@ -1000,9 +1072,13 @@ fn typed_inspection_reconstructs_phase2_proof_without_a_proof_cache_or_proof_rpc
         )
         .unwrap();
     assert!(producer.finish_pending_rpcs(Duration::from_secs(1)));
-    assert!(stores
-        .iter()
-        .all(|(_, store)| store.inspect_decision_proof(1).unwrap().is_none()));
+    assert!(
+        stores
+            .iter()
+            .filter(|(_, store)| store.inspect_decision_proof(1).unwrap().is_some())
+            .count()
+            >= 2
+    );
 
     let proof_inspections = Arc::new(AtomicUsize::new(0));
     let summary_inspections = Arc::new(AtomicUsize::new(0));
@@ -1022,6 +1098,136 @@ fn typed_inspection_reconstructs_phase2_proof_without_a_proof_cache_or_proof_rpc
     assert!(matches!(certified.proof, DecisionProof::Phase2 { .. }));
     assert_eq!(proof_inspections.load(Ordering::SeqCst), 0);
     assert!(summary_inspections.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn phase2_recovery_does_not_substitute_a_later_summary_quorum() {
+    let root = tempfile::tempdir().unwrap();
+    let (membership, stores) = recorder_stores(root.path());
+    let v_command = StoredCommand::new(EntryType::Command, b"higher-prior".to_vec());
+    let w_command = StoredCommand::new(EntryType::Command, b"phase2-winner".to_vec());
+    let v = Proposal::new(
+        ProposalPriority::from_u64(2),
+        "n1",
+        1,
+        AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &v_command),
+    );
+    let w = Proposal::new(
+        ProposalPriority::from_u64(1),
+        "n2",
+        1,
+        AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &w_command),
+    );
+    let record =
+        |store: &RecorderFileStore, step: u64, proposal: Proposal, command: StoredCommand| {
+            store
+                .record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 1,
+                    step,
+                    proposal,
+                    command: Some(command),
+                })
+                .unwrap()
+        };
+
+    // At phase 1, A retains v while B and C retain w. B/C decide w at
+    // phase 2; A's delayed phase-2 record reports v as its aggregate prior.
+    // The removed raw-summary branch would inspect A/B and choose max(v, w)
+    // as v, despite B/C's live phase-2 quorum choosing w.
+    record(&stores[0].1, 5, v.clone(), v_command);
+    record(&stores[1].1, 5, w.clone(), w_command.clone());
+    record(&stores[2].1, 5, w.clone(), w_command.clone());
+    let b = record(&stores[1].1, 6, w.clone(), w_command.clone());
+    let c = record(&stores[2].1, 6, w.clone(), w_command.clone());
+    let proof = DecisionProof::Phase2 {
+        cluster_id: "cluster".into(),
+        slot: 1,
+        epoch: 1,
+        config_id: 1,
+        config_digest: membership.digest(),
+        step: 6,
+        proposal: w.clone(),
+        summaries: [b, c]
+            .into_iter()
+            .map(|summary| RecorderSummary {
+                recorder_id: summary.recorder_id,
+                slot: summary.slot,
+                step: summary.step,
+                first_current: summary.first_current,
+                aggregate_prior: summary.aggregate_prior,
+            })
+            .collect(),
+    };
+    stores[1]
+        .1
+        .install_decision_proof(proof.clone(), &membership)
+        .unwrap();
+    stores[2]
+        .1
+        .install_decision_proof(proof.clone(), &membership)
+        .unwrap();
+    record(&stores[0].1, 6, w.clone(), w_command);
+
+    let summary_only = ThreeNodeConsensus::from_recorders_with_ids(
+        "cluster",
+        "n1",
+        1,
+        1,
+        vec![
+            (
+                "n1".into(),
+                Box::new(ProofStrippingInspectionRecorder {
+                    store: stores[0].1.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ProofStrippingInspectionRecorder {
+                    store: stores[1].1.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            ("n3".into(), Box::new(DeadRecorder) as Box<dyn RecorderRpc>),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        summary_only
+            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .unwrap(),
+        CertifiedDecisionInspection::Pending
+    );
+    drop(summary_only);
+
+    let recovered = ThreeNodeConsensus::from_recorders_with_ids(
+        "cluster",
+        "n1",
+        1,
+        1,
+        vec![
+            (
+                "n1".into(),
+                Box::new(stores[0].1.clone()) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(stores[1].1.clone()) as Box<dyn RecorderRpc>,
+            ),
+            ("n3".into(), Box::new(DeadRecorder) as Box<dyn RecorderRpc>),
+        ],
+    )
+    .unwrap();
+    let CertifiedDecisionInspection::Committed(decision) = recovered
+        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .unwrap()
+    else {
+        panic!("installed phase-2 proof was not recoverable");
+    };
+    assert_eq!(decision.proof, proof);
+    assert_eq!(decision.entry.payload, b"phase2-winner");
 }
 
 #[derive(Clone)]
@@ -1743,6 +1949,25 @@ impl RecorderRpc for ObservedRecorder {
     }
 }
 
+#[derive(Clone)]
+struct ProofInstallFailingRecorder {
+    store: RecorderFileStore,
+}
+
+impl RecorderRpc for ProofInstallFailingRecorder {
+    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+        self.store.record(request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        _proof: DecisionProof,
+        _membership: &Membership,
+    ) -> Result<(), Error> {
+        Err(Error::Io("scripted proof install failure".into()))
+    }
+}
+
 struct DeadRecorder;
 
 impl RecorderRpc for DeadRecorder {
@@ -1982,7 +2207,7 @@ fn preferred_fast_path_piggybacks_command_without_post_ack_proof_writes() {
 }
 
 #[test]
-fn non_preferred_path_piggybacks_command_without_post_ack_proof_writes() {
+fn non_preferred_path_piggybacks_command_and_installs_a_proof_quorum_before_ack() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -2018,12 +2243,78 @@ fn non_preferred_path_piggybacks_command_without_post_ack_proof_writes() {
             Command::new(CommandKind::Deterministic, b"slow-path".to_vec()),
         )
         .unwrap();
+    assert!(counts.proof_installs.load(Ordering::SeqCst) >= membership.quorum_size());
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
     assert_eq!(counts.fetches.load(Ordering::SeqCst), 0);
     assert!(counts.piggybacks.load(Ordering::SeqCst) >= membership.quorum_size());
     assert!(counts.piggybacks.load(Ordering::SeqCst) <= 6);
-    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
+    assert!(counts.proof_installs.load(Ordering::SeqCst) >= membership.quorum_size());
+}
+
+#[test]
+fn non_preferred_path_does_not_ack_when_phase2_proof_install_lacks_a_quorum() {
+    let root = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let counts = Arc::new(ProtocolCounts::default());
+    let stores: Vec<_> = membership
+        .members()
+        .iter()
+        .map(|id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(id),
+                id.clone(),
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+        "cluster",
+        "n2",
+        1,
+        1,
+        vec![
+            (
+                "n1".into(),
+                Box::new(ObservedRecorder {
+                    store: stores[0].clone(),
+                    counts: Arc::clone(&counts),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ProofInstallFailingRecorder {
+                    store: stores[1].clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ProofInstallFailingRecorder {
+                    store: stores[2].clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ],
+    )
+    .unwrap()
+    .with_priority_source(Arc::new(FixedPriority));
+
+    assert_eq!(
+        consensus.propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(
+                CommandKind::Deterministic,
+                b"proof-install-failure".to_vec()
+            ),
+        ),
+        Err(Error::NoQuorum)
+    );
+    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 1);
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 }
 
 #[test]

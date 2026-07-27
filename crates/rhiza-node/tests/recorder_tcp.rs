@@ -497,8 +497,8 @@ async fn three_tcp_recorders_reconstruct_ordinary_proof_from_typed_summaries() {
         assert_eq!(summary.aggregate_prior, None);
         assert_eq!(inspector.inspect_decision_proof(1).unwrap(), None);
 
-        // The explicit proof-install transport remains available for
-        // configuration transitions even though ordinary decisions elide it.
+        // The explicit proof-install transport remains for Phase2 and
+        // configuration transitions; this ordinary FastPath elides it.
         inspector
             .install_decision_proof(proof.clone(), &install_membership)
             .unwrap();

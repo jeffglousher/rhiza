@@ -2046,8 +2046,9 @@ impl RecorderRpc for ProofDroppingRecorder {
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
-        // Simulate a proposer process that returned a phase-2 decision before
-        // its asynchronous proof dissemination survived a crash.
+        // Historical pre-P0 test double: deliberately violate the current
+        // durable-install contract to recreate a phase-2 decision whose proof
+        // quorum was never installed.
         Ok(())
     }
 

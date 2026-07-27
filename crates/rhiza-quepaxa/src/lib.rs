@@ -1278,6 +1278,10 @@ pub trait RecorderRpc: Send + Sync {
         Err(Error::TypedRecordRequired)
     }
 
+    /// Installs a verified decision proof durably.
+    ///
+    /// An `Ok(())` must mean the proof survives recorder recovery; ordinary
+    /// Phase2 acknowledgements rely on a quorum of these durable successes.
     fn install_decision_proof(
         &self,
         _proof: DecisionProof,
@@ -4491,7 +4495,10 @@ impl ThreeNodeConsensus {
                 .fetch_verified_value(proof_context(&proof).0, value)?
                 .ok_or(Error::CommandUnavailable)?,
         };
-        if command.entry_type != EntryType::ConfigChange && !transition_involved {
+        if !matches!(&proof, DecisionProof::Phase2 { .. })
+            && command.entry_type != EntryType::ConfigChange
+            && !transition_involved
+        {
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;
@@ -4860,6 +4867,8 @@ impl ThreeNodeConsensus {
             }
             if successful >= quorum {
                 if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
+                    // The nested command fetch reuses these bounded workers, so cancel queued summaries first.
+                    drop(cancellation);
                     return self.certified_inspection_from_proof(slot, prev_hash, proof);
                 }
             }
@@ -4943,21 +4952,6 @@ impl ThreeNodeConsensus {
                         epoch: self.epoch,
                         config_id: self.config_id,
                         config_digest: self.config_digest,
-                        proposal,
-                        summaries: proof_summaries.clone(),
-                    })
-            } else if step % 4 == 2 {
-                step_summaries
-                    .iter()
-                    .filter_map(|summary| summary.aggregate_prior.clone())
-                    .max()
-                    .map(|proposal| DecisionProof::Phase2 {
-                        cluster_id: self.cluster_id.clone(),
-                        slot,
-                        epoch: self.epoch,
-                        config_id: self.config_id,
-                        config_digest: self.config_digest,
-                        step,
                         proposal,
                         summaries: proof_summaries.clone(),
                     })

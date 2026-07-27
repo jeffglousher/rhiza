@@ -20,11 +20,11 @@ Consensus*](https://discovery.ucl.ac.uk/id/eprint/10181480/1/quepaxa.pdf), SOSP
 | Hedging and leader selection reduce redundant work but are not safety or liveness requirements. The paper adapts both with MAB-style tuning. | rhiza sql currently uses a static preferred identity and preferred-first endpoint order; later endpoints are used only for fallback or hedge attempts. MAB leader/hedge tuning remains documentation-only in [`mab-leader-hedge-tuning.md`](mab-leader-hedge-tuning.md). |
 
 rhiza sql adds a configuration-safety boundary beyond the paper's static-membership
-model: ordinary decisions neither wait for nor require proof-quorum installation
-before returning; asynchronous proof dissemination may overlap the response.
-`ConfigChange` decisions do require proof-quorum installation before returning.
-This distinction must not be summarized as "every decision waits for
-proof-quorum installation."
+model: ordinary FastPath decisions return without proof-quorum installation, while
+ordinary Phase2 decisions, `ConfigChange` decisions, and decisions reached after a
+transition was observed install a durable proof on a recorder quorum before
+returning. Recovery may reconstruct FastPath from recorder summaries, but never
+reconstructs Phase2 from summaries alone; it requires an installed decision proof.
 
 ## Executable safety evidence and boundaries
 

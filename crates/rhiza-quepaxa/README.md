@@ -32,17 +32,14 @@ See `examples/local_three_node.rs` for a complete runnable example.
 - `RecorderRpc` implementations must enforce a finite deadline for every
   network or process-bound operation. The consensus engine performs quorum RPCs
   concurrently and may return after a quorum while slower calls finish.
-- An ordinary command's proposal response does not wait for or require proof
-  dissemination. Its decision is offered to one fixed proof worker per
-  recorder. Each worker has room for one queued job in addition to its in-flight
-  RPC, stores the verified command bytes before idempotently installing the
-  proof, and drops new work when that bounded queue is full or disconnected.
-  These best-effort failures never change proposal success; sustained
-  saturation can therefore leave a recorder without a proof cache until later
-  recovery or dissemination.
-- Configuration-change decisions, and decisions reached after a transition was
-  observed, still install their proof on a recorder quorum synchronously before
-  the proposal succeeds.
+- An ordinary FastPath decision returns after its phase-0 recorder quorum and
+  does not install a proof. An ordinary Phase2 decision, configuration-change
+  decision, or decision reached after a transition was observed installs its
+  proof on a recorder quorum synchronously before the proposal succeeds. If
+  that installation lacks a quorum, the proposal does not succeed.
+- Recovery may reconstruct a FastPath decision from its recorder summaries, but
+  never reconstructs a Phase2 decision from summaries alone; Phase2 recovery
+  requires a durably installed decision proof.
 - Dropping `ThreeNodeConsensus` never waits indefinitely for outstanding RPC
   workers, including proof workers. A transport that ignores its deadline can
   leak its own worker and resources, but cannot block consensus destruction.
