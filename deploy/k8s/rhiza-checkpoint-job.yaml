@@ -14,11 +14,24 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: rhiza
           image: __RHIZA_IMAGE__
           imagePullPolicy: IfNotPresent
           args: __COMMAND_JSON__
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: RHIZA_EXECUTION_PROFILE
               value: __EXECUTION_PROFILE__
@@ -54,7 +67,11 @@ spec:
             - name: config
               mountPath: /etc/rhiza/__EXECUTION_PROFILE__
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           secret:
             secretName: __BUNDLE_SECRET__
+        - name: tmp
+          emptyDir: {}

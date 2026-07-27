@@ -65,18 +65,24 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: rhiza
           image: __RHIZA_IMAGE__
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-ec"]
-          args:
-            - |
-              ordinal="${HOSTNAME##*-}"
-              case "$ordinal" in ''|*[!0-9]*) exit 64;; esac
-              [ "$ordinal" -lt "__REPLICAS__" ] || exit 64
-              export RHIZA_NODE_ID="node-$((ordinal + 1))"
-              exec rhiza serve
+          args: ["serve"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: client
               containerPort: 8080
@@ -170,6 +176,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/rhiza
+            - name: tmp
+              mountPath: /tmp
             - name: config
               mountPath: /etc/rhiza/__EXECUTION_PROFILE__
               readOnly: true
@@ -177,6 +185,8 @@ spec:
         - name: data
           emptyDir:
             sizeLimit: "__DATA_SIZE_LIMIT__"
+        - name: tmp
+          emptyDir: {}
         - name: config
           secret:
             secretName: __BUNDLE_SECRET__

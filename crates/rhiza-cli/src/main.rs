@@ -819,7 +819,7 @@ impl ServeConfig {
             .strip_prefix(&profile_prefix)
             .expect("effective cluster id has the requested profile")
             .to_owned();
-        let node_id = required_env(&mut lookup, "RHIZA_NODE_ID")?;
+        let node_id = node_id_from_env(&mut lookup)?;
         let data_dir = PathBuf::from(required_env(&mut lookup, "RHIZA_DATA_DIR")?);
         let epoch = positive_env(&mut lookup, "RHIZA_EPOCH")?;
         let client_token = required_env(&mut lookup, "RHIZA_CLIENT_TOKEN")?;
@@ -1722,6 +1722,40 @@ fn required_env(
     lookup(name)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{name} is required"))
+}
+
+fn node_id_from_env(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<String, String> {
+    match lookup("RHIZA_NODE_ID") {
+        Some(node_id) if !node_id.is_empty() => Ok(node_id),
+        Some(_) => Err("RHIZA_NODE_ID must not be empty".into()),
+        None => {
+            let hostname = lookup("HOSTNAME").filter(|value| !value.is_empty()).ok_or_else(|| {
+                "RHIZA_NODE_ID is unset and HOSTNAME is required to derive the StatefulSet node ID"
+                    .to_string()
+            })?;
+            let (_, ordinal) = hostname.rsplit_once('-').ok_or_else(|| {
+                format!(
+                    "RHIZA_NODE_ID is unset and HOSTNAME must end with a StatefulSet ordinal: {hostname}"
+                )
+            })?;
+            if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!(
+                    "RHIZA_NODE_ID is unset and HOSTNAME must end with a StatefulSet ordinal: {hostname}"
+                ));
+            }
+            let ordinal = ordinal.parse::<u64>().map_err(|_| {
+                format!(
+                    "RHIZA_NODE_ID is unset and HOSTNAME has an invalid StatefulSet ordinal: {hostname}"
+                )
+            })?;
+            let member = ordinal.checked_add(1).ok_or_else(|| {
+                format!(
+                    "RHIZA_NODE_ID is unset and HOSTNAME has an invalid StatefulSet ordinal: {hostname}"
+                )
+            })?;
+            Ok(format!("node-{member}"))
+        }
+    }
 }
 
 fn execution_profile(
@@ -5101,6 +5135,54 @@ mod tests {
         assert!(config.remote.is_none());
         assert_eq!(config.recorder_transport, RecorderTransport::Http);
         assert!(config.recorder_tcp.is_none());
+    }
+
+    #[test]
+    fn serve_derives_node_id_from_statefulset_hostname_when_unset() {
+        let mut values = base_serve_env();
+        values.remove("RHIZA_NODE_ID");
+        values.insert("HOSTNAME", "rhiza-sql-c7-1");
+
+        let config = parse_serve_env(&values).unwrap();
+
+        assert_eq!(config.node_id, "node-2");
+    }
+
+    #[test]
+    fn serve_prefers_explicit_node_id_over_hostname() {
+        let mut values = base_serve_env();
+        values.insert("HOSTNAME", "not-a-statefulset-pod");
+
+        let config = parse_serve_env(&values).unwrap();
+
+        assert_eq!(config.node_id, "node-2");
+    }
+
+    #[test]
+    fn serve_rejects_missing_or_invalid_hostname_when_node_id_is_unset() {
+        let mut values = base_serve_env();
+        values.remove("RHIZA_NODE_ID");
+        assert!(parse_serve_env(&values)
+            .unwrap_err()
+            .contains("HOSTNAME is required"));
+
+        for hostname in ["rhiza", "rhiza-sql-c7-x", "rhiza-sql-c7-"] {
+            values.insert("HOSTNAME", hostname);
+            let error = parse_serve_env(&values).unwrap_err();
+            assert!(error.contains("StatefulSet ordinal"), "{error}");
+        }
+    }
+
+    #[test]
+    fn serve_rejects_an_explicitly_empty_node_id() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_NODE_ID", "");
+        values.insert("HOSTNAME", "rhiza-sql-c7-1");
+
+        assert_eq!(
+            parse_serve_env(&values).unwrap_err(),
+            "RHIZA_NODE_ID must not be empty"
+        );
     }
 
     #[test]

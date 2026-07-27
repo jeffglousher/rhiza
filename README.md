@@ -59,6 +59,11 @@ export RHIZA_EXECUTION_PROFILE=kv
 docker build --build-arg RHIZA_PROFILE=kv -t rhiza-kv:dev .
 ```
 
+The production stage is a digest-pinned Debian 13 distroless `cc` image. It
+runs `/usr/local/bin/rhiza` as UID/GID 65532 and intentionally contains no
+shell or package manager; mount runtime data and configuration with permissions
+that allow this non-root identity to read or write them as required.
+
 Image publication and registry tags are separate from the crates.io release;
 see [RELEASING.md](RELEASING.md) for the registry procedure.
 
@@ -559,6 +564,15 @@ endpoint, and Secret names with deployment-specific values.
 The renderer accepts only an unset or explicit `rejoin`
 `RHIZA_STARTUP_MODE`; bootstrap and disaster-recovery startup modes are not
 valid for the reference StatefulSet.
+
+The rendered Rhiza workload is compatible with distroless images: Kubernetes
+invokes the `rhiza` entrypoint directly and the binary derives `node-N` from
+the trailing StatefulSet ordinal in `HOSTNAME` when `RHIZA_NODE_ID` is unset.
+An explicit nonempty `RHIZA_NODE_ID` remains authoritative; a missing or
+malformed `HOSTNAME` fails startup instead of silently selecting an identity.
+Pods run as UID/GID 65532 with a read-only root filesystem, dropped Linux
+capabilities, `RuntimeDefault` seccomp, and writable `emptyDir` mounts only for
+Rhiza data and `/tmp`.
 
 Graph and KV rendering, checkpoint jobs, readiness checks, and replacement
 helpers use the same profile-scoped contracts. The static stable client Service

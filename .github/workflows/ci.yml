@@ -81,13 +81,25 @@ jobs:
           cache-from: |
             type=gha,scope=rhiza-${{ matrix.profile }}
           cache-to: type=gha,mode=max,scope=rhiza-${{ matrix.profile }}
-      - name: Verify image profile and entrypoint
+      - name: Verify distroless runtime contract
         env:
           RHIZA_IMAGE: rhiza-${{ matrix.profile }}:ci
           RHIZA_PROFILE: ${{ matrix.profile }}
         run: |
           test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ index .Config.Labels "io.rhiza.build-profile" }}')" = "$RHIZA_PROFILE"
-          test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ json .Config.Entrypoint }}')" = '["rhiza"]'
+          test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ json .Config.Entrypoint }}')" = '["/usr/local/bin/rhiza"]'
+          test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ .Config.User }}')" = '65532:65532'
+      - name: Smoke-test runtime loader
+        env:
+          RHIZA_IMAGE: rhiza-${{ matrix.profile }}:ci
+        run: |
+          set +e
+          runtime_output="$(docker run --rm "$RHIZA_IMAGE" 2>&1)"
+          runtime_status=$?
+          set -e
+          test "$runtime_status" -eq 2
+          printf '%s\n' "$runtime_output" | grep -Fx 'missing command'
+          printf '%s\n' "$runtime_output" | grep -Fx 'usage:'
 
   check:
     runs-on: ubuntu-latest
