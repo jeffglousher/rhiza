@@ -4867,6 +4867,8 @@ impl ThreeNodeConsensus {
             }
             if successful >= quorum {
                 if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
+                    // The nested command fetch reuses these bounded workers, so cancel queued summaries first.
+                    drop(cancellation);
                     return self.certified_inspection_from_proof(slot, prev_hash, proof);
                 }
             }

@@ -3,6 +3,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::SyncSender,
         Arc, Condvar, Mutex,
     },
     thread,
@@ -774,12 +775,19 @@ fn typed_inspector(
 
 #[derive(Clone)]
 enum SummaryGate {
-    Immediate,
     WaitForStart(Arc<(Mutex<bool>, Condvar)>),
     SignalAndBlock {
+        slot: u64,
         started: Arc<(Mutex<bool>, Condvar)>,
         release: Arc<(Mutex<bool>, Condvar)>,
     },
+}
+
+#[derive(Clone)]
+struct FetchGate {
+    command_hash: LogHash,
+    started: SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 #[derive(Clone)]
@@ -790,6 +798,7 @@ struct QueuedFetchInspectionRecorder {
     summary_gate: SummaryGate,
     command_slots: Vec<u64>,
     fetches: Option<Arc<AtomicUsize>>,
+    fetch_gate: Option<FetchGate>,
 }
 
 impl QueuedFetchInspectionRecorder {
@@ -852,6 +861,17 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
         if let Some(fetches) = &self.fetches {
             fetches.fetch_add(1, Ordering::SeqCst);
         }
+        if let Some(gate) = &self.fetch_gate {
+            if command_hash == gate.command_hash {
+                let _ = gate.started.send(());
+                let (released, condition) = &*gate.release;
+                drop(
+                    condition
+                        .wait_while(released.lock().unwrap(), |released| !*released)
+                        .unwrap(),
+                );
+            }
+        }
         Ok(self.commands.iter().find_map(|(slot, command)| {
             (self.command_slots.contains(slot) && command.hash() == command_hash)
                 .then_some(command.clone())
@@ -860,7 +880,6 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
 
     fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
         match &self.summary_gate {
-            SummaryGate::Immediate => {}
             SummaryGate::WaitForStart(started) => {
                 let (started, condition) = &**started;
                 drop(
@@ -869,7 +888,11 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
                         .unwrap(),
                 );
             }
-            SummaryGate::SignalAndBlock { started, release } => {
+            SummaryGate::SignalAndBlock {
+                slot: blocked_slot,
+                started,
+                release,
+            } if slot == *blocked_slot => {
                 let (started, condition) = &**started;
                 *started.lock().unwrap() = true;
                 condition.notify_all();
@@ -880,6 +903,7 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
                         .unwrap(),
                 );
             }
+            SummaryGate::SignalAndBlock { .. } => {}
         }
         if self.id == "n3" {
             Ok(None)
@@ -890,7 +914,7 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
 }
 
 #[test]
-fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
+fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let commands = vec![
         (1, StoredCommand::new(EntryType::Command, b"first".to_vec())),
@@ -901,7 +925,10 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
     ];
     let summary_started = Arc::new((Mutex::new(false), Condvar::new()));
     let summary_release = Arc::new((Mutex::new(false), Condvar::new()));
-    let minority_fetches = Arc::new(AtomicUsize::new(0));
+    let (fetch_started, fetch_started_receiver) = std::sync::mpsc::sync_channel(1);
+    let fetch_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let blocked_fetches = Arc::new(AtomicUsize::new(0));
+    let second_command_hash = commands[1].1.hash();
     let recorders = vec![
         (
             "n1".into(),
@@ -909,9 +936,14 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
                 id: "n1".into(),
                 membership: membership.clone(),
                 commands: commands.clone(),
-                summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
-                command_slots: vec![1],
-                fetches: None,
+                summary_gate: SummaryGate::SignalAndBlock {
+                    slot: 1,
+                    started: Arc::clone(&summary_started),
+                    release: Arc::clone(&summary_release),
+                },
+                command_slots: vec![2],
+                fetches: Some(Arc::clone(&blocked_fetches)),
+                fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
         ),
         (
@@ -920,9 +952,10 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
                 id: "n2".into(),
                 membership: membership.clone(),
                 commands: commands.clone(),
-                summary_gate: SummaryGate::Immediate,
-                command_slots: Vec::new(),
+                summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
+                command_slots: vec![1],
                 fetches: None,
+                fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
         ),
         (
@@ -931,12 +964,14 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
                 id: "n3".into(),
                 membership,
                 commands,
-                summary_gate: SummaryGate::SignalAndBlock {
-                    started: summary_started,
-                    release: Arc::clone(&summary_release),
-                },
-                command_slots: vec![1, 2],
-                fetches: Some(Arc::clone(&minority_fetches)),
+                summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
+                command_slots: Vec::new(),
+                fetches: None,
+                fetch_gate: Some(FetchGate {
+                    command_hash: second_command_hash,
+                    started: fetch_started,
+                    release: Arc::clone(&fetch_release),
+                }),
             }) as Box<dyn RecorderRpc>,
         ),
     ];
@@ -950,23 +985,30 @@ fn certified_inspection_discards_queued_minority_fetch_before_the_next_slot() {
         CertifiedDecisionInspection::Committed(_)
     ));
 
+    let consensus = Arc::new(consensus);
+    let inspecting = Arc::clone(&consensus);
+    let inspection =
+        thread::spawn(move || inspecting.inspect_certified_decision_at(2, LogHash::ZERO));
+
+    let fetch_started = fetch_started_receiver.recv_timeout(Duration::from_secs(1));
     let (released, condition) = &*summary_release;
     *released.lock().unwrap() = true;
     condition.notify_all();
-    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-    assert_eq!(
-        minority_fetches.load(Ordering::SeqCst),
-        0,
-        "the completed inspection must not run its queued minority command fetch"
-    );
+    let (released, condition) = &*fetch_release;
+    *released.lock().unwrap() = true;
+    condition.notify_all();
 
+    let inspected = inspection.join().unwrap().unwrap();
+    assert!(
+        fetch_started.is_ok(),
+        "n3 slot-2 fetch must start after n1 fetch dispatch: {fetch_started:?}"
+    );
     assert!(matches!(
-        consensus
-            .inspect_certified_decision_at(2, LogHash::ZERO)
-            .unwrap(),
+        inspected,
         CertifiedDecisionInspection::Committed(_)
     ));
-    assert_eq!(minority_fetches.load(Ordering::SeqCst), 1);
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    assert_eq!(blocked_fetches.load(Ordering::SeqCst), 1);
 }
 
 #[test]
