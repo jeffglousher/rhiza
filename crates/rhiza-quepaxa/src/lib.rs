@@ -12173,6 +12173,26 @@ mod tests {
                 .unwrap();
         });
         let caller_a_guard = ChannelReleaseAndJoin::new(vec![n1_release_tx], caller_a);
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            n1_started_rx.recv_timeout(event_timeout),
+            Ok(1),
+            "A n1 start missing: a_done={:?}, probe_registrations={}, probe_pending={}, probe_outstanding={}, probe_dispatches={}, n1_pending={}, n1_quarantined={}",
+            a_done_rx.try_recv(),
+            consensus.test_record_operation_probe_registration_count(),
+            queued_hedge_probe.pending(),
+            queued_hedge_probe.outstanding(),
+            queued_hedge_probe.dispatch_count(),
+            consensus.record_workers[0]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            consensus.record_workers[0]
+                .state
+                .quarantined
+                .load(Ordering::Acquire),
+        );
+        #[cfg(not(feature = "test-hooks"))]
         assert_eq!(n1_started_rx.recv_timeout(event_timeout), Ok(1));
         assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(1));
         assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(1));
@@ -12244,7 +12264,19 @@ mod tests {
             ),
             Ok(replies) if replies.len() == 2
         ));
-        assert_eq!(n1_started_rx.recv_timeout(event_timeout), Ok(3));
+        assert_eq!(
+            n1_started_rx.recv_timeout(event_timeout),
+            Ok(3),
+            "final recovery n1 worker state: pending={}, quarantined={}",
+            consensus.record_workers[0]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            consensus.record_workers[0]
+                .state
+                .quarantined
+                .load(Ordering::Acquire),
+        );
         assert!(consensus.finish_pending_rpcs(event_timeout));
     }
 
