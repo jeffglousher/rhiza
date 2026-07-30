@@ -102,8 +102,11 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
             _ => {}
         }
     }
-    assert_eq!(calls.iter().filter(|call| **call == "piggyback").count(), 3);
-    assert_eq!(calls.iter().filter(|call| **call == "record").count(), 3);
+    // Quorum freezes the public decision. A pending hedge may be pruned
+    // before it starts, so every executed recorder must piggyback before its
+    // record, but all three recorders need not execute.
+    assert!((2..=3).contains(&piggybacks));
+    assert_eq!(piggybacks, records);
     assert_eq!(calls.iter().filter(|call| **call == "store").count(), 0);
 }
 

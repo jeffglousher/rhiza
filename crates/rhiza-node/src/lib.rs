@@ -11857,12 +11857,43 @@ mod tests {
         RECORDER_PROTOCOL_VERSION, RECORDER_RECORD_PATH, RECORDER_WIRE_VERSION,
     };
     use super::{
-        client_authenticated, next_sync_flush_retry, post, run_read_operation,
-        sql_query_http_response, valid_recorder_record, Duration, FileLogStore, HeaderMap, Instant,
-        Json, NodeError, ReadConsistency, Request, Router, SqlCommand, SqlQueryResponse,
-        SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES,
-        PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+        client_authenticated, next_sync_flush_retry, post,
+        retain_peer_permit_until_response_body_complete, run_read_operation,
+        sql_query_http_response, valid_recorder_record, Body, Duration, FileLogStore, HeaderMap,
+        Instant, Json, NodeError, ReadConsistency, Request, Response, Router, SqlCommand,
+        SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
+        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
+        VERSION_HEADER,
     };
+
+    struct PendingThenDataBody {
+        state: u8,
+    }
+
+    impl http_body::Body for PendingThenDataBody {
+        type Data = axum::body::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.state {
+                0 => {
+                    self.state = 1;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                1 => {
+                    self.state = 2;
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
+                        axum::body::Bytes::from_static(b"response"),
+                    ))))
+                }
+                _ => std::task::Poll::Ready(None),
+            }
+        }
+    }
 
     struct BlockingStartupInspection {
         recorder: RecorderFileStore,
@@ -13894,6 +13925,44 @@ mod tests {
             with_graph_client_permit(permit, || slots.clone().try_acquire_owned().is_err());
 
         assert!(capacity_exhausted_during_response);
+        assert!(slots.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn peer_permit_body_holds_capacity_through_frames_until_eof_or_drop() {
+        use http_body::Body as _;
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let response = Response::new(Body::new(PendingThenDataBody { state: 0 }));
+        let mut body =
+            retain_peer_permit_until_response_body_complete(response, permit).into_body();
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+
+        assert!(slots.try_acquire().is_err());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(slots.try_acquire().is_err());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut context),
+            std::task::Poll::Ready(Some(Ok(_)))
+        ));
+        assert!(slots.try_acquire().is_err());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut context),
+            std::task::Poll::Ready(None)
+        ));
+        assert!(slots.try_acquire().is_ok());
+
+        let dropped_permit = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let dropped_response = Response::new(Body::new(PendingThenDataBody { state: 0 }));
+        let dropped_body =
+            retain_peer_permit_until_response_body_complete(dropped_response, dropped_permit);
+        assert!(slots.try_acquire().is_err());
+        drop(dropped_body);
         assert!(slots.try_acquire().is_ok());
     }
 
