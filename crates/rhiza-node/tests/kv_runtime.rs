@@ -124,6 +124,40 @@ fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() 
 }
 
 #[test]
+fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders() {
+    for attempt in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let config = kv_config(dir.path());
+        let runtime =
+            NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+        runtime
+            .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+            .unwrap();
+        let second = runtime
+            .mutate_kv(
+                KvCommandV1::put("request-2", b"other".to_vec(), b"second".to_vec()).unwrap(),
+            )
+            .unwrap();
+        drop(runtime);
+
+        std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
+        std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
+        std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
+
+        let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[])
+            .unwrap_or_else(|error| panic!("recovery attempt {attempt} failed: {error}"));
+        let key = reopened.get_kv(b"key", ReadConsistency::Local).unwrap();
+        let other = reopened.get_kv(b"other", ReadConsistency::Local).unwrap();
+        assert_eq!(key.value, Some(b"value".to_vec()), "attempt {attempt}");
+        assert_eq!(other.value, Some(b"second".to_vec()), "attempt {attempt}");
+        assert_eq!(key.applied_index, 2, "attempt {attempt}");
+        assert_eq!(other.applied_index, 2, "attempt {attempt}");
+        assert_eq!(key.hash, second.hash(), "attempt {attempt}");
+        assert_eq!(other.hash, second.hash(), "attempt {attempt}");
+    }
+}
+
+#[test]
 fn missing_partial_and_identity_invalid_unanchored_kv_rebuild_from_qlog() {
     #[derive(Clone, Copy, Debug)]
     enum Fault {
@@ -196,10 +230,21 @@ fn corrupt_unanchored_kv_fails_closed_when_only_one_recorder_has_the_tail() {
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
-    assert!(matches!(
-        NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]),
-        Err(NodeError::Unavailable(_))
-    ));
+    let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]);
+    let classification = match &reopened {
+        Ok(_) => "ok",
+        Err(NodeError::Unavailable(_)) => "unavailable",
+        Err(NodeError::Reconciliation(_)) => "reconciliation",
+        Err(_) => "other_error",
+    };
+    let diagnostic = match &reopened {
+        Ok(_) => "Ok(NodeRuntime)".to_owned(),
+        Err(error) => format!("Err({error:?})"),
+    };
+    assert!(
+        matches!(&reopened, Err(NodeError::Unavailable(_))),
+        "expected fail-closed Unavailable; result={diagnostic}; classification={classification}; tail_recorder_count=1; local_consensus_log=removed; kv_cache=corrupt"
+    );
 }
 
 #[tokio::test]
@@ -233,13 +278,13 @@ async fn corrupt_anchored_kv_requires_snapshot_without_quarantining_the_view() {
         NodeError::SnapshotRequired(Box::new(anchor))
     );
     assert!(config.data_dir().join("kv").is_dir());
-    assert!(!std::fs::read_dir(config.data_dir())
-        .unwrap()
-        .any(|entry| entry
+    assert!(!std::fs::read_dir(config.data_dir()).unwrap().any(|entry| {
+        entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with("kv.quarantine-")));
+            .starts_with("kv.quarantine-")
+    }));
 }
 
 #[test]
@@ -278,13 +323,13 @@ fn corrupt_qlog_fails_before_kv_quarantine_and_preserves_both_views() {
         std::fs::read(config.data_dir().join("kv/data.redb")).unwrap(),
         corrupt_kv
     );
-    assert!(!std::fs::read_dir(config.data_dir())
-        .unwrap()
-        .any(|entry| entry
+    assert!(!std::fs::read_dir(config.data_dir()).unwrap().any(|entry| {
+        entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with("kv.quarantine-")));
+            .starts_with("kv.quarantine-")
+    }));
 }
 
 #[test]

@@ -24,12 +24,12 @@ use rhiza_node::{
     AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
     AdminTaskTracker, CertifiedTailErrorResponse, CertifiedTailResponse, CheckpointCoordinator,
     DurabilityMode, HttpLogPeer, HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime,
-    PeerConfig, ReadConsistency, RecorderTlsClientConfig, RecorderTlsServerConfig, StopInformation,
-    TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH,
-    ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH, CERTIFIED_TAIL_PATH,
-    LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, RECOVERY_GENERATION_HEADER, TAIL_CLUSTER_ID_HEADER,
-    TAIL_CONFIG_ID_HEADER, TAIL_EPOCH_HEADER, TAIL_MEMBERSHIP_DIGEST_HEADER, TAIL_PROTOCOL_VERSION,
-    TAIL_VERSION_HEADER, VERSION_HEADER,
+    PeerConfig, ReadConsistency, RecorderIngressLifecycle, RecorderTlsClientConfig,
+    RecorderTlsServerConfig, StopInformation, TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH,
+    ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH,
+    CERTIFIED_TAIL_PATH, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, RECOVERY_GENERATION_HEADER,
+    TAIL_CLUSTER_ID_HEADER, TAIL_CONFIG_ID_HEADER, TAIL_EPOCH_HEADER,
+    TAIL_MEMBERSHIP_DIGEST_HEADER, TAIL_PROTOCOL_VERSION, TAIL_VERSION_HEADER, VERSION_HEADER,
 };
 #[cfg(feature = "sql")]
 use rhiza_node::{
@@ -2638,34 +2638,6 @@ async fn before_shutdown_deadline<T>(
         .map_err(|_| shutdown_deadline_error(timeout))
 }
 
-fn remaining_shutdown_budget(deadline: tokio::time::Instant) -> Duration {
-    deadline.saturating_duration_since(tokio::time::Instant::now())
-}
-
-fn pending_consensus_rpc_result(finished: bool) -> Result<(), String> {
-    if finished {
-        Ok(())
-    } else {
-        Err("consensus RPCs did not finish before the shutdown deadline".into())
-    }
-}
-
-fn finish_pending_consensus_rpcs(
-    runtime: &Arc<NodeRuntime>,
-    timeout: Duration,
-) -> Result<(), String> {
-    let consensus = runtime.consensus();
-    let finished = if matches!(
-        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-    ) {
-        tokio::task::block_in_place(|| consensus.finish_pending_rpcs(timeout))
-    } else {
-        consensus.finish_pending_rpcs(timeout)
-    };
-    pending_consensus_rpc_result(finished)
-}
-
 async fn serve_local_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -2778,10 +2750,6 @@ where
     .unwrap_or_else(Err);
     let mut shutdown_result = result;
     retain_first_error(&mut shutdown_result, drained);
-    retain_first_error(
-        &mut shutdown_result,
-        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)),
-    );
     shutdown_result
 }
 
@@ -3112,15 +3080,12 @@ where
                 .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
             let peers = config.bundle.peers.clone();
             let recovery_generation = config.recovery_generation;
+            let (lifecycle, keepalive) = recorder_ingress_lifecycle(shutdown);
             Ok(AbortOnDrop(tokio::spawn(async move {
-                serve_recorder_tcp(
-                    listener,
-                    recorder,
-                    peers,
-                    recovery_generation,
-                    wait_for_shutdown(shutdown),
-                )
-                .await
+                let _keepalive = keepalive;
+                serve_recorder_tcp(listener, recorder, peers, recovery_generation, lifecycle)
+                    .await
+                    .result
             })))
         }
         RecorderTransport::TcpTlsPostcard => {
@@ -3142,16 +3107,19 @@ where
                 .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
             let peers = config.bundle.peers.clone();
             let recovery_generation = config.recovery_generation;
+            let (lifecycle, keepalive) = recorder_ingress_lifecycle(shutdown);
             Ok(AbortOnDrop(tokio::spawn(async move {
+                let _keepalive = keepalive;
                 serve_recorder_tcp_tls(
                     listener,
                     recorder,
                     peers,
                     recovery_generation,
                     tls,
-                    wait_for_shutdown(shutdown),
+                    lifecycle,
                 )
                 .await
+                .result
             })))
         }
         #[cfg(feature = "recorder-postcard-rpc")]
@@ -3165,15 +3133,18 @@ where
                 .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
             let peers = config.bundle.peers.clone();
             let recovery_generation = config.recovery_generation;
+            let (lifecycle, keepalive) = recorder_ingress_lifecycle(shutdown);
             Ok(AbortOnDrop(tokio::spawn(async move {
+                let _keepalive = keepalive;
                 serve_recorder_postcard_rpc(
                     listener,
                     recorder,
                     peers,
                     recovery_generation,
-                    wait_for_shutdown(shutdown),
+                    lifecycle,
                 )
                 .await
+                .result
             })))
         }
         #[cfg(feature = "recorder-postcard-rpc")]
@@ -3196,19 +3167,44 @@ where
                 .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
             let peers = config.bundle.peers.clone();
             let recovery_generation = config.recovery_generation;
+            let (lifecycle, keepalive) = recorder_ingress_lifecycle(shutdown);
             Ok(AbortOnDrop(tokio::spawn(async move {
+                let _keepalive = keepalive;
                 serve_recorder_postcard_rpc_tls(
                     listener,
                     recorder,
                     peers,
                     recovery_generation,
                     tls,
-                    wait_for_shutdown(shutdown),
+                    lifecycle,
                 )
                 .await
+                .result
             })))
         }
     }
+}
+
+struct RecorderIngressKeepalive {
+    _force: tokio::sync::watch::Sender<bool>,
+    _started: tokio::sync::oneshot::Receiver<()>,
+    _listener_dropped: tokio::sync::oneshot::Receiver<()>,
+}
+
+fn recorder_ingress_lifecycle(
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (RecorderIngressLifecycle, RecorderIngressKeepalive) {
+    let (force, force_rx) = tokio::sync::watch::channel(false);
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (listener_dropped, listener_dropped_rx) = tokio::sync::oneshot::channel();
+    (
+        RecorderIngressLifecycle::new(shutdown, force_rx, started, listener_dropped),
+        RecorderIngressKeepalive {
+            _force: force,
+            _started: started_rx,
+            _listener_dropped: listener_dropped_rx,
+        },
+    )
 }
 
 async fn bind_client_listener(config: &ServeConfig) -> Result<tokio::net::TcpListener, String> {
@@ -4138,9 +4134,13 @@ async fn roll_checkpoint(
         return Ok((source_tip, *published.manifest().tip()));
     }
     let entries = source
-        .restore_checkpoint()
+        .load_checkpoint_restore()
         .await
-        .map_err(|error| format!("source checkpoint verification failed: {error}"))?;
+        .map_err(|error| format!("source checkpoint verification failed: {error}"))?
+        .ok_or_else(|| "source checkpoint disappeared during roll".to_string())?
+        .restored()
+        .suffix()
+        .to_vec();
     let source_after = source
         .load_checkpoint()
         .await
@@ -4158,9 +4158,13 @@ async fn roll_checkpoint(
         .await
         .map_err(|error| error.to_string())?;
     let target_entries = target
-        .restore_checkpoint()
+        .load_checkpoint_restore()
         .await
-        .map_err(|error| format!("target checkpoint verification failed: {error}"))?;
+        .map_err(|error| format!("target checkpoint verification failed: {error}"))?
+        .ok_or_else(|| "target checkpoint disappeared during roll".to_string())?
+        .restored()
+        .suffix()
+        .to_vec();
     let source_tip = *source_after.manifest().tip();
     let target_tip = target_entries
         .last()
@@ -6429,10 +6433,28 @@ mod tests {
         let (old_tip, new_tip) = roll_checkpoint(&source, &target).await.unwrap();
         assert_eq!(old_tip.index(), 3);
         assert_eq!(new_tip, old_tip);
-        assert_eq!(target.restore_checkpoint().await.unwrap(), entries(3));
+        assert_eq!(
+            target
+                .load_checkpoint_restore()
+                .await
+                .unwrap()
+                .unwrap()
+                .restored()
+                .suffix(),
+            entries(3)
+        );
         let retry = roll_checkpoint(&source, &target).await.unwrap();
         assert_eq!(retry, (old_tip, new_tip));
-        assert_eq!(target.restore_checkpoint().await.unwrap(), entries(3));
+        assert_eq!(
+            target
+                .load_checkpoint_restore()
+                .await
+                .unwrap()
+                .unwrap()
+                .restored()
+                .suffix(),
+            entries(3)
+        );
     }
 
     #[tokio::test]
@@ -6499,13 +6521,18 @@ mod tests {
         let (source_tip, target_tip) = roll_checkpoint(&source, &target).await.unwrap();
 
         assert_eq!(source_tip, target_tip);
-        let restored = target.restore_checkpoint_state().await.unwrap();
-        assert_eq!(restored.snapshot().unwrap().bytes(), bytes);
+        let restored = target.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(restored.restored().snapshot().unwrap().bytes(), bytes);
         assert_eq!(
-            restored.snapshot().unwrap().anchor().recovery_generation(),
+            restored
+                .restored()
+                .snapshot()
+                .unwrap()
+                .anchor()
+                .recovery_generation(),
             2
         );
-        assert_eq!(restored.suffix(), &committed[2..]);
+        assert_eq!(restored.restored().suffix(), &committed[2..]);
     }
 
     fn unused_local_address() -> String {
@@ -6622,24 +6649,31 @@ mod tests {
         let consensus = build_consensus(&config, Some(&local_recorder)).unwrap();
 
         let entry = tokio::task::spawn_blocking(move || {
-            let entry = consensus
-                .propose_at(
-                    1,
-                    LogHash::ZERO,
-                    rhiza_core::Command::new(
-                        rhiza_core::CommandKind::Deterministic,
-                        b"direct-self".to_vec(),
-                    ),
-                )
-                .unwrap();
+            let entry = consensus.propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO,
+                rhiza_core::Command::new(
+                    rhiza_core::CommandKind::Deterministic,
+                    b"direct-self".to_vec(),
+                ),
+            );
             assert!(consensus.finish_pending_rpcs(Duration::from_secs(2)));
             entry
         })
         .await
         .unwrap();
 
-        assert_eq!(entry.payload, b"direct-self");
-        assert!(local_recorder.inspect_record_summary(1).unwrap().is_some());
+        match entry {
+            Ok(entry) => {
+                assert_eq!(entry.payload, b"direct-self");
+                assert!(local_recorder.inspect_record_summary(1).unwrap().is_some());
+            }
+            Err(rhiza_quepaxa::Error::UnknownOutcome) => {
+                assert!(local_recorder.inspect_record_summary(1).unwrap().is_some());
+            }
+            Err(error) => panic!("direct recorder proposal failed: {error}"),
+        }
         self_server.abort();
         remote_server.abort();
         unavailable_server.abort();

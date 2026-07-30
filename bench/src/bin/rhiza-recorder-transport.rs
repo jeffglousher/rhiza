@@ -11,13 +11,13 @@ use std::{
 use rhiza_core::LogHash;
 use rhiza_node::{
     serve_recorder_postcard_rpc, serve_recorder_postcard_rpc_tls, serve_recorder_tcp,
-    serve_recorder_tcp_tls, PeerConfig, RecorderPostcardRpcTlsClientConfig,
-    RecorderPostcardRpcTlsServerConfig, RecorderTlsClientConfig, RecorderTlsServerConfig,
-    TcpPostcardRecorderClient, TcpPostcardRpcRecorderClient,
+    serve_recorder_tcp_tls, PeerConfig, RecorderIngressLifecycle,
+    RecorderPostcardRpcTlsClientConfig, RecorderPostcardRpcTlsServerConfig,
+    RecorderTlsClientConfig, RecorderTlsServerConfig, TcpPostcardRecorderClient,
+    TcpPostcardRpcRecorderClient,
 };
 use rhiza_quepaxa::{Error, Proposal, RecordRequest, RecordSummary, RecorderRpc};
 use serde::Serialize;
-use tokio::sync::oneshot;
 
 const RECORDER_ID: &str = "node-1";
 const CLIENT_ID: &str = "node-2";
@@ -196,15 +196,26 @@ fn print_usage() {
 struct DeterministicRecorder;
 
 impl RecorderRpc for DeterministicRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         Ok(RECORDER_ID.into())
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         Ok(summary_for(request.slot))
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         Ok(Some(summary_for(slot)))
     }
 }
@@ -263,14 +274,17 @@ fn tls_material() -> TlsMaterial {
 }
 
 struct ServerHandle {
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    _force: tokio::sync::watch::Sender<bool>,
+    _started: tokio::sync::oneshot::Receiver<()>,
+    _listener_dropped: tokio::sync::oneshot::Receiver<()>,
     task: tokio::task::JoinHandle<Result<(), String>>,
 }
 
 impl ServerHandle {
     async fn shutdown(mut self) -> Result<(), String> {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            shutdown.send_replace(true);
         }
         self.task
             .await
@@ -292,53 +306,58 @@ async fn start_candidate(
         .await
         .map_err(|error| error.to_string())?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
-    let (shutdown, receiver) = oneshot::channel();
-    let shutdown_future = async move {
-        let _ = receiver.await;
-    };
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (force, force_rx) = tokio::sync::watch::channel(false);
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (listener_dropped, listener_dropped_rx) = tokio::sync::oneshot::channel();
+    let lifecycle = RecorderIngressLifecycle::new(shutdown_rx, force_rx, started, listener_dropped);
     let recorder = DeterministicRecorder;
     let peers = peers();
 
     let task = match candidate {
-        Candidate::TcpPostcard => tokio::spawn(serve_recorder_tcp(
-            listener,
-            recorder,
-            peers,
-            RECOVERY_GENERATION,
-            shutdown_future,
-        )),
-        Candidate::TcpPostcardRpc => tokio::spawn(serve_recorder_postcard_rpc(
-            listener,
-            recorder,
-            peers,
-            RECOVERY_GENERATION,
-            shutdown_future,
-        )),
+        Candidate::TcpPostcard => tokio::spawn(async move {
+            serve_recorder_tcp(listener, recorder, peers, RECOVERY_GENERATION, lifecycle)
+                .await
+                .result
+        }),
+        Candidate::TcpPostcardRpc => tokio::spawn(async move {
+            serve_recorder_postcard_rpc(listener, recorder, peers, RECOVERY_GENERATION, lifecycle)
+                .await
+                .result
+        }),
         Candidate::TcpTlsPostcard => {
             let config =
                 RecorderTlsServerConfig::from_pem(tls.cert_pem.as_bytes(), tls.key_pem.as_bytes())?;
-            tokio::spawn(serve_recorder_tcp_tls(
-                listener,
-                recorder,
-                peers,
-                RECOVERY_GENERATION,
-                config,
-                shutdown_future,
-            ))
+            tokio::spawn(async move {
+                serve_recorder_tcp_tls(
+                    listener,
+                    recorder,
+                    peers,
+                    RECOVERY_GENERATION,
+                    config,
+                    lifecycle,
+                )
+                .await
+                .result
+            })
         }
         Candidate::TcpTlsPostcardRpc => {
             let config = RecorderPostcardRpcTlsServerConfig::from_pem(
                 tls.cert_pem.as_bytes(),
                 tls.key_pem.as_bytes(),
             )?;
-            tokio::spawn(serve_recorder_postcard_rpc_tls(
-                listener,
-                recorder,
-                peers,
-                RECOVERY_GENERATION,
-                config,
-                shutdown_future,
-            ))
+            tokio::spawn(async move {
+                serve_recorder_postcard_rpc_tls(
+                    listener,
+                    recorder,
+                    peers,
+                    RECOVERY_GENERATION,
+                    config,
+                    lifecycle,
+                )
+                .await
+                .result
+            })
         }
     };
     let client = client_for(candidate, address, tls)?;
@@ -347,6 +366,9 @@ async fn start_candidate(
         client,
         server: ServerHandle {
             shutdown: Some(shutdown),
+            _force: force,
+            _started: started_rx,
+            _listener_dropped: listener_dropped_rx,
             task,
         },
     })
@@ -409,10 +431,11 @@ struct CallFailure {
 
 fn call(client: &dyn RecorderRpc, workload: Workload, sequence: usize) -> Result<(), CallFailure> {
     let slot = sequence as u64 + 1;
+    let context = rhiza_quepaxa::RecorderRpcContext::default_timeout();
     let result = match workload {
-        Workload::Record => client.record(request_for(slot)),
+        Workload::Record => client.record(&context, request_for(slot)),
         Workload::InspectRecordSummary => client
-            .inspect_record_summary(slot)
+            .inspect_record_summary(&context, slot)
             .and_then(|summary| summary.ok_or(Error::TypedRecordRequired)),
     };
     match result {

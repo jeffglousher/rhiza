@@ -1,9 +1,6 @@
-use std::{
-    fs,
-    time::{Duration, SystemTime},
-};
+use std::{fs, time::SystemTime};
 
-use rhiza_quepaxa::{Command, CommandKind, Consensus, ThreeNodeConsensus};
+use rhiza_quepaxa::{Command, CommandKind, RecorderRpcContext, ThreeNodeConsensus};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let suffix = SystemTime::now()
@@ -13,15 +10,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let roots = [base.join("n1"), base.join("n2"), base.join("n3")];
 
     let consensus = ThreeNodeConsensus::new("example", "n1", 1, 1, roots)?;
-    let entry = consensus.propose(Command::new(
-        CommandKind::Deterministic,
-        b"create user 42".to_vec(),
-    ))?;
+    let entry = consensus.propose(
+        RecorderRpcContext::default_timeout(),
+        Command::new(CommandKind::Deterministic, b"create user 42".to_vec()),
+    )?;
 
     println!("decided slot {} with hash {:?}", entry.index, entry.hash);
-    if !consensus.finish_pending_rpcs(Duration::from_secs(1)) {
-        return Err("timed out waiting for pending QuePaxa RPCs".into());
-    }
     drop(consensus);
     fs::remove_dir_all(base)?;
     Ok(())

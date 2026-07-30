@@ -115,12 +115,13 @@ impl AdversarialRecorder {
 }
 
 impl RecorderRpc for AdversarialRecorder {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         self.store.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -140,6 +141,7 @@ impl RecorderRpc for AdversarialRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -150,24 +152,37 @@ impl RecorderRpc for AdversarialRecorder {
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         self.broadcast.wait();
         self.deliver(request)
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> Result<(), Error> {
         self.store.install_decision_proof(proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> Result<Option<DecisionProof>, Error> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<DecisionProof>, Error> {
         self.store.inspect_decision_proof(slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         self.store.inspect_record_summary(slot)
     }
 }
@@ -179,7 +194,11 @@ struct DroppedRecorder {
 }
 
 impl RecorderRpc for DroppedRecorder {
-    fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         self.counts.dropped.fetch_add(1, Ordering::Relaxed);
         if let Some(broadcast) = &self.broadcast {
             broadcast.wait();
@@ -187,11 +206,19 @@ impl RecorderRpc for DroppedRecorder {
         Err(Error::Io("scripted dropped delivery".into()))
     }
 
-    fn inspect_decision_proof(&self, _slot: u64) -> Result<Option<DecisionProof>, Error> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<DecisionProof>, Error> {
         Err(Error::Io("scripted dropped delivery".into()))
     }
 
-    fn inspect_record_summary(&self, _slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         Err(Error::Io("scripted dropped delivery".into()))
     }
 }
@@ -273,6 +300,7 @@ fn run_membership_case(member_count: usize) {
 
     let committed = proposer_a
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             SLOT,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"command-a".to_vec()),
@@ -280,6 +308,7 @@ fn run_membership_case(member_count: usize) {
         .expect("proposer A commits");
     let adopted = proposer_b
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             SLOT,
             LogHash::ZERO,
             Command::new(
@@ -337,7 +366,11 @@ fn run_membership_case(member_count: usize) {
     )
     .expect("construct recovery proposer");
     let recovered = match recovery
-        .inspect_certified_decision_at(SLOT, LogHash::ZERO)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            SLOT,
+            LogHash::ZERO,
+        )
         .expect("inspect reopened recorders")
     {
         CertifiedDecisionInspection::Committed(certified) => certified.entry,

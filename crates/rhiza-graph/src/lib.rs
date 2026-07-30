@@ -5090,7 +5090,10 @@ mod query_tests {
             )
             .unwrap_err();
 
-        assert!(matches!(error, Error::ResourceExhausted(_)));
+        assert!(
+            matches!(error, Error::ResourceExhausted(_)),
+            "unexpected query timeout error: {error:?}"
+        );
     }
 
     #[test]

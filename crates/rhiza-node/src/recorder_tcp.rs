@@ -1,12 +1,12 @@
 use std::{
     fmt,
-    future::Future,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -15,23 +15,114 @@ use rhiza_quepaxa::{
     DecisionProof, Error, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
     RecordSummary, RecorderRpc, RejectReason,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    authenticated_proposer_admitted, map_quorum_record_transport_error,
-    peer_credentials_authenticated, valid_recorder_command, valid_recorder_record, PeerConfig,
-    DEFAULT_PEER_CONCURRENCY, MAX_HTTP_BODY_BYTES, QUORUM_RECORD_REQUEST_TIMEOUT,
-    READ_FENCE_REQUEST_TIMEOUT,
+    authenticated_proposer_admitted, peer_credentials_authenticated, preserve_mutation_outcome,
+    recorder_decode::{decode_postcard_exact_bounded, RecorderDecodeLimits, RecorderWireRoot},
+    recorder_error_from_wire, recorder_wire_error, valid_recorder_command, valid_recorder_record,
+    PeerConfig, RecorderWireError, DEFAULT_PEER_CONCURRENCY, MAX_HTTP_BODY_BYTES,
+    QUORUM_RECORD_REQUEST_TIMEOUT, READ_FENCE_REQUEST_TIMEOUT,
 };
 
-const WIRE_VERSION: u16 = 3;
+const WIRE_VERSION: u16 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTIONS_PER_LANE: usize = 2;
 const MAX_SERVER_CONNECTIONS: usize = DEFAULT_PEER_CONCURRENCY * 4;
-const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/3";
+const MAX_SERVER_DECODE_CONCURRENCY: usize = 32;
+const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/5";
+
+/// Lifecycle signals and ownership receipts for one recorder listener.
+///
+/// `started` is acknowledged only after the server future owns the listener
+/// through its RAII owner. `listener_dropped` is sent only after that owner
+/// has dropped the actual listener FD. Cooperative shutdown stops admission
+/// and drains protocol work; force asks every connection scope to abort its
+/// remaining asynchronous work and reap it.
+pub struct RecorderIngressLifecycle {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    force: tokio::sync::watch::Receiver<bool>,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+    listener_dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl RecorderIngressLifecycle {
+    pub fn new(
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        force: tokio::sync::watch::Receiver<bool>,
+        started: tokio::sync::oneshot::Sender<()>,
+        listener_dropped: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            shutdown,
+            force,
+            started: Some(started),
+            listener_dropped: Some(listener_dropped),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecorderTaskDisposition {
+    Quiesced,
+    Uncertain,
+}
+
+#[derive(Debug)]
+pub struct RecorderIngressExit {
+    pub result: Result<(), String>,
+    pub tasks: RecorderTaskDisposition,
+}
+
+struct RecorderListenerOwner {
+    listener: Option<tokio::net::TcpListener>,
+    listener_dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl RecorderListenerOwner {
+    fn new(
+        listener: tokio::net::TcpListener,
+        listener_dropped: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            listener: Some(listener),
+            listener_dropped: Some(listener_dropped),
+        }
+    }
+
+    fn listener(&self) -> &tokio::net::TcpListener {
+        self.listener
+            .as_ref()
+            .expect("recorder listener is accepted only while open")
+    }
+
+    fn close(&mut self) {
+        drop(self.listener.take());
+        if let Some(listener_dropped) = self.listener_dropped.take() {
+            let _ = listener_dropped.send(());
+        }
+    }
+}
+
+impl Drop for RecorderListenerOwner {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+async fn wait_for_ingress_signal(signal: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *signal.borrow() {
+            return;
+        }
+        if signal.changed().await.is_err() {
+            return;
+        }
+    }
+}
 
 #[cfg(feature = "recorder-postcard-rpc")]
 mod postcard_rpc;
@@ -139,7 +230,7 @@ impl RecorderTlsClientConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct Hello {
+pub(crate) struct Hello {
     version: u16,
     node_id: String,
     recovery_generation: u64,
@@ -147,21 +238,32 @@ struct Hello {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-enum HelloReply {
+pub(crate) enum HelloReply {
     Accepted { version: u16, recorder_id: String },
     Rejected,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct RequestFrame {
+pub(crate) struct RequestFrame {
     version: u16,
     request_id: u64,
     remaining_deadline_ms: u32,
     body: RecorderRequestBody,
 }
 
+// Postcard encodes structs positionally. This borrowed form is deliberately
+// wire-identical to `RequestFrame`, allowing allocation-free preflight before
+// socket checkout while the owned body remains available for the final encode.
+#[derive(Serialize)]
+struct RequestFrameRef<'a> {
+    version: u16,
+    request_id: u64,
+    remaining_deadline_ms: u32,
+    body: &'a RecorderRequestBody,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
-enum RecorderRequestBody {
+pub(crate) enum RecorderRequestBody {
     Identity,
     StoreCommand {
         cluster_id: String,
@@ -193,14 +295,14 @@ enum RecorderRequestBody {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ResponseFrame {
+pub(crate) struct ResponseFrame {
     version: u16,
     request_id: u64,
     body: RecorderResponseBody,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-enum RecorderResponseBody {
+pub(crate) enum RecorderResponseBody {
     Identity(RpcResult<String>),
     StoreCommand(RpcResult<()>),
     FetchCommand(RpcResult<Option<StoredCommand>>),
@@ -212,10 +314,10 @@ enum RecorderResponseBody {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-enum RpcResult<T> {
+pub(crate) enum RpcResult<T> {
     Ok(T),
     Rejected(RejectReason),
-    Error(String),
+    Error(RecorderWireError),
     Overloaded,
 }
 
@@ -224,7 +326,7 @@ impl<T> RpcResult<T> {
         match result {
             Ok(value) => Self::Ok(value),
             Err(Error::Rejected(reason)) => Self::Rejected(reason),
-            Err(error) => Self::Error(error.to_string()),
+            Err(error) => Self::Error(recorder_wire_error(error)),
         }
     }
 
@@ -232,22 +334,21 @@ impl<T> RpcResult<T> {
         match self {
             Self::Ok(value) => Ok(value),
             Self::Rejected(reason) => Err(Error::Rejected(reason)),
-            Self::Error(message) => Err(Error::Io(message)),
+            Self::Error(error) => Err(recorder_error_from_wire(error)),
             Self::Overloaded => Err(Error::Io("recorder RPC overloaded".into())),
         }
     }
 }
 
-pub async fn serve_recorder_tcp<R, F>(
+pub async fn serve_recorder_tcp<R>(
     listener: tokio::net::TcpListener,
     recorder: R,
     peers: Vec<PeerConfig>,
     recovery_generation: u64,
-    shutdown: F,
-) -> Result<(), String>
+    lifecycle: RecorderIngressLifecycle,
+) -> RecorderIngressExit
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
-    F: Future<Output = ()> + Send,
 {
     serve_recorder_tcp_inner(
         listener,
@@ -255,22 +356,21 @@ where
         peers,
         recovery_generation,
         None,
-        shutdown,
+        lifecycle,
     )
     .await
 }
 
-pub async fn serve_recorder_tcp_tls<R, F>(
+pub async fn serve_recorder_tcp_tls<R>(
     listener: tokio::net::TcpListener,
     recorder: R,
     peers: Vec<PeerConfig>,
     recovery_generation: u64,
     tls: RecorderTlsServerConfig,
-    shutdown: F,
-) -> Result<(), String>
+    lifecycle: RecorderIngressLifecycle,
+) -> RecorderIngressExit
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
-    F: Future<Output = ()> + Send,
 {
     serve_recorder_tcp_inner(
         listener,
@@ -278,84 +378,250 @@ where
         peers,
         recovery_generation,
         Some(tls.inner),
-        shutdown,
+        lifecycle,
     )
     .await
 }
 
-async fn serve_recorder_tcp_inner<R, F>(
+async fn serve_recorder_tcp_inner<R>(
     listener: tokio::net::TcpListener,
     recorder: R,
     peers: Vec<PeerConfig>,
     recovery_generation: u64,
     tls: Option<Arc<rustls::ServerConfig>>,
-    shutdown: F,
-) -> Result<(), String>
+    lifecycle: RecorderIngressLifecycle,
+) -> RecorderIngressExit
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
-    F: Future<Output = ()> + Send,
 {
+    #[cfg(test)]
+    let response_write_test_server = listener.local_addr().ok();
     let peers: Arc<[PeerConfig]> = peers.into();
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
-    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_CONNECTIONS));
+    let decode_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_DECODE_CONCURRENCY));
     let reported_connection_error = Arc::new(AtomicBool::new(false));
-    let mut tasks = tokio::task::JoinSet::new();
-    tokio::pin!(shutdown);
+    run_recorder_ingress(
+        listener,
+        lifecycle,
+        Arc::clone(&slots),
+        DEFAULT_PEER_CONCURRENCY,
+        MAX_SERVER_CONNECTIONS,
+        "recorder TCP accept failed",
+        move |stream, _peer_address, shutdown, force, connection| {
+            let recorder = recorder.clone();
+            let peers = Arc::clone(&peers);
+            let slots = Arc::clone(&slots);
+            let decode_slots = Arc::clone(&decode_slots);
+            let tls = tls.clone();
+            let reported_connection_error = Arc::clone(&reported_connection_error);
+            async move {
+                let _connection = connection;
+                let signals = RecorderConnectionSignals { shutdown, force };
+                let context = RecorderConnectionContext {
+                    peers,
+                    recovery_generation,
+                    slots,
+                    decode_slots,
+                    signals: Some(signals),
+                    #[cfg(test)]
+                    response_write_test_server,
+                };
+                let result = if let Some(config) = tls {
+                    serve_tls_connection(stream, config, recorder, context).await
+                } else {
+                    serve_connection_with_decode_slots(stream, recorder, context).await
+                };
+                if let Err(error) = &result {
+                    if error != "connection closed"
+                        && !reported_connection_error.swap(true, Ordering::Relaxed)
+                    {
+                        eprintln!("recorder TCP connection rejected: {error}");
+                    }
+                }
+                result
+            }
+        },
+    )
+    .await
+}
+
+async fn run_recorder_ingress<H, Fut>(
+    listener: tokio::net::TcpListener,
+    mut lifecycle: RecorderIngressLifecycle,
+    work_slots: Arc<tokio::sync::Semaphore>,
+    work_slot_count: usize,
+    connection_limit: usize,
+    accept_error_prefix: &'static str,
+    mut serve_connection: H,
+) -> RecorderIngressExit
+where
+    H: FnMut(
+        tokio::net::TcpStream,
+        SocketAddr,
+        tokio::sync::watch::Receiver<bool>,
+        tokio::sync::watch::Receiver<bool>,
+        tokio::sync::OwnedSemaphorePermit,
+    ) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let listener_dropped = lifecycle
+        .listener_dropped
+        .take()
+        .expect("recorder lifecycle owns one listener-drop receipt");
+    let mut listener = RecorderListenerOwner::new(listener, listener_dropped);
+    let connection_slots = Arc::new(tokio::sync::Semaphore::new(connection_limit));
+    let (connection_shutdown, _) = tokio::sync::watch::channel(false);
+    let (connection_force, _) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
+    let mut result = Ok(());
+    let mut forced = false;
+    // A connection join error means its asynchronous scope was cancelled or
+    // panicked outside the protocol's normal error path.  The listener can
+    // still close cleanly, but that is not evidence that all admitted work
+    // reached a known terminal state.
+    let mut connection_tasks_uncertain = false;
+    if let Some(started) = lifecycle.started.take() {
+        let _ = started.send(());
+    }
+
     loop {
         tokio::select! {
-            () = &mut shutdown => break,
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|error| format!("recorder TCP accept failed: {error}"))?;
-                let Ok(connection) = connections.clone().try_acquire_owned() else {
+            biased;
+            () = wait_for_ingress_signal(&mut lifecycle.force) => {
+                forced = true;
+                break;
+            }
+            () = wait_for_ingress_signal(&mut lifecycle.shutdown) => break,
+            Some(completed) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = completed {
+                    eprintln!("recorder connection task failed: {error}");
+                    connection_tasks_uncertain = true;
+                }
+            }
+            accepted = listener.listener().accept() => {
+                let (stream, peer_address) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        result = Err(format!("{accept_error_prefix}: {error}"));
+                        break;
+                    }
+                };
+                let Ok(connection) = connection_slots.clone().try_acquire_owned() else {
                     continue;
                 };
                 let _ = stream.set_nodelay(true);
-                let recorder = recorder.clone();
-                let peers = peers.clone();
-                let slots = slots.clone();
-                let tls = tls.clone();
-                let reported_connection_error = Arc::clone(&reported_connection_error);
-                tasks.spawn(async move {
-                    let _connection = connection;
-                    let result = if let Some(config) = tls {
-                        let acceptor = TlsAcceptor::from(config);
-                        match tokio::time::timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await {
-                            Ok(Ok(tls_stream)) => {
-                                if tls_stream.get_ref().1.alpn_protocol() != Some(RECORDER_TLS_ALPN) {
-                                    Err("recorder TLS ALPN negotiation failed".to_string())
-                                } else {
-                                    serve_connection(tls_stream, recorder, peers, recovery_generation, slots).await
-                                }
-                            }
-                            Ok(Err(_)) => Err("recorder TLS handshake failed".to_string()),
-                            Err(_) => Err("recorder TLS handshake timed out".to_string()),
-                        }
-                    } else {
-                        serve_connection(stream, recorder, peers, recovery_generation, slots).await
-                    };
-                    if let Err(error) = result {
-                        if error != "connection closed"
-                            && !reported_connection_error.swap(true, Ordering::Relaxed)
-                        {
-                            eprintln!("recorder TCP connection rejected: {error}");
-                        }
-                    }
-                });
+                connections.spawn(serve_connection(
+                    stream,
+                    peer_address,
+                    connection_shutdown.subscribe(),
+                    connection_force.subscribe(),
+                    connection,
+                ));
             }
         }
     }
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    let _drained = slots
-        .acquire_many_owned(u32::try_from(DEFAULT_PEER_CONCURRENCY).unwrap_or(u32::MAX))
-        .await
-        .map_err(|_| "recorder operation semaphore closed during shutdown".to_string())?;
-    Ok(())
+
+    // Dropping the actual listener is the only source of the out-of-band
+    // Closed receipt. Existing connections remain owned by this scope.
+    listener.close();
+    if forced {
+        connection_force.send_replace(true);
+    } else {
+        connection_shutdown.send_replace(true);
+    }
+    while !connections.is_empty() {
+        tokio::select! {
+            biased;
+            () = wait_for_ingress_signal(&mut lifecycle.force), if !forced => {
+                forced = true;
+                connection_force.send_replace(true);
+            }
+            Some(completed) = connections.join_next() => {
+                if let Err(error) = completed {
+                    eprintln!("recorder connection task failed while draining: {error}");
+                    connection_tasks_uncertain = true;
+                }
+            }
+        }
+    }
+
+    if forced || connection_tasks_uncertain {
+        return RecorderIngressExit {
+            result,
+            tasks: RecorderTaskDisposition::Uncertain,
+        };
+    }
+
+    let work_slot_count = u32::try_from(work_slot_count).unwrap_or(u32::MAX);
+    let work_drained = work_slots.acquire_many_owned(work_slot_count);
+    tokio::pin!(work_drained);
+    tokio::select! {
+        biased;
+        () = wait_for_ingress_signal(&mut lifecycle.force) => RecorderIngressExit {
+            result,
+            tasks: RecorderTaskDisposition::Uncertain,
+        },
+        drained = &mut work_drained => match drained {
+            Ok(_permit) => RecorderIngressExit {
+                result,
+                tasks: RecorderTaskDisposition::Quiesced,
+            },
+            Err(_) => RecorderIngressExit {
+                result: Err("recorder operation semaphore closed during shutdown".to_string()),
+                tasks: RecorderTaskDisposition::Uncertain,
+            },
+        },
+    }
 }
 
+struct RecorderConnectionSignals {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    force: tokio::sync::watch::Receiver<bool>,
+}
+
+struct RecorderConnectionContext {
+    peers: Arc<[PeerConfig]>,
+    recovery_generation: u64,
+    slots: Arc<tokio::sync::Semaphore>,
+    decode_slots: Arc<tokio::sync::Semaphore>,
+    signals: Option<RecorderConnectionSignals>,
+    #[cfg(test)]
+    response_write_test_server: Option<SocketAddr>,
+}
+
+async fn serve_tls_connection<R>(
+    stream: tokio::net::TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    recorder: R,
+    mut context: RecorderConnectionContext,
+) -> Result<(), String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let acceptor = TlsAcceptor::from(config);
+    let handshake = tokio::time::timeout(CONNECT_TIMEOUT, acceptor.accept(stream));
+    tokio::pin!(handshake);
+    let mut signals = context.signals.take().expect("TLS connection has signals");
+    let tls_stream = tokio::select! {
+        biased;
+        () = wait_for_ingress_signal(&mut signals.force) => return Ok(()),
+        () = wait_for_ingress_signal(&mut signals.shutdown) => return Ok(()),
+        handshake = &mut handshake => match handshake {
+            Ok(Ok(tls_stream)) => tls_stream,
+            Ok(Err(_)) => return Err("recorder TLS handshake failed".to_string()),
+            Err(_) => return Err("recorder TLS handshake timed out".to_string()),
+        },
+    };
+    if tls_stream.get_ref().1.alpn_protocol() != Some(RECORDER_TLS_ALPN) {
+        return Err("recorder TLS ALPN negotiation failed".to_string());
+    }
+    context.signals = Some(signals);
+    serve_connection_with_decode_slots(tls_stream, recorder, context).await
+}
+
+#[cfg(test)]
 async fn serve_connection<R, S>(
-    mut stream: S,
+    stream: S,
     recorder: R,
     peers: Arc<[PeerConfig]>,
     recovery_generation: u64,
@@ -365,37 +631,98 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let hello_bytes = tokio::time::timeout(CALL_TIMEOUT, read_frame_async(&mut stream))
-        .await
-        .map_err(|_| "recorder HELLO timed out".to_string())??;
-    let hello: Hello = decode_exact(&hello_bytes)?;
-    if !hello_authenticated(&hello, &peers, recovery_generation) {
-        let _ = write_value_async_with_timeout(
+    serve_connection_with_decode_slots(
+        stream,
+        recorder,
+        RecorderConnectionContext {
+            peers,
+            recovery_generation,
+            slots,
+            decode_slots: Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_DECODE_CONCURRENCY)),
+            signals: None,
+            response_write_test_server: None,
+        },
+    )
+    .await
+}
+
+async fn serve_connection_with_decode_slots<R, S>(
+    mut stream: S,
+    recorder: R,
+    mut context: RecorderConnectionContext,
+) -> Result<(), String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let hello_bytes = tokio::time::timeout(
+        CALL_TIMEOUT,
+        read_frame_with_signals(&mut stream, &mut context.signals),
+    )
+    .await
+    .map_err(|_| "recorder HELLO timed out".to_string())??;
+    let Some(hello_bytes) = hello_bytes else {
+        return Ok(());
+    };
+    let hello: Hello = decode_framed_with_gate(&hello_bytes, &context.decode_slots).await?;
+    if !hello_authenticated(&hello, &context.peers, context.recovery_generation) {
+        let rejection = write_value_async_with_timeout(
             &mut stream,
             &HelloReply::Rejected,
             "recorder HELLO rejection",
-        )
-        .await;
+        );
+        let _ = await_unless_forced(&mut context.signals, rejection).await;
         return Err("recorder HELLO rejected".into());
     }
+    let permit = match context.slots.clone().try_acquire_owned() {
+        Ok(permit) => Arc::new(permit),
+        Err(_) => {
+            let rejection = write_value_async_with_timeout(
+                &mut stream,
+                &HelloReply::Rejected,
+                "recorder HELLO overload rejection",
+            );
+            let _ = await_unless_forced(&mut context.signals, rejection).await;
+            return Err("recorder HELLO overloaded".into());
+        }
+    };
     let identity_recorder = recorder.clone();
-    let recorder_id = tokio::task::spawn_blocking(move || identity_recorder.recorder_id())
-        .await
+    // Keep one permit reference in the connection scope through the full
+    // HELLO response write. The blocking task owns the other reference, so a
+    // force/deadline that detaches the task cannot make its work invisible to
+    // ingress quiescence.
+    let backend_permit = Arc::clone(&permit);
+    let identity = tokio::task::spawn_blocking(move || {
+        let _permit = backend_permit;
+        identity_recorder.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+            CALL_TIMEOUT,
+        ))
+    });
+    let Some(recorder_id) = await_unless_forced(&mut context.signals, identity).await else {
+        return Ok(());
+    };
+    let recorder_id = recorder_id
         .map_err(|error| format!("recorder identity task failed: {error}"))?
         .map_err(|error| error.to_string())?;
-    write_value_async_with_timeout(
-        &mut stream,
-        &HelloReply::Accepted {
-            version: WIRE_VERSION,
-            recorder_id,
-        },
-        "recorder HELLO response",
-    )
-    .await?;
+    let hello_reply = HelloReply::Accepted {
+        version: WIRE_VERSION,
+        recorder_id,
+    };
+    let hello_response =
+        write_value_async_with_timeout(&mut stream, &hello_reply, "recorder HELLO response");
+    let Some(hello_response) = await_unless_forced(&mut context.signals, hello_response).await
+    else {
+        return Ok(());
+    };
+    hello_response?;
+    drop(permit);
 
     loop {
-        let request = match read_frame_async(&mut stream).await {
-            Ok(bytes) => decode_exact::<RequestFrame>(&bytes)?,
+        let request = match read_frame_with_signals(&mut stream, &mut context.signals).await {
+            Ok(Some(bytes)) => {
+                decode_request_framed_with_gate(&bytes, &context.decode_slots).await?
+            }
+            Ok(None) => return Ok(()),
             Err(error) if error == "connection closed" => return Ok(()),
             Err(error) => return Err(error),
         };
@@ -406,42 +733,320 @@ where
         let operation = response_operation(&request.body);
         let dispatch_deadline = Instant::now()
             + Duration::from_millis(u64::from(request.remaining_deadline_ms)).min(CALL_TIMEOUT);
-        let permit = match slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
+        let permit = match context.slots.clone().try_acquire_owned() {
+            Ok(permit) => Arc::new(permit),
             Err(_) => {
-                write_value_async_with_timeout(
+                let overload = write_response_async_with_timeout(
                     &mut stream,
-                    &ResponseFrame {
-                        version: WIRE_VERSION,
-                        request_id,
-                        body: overloaded_response(operation),
-                    },
+                    request_id,
+                    operation,
+                    overloaded_response(operation),
                     "recorder overload response",
-                )
-                .await?;
+                );
+                let Some(overload) = await_unless_forced(&mut context.signals, overload).await
+                else {
+                    return Ok(());
+                };
+                overload?;
                 continue;
             }
         };
-        let body = dispatch_with_deadline(
+        let dispatch = dispatch_with_deadline(
             recorder.clone(),
             request.body,
             operation,
-            permit,
+            Arc::clone(&permit),
             dispatch_deadline,
             hello.node_id.clone(),
-            Arc::clone(&peers),
-        )
-        .await;
-        write_value_async_with_timeout(
+            Arc::clone(&context.peers),
+        );
+        let Some(body) = await_unless_forced(&mut context.signals, dispatch).await else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        response_write_test_gate_before_write(context.response_write_test_server, request_id).await;
+        let response = write_response_async_with_timeout(
             &mut stream,
-            &ResponseFrame {
-                version: WIRE_VERSION,
-                request_id,
-                body,
-            },
+            request_id,
+            operation,
+            body,
             "recorder response",
-        )
-        .await?;
+        );
+        let Some(response) = await_unless_forced(&mut context.signals, response).await else {
+            return Ok(());
+        };
+        response?;
+        // A response-side reference makes the admission slot cover protocol
+        // work through the completed socket write. A timed-out blocking
+        // dispatch retains its clone until it really returns.
+        drop(permit);
+    }
+}
+
+async fn read_frame_with_signals<R>(
+    reader: &mut R,
+    signals: &mut Option<RecorderConnectionSignals>,
+) -> Result<Option<Vec<u8>>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match signals {
+        Some(signals) => tokio::select! {
+            biased;
+            () = wait_for_ingress_signal(&mut signals.force) => Ok(None),
+            () = wait_for_ingress_signal(&mut signals.shutdown) => Ok(None),
+            frame = read_frame_async(reader) => frame.map(Some),
+        },
+        None => read_frame_async(reader).await.map(Some),
+    }
+}
+
+async fn await_unless_forced<T, F>(
+    signals: &mut Option<RecorderConnectionSignals>,
+    work: F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match signals {
+        Some(signals) => tokio::select! {
+            biased;
+            () = wait_for_ingress_signal(&mut signals.force) => None,
+            result = work => Some(result),
+        },
+        None => Some(work.await),
+    }
+}
+
+async fn decode_framed_with_gate<T>(
+    bytes: &[u8],
+    decode_slots: &Arc<tokio::sync::Semaphore>,
+) -> Result<T, String>
+where
+    T: RecorderWireRoot,
+{
+    let _permit = decode_slots
+        .acquire()
+        .await
+        .map_err(|_| "recorder decode semaphore closed".to_string())?;
+    decode_postcard_exact_bounded(
+        bytes,
+        RecorderDecodeLimits::for_wire_bytes(MAX_HTTP_BODY_BYTES),
+    )
+    .map_err(|error| error.to_string())
+}
+
+async fn decode_request_framed_with_gate(
+    bytes: &[u8],
+    decode_slots: &Arc<tokio::sync::Semaphore>,
+) -> Result<RequestFrame, String> {
+    let _permit = decode_slots
+        .acquire()
+        .await
+        .map_err(|_| "recorder decode semaphore closed".to_string())?;
+    #[cfg(test)]
+    let test_hook = request_decode_test_hook_after_permit(bytes).await;
+    let decoded = decode_postcard_exact_bounded(
+        bytes,
+        RecorderDecodeLimits::for_wire_bytes(MAX_HTTP_BODY_BYTES),
+    );
+    #[cfg(test)]
+    if let (Some(hook), Err(error)) = (&test_hook, &decoded) {
+        let _ = hook
+            .events
+            .send(RequestDecodeTestEvent::Failed(error.to_string()));
+    }
+    decoded.map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RequestDecodeTestEvent {
+    Entered,
+    Failed(String),
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RequestDecodeTestHook {
+    request_ids: Arc<std::collections::BTreeSet<u64>>,
+    events: tokio::sync::mpsc::UnboundedSender<RequestDecodeTestEvent>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[cfg(test)]
+static REQUEST_DECODE_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<RequestDecodeTestHook>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static REQUEST_DECODE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn request_decode_test_hook_slot() -> &'static std::sync::Mutex<Option<Arc<RequestDecodeTestHook>>>
+{
+    REQUEST_DECODE_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn request_decode_test_lock() -> &'static tokio::sync::Mutex<()> {
+    REQUEST_DECODE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+struct RequestDecodeTestHookGuard;
+
+#[cfg(test)]
+impl Drop for RequestDecodeTestHookGuard {
+    fn drop(&mut self) {
+        *request_decode_test_hook_slot().lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+fn install_request_decode_test_hook(hook: RequestDecodeTestHook) -> RequestDecodeTestHookGuard {
+    let mut slot = request_decode_test_hook_slot().lock().unwrap();
+    assert!(
+        slot.is_none(),
+        "request decode test hook is already installed"
+    );
+    *slot = Some(Arc::new(hook));
+    RequestDecodeTestHookGuard
+}
+
+#[cfg(test)]
+async fn request_decode_test_hook_after_permit(bytes: &[u8]) -> Option<Arc<RequestDecodeTestHook>> {
+    // This is intentionally a prefix-only test discriminator: production
+    // still performs exactly one owned RequestFrame decode after the permit.
+    let request_id = {
+        let mut deserializer = postcard::Deserializer::from_bytes(bytes);
+        let _version = u16::deserialize(&mut deserializer).ok()?;
+        u64::deserialize(&mut deserializer).ok()?
+    };
+    let hook = request_decode_test_hook_slot().lock().unwrap().clone()?;
+    if !hook.request_ids.contains(&request_id) {
+        return None;
+    }
+    let _ = hook.events.send(RequestDecodeTestEvent::Entered);
+    if let Some(release) = &hook.release {
+        release.notified().await;
+    }
+    Some(hook)
+}
+
+#[cfg(test)]
+struct ResponseWriteTestGate {
+    server: SocketAddr,
+    request_ids: std::collections::BTreeSet<u64>,
+    entered: tokio::sync::mpsc::UnboundedSender<u64>,
+    released: AtomicBool,
+    release_notification: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ResponseWriteTestGate {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.release_notification.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.release_notification.notified();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+type ResponseWriteTestGates = Vec<(u64, Arc<ResponseWriteTestGate>)>;
+
+#[cfg(test)]
+static RESPONSE_WRITE_TEST_GATES: std::sync::OnceLock<std::sync::Mutex<ResponseWriteTestGates>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static NEXT_RESPONSE_WRITE_TEST_GATE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+fn response_write_test_gates() -> &'static std::sync::Mutex<ResponseWriteTestGates> {
+    RESPONSE_WRITE_TEST_GATES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+struct InstalledResponseWriteTestGate {
+    id: u64,
+    gate: Arc<ResponseWriteTestGate>,
+}
+
+#[cfg(test)]
+impl InstalledResponseWriteTestGate {
+    fn release(&self) {
+        self.gate.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledResponseWriteTestGate {
+    fn drop(&mut self) {
+        self.gate.release();
+        response_write_test_gates()
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn install_response_write_test_gate(
+    server: SocketAddr,
+    request_ids: std::collections::BTreeSet<u64>,
+    entered: tokio::sync::mpsc::UnboundedSender<u64>,
+) -> InstalledResponseWriteTestGate {
+    assert!(
+        !request_ids.is_empty(),
+        "response write gate must be scoped"
+    );
+    let id = NEXT_RESPONSE_WRITE_TEST_GATE.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "response write test gate identity exhausted");
+    let gate = Arc::new(ResponseWriteTestGate {
+        server,
+        request_ids,
+        entered,
+        released: AtomicBool::new(false),
+        release_notification: tokio::sync::Notify::new(),
+    });
+    let mut gates = response_write_test_gates().lock().unwrap();
+    assert!(
+        !gates.iter().any(|(_, existing)| existing.server == server),
+        "response write test gate already installed for server {server}"
+    );
+    gates.push((id, Arc::clone(&gate)));
+    InstalledResponseWriteTestGate { id, gate }
+}
+
+#[cfg(test)]
+async fn response_write_test_gate_before_write(server: Option<SocketAddr>, request_id: u64) {
+    let Some(server) = server else {
+        return;
+    };
+    let gate = response_write_test_gates()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, gate)| gate.server == server && gate.request_ids.contains(&request_id))
+        .map(|(_, gate)| Arc::clone(gate));
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(request_id);
+        gate.wait().await;
     }
 }
 
@@ -449,7 +1054,7 @@ async fn dispatch_with_deadline<R>(
     recorder: R,
     body: RecorderRequestBody,
     operation: Operation,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     deadline: Instant,
     authenticated_peer_id: String,
     peers: Arc<[PeerConfig]>,
@@ -458,16 +1063,22 @@ where
     R: RecorderRpc + Send + Sync + 'static,
 {
     if deadline <= Instant::now() {
-        return error_response(operation, "recorder RPC deadline exceeded".into());
+        return error_response(operation, Error::RpcDeadlineExceeded);
     }
     let dispatched = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        dispatch(recorder, body, &authenticated_peer_id, &peers)
+        dispatch(
+            recorder,
+            body,
+            &rhiza_quepaxa::RecorderRpcContext::with_deadline(deadline),
+            &authenticated_peer_id,
+            &peers,
+        )
     });
     match tokio::time::timeout_at(deadline.into(), dispatched).await {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => error_response(operation, error.to_string()),
-        Err(_) => error_response(operation, "recorder RPC deadline exceeded".into()),
+        Ok(Err(_)) => error_response(operation, operation.panic_error()),
+        Err(_) => error_response(operation, Error::RpcDeadlineExceeded),
     }
 }
 
@@ -489,6 +1100,23 @@ enum Operation {
     ObserveReadFence,
 }
 
+impl Operation {
+    const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::StoreCommand | Self::Record | Self::InstallDecisionProof
+        )
+    }
+
+    const fn panic_error(self) -> Error {
+        if self.is_mutating() {
+            Error::UnknownOutcome
+        } else {
+            Error::ProposeFailed
+        }
+    }
+}
+
 fn response_operation(request: &RecorderRequestBody) -> Operation {
     match request {
         RecorderRequestBody::Identity => Operation::Identity,
@@ -505,12 +1133,13 @@ fn response_operation(request: &RecorderRequestBody) -> Operation {
 fn dispatch<R: RecorderRpc>(
     recorder: R,
     request: RecorderRequestBody,
+    context: &rhiza_quepaxa::RecorderRpcContext,
     authenticated_peer_id: &str,
     peers: &[PeerConfig],
 ) -> RecorderResponseBody {
     match request {
         RecorderRequestBody::Identity => {
-            RecorderResponseBody::Identity(RpcResult::from_result(recorder.recorder_id()))
+            RecorderResponseBody::Identity(RpcResult::from_result(recorder.recorder_id(context)))
         }
         RecorderRequestBody::StoreCommand {
             cluster_id,
@@ -524,6 +1153,7 @@ fn dispatch<R: RecorderRpc>(
                 Err(Error::Rejected(RejectReason::InvalidRequest))
             } else {
                 recorder.store_command_for(
+                    context,
                     cluster_id,
                     epoch,
                     config_id,
@@ -540,9 +1170,16 @@ fn dispatch<R: RecorderRpc>(
             config_id,
             config_digest,
             command_hash,
-        } => RecorderResponseBody::FetchCommand(RpcResult::from_result(
-            recorder.fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash),
-        )),
+        } => {
+            RecorderResponseBody::FetchCommand(RpcResult::from_result(recorder.fetch_command_for(
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )))
+        }
         RecorderRequestBody::Record(request) => {
             let result = if !valid_recorder_record(&request)
                 || !authenticated_proposer_admitted(
@@ -552,7 +1189,7 @@ fn dispatch<R: RecorderRpc>(
                 ) {
                 Err(Error::Rejected(RejectReason::InvalidRequest))
             } else {
-                recorder.record(request)
+                recorder.record(context, request)
             };
             RecorderResponseBody::Record(RpcResult::from_result(result))
         }
@@ -564,23 +1201,24 @@ fn dispatch<R: RecorderRpc>(
             ) {
                 Err(Error::Rejected(RejectReason::InvalidRequest))
             } else {
-                Membership::from_voters(members)
-                    .and_then(|membership| recorder.install_decision_proof(proof, &membership))
+                Membership::from_voters(members).and_then(|membership| {
+                    recorder.install_decision_proof(context, proof, &membership)
+                })
             };
             RecorderResponseBody::InstallDecisionProof(RpcResult::from_result(result))
         }
         RecorderRequestBody::InspectDecisionProof { slot } => {
             RecorderResponseBody::InspectDecisionProof(RpcResult::from_result(
-                recorder.inspect_decision_proof(slot),
+                recorder.inspect_decision_proof(context, slot),
             ))
         }
         RecorderRequestBody::InspectRecordSummary { slot } => {
             RecorderResponseBody::InspectRecordSummary(RpcResult::from_result(
-                recorder.inspect_record_summary(slot),
+                recorder.inspect_record_summary(context, slot),
             ))
         }
         RecorderRequestBody::ObserveReadFence(request) => RecorderResponseBody::ObserveReadFence(
-            RpcResult::from_result(recorder.observe_read_fence(request)),
+            RpcResult::from_result(recorder.observe_read_fence(context, request)),
         ),
     }
 }
@@ -606,23 +1244,24 @@ fn overloaded_response(operation: Operation) -> RecorderResponseBody {
     }
 }
 
-fn error_response(operation: Operation, message: String) -> RecorderResponseBody {
+fn error_response(operation: Operation, error: Error) -> RecorderResponseBody {
+    let error = recorder_wire_error(error);
     match operation {
-        Operation::Identity => RecorderResponseBody::Identity(RpcResult::Error(message)),
-        Operation::StoreCommand => RecorderResponseBody::StoreCommand(RpcResult::Error(message)),
-        Operation::FetchCommand => RecorderResponseBody::FetchCommand(RpcResult::Error(message)),
-        Operation::Record => RecorderResponseBody::Record(RpcResult::Error(message)),
+        Operation::Identity => RecorderResponseBody::Identity(RpcResult::Error(error)),
+        Operation::StoreCommand => RecorderResponseBody::StoreCommand(RpcResult::Error(error)),
+        Operation::FetchCommand => RecorderResponseBody::FetchCommand(RpcResult::Error(error)),
+        Operation::Record => RecorderResponseBody::Record(RpcResult::Error(error)),
         Operation::InstallDecisionProof => {
-            RecorderResponseBody::InstallDecisionProof(RpcResult::Error(message))
+            RecorderResponseBody::InstallDecisionProof(RpcResult::Error(error))
         }
         Operation::InspectDecisionProof => {
-            RecorderResponseBody::InspectDecisionProof(RpcResult::Error(message))
+            RecorderResponseBody::InspectDecisionProof(RpcResult::Error(error))
         }
         Operation::InspectRecordSummary => {
-            RecorderResponseBody::InspectRecordSummary(RpcResult::Error(message))
+            RecorderResponseBody::InspectRecordSummary(RpcResult::Error(error))
         }
         Operation::ObserveReadFence => {
-            RecorderResponseBody::ObserveReadFence(RpcResult::Error(message))
+            RecorderResponseBody::ObserveReadFence(RpcResult::Error(error))
         }
     }
 }
@@ -634,7 +1273,7 @@ async fn read_frame_async<R: tokio::io::AsyncRead + Unpin>(
     match reader.read_exact(&mut length).await {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err("connection closed".into())
+            return Err("connection closed".into());
         }
         Err(error) => return Err(error.to_string()),
     }
@@ -650,11 +1289,72 @@ async fn read_frame_async<R: tokio::io::AsyncRead + Unpin>(
     Ok(frame)
 }
 
+/// Postcard's allocating helper grows a `Vec` before a caller can compare the
+/// result with the wire cap. Count first with a hard ceiling, then allocate
+/// exactly the accepted size for the real serialization pass.
+struct BoundedPostcardSize {
+    size: usize,
+    limit: usize,
+}
+
+impl postcard::ser_flavors::Flavor for BoundedPostcardSize {
+    type Output = usize;
+
+    fn try_push(&mut self, _byte: u8) -> postcard::Result<()> {
+        self.try_extend(&[0])
+    }
+
+    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+        let Some(size) = self.size.checked_add(bytes.len()) else {
+            return Err(postcard::Error::SerializeBufferFull);
+        };
+        if size > self.limit {
+            return Err(postcard::Error::SerializeBufferFull);
+        }
+        self.size = size;
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(self.size)
+    }
+}
+
+pub(super) fn bounded_postcard_size<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<usize, String> {
+    postcard::serialize_with_flavor(value, BoundedPostcardSize { size: 0, limit }).map_err(
+        |error| {
+            if matches!(error, postcard::Error::SerializeBufferFull) {
+                "recorder frame exceeds limit".to_string()
+            } else {
+                error.to_string()
+            }
+        },
+    )
+}
+
+pub(super) fn bounded_postcard_encode<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let size = bounded_postcard_size(value, limit)?;
+    let mut encoded = vec![0_u8; size];
+    let encoded_len = postcard::to_slice(value, &mut encoded)
+        .map_err(|error| error.to_string())?
+        .len();
+    if encoded_len != size {
+        return Err("recorder frame serialization size changed".into());
+    }
+    Ok(encoded)
+}
+
 async fn write_value_async<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<(), String> {
-    let encoded = postcard::to_allocvec(value).map_err(|error| error.to_string())?;
+    let encoded = bounded_postcard_encode(value, MAX_HTTP_BODY_BYTES)?;
     write_frame_async(writer, &encoded).await
 }
 
@@ -666,6 +1366,50 @@ async fn write_value_async_with_timeout<W: tokio::io::AsyncWrite + Unpin, T: Ser
     tokio::time::timeout(CALL_TIMEOUT, write_value_async(writer, value))
         .await
         .map_err(|_| format!("{operation} timed out"))?
+}
+
+async fn write_response_async<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    request_id: u64,
+    operation: Operation,
+    body: RecorderResponseBody,
+) -> Result<(), String> {
+    let response = ResponseFrame {
+        version: WIRE_VERSION,
+        request_id,
+        body,
+    };
+    let encoded = match bounded_postcard_encode(&response, MAX_HTTP_BODY_BYTES) {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            let fallback = ResponseFrame {
+                version: WIRE_VERSION,
+                request_id,
+                body: error_response(
+                    operation,
+                    Error::Decode("recorder response exceeds frame limit".into()),
+                ),
+            };
+            bounded_postcard_encode(&fallback, MAX_HTTP_BODY_BYTES)
+                .map_err(|_| "recorder response fallback exceeds frame limit".to_string())?
+        }
+    };
+    write_frame_async(writer, &encoded).await
+}
+
+async fn write_response_async_with_timeout<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    request_id: u64,
+    operation: Operation,
+    body: RecorderResponseBody,
+    description: &str,
+) -> Result<(), String> {
+    tokio::time::timeout(
+        CALL_TIMEOUT,
+        write_response_async(writer, request_id, operation, body),
+    )
+    .await
+    .map_err(|_| format!("{description} timed out"))?
 }
 
 async fn write_frame_async<W: tokio::io::AsyncWrite + Unpin>(
@@ -683,7 +1427,19 @@ async fn write_frame_async<W: tokio::io::AsyncWrite + Unpin>(
         .map_err(|error| error.to_string())
 }
 
-fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+fn decode_framed<T>(bytes: &[u8]) -> Result<T, String>
+where
+    T: RecorderWireRoot,
+{
+    decode_postcard_exact_bounded(
+        bytes,
+        RecorderDecodeLimits::for_wire_bytes(MAX_HTTP_BODY_BYTES),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let (value, trailing) = postcard::take_from_bytes(bytes).map_err(|error| error.to_string())?;
     if !trailing.is_empty() {
         return Err("trailing recorder frame bytes".into());
@@ -692,16 +1448,53 @@ fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
 }
 
 fn frame_length(frame: &[u8]) -> Result<[u8; 4], String> {
-    if frame.is_empty() || frame.len() > MAX_HTTP_BODY_BYTES {
+    frame_length_from_size(frame.len())
+}
+
+fn frame_length_from_size(size: usize) -> Result<[u8; 4], String> {
+    if size == 0 || size > MAX_HTTP_BODY_BYTES {
         return Err("invalid recorder frame length".into());
     }
-    let length = u32::try_from(frame.len()).map_err(|_| "recorder frame is too large")?;
+    let length = u32::try_from(size).map_err(|_| "recorder frame is too large")?;
     Ok(length.to_be_bytes())
 }
 
 struct ConnectionPool {
     state: Mutex<PoolState>,
     available: Condvar,
+}
+
+/// Owns one `PoolState::open` reservation while a connector result is in
+/// flight.  A successful receiver explicitly disarms it because the checked
+/// out stream then represents that open slot; every other path (failed send,
+/// queued completion dropped after cancellation, or failed connection) drops
+/// the reservation and returns the slot exactly once.
+struct ConnectionReservation {
+    pool: Arc<ConnectionPool>,
+    active: bool,
+}
+
+impl ConnectionReservation {
+    fn new(pool: Arc<ConnectionPool>) -> Self {
+        Self { pool, active: true }
+    }
+
+    fn into_checked_out(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ConnectionReservation {
+    fn drop(&mut self) {
+        if self.active {
+            TcpPostcardRecorderClient::discard_pool(&self.pool);
+        }
+    }
+}
+
+struct ConnectorCompletion {
+    result: Result<RecorderClientStream, String>,
+    reservation: ConnectionReservation,
 }
 
 #[derive(Default)]
@@ -816,6 +1609,13 @@ impl RecorderClientStream {
             Self::Tls(stream) => stream.sock.remaining().map(|_| ()),
         }
     }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.inner.set_nonblocking(nonblocking),
+            Self::Tls(stream) => stream.sock.inner.set_nonblocking(nonblocking),
+        }
+    }
 }
 
 impl Read for RecorderClientStream {
@@ -846,6 +1646,86 @@ impl Write for RecorderClientStream {
     }
 }
 
+/// Bounds each blocking socket operation to a short slice of the caller's
+/// absolute deadline.  Between slices we observe the shared cancellation
+/// token; this lets shutdown return without waiting for a long read/write
+/// timeout while retaining the original deadline as the hard cap.
+struct ContextualStream<'a> {
+    inner: &'a mut RecorderClientStream,
+    context: &'a rhiza_quepaxa::RecorderRpcContext,
+    deadline: Instant,
+}
+
+impl ContextualStream<'_> {
+    fn check(&mut self) -> io::Result<()> {
+        self.context.check().map_err(|error| {
+            io::Error::new(
+                match error {
+                    Error::RpcDeadlineExceeded => io::ErrorKind::TimedOut,
+                    _ => io::ErrorKind::Interrupted,
+                },
+                error.to_string(),
+            )
+        })?;
+        let slice = Instant::now()
+            .checked_add(Duration::from_millis(10))
+            .unwrap_or(self.deadline)
+            .min(self.deadline);
+        self.inner.set_deadline(slice);
+        Ok(())
+    }
+
+    fn retryable_timeout(&self, error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) && Instant::now() < self.deadline
+    }
+}
+
+impl Read for ContextualStream<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.check()?;
+            match self.inner.read(buffer) {
+                Err(error) if self.retryable_timeout(&error) => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for ContextualStream<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        loop {
+            self.check()?;
+            match self.inner.write(buffer) {
+                Err(error) if self.retryable_timeout(&error) => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        loop {
+            self.check()?;
+            match self.inner.flush() {
+                Err(error) if self.retryable_timeout(&error) => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ClientTransport {
     Plain,
@@ -869,8 +1749,8 @@ pub struct TcpPostcardRecorderClient {
     recovery_generation: u64,
     transport: ClientTransport,
     call_timeout: Duration,
-    consensus: ConnectionPool,
-    control: ConnectionPool,
+    consensus: Arc<ConnectionPool>,
+    control: Arc<ConnectionPool>,
     next_request_id: AtomicU64,
 }
 
@@ -980,52 +1860,90 @@ impl TcpPostcardRecorderClient {
             recovery_generation,
             transport,
             call_timeout,
-            consensus: ConnectionPool::new(),
-            control: ConnectionPool::new(),
+            consensus: Arc::new(ConnectionPool::new()),
+            control: Arc::new(ConnectionPool::new()),
             next_request_id: AtomicU64::new(1),
         })
     }
 
     fn exchange(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: RecorderRequestBody,
         consensus: bool,
+        mutating: bool,
     ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
-        self.exchange_with_timeout(request, consensus, self.call_timeout)
+        self.exchange_with_timeout(context, request, consensus, mutating, self.call_timeout)
     }
 
     fn exchange_with_timeout(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: RecorderRequestBody,
         consensus: bool,
-        timeout: Duration,
+        mutating: bool,
+        transport_cap: Duration,
     ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
-        let deadline = Instant::now() + timeout.min(self.call_timeout);
+        context.check()?;
+        let timeout = context
+            .remaining()
+            .ok_or(Error::RpcDeadlineExceeded)?
+            .min(transport_cap)
+            .min(self.call_timeout);
+        if timeout.is_zero() {
+            return Err(Error::RpcDeadlineExceeded);
+        }
+        let deadline = Instant::now() + timeout;
+        let operation = response_operation(&request);
+        // Count a maximum-size envelope before a socket is checked out. This
+        // proves a caller request fits without allocating it or advertising a
+        // deadline that goes stale while connection setup runs.
+        match preflight_request_frame_size(context, &request) {
+            Ok(()) => {}
+            Err(FramePreflightError::Context(error)) => return Err(error),
+            Err(FramePreflightError::Decode(error)) => return Err(Error::Decode(error)),
+        }
         let pool = if consensus {
             &self.consensus
         } else {
             &self.control
         };
-        let mut stream = self.checkout(pool, deadline)?;
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let operation = response_operation(&request);
+        let mut stream = self.checkout(pool, deadline, context)?;
         stream.set_deadline(deadline);
-        let remaining_deadline_ms = match advertised_remaining_deadline_ms(deadline) {
-            Ok(remaining) => remaining,
-            Err(error) => {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let frame = match prepare_request_frame(context, deadline, request_id, request) {
+            Ok(frame) => frame,
+            Err(FramePreflightError::Context(error)) => {
                 self.discard(pool);
                 return Err(error);
             }
+            Err(FramePreflightError::Decode(error)) => {
+                self.discard(pool);
+                return Err(Error::Decode(error));
+            }
         };
-        let frame = RequestFrame {
-            version: WIRE_VERSION,
-            request_id,
-            remaining_deadline_ms,
-            body: request,
+        // The write helper returns the exact number of bytes accepted by the
+        // underlying stream. A mutation becomes ambiguous only after at least
+        // one request byte left this process; pre-write cancellation, expiry,
+        // and transport failures remain definite local outcomes.
+        let result = {
+            let mut contextual = ContextualStream {
+                inner: &mut stream,
+                context,
+                deadline,
+            };
+            let request_bytes = match write_prepared_frame(&mut contextual, context, &frame) {
+                Ok(bytes) => bytes,
+                Err(error) => return self.finish_frame_write_error(pool, mutating, error),
+            };
+            read_frame_with_context(&mut contextual, context)
+                .map_err(|error| (request_bytes, error))
+                .and_then(|bytes| {
+                    decode_framed::<ResponseFrame>(&bytes)
+                        .map_err(FrameIoError::Decode)
+                        .map_err(|error| (request_bytes, error))
+                })
         };
-        let result = write_value_sync(&mut stream, &frame)
-            .and_then(|()| read_frame_sync(&mut stream))
-            .and_then(|bytes| decode_exact::<ResponseFrame>(&bytes));
         match result {
             Ok(response)
                 if response.version == WIRE_VERSION
@@ -1033,25 +1951,49 @@ impl TcpPostcardRecorderClient {
                     && response_matches(operation, &response.body) =>
             {
                 self.checkin(pool, stream);
-                Ok(response.body)
+                match context.check() {
+                    Ok(()) => Ok(response.body),
+                    Err(_) if mutating => Err(Error::UnknownOutcome),
+                    Err(error) => Err(error),
+                }
             }
             Ok(_) => {
                 self.discard(pool);
-                Err(Error::Decode("recorder response envelope mismatch".into()))
+                Err(if mutating {
+                    Error::UnknownOutcome
+                } else {
+                    Error::Decode("recorder response envelope mismatch".into())
+                })
             }
-            Err(error) => {
+            Err((request_bytes, error)) => {
                 self.discard(pool);
-                Err(Error::Io(error))
+                Err(frame_error_outcome(error, request_bytes, mutating))
             }
         }
     }
 
-    fn checkout(
+    fn finish_frame_write_error(
         &self,
         pool: &ConnectionPool,
+        mutating: bool,
+        error: FrameWriteError,
+    ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
+        self.discard(pool);
+        Err(frame_error_outcome(
+            error.error,
+            error.bytes_written,
+            mutating,
+        ))
+    }
+
+    fn checkout(
+        &self,
+        pool: &Arc<ConnectionPool>,
         deadline: Instant,
+        context: &rhiza_quepaxa::RecorderRpcContext,
     ) -> rhiza_quepaxa::Result<RecorderClientStream> {
         loop {
+            context.check()?;
             let mut state = pool
                 .state
                 .lock()
@@ -1062,13 +2004,84 @@ impl TcpPostcardRecorderClient {
             if state.open < CONNECTIONS_PER_LANE {
                 state.open += 1;
                 drop(state);
-                return match self.connect(deadline) {
-                    Ok(stream) => Ok(stream),
-                    Err(error) => {
-                        self.discard(pool);
-                        Err(Error::Io(error))
+                // DNS, TCP connect, TLS, and HELLO are all potentially
+                // blocking std APIs.  Bound them to the existing lane open
+                // count, then let the caller poll its own cancellation
+                // context.  If the caller leaves first, the worker drops any
+                // completed socket and releases its reservation; it can never
+                // add that socket to the pool.
+                let (reply, receive) = std::sync::mpsc::sync_channel(1);
+                let reservation = ConnectionReservation::new(Arc::clone(pool));
+                let address = self.address.clone();
+                let expected_recorder_id = self.expected_recorder_id.clone();
+                let local_node_id = self.local_node_id.clone();
+                let peer_token = self.peer_token.clone();
+                let recovery_generation = self.recovery_generation;
+                let transport = self.transport.clone();
+                if let Err(error) = thread::Builder::new()
+                    .name("rhiza-recorder-connect".into())
+                    .spawn(move || {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let worker_context =
+                            rhiza_quepaxa::RecorderRpcContext::with_timeout(remaining);
+                        let result = Self::connect_with_config(
+                            address,
+                            expected_recorder_id,
+                            local_node_id,
+                            peer_token,
+                            recovery_generation,
+                            transport,
+                            deadline,
+                            &worker_context,
+                        );
+                        // `ConnectorCompletion` owns the reservation until a
+                        // receiver has accepted a stream.  In particular,
+                        // dropping a queued completion after cancellation
+                        // releases it without relying on the caller.
+                        let _ = reply.send(ConnectorCompletion {
+                            result,
+                            reservation,
+                        });
+                    })
+                {
+                    return Err(Error::Io(format!(
+                        "cannot start recorder connector: {error}"
+                    )));
+                }
+                loop {
+                    context.check()?;
+                    let Some(remaining) = context.remaining() else {
+                        return Err(Error::RpcDeadlineExceeded);
+                    };
+                    match receive.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                        Ok(ConnectorCompletion {
+                            result: Ok(stream),
+                            reservation,
+                        }) => match context.check() {
+                            Ok(()) => {
+                                reservation.into_checked_out();
+                                return Ok(stream);
+                            }
+                            Err(error) => return Err(error),
+                        },
+                        Ok(ConnectorCompletion {
+                            result: Err(error),
+                            reservation,
+                        }) => {
+                            drop(reservation);
+                            return match context.check() {
+                                Err(error) => Err(error),
+                                Ok(()) => Err(Error::Io(error)),
+                            };
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(Error::Io(
+                                "recorder connector stopped unexpectedly".into(),
+                            ));
+                        }
                     }
-                };
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1076,16 +2089,27 @@ impl TcpPostcardRecorderClient {
             }
             let (next, wait) = pool
                 .available
-                .wait_timeout(state, remaining)
+                .wait_timeout(state, remaining.min(Duration::from_millis(10)))
                 .map_err(|_| Error::Io("recorder connection pool lock poisoned".into()))?;
             drop(next);
-            if wait.timed_out() {
-                return Err(Error::Io("recorder connection checkout timed out".into()));
+            if wait.timed_out() && deadline <= Instant::now() {
+                return Err(Error::RpcDeadlineExceeded);
             }
         }
     }
 
-    fn connect(&self, deadline: Instant) -> Result<RecorderClientStream, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn connect_with_config(
+        address: String,
+        expected_recorder_id: String,
+        local_node_id: String,
+        peer_token: String,
+        recovery_generation: u64,
+        transport: ClientTransport,
+        deadline: Instant,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> Result<RecorderClientStream, String> {
+        context.check().map_err(|error| error.to_string())?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let connect_timeout = CONNECT_TIMEOUT.min(remaining);
         if connect_timeout.is_zero() {
@@ -1093,8 +2117,8 @@ impl TcpPostcardRecorderClient {
         }
         let mut last_error = None;
         let mut socket = None;
-        let resolved_addresses = self
-            .address
+        let resolved_addresses = address
+            .as_str()
             .to_socket_addrs()
             .map_err(|error| format!("cannot resolve recorder TCP address: {error}"))?
             .collect::<Vec<SocketAddr>>();
@@ -1126,7 +2150,7 @@ impl TcpPostcardRecorderClient {
             .set_nodelay(true)
             .map_err(|error| format!("cannot set recorder TCP_NODELAY: {error}"))?;
         let socket = DeadlineStream::new(socket, deadline);
-        let mut stream = match &self.transport {
+        let mut stream = match &transport {
             ClientTransport::Plain => RecorderClientStream::Plain(socket),
             ClientTransport::Tls(tls) => {
                 let connection =
@@ -1149,21 +2173,34 @@ impl TcpPostcardRecorderClient {
                 RecorderClientStream::Tls(Box::new(stream))
             }
         };
-        write_value_sync(
-            &mut stream,
-            &Hello {
-                version: WIRE_VERSION,
-                node_id: self.local_node_id.clone(),
-                recovery_generation: self.recovery_generation,
-                token: self.peer_token.clone(),
-            },
-        )?;
-        let reply: HelloReply = decode_exact(&read_frame_sync(&mut stream)?)?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot make recorder HELLO socket nonblocking: {error}"))?;
+        let reply: HelloReply = {
+            let mut contextual = ContextualStream {
+                inner: &mut stream,
+                context,
+                deadline,
+            };
+            write_value_sync(
+                &mut contextual,
+                &Hello {
+                    version: WIRE_VERSION,
+                    node_id: local_node_id,
+                    recovery_generation,
+                    token: peer_token,
+                },
+            )?;
+            decode_framed(&read_frame_sync(&mut contextual)?)?
+        };
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("cannot restore recorder socket blocking mode: {error}"))?;
         match reply {
             HelloReply::Accepted {
                 version,
                 recorder_id,
-            } if version == WIRE_VERSION && recorder_id == self.expected_recorder_id => Ok(stream),
+            } if version == WIRE_VERSION && recorder_id == expected_recorder_id => Ok(stream),
             HelloReply::Accepted { .. } => Err("recorder identity mismatch".into()),
             HelloReply::Rejected => Err("recorder HELLO rejected".into()),
         }
@@ -1177,6 +2214,10 @@ impl TcpPostcardRecorderClient {
     }
 
     fn discard(&self, pool: &ConnectionPool) {
+        Self::discard_pool(pool);
+    }
+
+    fn discard_pool(pool: &ConnectionPool) {
         if let Ok(mut state) = pool.state.lock() {
             state.open = state.open.saturating_sub(1);
             pool.available.notify_one();
@@ -1231,8 +2272,11 @@ fn response_matches(operation: Operation, response: &RecorderResponseBody) -> bo
 }
 
 impl RecorderRpc for TcpPostcardRecorderClient {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
-        match self.exchange(RecorderRequestBody::Identity, false)? {
+    fn recorder_id(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
+        match self.exchange(context, RecorderRequestBody::Identity, false, false)? {
             RecorderResponseBody::Identity(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
@@ -1240,6 +2284,7 @@ impl RecorderRpc for TcpPostcardRecorderClient {
 
     fn store_command_for(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -1255,14 +2300,17 @@ impl RecorderRpc for TcpPostcardRecorderClient {
             command_hash,
             command,
         };
-        match self.exchange(request, false)? {
-            RecorderResponseBody::StoreCommand(result) => result.into_result(),
+        match self.exchange(context, request, false, true)? {
+            RecorderResponseBody::StoreCommand(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
     }
 
     fn fetch_command_for(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -1276,29 +2324,35 @@ impl RecorderRpc for TcpPostcardRecorderClient {
             config_digest,
             command_hash,
         };
-        match self.exchange(request, false)? {
+        match self.exchange(context, request, false, false)? {
             RecorderResponseBody::FetchCommand(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-        let response = self
-            .exchange_with_timeout(
-                RecorderRequestBody::Record(request),
-                true,
-                QUORUM_RECORD_REQUEST_TIMEOUT,
-            )
-            .map_err(map_quorum_record_transport_error)?;
+    fn record(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
+        let response = self.exchange_with_timeout(
+            context,
+            RecorderRequestBody::Record(request),
+            true,
+            true,
+            QUORUM_RECORD_REQUEST_TIMEOUT,
+        )?;
         match response {
-            RecorderResponseBody::Record(result) => result.into_result(),
+            RecorderResponseBody::Record(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
-        .map_err(map_quorum_record_transport_error)
     }
 
     fn install_decision_proof(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
@@ -1306,23 +2360,33 @@ impl RecorderRpc for TcpPostcardRecorderClient {
             proof,
             members: membership.members().to_vec(),
         };
-        match self.exchange(request, true)? {
-            RecorderResponseBody::InstallDecisionProof(result) => result.into_result(),
+        match self.exchange(context, request, true, true)? {
+            RecorderResponseBody::InstallDecisionProof(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         let request = RecorderRequestBody::InspectDecisionProof { slot };
-        match self.exchange(request, false)? {
+        match self.exchange(context, request, false, false)? {
             RecorderResponseBody::InspectDecisionProof(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         let request = RecorderRequestBody::InspectRecordSummary { slot };
-        match self.exchange(request, false)? {
+        match self.exchange(context, request, false, false)? {
             RecorderResponseBody::InspectRecordSummary(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
@@ -1334,10 +2398,13 @@ impl RecorderRpc for TcpPostcardRecorderClient {
 
     fn observe_read_fence(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
         match self.exchange_with_timeout(
+            context,
             RecorderRequestBody::ObserveReadFence(request),
+            false,
             false,
             READ_FENCE_REQUEST_TIMEOUT,
         )? {
@@ -1350,11 +2417,183 @@ impl RecorderRpc for TcpPostcardRecorderClient {
 fn advertised_remaining_deadline_ms(deadline: Instant) -> rhiza_quepaxa::Result<u32> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(Error::Io("recorder RPC deadline exceeded".into()));
+        return Err(Error::RpcDeadlineExceeded);
     }
     Ok(u32::try_from(remaining.as_millis())
         .unwrap_or(u32::MAX)
         .max(1))
+}
+
+#[derive(Debug)]
+enum FramePreflightError {
+    Context(Error),
+    Decode(String),
+}
+
+#[derive(Debug)]
+enum FrameIoError {
+    Context(Error),
+    Transport(String),
+    Decode(String),
+}
+
+#[derive(Debug)]
+struct FrameWriteError {
+    error: FrameIoError,
+    bytes_written: usize,
+}
+
+fn preflight_request_frame_size(
+    context: &rhiza_quepaxa::RecorderRpcContext,
+    body: &RecorderRequestBody,
+) -> Result<(), FramePreflightError> {
+    context.check().map_err(FramePreflightError::Context)?;
+    // Use largest varints for the two envelope counters. If this maximum form
+    // fits, the final frame built after connection setup also fits; unlike the
+    // final frame this pass allocates nothing and cannot advertise a stale
+    // deadline to the peer.
+    bounded_postcard_size(
+        &RequestFrameRef {
+            version: WIRE_VERSION,
+            request_id: u64::MAX,
+            remaining_deadline_ms: u32::MAX,
+            body,
+        },
+        MAX_HTTP_BODY_BYTES,
+    )
+    .map_err(FramePreflightError::Decode)?;
+    context.check().map_err(FramePreflightError::Context)
+}
+
+fn prepare_request_frame(
+    context: &rhiza_quepaxa::RecorderRpcContext,
+    deadline: Instant,
+    request_id: u64,
+    body: RecorderRequestBody,
+) -> Result<Vec<u8>, FramePreflightError> {
+    context.check().map_err(FramePreflightError::Context)?;
+    let remaining_deadline_ms =
+        advertised_remaining_deadline_ms(deadline).map_err(FramePreflightError::Context)?;
+    let request = RequestFrame {
+        version: WIRE_VERSION,
+        request_id,
+        remaining_deadline_ms,
+        body,
+    };
+    let encoded_size = bounded_postcard_size(&request, MAX_HTTP_BODY_BYTES)
+        .map_err(FramePreflightError::Decode)?;
+    let length = frame_length_from_size(encoded_size).map_err(FramePreflightError::Decode)?;
+    context.check().map_err(FramePreflightError::Context)?;
+    // Prefix and payload share one exact allocation, so a large accepted
+    // request never coexists with a second full-size prefix frame.
+    let mut frame = vec![0_u8; length.len() + encoded_size];
+    frame[..length.len()].copy_from_slice(&length);
+    let actual_size = postcard::to_slice(&request, &mut frame[length.len()..])
+        .map_err(|error| FramePreflightError::Decode(error.to_string()))?
+        .len();
+    if actual_size != encoded_size {
+        return Err(FramePreflightError::Decode(
+            "recorder frame serialization size changed".into(),
+        ));
+    }
+    Ok(frame)
+}
+
+fn classify_frame_io_error(
+    context: &rhiza_quepaxa::RecorderRpcContext,
+    error: io::Error,
+) -> FrameIoError {
+    match context.check() {
+        Err(error) => FrameIoError::Context(error),
+        Ok(()) => FrameIoError::Transport(error.to_string()),
+    }
+}
+
+fn write_prepared_frame<W: Write>(
+    writer: &mut W,
+    context: &rhiza_quepaxa::RecorderRpcContext,
+    frame: &[u8],
+) -> Result<usize, FrameWriteError> {
+    let mut written = 0_usize;
+    while written < frame.len() {
+        if let Err(error) = context.check() {
+            return Err(FrameWriteError {
+                error: FrameIoError::Context(error),
+                bytes_written: written,
+            });
+        }
+        match writer.write(&frame[written..]) {
+            Ok(0) => {
+                return Err(FrameWriteError {
+                    error: FrameIoError::Transport(
+                        "recorder request write returned zero bytes".into(),
+                    ),
+                    bytes_written: written,
+                });
+            }
+            Ok(count) => written += count,
+            Err(error) => {
+                return Err(FrameWriteError {
+                    error: classify_frame_io_error(context, error),
+                    bytes_written: written,
+                });
+            }
+        }
+    }
+    if let Err(error) = writer.flush() {
+        return Err(FrameWriteError {
+            error: classify_frame_io_error(context, error),
+            bytes_written: written,
+        });
+    }
+    Ok(written)
+}
+
+fn read_frame_with_context(
+    reader: &mut impl Read,
+    context: &rhiza_quepaxa::RecorderRpcContext,
+) -> Result<Vec<u8>, FrameIoError> {
+    let mut length = [0_u8; 4];
+    read_exact_with_context(reader, context, &mut length)?;
+    let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+    if length == 0 || length > MAX_HTTP_BODY_BYTES {
+        return Err(FrameIoError::Decode("invalid recorder frame length".into()));
+    }
+    let mut frame = vec![0; length];
+    read_exact_with_context(reader, context, &mut frame)?;
+    Ok(frame)
+}
+
+fn read_exact_with_context(
+    reader: &mut impl Read,
+    context: &rhiza_quepaxa::RecorderRpcContext,
+    buffer: &mut [u8],
+) -> Result<(), FrameIoError> {
+    let mut read = 0;
+    while read < buffer.len() {
+        context.check().map_err(FrameIoError::Context)?;
+        match reader.read(&mut buffer[read..]) {
+            Ok(0) => {
+                return Err(FrameIoError::Transport(
+                    "recorder response closed before a complete frame".into(),
+                ));
+            }
+            Ok(count) => read += count,
+            Err(error) => return Err(classify_frame_io_error(context, error)),
+        }
+    }
+    Ok(())
+}
+
+fn frame_error_outcome(error: FrameIoError, request_bytes_written: usize, mutating: bool) -> Error {
+    if mutating && request_bytes_written > 0 {
+        return Error::UnknownOutcome;
+    }
+    match error {
+        FrameIoError::Context(error) => error,
+        FrameIoError::Transport(error) => Error::Io(error),
+        FrameIoError::Decode(error) => Error::Decode(error),
+    }
 }
 
 fn read_frame_sync(reader: &mut impl Read) -> Result<Vec<u8>, String> {
@@ -1374,7 +2613,7 @@ fn read_frame_sync(reader: &mut impl Read) -> Result<Vec<u8>, String> {
 }
 
 fn write_value_sync(writer: &mut impl Write, value: &impl Serialize) -> Result<(), String> {
-    let encoded = postcard::to_allocvec(value).map_err(|error| error.to_string())?;
+    let encoded = bounded_postcard_encode(value, MAX_HTTP_BODY_BYTES)?;
     let length = frame_length(&encoded)?;
     writer
         .write_all(&length)
@@ -1394,7 +2633,7 @@ mod tests {
         net::TcpListener,
         rc::Rc,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         thread,
@@ -1484,6 +2723,78 @@ mod tests {
         }
     }
 
+    struct ScriptedWriter {
+        actions: VecDeque<Result<usize, io::ErrorKind>>,
+        bytes_written: usize,
+        write_calls: usize,
+    }
+
+    impl ScriptedWriter {
+        fn new(actions: impl IntoIterator<Item = Result<usize, io::ErrorKind>>) -> Self {
+            Self {
+                actions: actions.into_iter().collect(),
+                bytes_written: 0,
+                write_calls: 0,
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            match self.actions.pop_front().unwrap_or(Ok(bytes.len())) {
+                Ok(count) => {
+                    let count = count.min(bytes.len());
+                    self.bytes_written += count;
+                    Ok(count)
+                }
+                Err(kind) => Err(io::Error::from(kind)),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CancelAfterFirstWrite {
+        cancelled: Arc<AtomicBool>,
+        bytes_written: usize,
+    }
+
+    impl Write for CancelAfterFirstWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = bytes.len().min(1);
+            self.bytes_written += count;
+            self.cancelled.store(true, Ordering::SeqCst);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ExpireAfterFirstWrite {
+        until: Instant,
+        bytes_written: usize,
+    }
+
+    impl Write for ExpireAfterFirstWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = bytes.len().min(1);
+            self.bytes_written += count;
+            while Instant::now() < self.until {
+                thread::yield_now();
+            }
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn slow_partial_io(input: Vec<u8>) -> SlowPartialFixture {
         let clock = FakeClock {
             origin: Instant::now(),
@@ -1539,6 +2850,180 @@ mod tests {
         );
     }
 
+    fn prepared_identity_frame(context: &rhiza_quepaxa::RecorderRpcContext) -> Vec<u8> {
+        prepare_request_frame(
+            context,
+            Instant::now() + Duration::from_secs(1),
+            1,
+            RecorderRequestBody::Identity,
+        )
+        .unwrap()
+    }
+
+    struct CancelledRead {
+        cancelled: Arc<AtomicBool>,
+        calls: usize,
+    }
+
+    impl Read for CancelledRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.cancelled.store(true, Ordering::SeqCst);
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled read"))
+        }
+    }
+
+    #[test]
+    fn framed_exact_read_does_not_retry_a_context_interruption() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancelled),
+        );
+        let mut reader = CancelledRead {
+            cancelled,
+            calls: 0,
+        };
+        let mut buffer = [0_u8; 1];
+        assert!(matches!(
+            read_exact_with_context(&mut reader, &context, &mut buffer),
+            Err(FrameIoError::Context(Error::RpcCancelled))
+        ));
+        assert_eq!(reader.calls, 1);
+    }
+
+    #[test]
+    fn framed_request_preflight_returns_typed_cancel_and_deadline_without_writing() {
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let cancelled_context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            cancelled,
+        );
+        assert!(matches!(
+            prepare_request_frame(
+                &cancelled_context,
+                Instant::now() + Duration::from_secs(1),
+                1,
+                RecorderRequestBody::Identity,
+            ),
+            Err(FramePreflightError::Context(Error::RpcCancelled))
+        ));
+        let expired_context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::ZERO);
+        assert!(matches!(
+            prepare_request_frame(
+                &expired_context,
+                Instant::now(),
+                1,
+                RecorderRequestBody::Identity,
+            ),
+            Err(FramePreflightError::Context(Error::RpcDeadlineExceeded))
+        ));
+        assert!(matches!(
+            advertised_remaining_deadline_ms(Instant::now()),
+            Err(Error::RpcDeadlineExceeded)
+        ));
+    }
+
+    #[test]
+    fn framed_request_write_counter_distinguishes_zero_prefix_and_body_failures() {
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(1));
+        let frame = prepared_identity_frame(&context);
+
+        let mut zero = ScriptedWriter::new([Err(io::ErrorKind::ConnectionReset)]);
+        let error = write_prepared_frame(&mut zero, &context, &frame).unwrap_err();
+        assert_eq!(error.bytes_written, 0);
+        assert_eq!(zero.bytes_written, 0);
+        assert_eq!(zero.write_calls, 1);
+        assert!(matches!(
+            frame_error_outcome(error.error, 0, true),
+            Error::Io(_)
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Transport("zero".into()), 0, false),
+            Error::Io(_)
+        ));
+
+        let mut prefix = ScriptedWriter::new([Ok(1), Err(io::ErrorKind::BrokenPipe)]);
+        let error = write_prepared_frame(&mut prefix, &context, &frame).unwrap_err();
+        assert_eq!(error.bytes_written, 1);
+        assert_eq!(prefix.bytes_written, 1);
+        assert!(matches!(
+            frame_error_outcome(error.error, 1, true),
+            Error::UnknownOutcome
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Transport("prefix".into()), 1, false),
+            Error::Io(_)
+        ));
+
+        let mut body =
+            ScriptedWriter::new([Ok(usize::from(4_u8)), Ok(1), Err(io::ErrorKind::BrokenPipe)]);
+        let error = write_prepared_frame(&mut body, &context, &frame).unwrap_err();
+        assert_eq!(error.bytes_written, 5);
+        assert_eq!(body.bytes_written, 5);
+        assert!(matches!(
+            frame_error_outcome(error.error, 5, true),
+            Error::UnknownOutcome
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Transport("body".into()), 5, false),
+            Error::Io(_)
+        ));
+    }
+
+    #[test]
+    fn framed_partial_request_cancel_and_deadline_are_ambiguous_only_for_mutations() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancelled),
+        );
+        let frame = prepared_identity_frame(&context);
+        let mut cancelling = CancelAfterFirstWrite {
+            cancelled,
+            bytes_written: 0,
+        };
+        let error = write_prepared_frame(&mut cancelling, &context, &frame).unwrap_err();
+        assert_eq!(error.bytes_written, 1);
+        assert_eq!(cancelling.bytes_written, 1);
+        assert!(matches!(
+            error.error,
+            FrameIoError::Context(Error::RpcCancelled)
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Context(Error::RpcCancelled), 1, true),
+            Error::UnknownOutcome
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Context(Error::RpcCancelled), 1, false),
+            Error::RpcCancelled
+        ));
+
+        // Leave enough scheduling headroom for the first accepted byte, then
+        // deterministically cross the context deadline before the next write.
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_millis(50));
+        let frame = prepared_identity_frame(&context);
+        let mut expiring = ExpireAfterFirstWrite {
+            until: Instant::now() + Duration::from_millis(75),
+            bytes_written: 0,
+        };
+        let error = write_prepared_frame(&mut expiring, &context, &frame).unwrap_err();
+        assert_eq!(error.bytes_written, 1);
+        assert_eq!(expiring.bytes_written, 1);
+        assert!(matches!(
+            error.error,
+            FrameIoError::Context(Error::RpcDeadlineExceeded)
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Context(Error::RpcDeadlineExceeded), 1, true),
+            Error::UnknownOutcome
+        ));
+        assert!(matches!(
+            frame_error_outcome(FrameIoError::Context(Error::RpcDeadlineExceeded), 1, false),
+            Error::RpcDeadlineExceeded
+        ));
+    }
+
     #[test]
     fn framed_client_bounds_partial_response_drip_by_sender_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1579,7 +3064,11 @@ mod tests {
         .unwrap();
 
         let started = Instant::now();
-        assert!(client.recorder_id().is_err());
+        assert!(client
+            .recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                Duration::from_millis(400),
+            ))
+            .is_err());
         let elapsed = started.elapsed();
 
         let advertised = advertised_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1591,6 +3080,76 @@ mod tests {
             elapsed < Duration::from_millis(550),
             "partial response exceeded the sender-owned deadline: {elapsed:?}"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn framed_response_envelope_mismatch_is_unknown_only_after_a_mutation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _: Hello = decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+                write_value_sync(
+                    &mut stream,
+                    &HelloReply::Accepted {
+                        version: WIRE_VERSION,
+                        recorder_id: "node-1".into(),
+                    },
+                )
+                .unwrap();
+                let request: RequestFrame =
+                    decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+                let body = match request.body {
+                    RecorderRequestBody::Record(_) => {
+                        RecorderResponseBody::Record(RpcResult::Overloaded)
+                    }
+                    RecorderRequestBody::Identity => {
+                        RecorderResponseBody::Identity(RpcResult::Overloaded)
+                    }
+                    _ => panic!("test only sends record and identity"),
+                };
+                write_value_sync(
+                    &mut stream,
+                    &ResponseFrame {
+                        version: WIRE_VERSION,
+                        request_id: request.request_id.wrapping_add(1),
+                        body,
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let client = TcpPostcardRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2));
+        let mutation = client.record(
+            &context,
+            RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            },
+        );
+        assert!(matches!(mutation, Err(Error::UnknownOutcome)));
+        assert!(matches!(
+            client.recorder_id(&context),
+            Err(Error::Decode(_))
+        ));
         server.join().unwrap();
     }
 
@@ -1615,13 +3174,16 @@ mod tests {
 
         let started = Instant::now();
         assert!(client
-            .observe_read_fence(ReadFenceRequest {
-                cluster_id: "cluster".into(),
-                epoch: 1,
-                config_id: 1,
-                config_digest: LogHash::ZERO,
-                slot: 1,
-            })
+            .observe_read_fence(
+                &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5),),
+                ReadFenceRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    slot: 1,
+                }
+            )
             .is_err());
         assert!(started.elapsed() < Duration::from_millis(1_500));
         server.join().unwrap();
@@ -1647,19 +3209,217 @@ mod tests {
         .unwrap();
 
         let started = Instant::now();
-        let result = client.record(RecordRequest {
-            cluster_id: "cluster".into(),
-            epoch: 1,
-            config_id: 1,
-            config_digest: LogHash::ZERO,
-            slot: 1,
-            step: 1,
-            proposal: rhiza_quepaxa::Proposal::nil(),
-            command: None,
-        });
+        let result = client.record(
+            &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+            RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            },
+        );
 
-        assert!(matches!(result, Err(Error::ProposeFailed)));
+        // The peer never completes HELLO, so no recorder request was framed;
+        // this is a definite pre-send transport failure, not an ambiguity.
+        assert!(matches!(result, Err(Error::Io(_))));
         assert!(started.elapsed() < Duration::from_millis(1_500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn framed_hello_observes_shared_cancellation_without_waiting_for_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        let client = Arc::new(
+            TcpPostcardRecorderClient::new_with_transport_and_timeout(
+                address,
+                "node-1",
+                "node-2",
+                "peer-token-2",
+                7,
+                ClientTransport::Plain,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(5),
+            Arc::clone(&cancelled),
+        );
+        let calling = Arc::clone(&client);
+        let caller = thread::spawn(move || calling.recorder_id(&context));
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        cancelled.store(true, Ordering::SeqCst);
+        let result = caller.join().unwrap();
+
+        assert!(matches!(result, Err(Error::RpcCancelled)));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "HELLO cancellation was not observed promptly: {:?}",
+            started.elapsed()
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_preframe_connectors_are_bounded_by_the_lane_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(CONNECTIONS_PER_LANE);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let mut streams = Vec::with_capacity(CONNECTIONS_PER_LANE);
+            for _ in 0..CONNECTIONS_PER_LANE {
+                let (stream, _) = listener.accept().unwrap();
+                accepted_tx.send(()).unwrap();
+                streams.push(stream);
+            }
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            drop(streams);
+        });
+        let client = Arc::new(
+            TcpPostcardRecorderClient::new_with_transport_and_timeout(
+                address,
+                "node-1",
+                "node-2",
+                "peer-token-2",
+                7,
+                ClientTransport::Plain,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+
+        for _ in 0..CONNECTIONS_PER_LANE {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(5),
+                Arc::clone(&cancelled),
+            );
+            let calling = Arc::clone(&client);
+            let caller = thread::spawn(move || calling.recorder_id(&context));
+            accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            cancelled.store(true, Ordering::SeqCst);
+            assert!(matches!(caller.join().unwrap(), Err(Error::RpcCancelled)));
+        }
+
+        for _ in 0..4 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(5),
+                Arc::clone(&cancelled),
+            );
+            let calling = Arc::clone(&client);
+            let caller = thread::spawn(move || calling.recorder_id(&context));
+            thread::sleep(Duration::from_millis(20));
+            cancelled.store(true, Ordering::SeqCst);
+            assert!(matches!(caller.join().unwrap(), Err(Error::RpcCancelled)));
+        }
+        assert!(accepted_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(
+            client.control.state.lock().unwrap().open,
+            CONNECTIONS_PER_LANE
+        );
+
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while client.control.state.lock().unwrap().open != 0 {
+            assert!(
+                Instant::now() < cleanup_deadline,
+                "connector lease was not released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn dropped_queued_connector_completions_release_every_reservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpPostcardRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let pool = Arc::clone(&client.control);
+        let (sender, receiver) = mpsc::sync_channel(CONNECTIONS_PER_LANE);
+        {
+            let mut state = pool.state.lock().unwrap();
+            state.open = CONNECTIONS_PER_LANE;
+        }
+        for _ in 0..CONNECTIONS_PER_LANE {
+            let stream = TcpStream::connect(address).unwrap();
+            sender
+                .send(ConnectorCompletion {
+                    result: Ok(RecorderClientStream::Plain(DeadlineStream::new(
+                        stream,
+                        Instant::now() + Duration::from_secs(2),
+                    ))),
+                    reservation: ConnectionReservation::new(Arc::clone(&pool)),
+                })
+                .unwrap();
+        }
+        drop(sender);
+        drop(receiver);
+
+        assert_eq!(pool.state.lock().unwrap().open, 0);
+        // A fresh public checkout is now admissible; it must not inherit
+        // either cancelled caller's reservation.
+        let server = thread::spawn(move || {
+            for _ in 0..CONNECTIONS_PER_LANE {
+                let (_cancelled_stream, _) = listener.accept().unwrap();
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: Hello = decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+            write_value_sync(
+                &mut stream,
+                &HelloReply::Accepted {
+                    version: WIRE_VERSION,
+                    recorder_id: "node-1".into(),
+                },
+            )
+            .unwrap();
+            let request: RequestFrame =
+                decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+            write_value_sync(
+                &mut stream,
+                &ResponseFrame {
+                    version: WIRE_VERSION,
+                    request_id: request.request_id,
+                    body: RecorderResponseBody::Identity(RpcResult::Ok("node-1".into())),
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            client
+                .recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                    Duration::from_secs(2),
+                ))
+                .unwrap(),
+            "node-1"
+        );
         server.join().unwrap();
     }
 
@@ -1671,17 +3431,39 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct BlockingIdentity {
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
     struct CountingMutation {
         calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct CountingIdentity {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct OversizedFetch {
+        command: Arc<StoredCommand>,
+        calls: Arc<AtomicUsize>,
+    }
+
     impl RecorderRpc for CountingMutation {
-        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
             Ok("node-1".into())
         }
 
         fn store_command_for(
             &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -1692,15 +3474,61 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        fn install_decision_proof(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl RecorderRpc for OversizedFetch {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            Ok("node-1".into())
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some((*self.command).clone()))
+        }
+    }
+
+    impl RecorderRpc for CountingIdentity {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("node-1".into())
+        }
     }
 
     impl RecorderRpc for BlockingMutation {
-        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
             Ok("node-1".into())
         }
 
         fn store_command_for(
             &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -1719,6 +3547,22 @@ mod tests {
         }
     }
 
+    impl RecorderRpc for BlockingIdentity {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            self.started.send(()).unwrap();
+            let (released, ready) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok("node-1".into())
+        }
+    }
+
     fn peers() -> Vec<PeerConfig> {
         (1..=3)
             .map(|index| {
@@ -1732,14 +3576,729 @@ mod tests {
             .collect()
     }
 
+    struct TestIngressControl {
+        shutdown: tokio::sync::watch::Sender<bool>,
+        force: tokio::sync::watch::Sender<bool>,
+        started: tokio::sync::oneshot::Receiver<()>,
+        listener_dropped: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    struct TestRunningIngressControl {
+        shutdown: tokio::sync::watch::Sender<bool>,
+        _force: tokio::sync::watch::Sender<bool>,
+        _listener_dropped: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    fn test_ingress_lifecycle() -> (TestIngressControl, RecorderIngressLifecycle) {
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (force, force_rx) = tokio::sync::watch::channel(false);
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (listener_dropped, listener_dropped_rx) = tokio::sync::oneshot::channel();
+        (
+            TestIngressControl {
+                shutdown,
+                force,
+                started: started_rx,
+                listener_dropped: listener_dropped_rx,
+            },
+            RecorderIngressLifecycle::new(shutdown_rx, force_rx, started, listener_dropped),
+        )
+    }
+
+    async fn start_actual_recorder_server<R>(
+        recorder: R,
+    ) -> (
+        SocketAddr,
+        TestRunningIngressControl,
+        tokio::task::JoinHandle<RecorderIngressExit>,
+    )
+    where
+        R: RecorderRpc + Clone + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (control, lifecycle) = test_ingress_lifecycle();
+        let server = tokio::spawn(serve_recorder_tcp(
+            listener,
+            recorder,
+            peers(),
+            7,
+            lifecycle,
+        ));
+        let TestIngressControl {
+            shutdown,
+            force,
+            started,
+            listener_dropped,
+        } = control;
+        started.await.unwrap();
+        (
+            address,
+            TestRunningIngressControl {
+                shutdown,
+                _force: force,
+                _listener_dropped: listener_dropped,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn ingress_marks_connection_task_panic_as_uncertain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (control, lifecycle) = test_ingress_lifecycle();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let mut entered = Some(entered);
+        let server = tokio::spawn(run_recorder_ingress(
+            listener,
+            lifecycle,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            1,
+            1,
+            "test accept failed",
+            move |_stream, _peer, _shutdown, _force, _connection| {
+                let entered = entered.take().expect("test admits exactly one connection");
+                async move {
+                    let _ = entered.send(());
+                    panic!("test connection task panic");
+                    #[allow(unreachable_code)]
+                    Ok::<(), String>(())
+                }
+            },
+        ));
+        control.started.await.unwrap();
+        let client = tokio::net::TcpStream::connect(address).await.unwrap();
+        entered_rx.await.unwrap();
+        control.shutdown.send_replace(true);
+        control.listener_dropped.await.unwrap();
+        let exit = server.await.unwrap();
+        assert!(exit.result.is_ok());
+        assert_eq!(exit.tasks, RecorderTaskDisposition::Uncertain);
+        drop(client);
+        drop(control.force);
+    }
+
+    async fn authenticated_tcp_hello(address: SocketAddr) -> tokio::net::TcpStream {
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        write_value_async(
+            &mut stream,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(
+                &tokio::time::timeout(Duration::from_secs(1), read_frame_async(&mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap(),
+            HelloReply::Accepted { .. }
+        ));
+        stream
+    }
+
+    async fn next_decode_event(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<RequestDecodeTestEvent>,
+    ) -> RequestDecodeTestEvent {
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn bounded_postcard_encode_rejects_before_allocating_an_oversized_output() {
+        // A bytes Vec has a one-byte sequence length prefix at these sizes.
+        // The exact boundary proves the second pass allocates only accepted
+        // output; the following byte is rejected by the counting pass.
+        assert_eq!(
+            bounded_postcard_encode(&vec![0_u8; 31], 32).unwrap().len(),
+            32
+        );
+        assert!(bounded_postcard_encode(&vec![0_u8; 32], 32).is_err());
+    }
+
+    #[tokio::test]
+    async fn framed_decode_gate_blocks_until_a_permit_is_released() {
+        // Keep the gate parameterized in the helper so this remains a
+        // deterministic test of the same acquire/decode/release path used by
+        // the production-wide 32-slot gate.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = Arc::clone(&gate).acquire_owned().await.unwrap();
+        let bytes = bounded_postcard_encode(
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+            MAX_HTTP_BODY_BYTES,
+        )
+        .unwrap();
+        let mut decode = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { decode_framed_with_gate::<Hello>(&bytes, &gate).await }
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut decode)
+            .await
+            .is_err());
+        drop(held);
+        let hello = tokio::time::timeout(Duration::from_secs(1), decode)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello.node_id, "node-2");
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn framed_oversized_decision_proof_does_not_dispatch_and_releases_decode_slot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let operation_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let decode_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let summary = rhiza_quepaxa::RecorderSummary {
+            recorder_id: "r".into(),
+            slot: 1,
+            step: 1,
+            first_current: None,
+            aggregate_prior: None,
+        };
+        let proof = DecisionProof::FastPath {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::ZERO,
+            proposal: rhiza_quepaxa::Proposal::new(
+                rhiza_quepaxa::ProposalPriority::from_u64(1),
+                "node-2",
+                1,
+                rhiza_quepaxa::AcceptedValue {
+                    command_hash: LogHash::ZERO,
+                    prev_hash: LogHash::ZERO,
+                    entry_hash: LogHash::ZERO,
+                },
+            ),
+            // The wire frame is comfortably below MAX_HTTP_BODY_BYTES, but
+            // decoding its Vec exceeds the fixed 4x MAX_HTTP_BODY_BYTES heap
+            // budget due to RecorderSummary's in-memory footprint.
+            summaries: vec![summary; 16_384],
+        };
+        let malformed = RequestFrame {
+            version: WIRE_VERSION,
+            request_id: 1,
+            remaining_deadline_ms: 1_000,
+            body: RecorderRequestBody::InstallDecisionProof {
+                proof,
+                members: vec!["node-1".into(), "node-2".into()],
+            },
+        };
+        let malformed_bytes = bounded_postcard_encode(&malformed, MAX_HTTP_BODY_BYTES).unwrap();
+        assert!(malformed_bytes.len() < MAX_HTTP_BODY_BYTES);
+        assert!(decode_framed::<RequestFrame>(&malformed_bytes).is_err());
+
+        let (mut client, server_stream) = tokio::io::duplex(512 * 1024);
+        let server = tokio::spawn(serve_connection_with_decode_slots(
+            server_stream,
+            CountingMutation {
+                calls: Arc::clone(&calls),
+            },
+            RecorderConnectionContext {
+                peers: peers().into(),
+                recovery_generation: 7,
+                slots: Arc::clone(&operation_slots),
+                decode_slots: Arc::clone(&decode_slots),
+                signals: None,
+                response_write_test_server: None,
+            },
+        ));
+        write_value_async(
+            &mut client,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut client).await.unwrap()).unwrap(),
+            HelloReply::Accepted { .. }
+        ));
+        write_frame_async(&mut client, &malformed_bytes)
+            .await
+            .unwrap();
+        assert!(server.await.unwrap().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(decode_slots.available_permits(), 1);
+
+        // A separate connection sharing the same decode gate must proceed:
+        // malformed request decode never leaks a permit or consumes an
+        // operation slot.
+        let (mut fresh_client, fresh_server_stream) = tokio::io::duplex(16 * 1024);
+        let fresh_server = tokio::spawn(serve_connection_with_decode_slots(
+            fresh_server_stream,
+            CountingMutation {
+                calls: Arc::clone(&calls),
+            },
+            RecorderConnectionContext {
+                peers: peers().into(),
+                recovery_generation: 7,
+                slots: operation_slots,
+                decode_slots: Arc::clone(&decode_slots),
+                signals: None,
+                response_write_test_server: None,
+            },
+        ));
+        write_value_async(
+            &mut fresh_client,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut fresh_client).await.unwrap())
+                .unwrap(),
+            HelloReply::Accepted { .. }
+        ));
+        write_value_async(
+            &mut fresh_client,
+            &RequestFrame {
+                version: WIRE_VERSION,
+                request_id: 2,
+                remaining_deadline_ms: 1_000,
+                body: RecorderRequestBody::Identity,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<ResponseFrame>(&read_frame_async(&mut fresh_client).await.unwrap())
+                .unwrap()
+                .body,
+            RecorderResponseBody::Identity(RpcResult::Ok(recorder_id)) if recorder_id == "node-1"
+        ));
+        drop(fresh_client);
+        assert!(fresh_server.await.unwrap().is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(decode_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn actual_listener_rejects_oversized_proof_before_backend_and_recovers_slot() {
+        let _test_lock = request_decode_test_lock().lock().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let summary = rhiza_quepaxa::RecorderSummary {
+            recorder_id: "r".into(),
+            slot: 1,
+            step: 1,
+            first_current: None,
+            aggregate_prior: None,
+        };
+        let request = RequestFrame {
+            version: WIRE_VERSION,
+            request_id: 90_001,
+            remaining_deadline_ms: 1_000,
+            body: RecorderRequestBody::InstallDecisionProof {
+                proof: DecisionProof::FastPath {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    slot: 1,
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    proposal: rhiza_quepaxa::Proposal::new(
+                        rhiza_quepaxa::ProposalPriority::from_u64(1),
+                        "node-2",
+                        1,
+                        rhiza_quepaxa::AcceptedValue {
+                            command_hash: LogHash::ZERO,
+                            prev_hash: LogHash::ZERO,
+                            entry_hash: LogHash::ZERO,
+                        },
+                    ),
+                    summaries: vec![summary; 16_384],
+                },
+                members: vec!["node-1".into(), "node-2".into()],
+            },
+        };
+        let bytes = bounded_postcard_encode(&request, MAX_HTTP_BODY_BYTES).unwrap();
+        assert!(bytes.len() < MAX_HTTP_BODY_BYTES);
+        assert!(decode_framed::<RequestFrame>(&bytes).is_err());
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let _hook = install_request_decode_test_hook(RequestDecodeTestHook {
+            request_ids: Arc::new([90_001].into_iter().collect()),
+            events: events_tx,
+            release: None,
+        });
+        let (address, shutdown, server) = start_actual_recorder_server(CountingMutation {
+            calls: Arc::clone(&calls),
+        })
+        .await;
+        let mut client = authenticated_tcp_hello(address).await;
+        write_frame_async(&mut client, &bytes).await.unwrap();
+        assert_eq!(
+            next_decode_event(&mut events).await,
+            RequestDecodeTestEvent::Entered
+        );
+        assert_eq!(
+            next_decode_event(&mut events).await,
+            RequestDecodeTestEvent::Failed("recorder decode heap budget exceeded".into())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), read_frame_async(&mut client))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut fresh = authenticated_tcp_hello(address).await;
+        write_value_async(
+            &mut fresh,
+            &RequestFrame {
+                version: WIRE_VERSION,
+                request_id: 90_002,
+                remaining_deadline_ms: 1_000,
+                body: RecorderRequestBody::Identity,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<ResponseFrame>(
+                &tokio::time::timeout(Duration::from_secs(1), read_frame_async(&mut fresh))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+            .body,
+            RecorderResponseBody::Identity(RpcResult::Ok(recorder_id)) if recorder_id == "node-1"
+        ));
+        drop(client);
+        drop(fresh);
+        shutdown.shutdown.send_replace(true);
+        let exit = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exit.result.is_ok());
+        assert_eq!(exit.tasks, RecorderTaskDisposition::Quiesced);
+    }
+
+    #[tokio::test]
+    async fn actual_listener_limits_shared_request_decode_to_32() {
+        let _test_lock = request_decode_test_lock().lock().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let _hook = install_request_decode_test_hook(RequestDecodeTestHook {
+            request_ids: Arc::new((91_000..91_033).collect()),
+            events: events_tx,
+            release: Some(Arc::clone(&release)),
+        });
+        let (address, shutdown, server) = start_actual_recorder_server(CountingIdentity {
+            calls: Arc::clone(&calls),
+        })
+        .await;
+        let mut clients = Vec::new();
+        for _ in 0..33 {
+            clients.push(authenticated_tcp_hello(address).await);
+        }
+        // HELLO authentication/identity is deliberately outside the scoped
+        // request-decode test gate; measure only request backend dispatch.
+        calls.store(0, Ordering::SeqCst);
+        for (offset, client) in clients.iter_mut().enumerate() {
+            write_value_async(
+                client,
+                &RequestFrame {
+                    version: WIRE_VERSION,
+                    request_id: 91_000 + u64::try_from(offset).unwrap(),
+                    // Gate orchestration, rather than the request deadline,
+                    // controls this concurrency proof under a loaded suite.
+                    remaining_deadline_ms: 30_000,
+                    body: RecorderRequestBody::Identity,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for _ in 0..MAX_SERVER_DECODE_CONCURRENCY {
+            assert_eq!(
+                next_decode_event(&mut events).await,
+                RequestDecodeTestEvent::Entered
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        release.notify_waiters();
+        assert_eq!(
+            next_decode_event(&mut events).await,
+            RequestDecodeTestEvent::Entered
+        );
+        release.notify_waiters();
+        for client in &mut clients {
+            let response: ResponseFrame = decode_exact(
+                &tokio::time::timeout(Duration::from_secs(1), read_frame_async(client))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                response.body,
+                RecorderResponseBody::Identity(RpcResult::Ok(_))
+                    | RecorderResponseBody::Identity(RpcResult::Overloaded)
+            ));
+        }
+        drop(clients);
+        shutdown.shutdown.send_replace(true);
+        let exit = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exit.result.is_ok());
+        assert_eq!(exit.tasks, RecorderTaskDisposition::Quiesced);
+        assert!(
+            (MAX_SERVER_DECODE_CONCURRENCY..=MAX_SERVER_DECODE_CONCURRENCY + 1)
+                .contains(&calls.load(Ordering::SeqCst)),
+            "all requests decoded; operation admission may overload one while the shared gate drains"
+        );
+    }
+
+    #[test]
+    fn client_maps_malicious_framed_response_to_decode_or_sent_mutation_unknown() {
+        let summary = rhiza_quepaxa::RecorderSummary {
+            recorder_id: "r".into(),
+            slot: 1,
+            step: 1,
+            first_current: None,
+            aggregate_prior: None,
+        };
+        let oversized_proof = DecisionProof::FastPath {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::ZERO,
+            proposal: rhiza_quepaxa::Proposal::new(
+                rhiza_quepaxa::ProposalPriority::from_u64(1),
+                "node-2",
+                1,
+                rhiza_quepaxa::AcceptedValue {
+                    command_hash: LogHash::ZERO,
+                    prev_hash: LogHash::ZERO,
+                    entry_hash: LogHash::ZERO,
+                },
+            ),
+            summaries: vec![summary; 16_384],
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, observed_rx) = mpsc::sync_channel(2);
+        let server = thread::spawn(move || {
+            for expected_mutation in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _: Hello = decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+                write_value_sync(
+                    &mut stream,
+                    &HelloReply::Accepted {
+                        version: WIRE_VERSION,
+                        recorder_id: "node-1".into(),
+                    },
+                )
+                .unwrap();
+                let request: RequestFrame =
+                    decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+                observed_tx
+                    .send(matches!(&request.body, RecorderRequestBody::Record(_)))
+                    .unwrap();
+                assert_eq!(
+                    matches!(&request.body, RecorderRequestBody::Record(_)),
+                    expected_mutation
+                );
+                let response = ResponseFrame {
+                    version: WIRE_VERSION,
+                    request_id: request.request_id,
+                    // Deliberately a valid but operation-mismatched envelope:
+                    // bounded decode must fail before operation matching.
+                    body: RecorderResponseBody::InspectDecisionProof(RpcResult::Ok(Some(
+                        oversized_proof.clone(),
+                    ))),
+                };
+                let bytes = bounded_postcard_encode(&response, MAX_HTTP_BODY_BYTES).unwrap();
+                assert!(bytes.len() < MAX_HTTP_BODY_BYTES);
+                assert!(decode_framed::<ResponseFrame>(&bytes).is_err());
+                stream.write_all(&frame_length(&bytes).unwrap()).unwrap();
+                stream.write_all(&bytes).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let client = TcpPostcardRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2));
+        assert!(matches!(
+            client.recorder_id(&context),
+            Err(Error::Decode(message)) if message == "recorder decode heap budget exceeded"
+        ));
+        assert!(!observed_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(matches!(
+            client.record(
+                &context,
+                RecordRequest {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    slot: 1,
+                    step: 1,
+                    proposal: rhiza_quepaxa::Proposal::nil(),
+                    command: None,
+                },
+            ),
+            Err(Error::UnknownOutcome)
+        ));
+        assert!(observed_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn framed_oversized_mutation_is_definite_before_socket_checkout() {
+        let client =
+            TcpPostcardRecorderClient::new("127.0.0.1:9", "node-1", "node-2", "peer-token-2", 7)
+                .unwrap();
+        let command = StoredCommand::new(
+            rhiza_core::EntryType::Command,
+            vec![0_u8; MAX_HTTP_BODY_BYTES],
+        );
+        let result = client.exchange(
+            &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+            RecorderRequestBody::StoreCommand {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                command_hash: command.hash(),
+                command,
+            },
+            true,
+            true,
+        );
+        assert!(matches!(result, Err(Error::Decode(_))));
+        assert_eq!(client.consensus.state.lock().unwrap().open, 0);
+        assert!(client.consensus.state.lock().unwrap().idle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn framed_oversized_backend_response_is_a_typed_bounded_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let command = Arc::new(StoredCommand::new(
+            rhiza_core::EntryType::Command,
+            vec![0_u8; MAX_HTTP_BODY_BYTES],
+        ));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (mut client, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(serve_connection(
+            server_stream,
+            OversizedFetch {
+                command,
+                calls: Arc::clone(&calls),
+            },
+            peers().into(),
+            7,
+            slots,
+        ));
+        write_value_async(
+            &mut client,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut client).await.unwrap()).unwrap(),
+            HelloReply::Accepted { .. }
+        ));
+        write_value_async(
+            &mut client,
+            &RequestFrame {
+                version: WIRE_VERSION,
+                request_id: 9,
+                remaining_deadline_ms: 1_000,
+                body: RecorderRequestBody::FetchCommand {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    command_hash: LogHash::ZERO,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response: ResponseFrame =
+            decode_exact(&read_frame_async(&mut client).await.unwrap()).unwrap();
+        assert_eq!(response.request_id, 9);
+        assert!(matches!(
+            response.body,
+            RecorderResponseBody::FetchCommand(RpcResult::Error(error))
+                if matches!(error.code, crate::RecorderWireErrorCode::Decode)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(client);
+        assert!(server.await.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn request_expired_before_dispatch_never_reaches_recorder() {
         let calls = Arc::new(AtomicUsize::new(0));
         let command = StoredCommand::new(rhiza_core::EntryType::Command, b"expired".to_vec());
-        let permit = Arc::new(tokio::sync::Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .unwrap();
+        let permit = Arc::new(
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
 
         let response = dispatch_with_deadline(
             CountingMutation {
@@ -1764,13 +4323,13 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
             response,
-            RecorderResponseBody::StoreCommand(RpcResult::Error(message))
-                if message.contains("deadline")
+            RecorderResponseBody::StoreCommand(RpcResult::Error(error))
+                if matches!(error.code, crate::RecorderWireErrorCode::RpcDeadlineExceeded)
         ));
     }
 
     #[tokio::test]
-    async fn saturated_server_returns_overload_without_calling_recorder() {
+    async fn saturated_server_rejects_hello_without_calling_recorder() {
         let calls = Arc::new(AtomicUsize::new(0));
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
         let held = Arc::clone(&slots).acquire_owned().await.unwrap();
@@ -1797,8 +4356,45 @@ mod tests {
         .unwrap();
         assert!(matches!(
             decode_exact::<HelloReply>(&read_frame_async(&mut client).await.unwrap()).unwrap(),
+            HelloReply::Rejected
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(client);
+        drop(held);
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn saturated_server_returns_operation_overload_after_hello() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (mut client, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_connection(
+            server_stream,
+            CountingMutation {
+                calls: Arc::clone(&calls),
+            },
+            peers().into(),
+            7,
+            Arc::clone(&slots),
+        ));
+        write_value_async(
+            &mut client,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut client).await.unwrap()).unwrap(),
             HelloReply::Accepted { .. }
         ));
+        let held = slots.acquire_owned().await.unwrap();
         let command = StoredCommand::new(rhiza_core::EntryType::Command, b"overloaded".to_vec());
         write_value_async(
             &mut client,
@@ -1833,13 +4429,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn hello_identity_shutdown_waits_for_the_blocking_backend() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ingress, lifecycle) = test_ingress_lifecycle();
+        let TestIngressControl {
+            shutdown,
+            force: _force,
+            started: ingress_started,
+            listener_dropped,
+        } = ingress;
+        let mut server = tokio::spawn(serve_recorder_tcp(
+            listener,
+            BlockingIdentity {
+                started: started_tx,
+                release: Arc::clone(&release),
+                completed: Arc::clone(&completed),
+            },
+            peers(),
+            7,
+            lifecycle,
+        ));
+        ingress_started.await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        write_value_async(
+            &mut stream,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        shutdown.send_replace(true);
+        listener_dropped.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut server)
+                .await
+                .is_err(),
+            "shutdown drained before the admitted HELLO identity backend completed"
+        );
+        let (released, ready) = &*release;
+        *released.lock().unwrap() = true;
+        ready.notify_all();
+        let exit = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server did not drain after identity release")
+            .unwrap();
+        assert!(exit.result.is_ok());
+        assert_eq!(exit.tasks, RecorderTaskDisposition::Quiesced);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        drop(stream);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn server_deadline_returns_while_admitted_mutation_finishes_and_shutdown_drains_it() {
         let (started_tx, started_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let completed = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (ingress, lifecycle) = test_ingress_lifecycle();
+        let TestIngressControl {
+            shutdown,
+            force: _force,
+            started: ingress_started,
+            listener_dropped,
+        } = ingress;
         let server = tokio::spawn(serve_recorder_tcp(
             listener,
             BlockingMutation {
@@ -1849,10 +4511,9 @@ mod tests {
             },
             peers(),
             7,
-            async move {
-                let _ = shutdown_rx.await;
-            },
+            lifecycle,
         ));
+        ingress_started.await.unwrap();
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         write_value_async(
             &mut stream,
@@ -1892,28 +4553,126 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let response =
             tokio::time::timeout(Duration::from_millis(300), read_frame_async(&mut stream)).await;
-        shutdown_tx.send(()).unwrap();
+        shutdown.send_replace(true);
+        listener_dropped.await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!server.is_finished());
         let (released, ready) = &*release;
         *released.lock().unwrap() = true;
         ready.notify_all();
-        server.await.unwrap().unwrap();
+        let exit = server.await.unwrap();
+        assert!(exit.result.is_ok());
+        assert_eq!(exit.tasks, RecorderTaskDisposition::Quiesced);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         let response = response
             .expect("server must answer the advertised deadline")
             .unwrap();
         assert!(matches!(
             decode_exact::<ResponseFrame>(&response).unwrap().body,
-            RecorderResponseBody::StoreCommand(RpcResult::Error(message))
-                if message.contains("deadline")
+            RecorderResponseBody::StoreCommand(RpcResult::Error(error))
+                if matches!(error.code, crate::RecorderWireErrorCode::RpcDeadlineExceeded)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_reader_holds_framed_admission_permits_until_connection_close() {
+        let payload = Arc::new(StoredCommand::new(
+            rhiza_core::EntryType::Command,
+            b"gated response".to_vec(),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_ids = (1..=u64::try_from(DEFAULT_PEER_CONCURRENCY).unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let response_gate =
+            install_response_write_test_gate(address, request_ids.clone(), entered_tx);
+        let (_control, lifecycle) = test_ingress_lifecycle();
+        let server = tokio::spawn(serve_recorder_tcp(
+            listener,
+            OversizedFetch {
+                command: Arc::clone(&payload),
+                calls: Arc::clone(&calls),
+            },
+            peers(),
+            7,
+            lifecycle,
+        ));
+        let mut slow_readers = Vec::new();
+        for request_id in request_ids.iter().copied() {
+            let mut stream = authenticated_tcp_hello(address).await;
+            write_value_async(
+                &mut stream,
+                &RequestFrame {
+                    version: WIRE_VERSION,
+                    request_id,
+                    remaining_deadline_ms: u32::try_from(CALL_TIMEOUT.as_millis()).unwrap(),
+                    body: RecorderRequestBody::FetchCommand {
+                        cluster_id: "rhiza:sql:cluster-a".into(),
+                        epoch: 1,
+                        config_id: 1,
+                        config_digest: LogHash::ZERO,
+                        command_hash: payload.hash(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            slow_readers.push(stream);
+        }
+        let mut entered = std::collections::BTreeSet::new();
+        for _ in 0..DEFAULT_PEER_CONCURRENCY {
+            let request_id = tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+                .await
+                .expect("admitted recorder response did not enter the write gate")
+                .expect("response write gate closed before all admitted writes entered");
+            assert!(
+                entered.insert(request_id),
+                "response write gate observed request {request_id} twice"
+            );
+        }
+        assert_eq!(entered, request_ids);
+        assert_eq!(calls.load(Ordering::SeqCst), DEFAULT_PEER_CONCURRENCY);
+
+        // Every backend has returned, but each admitted response write is
+        // causally paused while retaining its operation permit.
+        // A new HELLO must therefore be rejected instead of borrowing a slot
+        // released before its predecessor's response completed.
+        let saturated =
+            TcpPostcardRecorderClient::new(address, "node-1", "node-2", "peer-token-2", 7).unwrap();
+        assert!(tokio::task::spawn_blocking(move || {
+            saturated.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
+        })
+        .await
+        .unwrap()
+        .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), DEFAULT_PEER_CONCURRENCY);
+
+        drop(slow_readers);
+        response_gate.release();
+        let recovered =
+            TcpPostcardRecorderClient::new(address, "node-1", "node-2", "peer-token-2", 7).unwrap();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout()) {
+                    Ok(id) => return id,
+                    Err(_) if Instant::now() < deadline => thread::yield_now(),
+                    Err(error) => panic!("framed permits were not recovered: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered, "node-1");
+        server.abort();
     }
 
     #[test]
     fn postcard_decoder_rejects_trailing_bytes_and_wrong_hello_version() {
-        assert_eq!(WIRE_VERSION, 3);
-        assert_eq!(RECORDER_TLS_ALPN, b"rhiza-recorder/3");
+        assert_eq!(WIRE_VERSION, 5);
+        assert_eq!(RECORDER_TLS_ALPN, b"rhiza-recorder/5");
         let hello = Hello {
             version: WIRE_VERSION,
             node_id: "node-1".into(),
@@ -1924,11 +4683,15 @@ mod tests {
         encoded.push(0);
         assert!(decode_exact::<Hello>(&encoded).is_err());
 
-        let wrong_version = Hello {
-            version: WIRE_VERSION + 1,
-            ..hello
-        };
-        assert!(!hello_authenticated(&wrong_version, &[], 7));
+        for version in [WIRE_VERSION - 1, WIRE_VERSION + 1] {
+            let wrong_version = Hello {
+                version,
+                node_id: "node-1".into(),
+                recovery_generation: 7,
+                token: "peer-token-1".into(),
+            };
+            assert!(!hello_authenticated(&wrong_version, &[], 7));
+        }
     }
 
     #[test]

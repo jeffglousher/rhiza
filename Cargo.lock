@@ -2086,6 +2086,7 @@ name = "rhiza-node"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "http-body",
  "postcard",
  "postcard-rpc",
  "rcgen",
@@ -2102,6 +2103,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -2161,6 +2163,9 @@ name = "rhizadb"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "hyper",
+ "hyper-util",
+ "rcgen",
  "rhiza-archive",
  "rhiza-core",
  "rhiza-graph",
@@ -2173,6 +2178,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]

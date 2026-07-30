@@ -55,7 +55,11 @@ fn peers(membership: &Membership) -> Vec<PeerConfig> {
 
 fn certified(consensus: &ThreeNodeConsensus, entry: &rhiza_core::LogEntry) -> CertifiedTailRecord {
     let CertifiedDecisionInspection::Committed(certified) = consensus
-        .inspect_certified_decision_at(entry.index, entry.prev_hash)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            entry.index,
+            entry.prev_hash,
+        )
         .unwrap()
     else {
         panic!("test decision was not certified");
@@ -119,6 +123,7 @@ async fn detached_learner_applies_only_certified_pages_and_adopts_the_exact_boun
     );
     let noop = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -140,7 +145,12 @@ async fn detached_learner_applies_only_certified_pages_and_adopts_the_exact_boun
         .unwrap()
         .clone();
     let stop_entry = consensus
-        .propose_stored_at(2, noop.hash, stop_command)
+        .propose_stored_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            2,
+            noop.hash,
+            stop_command,
+        )
         .unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     let noop_record = certified(&consensus, &noop);

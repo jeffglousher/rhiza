@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["consensus", "quepaxa", "distributed-systems"]
 categories = ["algorithms", "database"]
 
+[features]
+# Instrumentation available only to downstream test harnesses. It is not part
+# of the consensus runtime's normal feature set.
+test-hooks = []
+
 [dependencies]
 getrandom.workspace = true
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }

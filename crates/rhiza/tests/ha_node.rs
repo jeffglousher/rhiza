@@ -247,16 +247,20 @@ async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_the
             .unwrap();
             let identity_probe = probe.clone();
             assert_eq!(
-                tokio::task::spawn_blocking(move || identity_probe.recorder_id())
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                tokio::task::spawn_blocking(move || {
+                    identity_probe
+                        .recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
+                })
+                .await
+                .unwrap()
+                .unwrap(),
                 NODE_IDS[0]
             );
             let membership = Membership::new(NODE_IDS).unwrap();
             let command = StoredCommand::new(EntryType::Noop, Vec::new());
             let mutation_error = tokio::task::spawn_blocking(move || {
                 probe.store_command_for(
+                    &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                     "rhiza:sql:cluster-a".into(),
                     1,
                     1,
@@ -285,6 +289,23 @@ async fn rejoin_serves_quarantined_ingress_before_ready_and_shutdown_flushes_the
     .expect("three-node bootstrap must not hang")
     .unwrap();
     assert!(nodes.iter().all(|node| node.is_ready()));
+
+    // `ready` publishes application admission after the recorder tasks are
+    // spawned. Confirm every recorder has crossed its own HTTP startup edge
+    // before issuing the first all-recorder mutation; this keeps the test's
+    // quarantined-ingress assertion separate from connection warm-up races.
+    for (index, address) in recorder_addresses.iter().enumerate() {
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), NODE_IDS[0], PEER_TOKENS[0])
+                .unwrap();
+        let recorder_id = tokio::task::spawn_blocking(move || {
+            client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorder_id, NODE_IDS[index]);
+    }
 
     let first_handle = handles.0;
     first_handle
@@ -415,7 +436,7 @@ async fn archive_startup_failure_releases_owned_resources() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shutdown_reports_the_unfinished_startup_io_and_blocks_late_publication() {
+async fn shutdown_deadline_detaches_unfinished_startup_io_without_late_publication() {
     let root = tempfile::tempdir().unwrap();
     let archive = archive(&root.path().join("archive"));
     archive.initialize_checkpoint().await.unwrap();
@@ -448,28 +469,26 @@ async fn shutdown_reports_the_unfinished_startup_io_and_blocks_late_publication(
     tokio::task::spawn_blocking(move || startup_blocked.recv().unwrap())
         .await
         .unwrap();
-    let mut shutdown = Box::pin(node.shutdown_with_timeout(Duration::from_millis(100)));
-    let first_poll = poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
-    assert!(first_poll.is_pending());
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let after_deadline = poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    let shutdown_error = tokio::time::timeout(
+        Duration::from_secs(1),
+        node.shutdown_with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("shutdown must return at its own deadline without waiting for startup I/O")
+    .unwrap_err();
     assert!(
-        after_deadline.is_pending(),
-        "shutdown must retain the blocked startup task after the deadline"
+        matches!(
+            shutdown_error,
+            HaNodeError::ShutdownDeadlineExceeded {
+                phase: rhizadb::HaShutdownPhase::Supervisor,
+                ..
+            }
+        ),
+        "unexpected shutdown error: {shutdown_error:?}"
     );
     assert!(TcpStream::connect(recorder_address).await.is_err());
 
     release.release();
-    let shutdown_error = tokio::time::timeout(SHUTDOWN_HANG_GUARD, shutdown)
-        .await
-        .expect("shutdown must complete after the noncooperative RPC exits")
-        .unwrap_err();
-    assert_eq!(
-        shutdown_error,
-        HaNodeError::StartupIoDeadlineExceeded {
-            stage: "recorder decision inspection".to_owned(),
-        }
-    );
     assert!(TcpStream::connect(recorder_address).await.is_err());
     let rebound = TcpListener::bind(recorder_address).await.unwrap();
     let rebound_service = TcpListener::bind(service_address).await.unwrap();
@@ -535,18 +554,27 @@ struct BlockingStartupRecorder {
 }
 
 impl RecorderRpc for BlockingStartupRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
-        self.recorder.recorder_id()
+    fn recorder_id(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
+        RecorderRpc::recorder_id(&self.recorder, context)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-        self.started.send(()).unwrap();
+    fn inspect_record_summary(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        // The test needs only the first blocked startup RPC. Detached peers
+        // may enter after its receiver is intentionally dropped.
+        let _ = self.started.send(());
         let (released, condition) = &*self.gate;
         let mut released = released.lock().unwrap();
         while !*released {
             released = condition.wait(released).unwrap();
         }
-        self.recorder.inspect_record_summary(slot)
+        RecorderRpc::inspect_record_summary(&self.recorder, context, slot)
     }
 }
 

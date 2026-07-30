@@ -255,9 +255,17 @@ fn successor_is_bound_by_stop_proof_and_activation_barrier() {
     .unwrap();
     let next = Membership::new(["r1", "r2", "r3", "r4"]).unwrap();
     let stop = consensus
-        .propose_stop_for_successor_at(7, LogHash::ZERO, &next)
+        .propose_stop_for_successor_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            7,
+            LogHash::ZERO,
+            &next,
+        )
         .unwrap();
-    let proof = consensus.inspect_decision_proof_at(7).unwrap().unwrap();
+    let proof = consensus
+        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 7)
+        .unwrap()
+        .unwrap();
     drop(consensus);
 
     let joining = store(&dir, "r4", 4, old.clone());
@@ -289,10 +297,20 @@ fn successor_is_bound_by_stop_proof_and_activation_barrier() {
             .collect(),
     )
     .unwrap();
-    let barrier = successor.propose_activation_for_stop_at(&proof).unwrap();
+    let barrier = successor
+        .propose_activation_for_stop_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            &proof,
+        )
+        .unwrap();
     assert_eq!(barrier.index, 8);
     assert_eq!(
-        successor.propose_activation_for_stop_at(&proof).unwrap(),
+        successor
+            .propose_activation_for_stop_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                &proof
+            )
+            .unwrap(),
         barrier
     );
     assert!(
@@ -315,6 +333,7 @@ fn successor_is_bound_by_stop_proof_and_activation_barrier() {
     );
     successor
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             9,
             barrier.hash,
             Command::new(CommandKind::Deterministic, b"normal".to_vec()),
@@ -418,9 +437,17 @@ fn verified_checkpoint_recovery_reactivates_fresh_successor_recorders() {
     )
     .unwrap();
     let stop = old
-        .propose_stop_for_successor_at(7, LogHash::ZERO, &membership)
+        .propose_stop_for_successor_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            7,
+            LogHash::ZERO,
+            &membership,
+        )
         .unwrap();
-    let proof = old.inspect_decision_proof_at(7).unwrap().unwrap();
+    let proof = old
+        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 7)
+        .unwrap()
+        .unwrap();
     drop(old);
 
     let checkpoint_hash = LogHash::digest(&[b"checkpoint-tip"]);
@@ -465,6 +492,7 @@ fn verified_checkpoint_recovery_reactivates_fresh_successor_recorders() {
     assert_eq!(
         recovered
             .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                 10,
                 checkpoint_hash,
                 Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -497,9 +525,17 @@ fn checkpoint_head_intent_recovers_every_config_and_head_fault_phase() {
     )
     .unwrap();
     let stop = old
-        .propose_stop_for_successor_at(7, LogHash::ZERO, &membership)
+        .propose_stop_for_successor_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            7,
+            LogHash::ZERO,
+            &membership,
+        )
         .unwrap();
-    let proof = old.inspect_decision_proof_at(7).unwrap().unwrap();
+    let proof = old
+        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 7)
+        .unwrap()
+        .unwrap();
     drop(old);
     let checkpoint_hash = LogHash::digest(&[b"checkpoint-fault-tip"]);
 

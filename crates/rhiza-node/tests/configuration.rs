@@ -425,6 +425,7 @@ fn stop_advances_past_an_already_decided_normal_command() {
     let consensus = Arc::new(membership_consensus(root.path(), membership.clone()));
     consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -491,6 +492,7 @@ fn three_to_three_replacement_keeps_stopped_predecessor_alive_until_successor_is
     assert!(old_runtime
         .consensus()
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             stop.entry.index + 1,
             stop.entry.hash,
             Command::new(CommandKind::ReadBarrier, Vec::new())
@@ -723,7 +725,7 @@ async fn two_runtimes_materialize_same_voter_stop_and_activation_in_background()
 }
 
 #[test]
-fn slow_minority_is_not_on_the_write_quorum_critical_path() {
+fn admitted_slow_minority_keeps_write_pending_until_mutation_drains() {
     let root = TempDir::new().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let slow_gate = Arc::new(SlowGate::default());
@@ -780,11 +782,20 @@ fn slow_minority_is_not_on_the_write_quorum_critical_path() {
     });
 
     slow_gate.wait_until_entered();
+    // A quorum freezes the proposal result, but an already admitted mutating
+    // hedge must reach a terminal state before the write can return.  Returning
+    // while n3 is still running would make the successful write outcome race a
+    // later, potentially ambiguous mutation.
+    assert_eq!(
+        completed_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "write returned while the admitted minority mutation was still running"
+    );
+    slow_gate.release();
     completed_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("write waited for the blocked minority recorder")
+        .expect("write did not complete after the admitted minority mutation drained")
         .unwrap();
-    slow_gate.release();
     writer.join().unwrap();
 }
 
@@ -830,12 +841,16 @@ struct SlowRecorder {
 }
 
 impl RecorderRpc for SlowRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         self.inner.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -855,6 +870,7 @@ impl RecorderRpc for SlowRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -865,24 +881,37 @@ impl RecorderRpc for SlowRecorder {
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         self.gate.block();
         self.inner.record(request)
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
         self.inner.install_decision_proof(proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         self.inner.inspect_decision_proof(slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         self.inner.inspect_record_summary(slot)
     }
 }

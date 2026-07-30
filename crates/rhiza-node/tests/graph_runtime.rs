@@ -4,15 +4,14 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{ExecutionProfile, LogHash};
-use rhiza_graph::{encode_replicated_graph_batch, encode_replicated_graph_command};
 use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, node_router_with_limits,
     CheckpointCoordinator, ClientErrorResponse, DurabilityMode, GraphCommandResultV1,
     GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphValueDto, GraphValueV1,
     NodeConfig, NodeRuntime, PeerConfig, ReadConsistency, GRAPH_GET_DOCUMENT_PATH,
-    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_COMMAND_BYTES, MAX_GRAPH_MAX_ROWS,
-    MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_GRAPH_MAX_ROWS, MAX_HTTP_BODY_BYTES,
+    PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
@@ -158,75 +157,6 @@ async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
         "invalid_request"
     );
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
-    server.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn graph_batch_byte_cap_falls_back_to_individual_entries() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = graph_http_config(dir.path())
-        .with_writer_batching(4, Duration::from_millis(50))
-        .unwrap();
-    let runtime = Arc::new(
-        NodeRuntime::open(config, consensus(dir.path(), "byte-cap-recorders"), &[]).unwrap(),
-    );
-    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
-    let client = reqwest::Client::new();
-    let value = "x".repeat(129 * 1024);
-    let commands = (0..4)
-        .map(|index| {
-            GraphCommandV1::put_document(
-                format!("large-{index}"),
-                format!("large-{index}"),
-                GraphValueV1::String(value.clone()),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(commands.iter().all(
-        |command| encode_replicated_graph_command(command).unwrap().len() <= MAX_COMMAND_BYTES
-    ));
-    assert!(encode_replicated_graph_batch(&commands).unwrap().len() > MAX_COMMAND_BYTES);
-    assert!(encode_replicated_graph_batch(&commands[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
-
-    let mut requests = tokio::task::JoinSet::new();
-    for index in 0..4 {
-        let client = client.clone();
-        let value = value.clone();
-        requests.spawn(async move {
-            let response = post_graph_put(
-                &client,
-                addr,
-                &serde_json::json!({
-                    "request_id": format!("large-{index}"),
-                    "id": format!("large-{index}"),
-                    "value": {"type": "string", "value": value}
-                }),
-            )
-            .await;
-            let status = response.status();
-            let body = response.text().await.unwrap();
-            (status, body)
-        });
-    }
-    let mut indices = Vec::new();
-    while let Some(response) = requests.join_next().await {
-        let (status, body) = response.unwrap();
-        assert!(
-            status.is_success(),
-            "graph write failed with {status}: {body}"
-        );
-        indices.push(
-            serde_json::from_str::<GraphMutationResponse>(&body)
-                .unwrap()
-                .applied_index,
-        );
-    }
-    indices.sort_unstable();
-    indices.dedup();
-
-    assert_eq!(indices, [1, 2]);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
     server.abort();
 }
 

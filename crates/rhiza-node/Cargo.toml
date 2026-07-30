@@ -13,6 +13,8 @@ sql = ["dep:rhiza-sql"]
 graph = ["dep:rhiza-graph"]
 kv = ["dep:rhiza-kv"]
 recorder-postcard-rpc = ["dep:postcard-rpc", "dep:tracing"]
+# Non-production admission probes used by the HA ownership tests.
+test-hooks = []
 
 [dependencies]
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
@@ -24,6 +26,7 @@ rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
 axum.workspace = true
+http-body.workspace = true
 postcard.workspace = true
 postcard-rpc = { workspace = true, optional = true }
 reqwest.workspace = true
@@ -37,5 +40,7 @@ tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"
+rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa", features = ["test-hooks"] }
+socket2 = "0.6"
 tempfile.workspace = true
 tower.workspace = true

@@ -1,6 +1,6 @@
 use rhiza_archive::{
     archive_lag, ArchiveManifest, CheckpointBase, CheckpointIdentity, CheckpointPublisherOptions,
-    Error, ObjectArchiveStore, SnapshotRecord,
+    Error, ObjectArchiveStore, RestoredCheckpoint, SnapshotRecord,
 };
 use rhiza_core::{
     ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor,
@@ -8,6 +8,16 @@ use rhiza_core::{
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore, SegmentFile};
 use rhiza_obj_store::{Error as ObjStoreError, ObjStore, ObjStoreConfig};
+
+async fn load_restored_for_test(archive: &ObjectArchiveStore) -> RestoredCheckpoint {
+    archive
+        .load_checkpoint_restore()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .1
+}
 
 #[test]
 fn archive_lag_is_committed_index_minus_archived_index() {
@@ -124,7 +134,7 @@ async fn concurrent_publishers_with_different_batch_boundaries_converge() {
     let loaded = archive.load_checkpoint().await.unwrap().unwrap();
     assert_eq!(loaded.manifest().tip().index(), 8);
     assert_eq!(loaded.manifest().tip().hash(), entries[7].hash);
-    assert_eq!(archive.restore_checkpoint().await.unwrap(), entries);
+    assert_eq!(load_restored_for_test(&archive).await.suffix(), entries);
 }
 
 #[tokio::test]
@@ -144,7 +154,7 @@ async fn publication_retries_after_stale_manifest_cas() {
         publisher.await.unwrap().unwrap();
     }
 
-    assert_eq!(archive.restore_checkpoint().await.unwrap(), entries);
+    assert_eq!(load_restored_for_test(&archive).await.suffix(), entries);
 }
 
 #[tokio::test]
@@ -194,7 +204,7 @@ async fn publisher_session_coalesces_adjacent_concurrent_suffixes() {
 
     assert_eq!(prefix.unwrap().manifest().tip().index(), 4);
     assert_eq!(suffix.unwrap().manifest().tip().index(), 4);
-    assert_eq!(archive.restore_checkpoint().await.unwrap(), committed);
+    assert_eq!(load_restored_for_test(&archive).await.suffix(), committed);
 }
 
 #[tokio::test]
@@ -262,7 +272,7 @@ async fn publisher_session_reloads_a_stale_manifest_cache_after_cas_conflict() {
     let reloaded = stale.publish_committed(&committed).await.unwrap();
 
     assert_eq!(reloaded.manifest().tip().index(), 4);
-    assert_eq!(archive.restore_checkpoint().await.unwrap(), committed);
+    assert_eq!(load_restored_for_test(&archive).await.suffix(), committed);
     first.close().await.unwrap();
     stale.close().await.unwrap();
 }
@@ -367,7 +377,7 @@ async fn restore_rejects_corrupt_segment_bytes() {
     store.put(segment.object_key(), b"corrupt").await.unwrap();
 
     assert!(matches!(
-        archive.restore_checkpoint().await,
+        archive.load_checkpoint_restore().await,
         Err(Error::SizeMismatch { .. }) | Err(Error::ChecksumMismatch { .. })
     ));
 }
@@ -395,7 +405,7 @@ async fn restore_rejects_segment_identity_mismatch() {
         .unwrap();
 
     assert!(matches!(
-        archive.restore_checkpoint().await,
+        archive.load_checkpoint_restore().await,
         Err(Error::CheckpointIdentityMismatch { .. })
     ));
 }
@@ -449,10 +459,10 @@ async fn restored_entries_rebuild_an_empty_file_log_store() {
     archive.publish_committed(&entries[..2]).await.unwrap();
     archive.publish_committed(&entries[2..]).await.unwrap();
 
-    let restored = archive.restore_checkpoint().await.unwrap();
+    let restored = load_restored_for_test(&archive).await;
     let log_dir = tempfile::tempdir().unwrap();
     let log = FileLogStore::open(log_dir.path(), "cluster-a", 7, 3).unwrap();
-    log.append_batch(&restored).unwrap();
+    log.append_batch(restored.suffix()).unwrap();
     drop(log);
 
     let reopened = FileLogStore::open(log_dir.path(), "cluster-a", 7, 3).unwrap();
@@ -537,15 +547,11 @@ async fn snapshot_base_restores_snapshot_and_exact_tail() {
     assert_eq!(advanced.manifest().segments().len(), 1);
     assert_eq!(advanced.manifest().segments()[0].start_index(), 3);
 
-    let restored = archive.restore_checkpoint_state().await.unwrap();
+    let restored = load_restored_for_test(&archive).await;
     assert_eq!(restored.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(restored.snapshot().unwrap().bytes(), bytes);
     assert_eq!(restored.suffix(), second);
     assert_eq!(restored.tip().index(), 4);
-    assert!(matches!(
-        archive.restore_checkpoint().await,
-        Err(Error::SnapshotBaseRequiresStructuredRestore)
-    ));
 }
 
 #[tokio::test]
@@ -590,7 +596,7 @@ async fn snapshot_anchor_round_trips_configuration_state() {
         .publish_checkpoint_snapshot(anchor.clone(), bytes)
         .await
         .unwrap();
-    let restored = archive.restore_checkpoint_state().await.unwrap();
+    let restored = load_restored_for_test(&archive).await;
     assert_eq!(restored.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(
         restored.snapshot().unwrap().anchor().configuration_state(),
@@ -638,7 +644,7 @@ async fn checkpoint_snapshot_round_trip_preserves_executor_fingerprint() {
         .object_key()
         .ends_with(&format!("-{}.snapshot", executor_fingerprint.to_hex())));
 
-    let restored = archive.restore_checkpoint_state().await.unwrap();
+    let restored = load_restored_for_test(&archive).await;
     assert_eq!(restored.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(
         restored.snapshot().unwrap().anchor().executor_fingerprint(),
@@ -666,14 +672,12 @@ async fn recovery_generation_roll_preserves_snapshot_and_exact_suffix() {
 
     source.roll_recovery_generation(&target).await.unwrap();
 
-    let restored = target.restore_checkpoint_state().await.unwrap();
+    let restored = load_restored_for_test(&target).await;
     assert_eq!(restored.snapshot().unwrap().bytes(), bytes);
     assert_eq!(
         restored.snapshot().unwrap().anchor().configuration_state(),
-        source
-            .restore_checkpoint_state()
+        load_restored_for_test(&source)
             .await
-            .unwrap()
             .snapshot()
             .unwrap()
             .anchor()
@@ -734,7 +738,7 @@ async fn snapshot_restore_rejects_object_and_manifest_tamper() {
     let base = advanced.manifest().base().snapshot().unwrap();
     store.put(base.object_key(), b"tampered").await.unwrap();
     assert!(matches!(
-        archive.restore_checkpoint_state().await,
+        archive.load_checkpoint_restore().await,
         Err(Error::SizeMismatch { .. }) | Err(Error::ChecksumMismatch { .. })
     ));
 
@@ -861,7 +865,7 @@ async fn tail_publish_and_snapshot_base_cas_race_preserves_the_suffix() {
     tail.unwrap();
     base.unwrap();
 
-    let restored = archive.restore_checkpoint_state().await.unwrap();
+    let restored = load_restored_for_test(&archive).await;
     assert_eq!(restored.suffix(), second);
     assert_eq!(restored.tip().index(), 2);
 }

@@ -287,15 +287,19 @@ assert_statefulset_env_values_are_quoted_strings "$tmp/config-sql-3-tls.yaml"
 
 for recorder_tls in off on; do
   candidate_bundle="$tmp/config-sql-3-tcp.json"
-  candidate_env=()
   if [ "$recorder_tls" = on ]; then
     candidate_bundle="$tmp/config-sql-3-tls.json"
-    candidate_env+=(RHIZA_RECORDER_TLS_SECRET=rhiza-recorder-tls)
+    env RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+      RHIZA_RECORDER_TLS="$recorder_tls" \
+      RHIZA_RECORDER_TLS_SECRET=rhiza-recorder-tls \
+      scripts/render-k8s-config.sh 3 3 "$candidate_bundle" \
+        "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
+  else
+    env RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+      RHIZA_RECORDER_TLS="$recorder_tls" \
+      scripts/render-k8s-config.sh 3 3 "$candidate_bundle" \
+        "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
   fi
-  env RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
-    RHIZA_RECORDER_TLS="$recorder_tls" "${candidate_env[@]}" \
-    scripts/render-k8s-config.sh 3 3 "$candidate_bundle" \
-      "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
   assert_statefulset_env_values_are_quoted_strings \
     "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
   [ "$(yq eval -r 'select(.kind == "StatefulSet") |

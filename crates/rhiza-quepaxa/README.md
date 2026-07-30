@@ -11,13 +11,13 @@ public API. Applications normally need only this crate to construct commands,
 drive consensus, and inspect decisions.
 
 ```rust
-use rhiza_quepaxa::{Command, CommandKind, Consensus, ThreeNodeConsensus};
+use rhiza_quepaxa::{Command, CommandKind, RecorderRpcContext, ThreeNodeConsensus};
 
 let base = std::env::temp_dir().join(format!("rhiza-quepaxa-readme-{}", std::process::id()));
 let _ = std::fs::remove_dir_all(&base);
 let roots = [base.join("n1"), base.join("n2"), base.join("n3")];
 let consensus = ThreeNodeConsensus::new("cluster", "n1", 1, 1, roots)?;
-let entry = consensus.propose(Command::new(
+let entry = consensus.propose(RecorderRpcContext::default_timeout(), Command::new(
     CommandKind::Deterministic,
     b"deterministic command".to_vec(),
 ))?;
@@ -29,9 +29,12 @@ See `examples/local_three_node.rs` for a complete runnable example.
 
 ## Runtime contract
 
-- `RecorderRpc` implementations must enforce a finite deadline for every
-  network or process-bound operation. The consensus engine performs quorum RPCs
-  concurrently and may return after a quorum while slower calls finish.
+- Every recorder operation receives a `RecorderRpcContext`, which carries an
+  absolute deadline and cancellation signal. Network or process-bound
+  implementations must use both before starting I/O and while waiting for it.
+  Every public consensus operation accepts a caller-owned context; callers may
+  choose the five-second `default_timeout` explicitly. Expiry of a mutating call
+  is reported as `UnknownOutcome`, not as a safe-to-retry failure.
 - An ordinary FastPath decision returns after its phase-0 recorder quorum and
   does not install a proof. An ordinary Phase2 decision, configuration-change
   decision, or decision reached after a transition was observed installs its
@@ -40,13 +43,15 @@ See `examples/local_three_node.rs` for a complete runnable example.
 - Recovery may reconstruct a FastPath decision from its recorder summaries, but
   never reconstructs a Phase2 decision from summaries alone; Phase2 recovery
   requires a durably installed decision proof.
-- Dropping `ThreeNodeConsensus` never waits indefinitely for outstanding RPC
-  workers, including proof workers. A transport that ignores its deadline can
-  leak its own worker and resources, but cannot block consensus destruction.
-- Call `finish_pending_rpcs` with an application-selected bound before removing
-  local recorder storage or shutting down a transport used by accepted record,
-  proof, or control jobs. The drain does not recover jobs already dropped
-  because a bounded worker queue was full.
+- Dropping `ThreeNodeConsensus` cancels and detaches outstanding RPC workers;
+  it never waits for them. A transport that ignores cancellation can leak its
+  own worker and resources, but cannot block consensus destruction.
+- `finish_pending_rpcs` is a diagnostic observation only. It is never proof
+  that a shutdown is quiescent: it observes every call sharing the consensus
+  instance, including concurrently admitted work owned by other callers.
+  Before closing recorder storage or transport, an owner must close its own
+  admission and await or drain only its own calls. The diagnostic does not
+  recover jobs already dropped because a bounded worker queue was full.
 - Each recorder has one record worker and one control worker, each with room for
   one queued job. Record saturation returns retryable `Pending`; control
   saturation may surface retryable `NoQuorum` or `Unavailable`.
@@ -68,10 +73,11 @@ closed. An incomplete final frame is treated as an unacknowledged torn tail and
 truncated. QWAL v1 cannot distinguish a genuinely torn final frame from a
 corrupted declared frame length that extends beyond EOF; that ambiguity remains
 an explicit residual format risk until the framing format changes.
-Before each append, the recorder evaluates the WAL's 16 MiB byte threshold and
-1,024-frame threshold. Because the check precedes the append, an individual
-frame can carry the WAL past the 16 MiB soft threshold; the recorder checkpoints
-before the following append. Command payloads have no separate hard size bound.
+Before each append, the recorder evaluates the WAL's 64 MiB byte threshold and
+1,024-frame threshold. Because the check precedes the append, one accepted
+command (at most 512 KiB) can carry the WAL past the 64 MiB soft threshold; the
+recorder checkpoints before the following append. Commands larger than 512 KiB
+are rejected before they enter the durable Recorder protocol.
 The existing checkpoint format and 1,024-frame boundary are intentionally
 retained. A broader crash-safe checkpoint redesign is deferred; the logical
 boundary diagnostic below does not replace the physical power-loss deployment
