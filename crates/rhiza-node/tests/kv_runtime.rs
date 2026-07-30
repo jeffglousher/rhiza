@@ -669,24 +669,24 @@ async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
         post_kv_put(&client, addr, &first_body),
         post_kv_put(&client, addr, &second_body)
     );
-    let first = first.json::<KvMutationResponse>().await.unwrap();
-    let second = second.json::<KvMutationResponse>().await.unwrap();
+    let first = kv_mutation_response(first, "first concurrent write").await;
+    let second = kv_mutation_response(second, "second concurrent write").await;
 
     assert_eq!(first.applied_index, second.applied_index);
     assert_eq!(first.hash, second.hash);
     assert_ne!(first.result, second.result);
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
 
-    let first_retry = post_kv_put(&client, addr, &first_body)
-        .await
-        .json::<KvMutationResponse>()
-        .await
-        .unwrap();
-    let second_retry = post_kv_put(&client, addr, &second_body)
-        .await
-        .json::<KvMutationResponse>()
-        .await
-        .unwrap();
+    let first_retry = kv_mutation_response(
+        post_kv_put(&client, addr, &first_body).await,
+        "first write retry",
+    )
+    .await;
+    let second_retry = kv_mutation_response(
+        post_kv_put(&client, addr, &second_body).await,
+        "second write retry",
+    )
+    .await;
     assert_eq!(first_retry, first);
     assert_eq!(second_retry, second);
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -845,6 +845,35 @@ async fn post_kv_put(
         .send()
         .await
         .unwrap()
+}
+
+async fn kv_mutation_response(response: reqwest::Response, request: &str) -> KvMutationResponse {
+    const MAX_ERROR_BODY_BYTES: usize = 1024;
+
+    let status = response.status();
+    if status.is_success() {
+        return response.json::<KvMutationResponse>().await.unwrap_or_else(|error| {
+            panic!("{request} returned success status {status} but invalid mutation response: {error}")
+        });
+    }
+
+    let content_length = response.content_length();
+    let mut response = response;
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let Some(chunk) = response.chunk().await.unwrap_or_else(|error| {
+            panic!("{request} response body read failed after status {status}: {error}")
+        }) else {
+            break;
+        };
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+
+    panic!(
+        "{request} returned status {status} (content-length {content_length:?}): {}",
+        String::from_utf8_lossy(&body),
+    );
 }
 
 fn restore_archive(archive_root: &Path, archive_backup: &Path) {
