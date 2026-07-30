@@ -1734,7 +1734,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "current_thread")]
     async fn owned_and_unowned_consensus_groups_do_not_cross_cancel_under_shutdown_races() {
         let _serial = CONSENSUS_GROUP_STRESS_SERIALIZER
             .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1764,7 +1764,12 @@ mod tests {
                 tokio::spawn(async move { owned_handle.put("owned", "key", "value").await });
             let readiness_watchdog = Duration::from_secs(15);
             assert!(
-                owned_gate.wait_for_entered(2, readiness_watchdog),
+                tokio::task::spawn_blocking({
+                    let owned_gate = owned_gate.clone();
+                    move || owned_gate.wait_for_entered(2, readiness_watchdog)
+                })
+                .await
+                .expect("owned gate waiter must not panic"),
                 "owned group {iteration} did not enter both slot-scoped quorum gates"
             );
             let unrelated_consensus = consensus.clone();
@@ -1784,7 +1789,12 @@ mod tests {
                 )
             });
             assert!(
-                unowned_gate.wait_for_entered(1, readiness_watchdog),
+                tokio::task::spawn_blocking({
+                    let unowned_gate = unowned_gate.clone();
+                    move || unowned_gate.wait_for_entered(1, readiness_watchdog)
+                })
+                .await
+                .expect("unowned gate waiter must not panic"),
                 "unowned group {iteration} did not enter its non-overlapping slot gate"
             );
             assert!(
