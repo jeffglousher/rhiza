@@ -4351,11 +4351,21 @@ impl RecordWorker {
     }
 
     fn shutdown(&mut self) {
-        self.state.close_and_drain();
-        // Do not join here: a custom RecorderRpc may be stuck in a syscall or
-        // may ignore cancellation altogether. Dropping JoinHandle detaches the
-        // worker, while every future call observes this worker's cancellation.
-        self.handle.take();
+        // Closing/draining is also the admission fence. Only the post-close
+        // snapshot can prove that no recorder call is running: a pre-close
+        // idle observation could race a newly admitted noncooperative RPC.
+        let join_idle_worker = self.state.close_and_drain();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if join_idle_worker || handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        // A running custom RecorderRpc may be stuck in a syscall or ignore
+        // cancellation. Keep shutdown bounded in that case: detaching retains
+        // only the worker-owned recorder/state Arcs, never a runtime borrow.
+        drop(handle);
     }
 }
 
@@ -4543,7 +4553,9 @@ impl RecordWorkerState {
         self.close_and_drain();
     }
 
-    fn close_and_drain(&self) {
+    /// Fences admission and returns whether no job remained running after
+    /// queued jobs were drained. A true result permits a bounded worker join.
+    fn close_and_drain(&self) -> bool {
         self.cancellation.store(true, Ordering::Release);
         let drained = {
             let mut queue = lock_unpoison(&self.queue.state);
@@ -4559,6 +4571,7 @@ impl RecordWorkerState {
             }
             job.fail_for_worker();
         }
+        self.pending.load(Ordering::Acquire) == 0
     }
 }
 
@@ -5884,7 +5897,7 @@ impl ControlWorker {
 
     #[cfg(test)]
     fn dispatch(&self, job: ControlJob) -> ControlDispatch {
-        self.dispatch_inner(job, None, None, None)
+        Self::dispatch_inner(&self.state, job, None, None, None)
     }
 
     #[cfg(test)]
@@ -5893,11 +5906,11 @@ impl ControlWorker {
         job: ControlJob,
         cancellation: Arc<AtomicBool>,
     ) -> ControlDispatch {
-        self.dispatch_inner(job, Some(cancellation), None, None)
+        Self::dispatch_inner(&self.state, job, Some(cancellation), None, None)
     }
 
     fn dispatch_group(&self, job: ControlJob, group: &ControlCallGroup) -> ControlDispatch {
-        self.dispatch_inner(job, None, Some(group), None)
+        Self::dispatch_inner(&self.state, job, None, Some(group), None)
     }
 
     /// Marks the caller's mutation certainty while the queue is still locked,
@@ -5908,11 +5921,11 @@ impl ControlWorker {
         group: &ControlCallGroup,
         mutation_started: &AtomicBool,
     ) -> ControlDispatch {
-        self.dispatch_inner(job, None, Some(group), Some(mutation_started))
+        Self::dispatch_inner(&self.state, job, None, Some(group), Some(mutation_started))
     }
 
     fn dispatch_inner(
-        &self,
+        state: &Arc<ControlWorkerState>,
         job: ControlJob,
         cancelled: Option<Arc<AtomicBool>>,
         group: Option<&ControlCallGroup>,
@@ -5921,10 +5934,10 @@ impl ControlWorker {
         let mut queued_job = Some(QueuedControlJob {
             job,
             cancelled,
-            completion: ControlCompletionGuard::new(Arc::clone(&self.state.pending)),
+            completion: ControlCompletionGuard::new(Arc::clone(&state.pending)),
         });
         let (pruned, error, outcome) = {
-            let mut queue = lock_unpoison(&self.state.queue.state);
+            let mut queue = lock_unpoison(&state.queue.state);
             let mut pruned = Vec::new();
             let mut retained = VecDeque::with_capacity(queue.jobs.len());
             while let Some(job) = queue.jobs.pop_front() {
@@ -5935,7 +5948,7 @@ impl ControlWorker {
                 }
             }
             queue.jobs = retained;
-            if queue.closed || self.state.quarantined.load(Ordering::Acquire) {
+            if queue.closed || state.quarantined.load(Ordering::Acquire) {
                 (pruned, Some(Error::ProposeFailed), ControlDispatch::Failed)
             } else if queue.jobs.len() >= CONTROL_WORKER_QUEUE_CAPACITY {
                 (
@@ -5949,14 +5962,14 @@ impl ControlWorker {
                 let queued = queued_job.as_mut().expect("control job must be present");
                 // The lease and pending increment happen while the queue is
                 // still locked, before a worker can pop the job.
-                queued.completion.arm(group, &self.state);
+                queued.completion.arm(group, state);
                 if let Some(mutation_started) = mutation_started {
                     mutation_started.store(true, Ordering::Release);
                 }
                 queue
                     .jobs
                     .push_back(queued_job.take().expect("control job must be present"));
-                self.state.queue.available.notify_one();
+                state.queue.available.notify_one();
                 (pruned, None, ControlDispatch::Accepted)
             }
         };
@@ -5979,10 +5992,39 @@ impl ControlWorker {
     }
 
     fn shutdown(&mut self) {
-        self.state.close_and_drain();
-        // See RecordWorker::shutdown: lifecycle ownership must remain bounded
-        // even when a third-party RecorderRpc never returns.
-        self.handle.take();
+        self.shutdown_after_before_close();
+    }
+
+    #[cfg(test)]
+    fn shutdown_after_stale_idle_observation(
+        &mut self,
+        before_close: impl FnOnce(),
+    ) -> (bool, bool) {
+        // The seam is immediately before the admission fence. If an idle
+        // snapshot were taken before this callback, a real dispatch below
+        // could make that snapshot stale before close runs.
+        let stale_idle = self.is_idle();
+        before_close();
+        let current_idle = self.is_idle();
+        self.shutdown_after_before_close();
+        (stale_idle, current_idle)
+    }
+
+    fn shutdown_after_before_close(&mut self) {
+        // See RecordWorker::shutdown: closing first serializes the running
+        // snapshot with admission, so a successful join never waits on an
+        // RPC that raced a stale pre-close idle observation.
+        let join_idle_worker = self.state.close_and_drain();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if join_idle_worker || handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        // Preserve bounded shutdown for a noncooperative RecorderRpc. The
+        // detached closure owns only the explicit recorder/state Arcs.
+        drop(handle);
     }
 
     #[cfg(test)]
@@ -6068,7 +6110,9 @@ impl ControlWorkerState {
         self.close_and_drain();
     }
 
-    fn close_and_drain(&self) {
+    /// Fences admission and returns whether no job remained running after
+    /// queued jobs were drained. A true result permits a bounded worker join.
+    fn close_and_drain(&self) -> bool {
         self.cancellation.store(true, Ordering::Release);
         let drained = {
             let mut queue = lock_unpoison(&self.queue.state);
@@ -6079,6 +6123,7 @@ impl ControlWorkerState {
         for job in drained {
             job.fail_for_worker();
         }
+        self.pending.load(Ordering::Acquire) == 0
     }
 }
 
@@ -19911,33 +19956,81 @@ mod tests {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let mut release = ChannelRelease::new(release_tx);
-        let worker = ControlWorker::spawn(Arc::new(BlockingControlRecorder {
+        let mut worker = ControlWorker::spawn(Arc::new(BlockingControlRecorder {
             recorder_id: "n2",
             started: started_tx,
             release_first: Mutex::new(release_rx),
         }))
         .unwrap();
+        let state = Arc::clone(&worker.state);
+        let (seam_entered_tx, seam_entered_rx) = mpsc::sync_channel(1);
+        let (seam_release_tx, seam_release_rx) = mpsc::sync_channel(0);
         let (result_tx, _result_rx) = mpsc::sync_channel(1);
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            let idle_transition = worker.shutdown_after_stale_idle_observation(|| {
+                seam_entered_tx.send(()).unwrap();
+                seam_release_rx.recv().unwrap();
+            });
+            shutdown_done_tx.send(idle_transition).unwrap();
+        });
+        assert_eq!(seam_entered_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+
+        // This uses the exact admission function that normal worker dispatch
+        // uses. It is now definitely between the shutdown seam and close.
         assert_eq!(
-            worker.dispatch(ControlJob::InspectProof {
-                index: 1,
-                context: RecorderRpcContext::default_timeout(),
-                slot: 1,
-                result: result_tx,
-            }),
+            ControlWorker::dispatch_inner(
+                &state,
+                ControlJob::InspectProof {
+                    index: 1,
+                    context: RecorderRpcContext::default_timeout(),
+                    slot: 1,
+                    result: result_tx,
+                },
+                None,
+                None,
+                None,
+            ),
             ControlDispatch::Accepted
         );
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(10)), Ok(1));
-        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
-        let dropper = thread::spawn(move || {
-            drop(worker);
-            dropped_tx.send(()).unwrap();
-        });
-        let drop_started = Instant::now();
-        assert_eq!(dropped_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
-        assert!(drop_started.elapsed() < Duration::from_secs(5));
+        seam_release_tx.send(()).unwrap();
+        // A stale pre-close idle snapshot would make shutdown join the blocked
+        // RPC here. The post-close snapshot instead chooses bounded detach.
+        assert_eq!(
+            shutdown_done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((true, false))
+        );
         release.release();
-        dropper.join().unwrap();
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn idle_file_recorders_release_root_locks_before_consensus_drop_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [
+            root.path().join("recorders/n1"),
+            root.path().join("recorders/n2"),
+            root.path().join("recorders/n3"),
+        ];
+        let consensus = ThreeNodeConsensus::from_recovered_tip(
+            "cluster",
+            "n1",
+            1,
+            1,
+            roots.clone(),
+            1,
+            LogHash::ZERO,
+        )
+        .unwrap();
+
+        // Drop is the lifecycle boundary: reopening the exact same recorder
+        // roots immediately proves that every idle record/control worker gave
+        // up its RecorderFileStore ownership before it returned.
+        drop(consensus);
+        let reopened =
+            ThreeNodeConsensus::from_recovered_tip("cluster", "n1", 1, 1, roots, 1, LogHash::ZERO);
+        assert!(reopened.is_ok());
     }
 
     #[test]
