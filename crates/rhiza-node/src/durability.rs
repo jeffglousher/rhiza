@@ -3566,6 +3566,11 @@ fn validate_restore_marker_name(marker_name: &str) -> Result<(), DurabilityError
 
 fn validate_restore_completion_marker_name(marker_name: &str) -> Result<(), DurabilityError> {
     validate_restore_marker_name(marker_name)?;
+    if !is_portable_completion_marker_name(marker_name) {
+        return Err(DurabilityError::SnapshotVerification(
+            "restore completion marker name is not portable ASCII".into(),
+        ));
+    }
     // Recovery control names are ASCII protocol names. Compare them with
     // ASCII case folding so a marker accepted on a case-sensitive filesystem
     // cannot later alias a control path on a case-insensitive filesystem.
@@ -3596,6 +3601,28 @@ fn validate_restore_completion_marker_name(marker_name: &str) -> Result<(), Dura
         ));
     }
     Ok(())
+}
+
+fn is_portable_completion_marker_name(marker_name: &str) -> bool {
+    let bytes = marker_name.as_bytes();
+    if bytes.is_empty()
+        || bytes.ends_with(b".")
+        || bytes.ends_with(b" ")
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let stem = marker_name.split('.').next().unwrap_or_default();
+    let reserved_device = stem.eq_ignore_ascii_case("con")
+        || stem.eq_ignore_ascii_case("prn")
+        || stem.eq_ignore_ascii_case("aux")
+        || stem.eq_ignore_ascii_case("nul")
+        || (stem.len() == 4
+            && (stem[..3].eq_ignore_ascii_case("com") || stem[..3].eq_ignore_ascii_case("lpt"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    !reserved_device
 }
 
 fn is_owned_generated_recovery_name(name: &str, prefix: &str) -> bool {
@@ -4328,6 +4355,44 @@ mod tests {
         sync::{mpsc, Arc, Barrier, Mutex},
         time::Duration,
     };
+
+    #[test]
+    fn completion_marker_names_follow_one_portable_ascii_grammar() {
+        let cases = [
+            ("identity.json", true),
+            ("marker-1_2", true),
+            ("CON.txt", false),
+            ("con.JSON", false),
+            ("COM1.log", false),
+            ("lpt9.txt", false),
+            ("file:ads", false),
+            ("file.", false),
+            ("file ", false),
+            ("é.json", false),
+            ("control\u{001f}.json", false),
+            ("<", false),
+            (">", false),
+            ("\"", false),
+            ("|", false),
+            ("?", false),
+            ("*", false),
+            (".", false),
+            ("..", false),
+            ("dir/file", false),
+            ("dir\\file", false),
+            ("C:marker", false),
+            ("\\\\server\\share", false),
+            (".RHIZA-RESTORE.JSON", false),
+            ("CONSENSUS", false),
+        ];
+        for (name, accepted) in cases {
+            assert_eq!(
+                RestoreCompletionMarker::new(name, b"marker").is_ok(),
+                accepted,
+                "completion marker grammar result for {name:?}"
+            );
+        }
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct RestoreTreeEntry {
