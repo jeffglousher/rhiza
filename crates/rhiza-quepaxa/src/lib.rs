@@ -8059,8 +8059,15 @@ impl ThreeNodeConsensus {
         let mut observed_unknown = false;
         let mut safety_error = None;
         let mut frozen: Option<Result<Option<DecisionProof>>> = None;
-        let mut provisional_none = false;
-        while (frozen.is_none() || provisional_none) && !observed_unknown {
+        let mut provisional_none_hook_fired = false;
+        // An admitted summary RPC remains safety-relevant even after a
+        // quorum has produced a candidate.  In particular, a quorum of
+        // `None` responses cannot establish absence while another admitted
+        // recorder can still report an occupied slot or a conflicting proof.
+        // Keep the bounded original W/D until every admitted reply is
+        // observed (or the caller deadline/cancellation makes that
+        // impossible); only then may cleanup prune anything left queued.
+        while !observed_unknown {
             if let Err(error) = budget.check_admission() {
                 frozen = Some(Err(error));
                 break;
@@ -8098,16 +8105,15 @@ impl ThreeNodeConsensus {
             }
             if successful >= quorum {
                 let proof = self.proof_from_record_summaries(slot, &summaries);
-                provisional_none = matches!(&proof, Ok(None)) && !summaries.is_empty();
-                frozen = Some(proof);
-                if provisional_none {
-                    // `None` mixed with real summary evidence is not a
-                    // terminal absence result: an already admitted recorder
-                    // can still supply the matching proof. Keep collecting
-                    // under the original W/D budget before cancelling work.
+                if matches!(&proof, Ok(None))
+                    && !summaries.is_empty()
+                    && !provisional_none_hook_fired
+                {
+                    provisional_none_hook_fired = true;
                     #[cfg(test)]
                     pause_after_summary_provisional_none(&budget.caller);
                 }
+                frozen = Some(proof);
             }
         }
         let mut frozen = dispatch_error.map(Err).unwrap_or_else(|| {
@@ -14196,6 +14202,117 @@ mod tests {
             inspection,
             Ok(CertifiedDecisionInspection::Committed(_))
         ));
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_empty_quorum_keeps_a_queued_occupied_recorder_until_inspected() {
+        const BLOCKER_SLOT: Slot = 2;
+
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let summary = RecordSummary {
+            recorder_id: "n1".into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 1,
+            first_current: None,
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (blocker_started_tx, blocker_started_rx) = mpsc::sync_channel(1);
+        let blocker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_blocker = GateRelease::new(Arc::clone(&blocker_gate));
+        let (queued_summary_started_tx, queued_summary_started_rx) = mpsc::sync_channel(1);
+        let (empty_entered_tx, empty_entered_rx) = mpsc::sync_channel(2);
+        let command = StoredCommand::new(EntryType::Command, Vec::new());
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingQueuedSummaryFetchRecorder {
+                    blocker_slot: BLOCKER_SLOT,
+                    blocker_started: blocker_started_tx,
+                    blocker_gate: Arc::clone(&blocker_gate),
+                    summary_started: queued_summary_started_tx,
+                    summary,
+                    command,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: empty_entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: empty_entered_tx,
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+
+        let (blocker_result_tx, blocker_result_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[0].dispatch(ControlJob::InspectSummary {
+                index: 0,
+                context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                slot: BLOCKER_SLOT,
+                result: blocker_result_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        blocker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+
+        for _ in 0..2 {
+            empty_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+        }
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&blocker_gate);
+        assert_eq!(
+            queued_summary_started_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "an admitted occupied recorder must not be pruned after an empty quorum"
+        );
+        assert_eq!(
+            blocker_result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            (0, Ok(None))
+        );
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(CertifiedDecisionInspection::Unavailable)
+        );
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }

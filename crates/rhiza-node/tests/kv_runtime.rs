@@ -14,7 +14,10 @@ use rhiza_node::{
     PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
+use rhiza_quepaxa::{
+    Error as QuePaxaError, Membership, RecordRequest, RecordSummary, RecorderFileStore,
+    RecorderRpc, RecorderRpcContext, ThreeNodeConsensus,
+};
 
 const CLUSTER_ID: &str = "rhiza:kv:cluster-a";
 
@@ -82,8 +85,12 @@ fn kv_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
 fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() {
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
-    let runtime =
-        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let runtime = NodeRuntime::open(
+        config.clone(),
+        consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
+        &[],
+    )
+    .unwrap();
     let first = runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
@@ -92,7 +99,6 @@ fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() 
         .unwrap();
     drop(runtime);
 
-    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
@@ -128,8 +134,12 @@ fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders()
     for attempt in 0..20 {
         let dir = tempfile::tempdir().unwrap();
         let config = kv_config(dir.path());
-        let runtime =
-            NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+        let runtime = NodeRuntime::open(
+            config.clone(),
+            consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
+            &[],
+        )
+        .unwrap();
         runtime
             .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
             .unwrap();
@@ -140,7 +150,6 @@ fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders()
             .unwrap();
         drop(runtime);
 
-        std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
         std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
         std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
@@ -218,15 +227,18 @@ fn missing_partial_and_identity_invalid_unanchored_kv_rebuild_from_qlog() {
 fn corrupt_unanchored_kv_fails_closed_when_only_one_recorder_has_the_tail() {
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
-    let runtime =
-        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let runtime = NodeRuntime::open(
+        config.clone(),
+        consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
+        &[],
+    )
+    .unwrap();
     runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
     drop(runtime);
 
     std::fs::remove_dir_all(dir.path().join("recorders/n2")).unwrap();
-    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
@@ -876,6 +888,67 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
             ],
             1,
             LogHash::ZERO,
+        )
+        .unwrap(),
+    )
+}
+
+struct UnavailableRecorder;
+
+impl RecorderRpc for UnavailableRecorder {
+    fn record(
+        &self,
+        _context: &RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, QuePaxaError> {
+        Err(QuePaxaError::ProposeFailed)
+    }
+
+    fn inspect_record_summary(
+        &self,
+        _context: &RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<RecordSummary>, QuePaxaError> {
+        Err(QuePaxaError::ProposeFailed)
+    }
+}
+
+fn consensus_with_unavailable_third_recorder(
+    root: &Path,
+    recorder_dir: &str,
+) -> Arc<ThreeNodeConsensus> {
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let recorder = |recorder_id| {
+        RecorderFileStore::new_with_membership(
+            root.join(recorder_dir).join(recorder_id),
+            recorder_id,
+            CLUSTER_ID,
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap()
+    };
+    Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            CLUSTER_ID,
+            "n1",
+            1,
+            1,
+            vec![
+                (
+                    "n1".into(),
+                    Box::new(recorder("n1")) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(recorder("n2")) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(UnavailableRecorder) as Box<dyn RecorderRpc>,
+                ),
+            ],
         )
         .unwrap(),
     )
