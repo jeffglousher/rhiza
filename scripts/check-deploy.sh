@@ -11,6 +11,12 @@ shellcheck scripts/*.sh
 bash -n scripts/*.sh
 yq eval '.' deploy/k8s/*.yaml >/dev/null
 
+if grep -nF '/bin/sh' deploy/k8s/rhiza-cluster.yaml deploy/k8s/rhiza-checkpoint-job.yaml \
+  scripts/render-k8s-config.sh; then
+  echo "Rhiza runtime and object-admin images must not depend on a shell" >&2
+  exit 1
+fi
+
 client_service=deploy/k8s/rhiza-client-services.yaml
 [ "$(yq eval-all '[select(.kind == "Service")] | length' "$client_service")" = 1 ]
 grep -Fq 'k apply -f deploy/k8s/rhiza-client-services.yaml' scripts/e2e-vind-rustfs.sh
@@ -73,6 +79,34 @@ assert_statefulset_env_values_are_quoted_strings() {
     return 1
   }
 }
+assert_rhiza_workload_security() {
+  manifest="$1"
+  yq eval-all -e '
+    select(.kind == strenv(CHECK_WORKLOAD_KIND)) |
+    [
+      .spec.template.spec.securityContext.runAsNonRoot == true,
+      .spec.template.spec.securityContext.runAsUser == 65532,
+      .spec.template.spec.securityContext.runAsGroup == 65532,
+      .spec.template.spec.securityContext.fsGroup == 65532,
+      .spec.template.spec.securityContext.fsGroupChangePolicy == "OnRootMismatch",
+      .spec.template.spec.securityContext.seccompProfile.type == "RuntimeDefault",
+      (.spec.template.spec.containers[] | select(.name == strenv(CHECK_CONTAINER_NAME)) | [
+        .securityContext.allowPrivilegeEscalation == false,
+        .securityContext.readOnlyRootFilesystem == true,
+        (.securityContext.capabilities.drop | length == 1),
+        .securityContext.capabilities.drop[0] == "ALL",
+        ([.volumeMounts[] | select(.name == "tmp" and .mountPath == "/tmp")] |
+          length == 1)
+      ] | all),
+      ([.spec.template.spec.volumes[] | select(.name == "tmp" and has("emptyDir"))] |
+        length == 1)
+    ] | all
+  ' "$manifest" >/dev/null
+}
+export CHECK_WORKLOAD_KIND=Job CHECK_CONTAINER_NAME=rhiza
+assert_rhiza_workload_security deploy/k8s/rhiza-checkpoint-job.yaml
+export CHECK_CONTAINER_NAME=curl
+assert_rhiza_workload_security deploy/k8s/rhiza-admin-job.yaml
 for profile in sql graph kv; do
   for replicas in 3 7; do
   id="$replicas"
@@ -90,6 +124,8 @@ for profile in sql graph kv; do
     scripts/render-k8s-config.sh "$id" "$replicas" \
     "$tmp/config-${profile}-${id}.json" "$tmp/config-${profile}-${id}.yaml" successor
   assert_statefulset_env_values_are_quoted_strings "$tmp/config-${profile}-${id}.yaml"
+  export CHECK_WORKLOAD_KIND=StatefulSet CHECK_CONTAINER_NAME=rhiza
+  assert_rhiza_workload_security "$tmp/config-${profile}-${id}.yaml"
   yq eval '.' "$tmp/config-${profile}-${id}.yaml" >/dev/null
   [ "$(yq eval 'select(.kind == "StatefulSet") | .metadata.name' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}-c${id}" ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${profile}-${id}.yaml")" = "$replicas" ]
@@ -127,7 +163,8 @@ for profile in sql graph kv; do
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/prestage/config.json" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/source/config.json" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/transition/config.json" ]
-  yq eval -e 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].args[0] | contains("exec rhiza prestage serve")' "$tmp/config-${profile}-${id}.yaml" >/dev/null
+  [ "$(yq eval -o=json -I=0 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].args' "$tmp/config-${profile}-${id}.yaml")" = '["prestage","serve"]' ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].command // "absent"' "$tmp/config-${profile}-${id}.yaml")" = absent ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_TAIL_TOKEN") | .valueFrom.secretKeyRef.key' "$tmp/config-${profile}-${id}.yaml")" = tail-token ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.cpu' "$tmp/config-${profile}-${id}.yaml")" = 250m ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.memory' "$tmp/config-${profile}-${id}.yaml")" = 512Mi ]
@@ -167,6 +204,10 @@ RHIZA_EXECUTION_PROFILE=sql RHIZA_STARTUP_MODE=rejoin \
   .spec.template.spec.containers[0].env[] |
   select(.name == "RHIZA_STARTUP_MODE") | .value' \
   "$tmp/explicit-rejoin.yaml")" = rejoin ]
+[ "$(yq eval -o=json -I=0 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].args' \
+  "$tmp/explicit-rejoin.yaml")" = '["serve"]' ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].command // "absent"' \
+  "$tmp/explicit-rejoin.yaml")" = absent ]
 for invalid_startup_mode in '' bootstrap disaster recover; do
   if RHIZA_EXECUTION_PROFILE=sql RHIZA_STARTUP_MODE="$invalid_startup_mode" \
     scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \

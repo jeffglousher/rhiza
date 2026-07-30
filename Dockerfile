@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG RHIZA_PROFILE=sql
+ARG RHIZA_RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 
 FROM rust:1.95-trixie AS builder
 ARG RHIZA_PROFILE
@@ -30,11 +31,9 @@ RUN --mount=type=cache,id=rhiza-cargo-registry,target=/usr/local/cargo/registry,
     esac \
     && install -D -m 0755 /src/target/release/rhiza /out/rhiza
 
-FROM debian:trixie-slim
+FROM ${RHIZA_RUNTIME_IMAGE}
 ARG RHIZA_PROFILE
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 libstdc++6 \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/rhiza /usr/local/bin/rhiza
+COPY --from=builder --chown=65532:65532 /out/rhiza /usr/local/bin/rhiza
 LABEL io.rhiza.build-profile="$RHIZA_PROFILE"
-ENTRYPOINT ["rhiza"]
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/rhiza"]

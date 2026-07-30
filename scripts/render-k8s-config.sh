@@ -344,8 +344,8 @@ if "$successor_flag"; then
         with(.env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE");
           .value = "/etc/rhiza/prestage/config.json"
         ) |
-        .command = ["/bin/sh","-ec"] |
-        .args = ["ordinal=\"${HOSTNAME##*-}\"; case \"$ordinal\" in \"\"|*[!0-9]*) exit 64;; esac; export RHIZA_NODE_ID=\"node-$((ordinal + 1))\"; exec rhiza prestage serve"] |
+        del(.command) |
+        .args = ["prestage", "serve"] |
         .env += [
           {"name":"RHIZA_PRESTAGE_SOURCE_BUNDLE_FILE","value":"/etc/rhiza/source/config.json"},
           {"name":"RHIZA_PRESTAGE_TRANSITION_BUNDLE_FILE","value":"/etc/rhiza/transition/config.json"},
