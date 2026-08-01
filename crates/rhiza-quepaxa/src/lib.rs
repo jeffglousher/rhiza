@@ -12430,18 +12430,25 @@ mod tests {
             ),
             Ok(replies) if replies.len() == 2
         ));
+        let recovery_request = record_requests(&consensus, 4).remove(0);
+        let recovery_expected = record_summary("n1", recovery_request.clone());
+        let (recovered_tx, recovered_rx) = mpsc::sync_channel(1);
+        assert!(
+            matches!(
+                consensus.record_workers[0].dispatch(super::RecordJob {
+                    index: 0,
+                    context: RecorderRpcContext::with_timeout(event_timeout),
+                    request: recovery_request,
+                    result: recovered_tx,
+                }),
+                super::RecordDispatch::Accepted
+            ),
+            "released n1 must accept a later direct record"
+        );
         assert_eq!(
-            n1_started_rx.recv_timeout(event_timeout),
-            Ok(3),
-            "final recovery n1 worker state: pending={}, quarantined={}",
-            consensus.record_workers[0]
-                .state
-                .pending
-                .load(Ordering::Acquire),
-            consensus.record_workers[0]
-                .state
-                .quarantined
-                .load(Ordering::Acquire),
+            recovered_rx.recv_timeout(event_timeout),
+            Ok((0, Ok(recovery_expected))),
+            "released n1 must complete a later direct record",
         );
         assert!(consensus.finish_pending_rpcs(event_timeout));
     }
