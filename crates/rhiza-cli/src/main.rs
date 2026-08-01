@@ -6797,24 +6797,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[cfg(feature = "sql")]
-    async fn sequential_http_cluster_start_reaches_readiness_without_process_restart() {
-        sequential_cluster_start(RecorderTransport::Http).await;
+    async fn staggered_http_cluster_reaches_readiness_after_all_recorders_start() {
+        staggered_cluster_start(RecorderTransport::Http).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[cfg(feature = "sql")]
-    async fn sequential_tcp_postcard_cluster_commits_without_process_restart() {
-        sequential_cluster_start(RecorderTransport::TcpPostcard).await;
+    async fn staggered_tcp_postcard_cluster_commits_after_all_recorders_start() {
+        staggered_cluster_start(RecorderTransport::TcpPostcard).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[cfg(all(feature = "sql", feature = "recorder-postcard-rpc"))]
-    async fn sequential_postcard_rpc_cluster_commits_without_process_restart() {
-        sequential_cluster_start(RecorderTransport::TcpPostcardRpc).await;
+    async fn staggered_postcard_rpc_cluster_commits_after_all_recorders_start() {
+        staggered_cluster_start(RecorderTransport::TcpPostcardRpc).await;
     }
 
     #[cfg(feature = "sql")]
-    async fn sequential_cluster_start(recorder_transport: RecorderTransport) {
+    async fn staggered_cluster_start(recorder_transport: RecorderTransport) {
         let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
         let temp = tempfile::tempdir().unwrap();
         let recorder_addresses = [
@@ -6924,16 +6924,28 @@ mod tests {
         let second = tokio::spawn(serve_until(configs[1].clone(), async move {
             let _ = second_wait.await;
         }));
-        wait_until_ready(&client_addresses[0]).await;
-        wait_until_ready(&client_addresses[1]).await;
 
         let (third_shutdown, third_wait) = tokio::sync::oneshot::channel();
         let third = tokio::spawn(serve_until(configs[2].clone(), async move {
             let _ = third_wait.await;
         }));
-        for address in &client_addresses {
+        for index in 0..recorder_addresses.len() {
+            let recorder_address = match recorder_transport {
+                RecorderTransport::Http => &recorder_addresses[index],
+                RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard => {
+                    &tcp_addresses[index]
+                }
+                #[cfg(feature = "recorder-postcard-rpc")]
+                RecorderTransport::TcpPostcardRpc | RecorderTransport::TcpTlsPostcardRpc => {
+                    &tcp_addresses[index]
+                }
+            };
+            wait_for_tcp(recorder_address).await;
+        }
+        for address in &client_addresses[..2] {
             wait_until_ready(address).await;
         }
+        wait_until_ready(&client_addresses[2]).await;
         let committed = request_write(&WriteArgs {
             urls: client_addresses
                 .iter()

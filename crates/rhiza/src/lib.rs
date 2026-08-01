@@ -1572,7 +1572,12 @@ mod tests {
                 if index <= 1 {
                     gates.insert(owned_slot, owned_gate.clone());
                 }
-                if index >= 1 {
+                // Recorder 1's unowned RPC queues behind its owned RPC;
+                // recorder 2 is the one actively held at the unowned
+                // recorder boundary. Keep this gate specific so the test can
+                // prove an unowned record() attempt rather than merely a
+                // proposal thread start.
+                if index == 2 {
                     gates.insert(unowned_slot, unowned_gate.clone());
                 }
                 Ok((
@@ -1772,8 +1777,28 @@ mod tests {
                 .expect("owned gate waiter must not panic"),
                 "owned group {iteration} did not enter both slot-scoped quorum gates"
             );
+            assert!(
+                tokio::time::timeout(readiness_watchdog, async {
+                    while owned_group_probe.outstanding() != 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok(),
+                "owned recorder 2 did not drain before unowned dispatch: \
+                 dispatched={} max_outstanding={} outstanding={} drained={} workers={:?}",
+                owned_group_probe.dispatch_count(),
+                owned_group_probe.observed_max_outstanding(),
+                owned_group_probe.outstanding(),
+                owned_group_probe.drained_count(),
+                owned_group_probe.worker_transitions(),
+            );
+            let (unrelated_started_tx, unrelated_started_rx) = std::sync::mpsc::sync_channel(1);
             let unrelated_consensus = consensus.clone();
             let unrelated = std::thread::spawn(move || {
+                unrelated_started_tx
+                    .send(())
+                    .expect("unowned proposal start receiver must stay alive");
                 unrelated_consensus.propose_at(
                     // This is the caller-owned operation budget, not the
                     // intentionally short shutdown deadline below. Keep it
@@ -1789,13 +1814,38 @@ mod tests {
                 )
             });
             assert!(
+                tokio::task::spawn_blocking(move || {
+                    unrelated_started_rx.recv_timeout(readiness_watchdog)
+                })
+                .await
+                .expect("unowned proposal start waiter must not panic")
+                .is_ok(),
+                "unowned proposal thread {iteration} did not start before the dispatch watchdog"
+            );
+            assert!(
+                tokio::task::spawn_blocking({
+                    let unowned_group_probe = Arc::clone(&unowned_group_probe);
+                    move || unowned_group_probe.wait_for_admitted_outstanding(readiness_watchdog)
+                })
+                .await
+                .expect("unowned admission waiter must not panic"),
+                "unowned proposal thread {iteration} started but did not dispatch an admitted \
+                 recorder RPC group: dispatched={} max_outstanding={} outstanding={} drained={} workers={:?}",
+                unowned_group_probe.dispatch_count(),
+                unowned_group_probe.observed_max_outstanding(),
+                unowned_group_probe.outstanding(),
+                unowned_group_probe.drained_count(),
+                unowned_group_probe.worker_transitions(),
+            );
+            assert!(
                 tokio::task::spawn_blocking({
                     let unowned_gate = unowned_gate.clone();
                     move || unowned_gate.wait_for_entered(1, readiness_watchdog)
                 })
                 .await
                 .expect("unowned gate waiter must not panic"),
-                "unowned group {iteration} did not enter its non-overlapping slot gate"
+                "unowned group {iteration} dispatched but recorder 2 did not enter its \
+                 non-overlapping slot gate"
             );
             assert!(
                 owned_group_probe.wait_for_admitted_outstanding(readiness_watchdog),
@@ -1806,16 +1856,6 @@ mod tests {
                 owned_group_probe.outstanding(),
                 owned_group_probe.drained_count(),
                 owned_group_probe.worker_transitions(),
-            );
-            assert!(
-                unowned_group_probe.wait_for_admitted_outstanding(readiness_watchdog),
-                "unowned group {iteration} did not admit an outstanding lease: \
-                 dispatched={} max_outstanding={} outstanding={} drained={} workers={:?}",
-                unowned_group_probe.dispatch_count(),
-                unowned_group_probe.observed_max_outstanding(),
-                unowned_group_probe.outstanding(),
-                unowned_group_probe.drained_count(),
-                unowned_group_probe.worker_transitions(),
             );
             assert!(
                 owned_group_probe.outstanding() >= 2,

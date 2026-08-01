@@ -7011,7 +7011,7 @@ impl ThreeNodeConsensus {
         &self,
         proof: DecisionProof,
         known_command: Option<&StoredCommand>,
-        transition_involved: bool,
+        _transition_involved: bool,
         context: &RecorderRpcContext,
         mutation_started: &AtomicBool,
     ) -> Result<DriveOutcome> {
@@ -7031,7 +7031,7 @@ impl ThreeNodeConsensus {
             .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
         let mut control_budget = None;
         let mut fetched_command = false;
-        let command = match known_command {
+        let _command = match known_command {
             Some(command)
                 if self.command_matches_value(proof_context(&proof).0, value, command) =>
             {
@@ -7048,12 +7048,6 @@ impl ThreeNodeConsensus {
                 .ok_or(Error::CommandUnavailable)?
             }
         };
-        if !matches!(&proof, DecisionProof::Phase2 { .. })
-            && command.entry_type != EntryType::ConfigChange
-            && !transition_involved
-        {
-            return Ok(DriveOutcome::Decision(proof));
-        }
         let budget = Self::finish_control_budget(&mut control_budget, context, mutation_started)?;
         if fetched_command {
             #[cfg(test)]
@@ -7068,8 +7062,74 @@ impl ThreeNodeConsensus {
                 },
             );
         }
-        self.install_decision_proof_quorum_with_budget(budget, proof.clone(), mutation_started)?;
+        if let Err(error) =
+            self.install_decision_proof_quorum_with_budget(budget, proof.clone(), mutation_started)
+        {
+            // Once a decision proof exists, any non-safety failure while
+            // durably installing it may follow a partial install.  Returning
+            // a retryable transport/quorum failure would permit a caller to
+            // treat the decided slot as uncommitted.
+            if Self::is_control_safety_error(&error)
+                || matches!(
+                    error,
+                    Error::TypedProofInstallRequired | Error::TypedRecordRequired
+                )
+            {
+                return Err(error);
+            }
+            return self.reconcile_post_decision_unknown_outcome(
+                budget,
+                mutation_started,
+                &proof,
+                &_command,
+            );
+        }
         Ok(DriveOutcome::Decision(proof))
+    }
+
+    /// A failed durable-proof acknowledgement is ambiguous only after a
+    /// decision exists. The installer has already drained its worker group
+    /// before returning, so this bounded inspection can reuse the same
+    /// caller deadline without nesting control-worker groups.
+    fn reconcile_post_decision_unknown_outcome(
+        &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
+        proof: &DecisionProof,
+        offered_command: &StoredCommand,
+    ) -> Result<DriveOutcome> {
+        let slot = proof_context(proof).0;
+        let value = proof
+            .proposal()
+            .value
+            .as_ref()
+            .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
+        match self.inspect_typed_record_summaries_with_budget(
+            budget,
+            mutation_started,
+            slot,
+            value.prev_hash,
+        ) {
+            Ok(CertifiedDecisionInspection::Committed(certified))
+                if certified.certificate.value == *value
+                    && certified.entry.entry_type == offered_command.entry_type
+                    && certified.entry.payload == offered_command.payload
+                    && self.command_matches_value(slot, value, offered_command) =>
+            {
+                Ok(DriveOutcome::Decision(proof.clone()))
+            }
+            // Both certificates were individually validated for this exact
+            // slot and predecessor. A different decided value is therefore
+            // safety evidence, never permission to acknowledge our offer.
+            Ok(CertifiedDecisionInspection::Committed(_)) => Err(Error::ConflictingCertificates),
+            Ok(
+                CertifiedDecisionInspection::Empty
+                | CertifiedDecisionInspection::Pending
+                | CertifiedDecisionInspection::Unavailable,
+            ) => Err(Error::UnknownOutcome),
+            Err(error) if Self::is_control_safety_error(&error) => Err(error),
+            Err(_) => Err(Error::UnknownOutcome),
+        }
     }
 
     fn finish_control_budget<'a>(
@@ -7171,6 +7231,7 @@ impl ThreeNodeConsensus {
         let mut worker_failed = dispatches.contains(&Some(ControlDispatch::Failed));
         let mut observed_unknown = false;
         let mut safety_error = None;
+        let mut typed_error = None;
         let mut frozen = dispatch_error.map(Err);
         let mut disconnected = false;
         while frozen.is_none() {
@@ -7225,6 +7286,11 @@ impl ThreeNodeConsensus {
                     Err(error) if Self::is_control_safety_error(&error) => {
                         safety_error.get_or_insert(error);
                     }
+                    Err(
+                        error @ (Error::TypedProofInstallRequired | Error::TypedRecordRequired),
+                    ) => {
+                        typed_error.get_or_insert(error);
+                    }
                     Err(_) => {}
                 }
             }
@@ -7267,6 +7333,11 @@ impl ThreeNodeConsensus {
                     Err(error) if Self::is_control_safety_error(&error) => {
                         safety_error.get_or_insert(error);
                     }
+                    Err(
+                        error @ (Error::TypedProofInstallRequired | Error::TypedRecordRequired),
+                    ) => {
+                        typed_error.get_or_insert(error);
+                    }
                     // Cleanup cancellation is delivery, not an independently
                     // ambiguous proof installation.
                     Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) | Err(_) => {}
@@ -7282,9 +7353,14 @@ impl ThreeNodeConsensus {
         if let Err(error) = budget.check_admission() {
             return Err(Self::store_context_error(error, mutation_started));
         }
+        if installed >= quorum {
+            return Ok(());
+        }
+        if let Some(error) = typed_error {
+            return Err(error);
+        }
         match frozen {
             Some(result) => result,
-            None if installed >= quorum => Ok(()),
             None if worker_failed && !control_quorum_reachable(installed, saturated, quorum) => {
                 Err(Error::ProposeFailed)
             }
@@ -8103,6 +8179,7 @@ impl ThreeNodeConsensus {
         let mut worker_failed = false;
         let mut observed_unknown = false;
         let mut safety_error = None;
+        let mut summary_error = None;
         let mut frozen: Option<Result<Option<DecisionProof>>> = None;
         let mut provisional_none_hook_fired = false;
         // An admitted summary RPC remains safety-relevant even after a
@@ -8142,11 +8219,19 @@ impl ThreeNodeConsensus {
                     summaries.extend(summary);
                 }
                 Err(Error::UnknownOutcome) => observed_unknown = true,
-                Err(Error::ProposeFailed) => worker_failed = true,
+                Err(Error::ProposeFailed) => {
+                    worker_failed = true;
+                    summary_error.get_or_insert(Error::ProposeFailed);
+                }
+                Err(error) if Self::is_control_safety_error(&error) => {
+                    safety_error.get_or_insert(error);
+                }
                 Ok(_) => {
                     safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
                 }
-                Err(_) => {}
+                Err(error) => {
+                    summary_error.get_or_insert(error);
+                }
             }
             if successful >= quorum {
                 let proof = self.proof_from_record_summaries(slot, &summaries);
@@ -8203,7 +8288,16 @@ impl ThreeNodeConsensus {
                     safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
                 }
                 Err(Error::UnknownOutcome) => observed_unknown = true,
-                _ => {}
+                Err(Error::ProposeFailed) => {
+                    worker_failed = true;
+                    summary_error.get_or_insert(Error::ProposeFailed);
+                }
+                Err(error) if Self::is_control_safety_error(&error) => {
+                    safety_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    summary_error.get_or_insert(error);
+                }
             }
         }
         if safety_error.is_none() {
@@ -8245,7 +8339,10 @@ impl ThreeNodeConsensus {
                 error
             });
         }
-        let proof = frozen?;
+        let proof = match frozen {
+            Ok(proof) => proof,
+            Err(error) => return Err(summary_error.unwrap_or(error)),
+        };
         if let Some(proof) = proof {
             #[cfg(test)]
             record_budget_identity(
@@ -8264,8 +8361,11 @@ impl ThreeNodeConsensus {
                 proof,
             );
         }
+        if let Some(error) = summary_error {
+            return Err(error);
+        }
         if successful < quorum {
-            if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
+            if worker_failed {
                 return Err(Error::ProposeFailed);
             }
             return Ok(CertifiedDecisionInspection::Unavailable);
@@ -11039,14 +11139,14 @@ mod tests {
         pause_after_next_summary_provisional_none, record_budget_identity_for,
         reset_command_file_reads, reset_sync_counts, sync_counts, sync_wal_append,
         sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
-        CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus,
-        ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob, ControlJobCancellation,
-        ControlWorker, DecisionInspection, DecisionProof, DriveOutcome, Error, FileSyncKind,
-        Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
-        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
-        RecordedHeadProvenance, RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc,
-        RecorderRpcContext, RecorderSlotState, RecorderSummary, RejectReason, SealFaultPoint,
-        SingleNodeConsensus, Slot, ThreeNodeConsensus,
+        CertifiedDecisionInspection, ClusterId, ConfigChange, ConfigId, ConfigurationState,
+        Consensus, ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob,
+        ControlJobCancellation, ControlWorker, DecisionInspection, DecisionProof, DriveOutcome,
+        Epoch, Error, FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority,
+        ProposerProgress, ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState,
+        RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderPreflight,
+        RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState, RecorderSummary,
+        RejectReason, SealFaultPoint, SingleNodeConsensus, Slot, ThreeNodeConsensus,
     };
     #[cfg(feature = "test-hooks")]
     use super::{
@@ -12176,6 +12276,8 @@ mod tests {
         let (n1_release_tx, n1_release_rx) = mpsc::sync_channel(1);
         let (n2_seen_tx, n2_seen_rx) = mpsc::sync_channel(4);
         let (n3_seen_tx, n3_seen_rx) = mpsc::sync_channel(4);
+        let record_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _record_gate = GateRelease::new(Arc::clone(&record_gate));
         let recorders = vec![
             (
                 "n1".into(),
@@ -12187,18 +12289,18 @@ mod tests {
             ),
             (
                 "n2".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedObservedSlotRecorder {
                     recorder_id: "n2",
-                    reject_slot: None,
-                    observed: Some(n2_seen_tx),
+                    observed: n2_seen_tx,
+                    release: Arc::clone(&record_gate),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
                 "n3".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedObservedSlotRecorder {
                     recorder_id: "n3",
-                    reject_slot: None,
-                    observed: Some(n3_seen_tx),
+                    observed: n3_seen_tx,
+                    release: Arc::clone(&record_gate),
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
@@ -12245,6 +12347,7 @@ mod tests {
         );
         #[cfg(not(feature = "test-hooks"))]
         assert_eq!(n1_started_rx.recv_timeout(event_timeout), Ok(1));
+        release_gate(&record_gate);
         assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(1));
         assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(1));
 
@@ -12261,12 +12364,19 @@ mod tests {
         });
         assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(2));
         assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(2));
-        assert!(
-            matches!(
-                b_done_rx.recv_timeout(event_timeout),
-                Ok(Ok(replies)) if replies.len() == 2
-            ),
-            "the frozen quorum must reclaim B's queued n1 job without waiting for B's W"
+        let b_replies = b_done_rx
+            .recv_timeout(event_timeout)
+            .expect("B must reclaim its queued n1 hedge after the n2+n3 quorum")
+            .expect("the frozen quorum must reclaim B's queued n1 job without waiting for B's W");
+        let b_recorder_ids: HashSet<_> = b_replies
+            .iter()
+            .map(|reply| reply.recorder_id.clone())
+            .collect();
+        assert_eq!(b_recorder_ids, HashSet::from(["n2".into(), "n3".into()]));
+        assert_eq!(
+            a_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "A must remain blocked on its running n1 hedge while B reclaims only B's queued hedge"
         );
         caller_b.join().unwrap();
         #[cfg(feature = "test-hooks")]
@@ -12303,10 +12413,15 @@ mod tests {
             .load(Ordering::Acquire));
 
         assert!(caller_a_guard.finish());
-        assert!(matches!(
-            a_done_rx.recv_timeout(event_timeout),
-            Ok(Ok(replies)) if replies.len() == 2
-        ));
+        let a_replies = a_done_rx
+            .recv_timeout(event_timeout)
+            .expect("A must finish after its running n1 hedge is released")
+            .expect("A frozen quorum must succeed");
+        let a_recorder_ids: HashSet<_> = a_replies
+            .iter()
+            .map(|reply| reply.recorder_id.clone())
+            .collect();
+        assert_eq!(a_recorder_ids, HashSet::from(["n2".into(), "n3".into()]));
         assert!(matches!(
             consensus.record_broadcast_with_context(
                 record_requests(&consensus, 3),
@@ -14019,6 +14134,113 @@ mod tests {
     }
 
     #[test]
+    fn summary_error_never_turns_a_none_quorum_into_empty() {
+        let run = |error: Error, expected: Error| {
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+            let recorders = [("n1", Ok(None)), ("n2", Ok(None)), ("n3", Err(error))]
+                .into_iter()
+                .map(|(recorder_id, reply)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ScriptedSummaryRecorder {
+                            recorder_id,
+                            entered: entered_tx.clone(),
+                            gate: None,
+                            reply,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            assert_eq!(
+                consensus.inspect_certified_decision_at(
+                    &RecorderRpcContext::default_timeout(),
+                    1,
+                    LogHash::ZERO,
+                ),
+                Err(expected)
+            );
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+        run(
+            Error::Io("summary io".into()),
+            Error::Io("summary io".into()),
+        );
+        run(
+            Error::Decode("summary decode".into()),
+            Error::Decode("summary decode".into()),
+        );
+        run(Error::TypedRecordRequired, Error::TypedRecordRequired);
+        run(Error::ProposeFailed, Error::ProposeFailed);
+        run(Error::RpcCancelled, Error::RpcCancelled);
+    }
+
+    #[test]
+    fn summary_direct_safety_error_beats_a_valid_proof_quorum() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"direct-safety".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(Some(summary("n1"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(Some(summary("n2"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: None,
+                    reply: Err(Error::Rejected(RejectReason::WrongConfig)),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.inspect_certified_decision_at(
+                &RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO,
+            ),
+            Err(Error::Rejected(RejectReason::WrongConfig))
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn summary_drain_promotes_late_quorum_proof_after_pending_freeze() {
         let _blocking = lock_blocking_control_tests();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
@@ -14121,6 +14343,112 @@ mod tests {
             panic!("a valid late quorum proof must be promoted: {inspection:?}");
         };
         assert_eq!(certified.proof.proposal().value, proposal.value);
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_none_quorum_waits_for_a_late_certified_single_copy() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"late-single-proof".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: membership.members()[..membership.quorum_size()]
+                .iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.clone(),
+                    slot: 1,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        let late_summary = RecordSummary {
+            recorder_id: "n1".into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal),
+            aggregate_prior: None,
+            decided: Some(proof.clone()),
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryFetchRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&late)),
+                    cancellation_observed: None,
+                    summary: late_summary,
+                    command: command.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        wait_for_control_worker_idle(&consensus.control_workers[1], "n2");
+        wait_for_control_worker_idle(&consensus.control_workers[2], "n3");
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        let Ok(CertifiedDecisionInspection::Committed(certified)) =
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("a late certified single-copy proof must prevent Empty");
+        };
+        assert_eq!(certified.proof, proof);
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
@@ -14805,6 +15133,91 @@ mod tests {
         assert_eq!(
             result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Err(Error::Rejected(RejectReason::InvalidCertificate))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_late_direct_safety_error_beats_a_frozen_valid_proof() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"late-direct-safety".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(summary("n1"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(summary("n2"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Err(Error::Rejected(RejectReason::WrongConfig)),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::Rejected(RejectReason::WrongConfig))
         );
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
@@ -15608,6 +16021,108 @@ mod tests {
             }
             Ok(record_summary(self.recorder_id, request))
         }
+
+        fn install_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> super::Result<()> {
+            Err(Error::ProposeFailed)
+        }
+    }
+
+    struct FailInstallFileStore {
+        inner: RecorderFileStore,
+        fail_install: Arc<AtomicBool>,
+    }
+
+    impl RecorderRpc for FailInstallFileStore {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            context.check()?;
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> super::Result<()> {
+            if self.fail_install.load(Ordering::Acquire) {
+                return Err(Error::ProposeFailed);
+            }
+            context.check()?;
+            self.inner.install_decision_proof(proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            context.check()?;
+            self.inner.inspect_decision_proof(slot)
+        }
+    }
+
+    /// Models a recorder which made the proof durable but lost the response.
+    /// The production caller must recover only from the independently
+    /// certified durable state, not from this wrapper's acknowledgement.
+    struct PersistThenUnknownInstallFileStore {
+        inner: RecorderFileStore,
+        persist: bool,
+    }
+
+    impl RecorderRpc for PersistThenUnknownInstallFileStore {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            context.check()?;
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> super::Result<()> {
+            context.check()?;
+            if self.persist {
+                self.inner.install_decision_proof(proof, membership)?;
+            }
+            Err(Error::UnknownOutcome)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            context.check()?;
+            self.inner.inspect_record_summary(slot)
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: ClusterId,
+            epoch: Epoch,
+            config_id: ConfigId,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            context.check()?;
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
     }
 
     struct GatedRecordRecorder {
@@ -15626,6 +16141,38 @@ mod tests {
             while !*released {
                 released = condition.wait(released).unwrap();
             }
+            Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    /// A cooperative, observable recorder gate used to freeze a quorum after
+    /// its jobs are admitted, without relying on scheduler timing.
+    struct GatedObservedSlotRecorder {
+        recorder_id: &'static str,
+        observed: mpsc::SyncSender<Slot>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecorderRpc for GatedObservedSlotRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            let (released, condition) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                context.check()?;
+                let (next, _) = condition
+                    .wait_timeout(released, Duration::from_millis(5))
+                    .unwrap();
+                released = next;
+            }
+            context.check()?;
+            drop(released);
+            self.observed
+                .send(request.slot)
+                .expect("observable test recorder receiver must remain live");
             Ok(record_summary(self.recorder_id, request))
         }
     }
@@ -15827,6 +16374,86 @@ mod tests {
             proposal,
             summaries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn installed_proof_is_idempotent_for_the_same_value_and_rejects_conflict() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let proof = test_decision_proof(&membership);
+        let mut state = RecorderSlotState::new_with_digest(1, "cluster", 1, 1, membership.digest());
+        assert_eq!(state.install_proof(proof.clone()), Ok(()));
+        assert_eq!(state.install_proof(proof.clone()), Ok(()));
+
+        let mut conflicting = proof;
+        let DecisionProof::FastPath { proposal, .. } = &mut conflicting else {
+            unreachable!("test decision proof is FastPath");
+        };
+        proposal
+            .value
+            .as_mut()
+            .expect("test decision proof has a value")
+            .entry_hash = LogHash::digest(&[b"conflicting"]);
+        assert_eq!(
+            state.install_proof(conflicting),
+            Err(RejectReason::AlreadyDecided)
+        );
+    }
+
+    #[test]
+    fn one_record_summary_without_a_proof_is_unavailable_not_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = |recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        };
+        let n1 = store("n1");
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            vec![
+                ("n1".into(), Box::new(n1.clone()) as Box<dyn RecorderRpc>),
+                ("n2".into(), Box::new(store("n2")) as Box<dyn RecorderRpc>),
+                ("n3".into(), Box::new(store("n3")) as Box<dyn RecorderRpc>),
+            ],
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"one-summary".to_vec());
+        n1.record_proposal(RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot: 1,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                1,
+                AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+            ),
+            command: Some(command),
+        })
+        .unwrap();
+        assert_eq!(n1.inspect_decision_proof(1).unwrap(), None);
+        assert_eq!(
+            consensus.inspect_certified_decision_at(
+                &RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO,
+            ),
+            Ok(CertifiedDecisionInspection::Unavailable)
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
     struct FailingFromSlotRecorder {
@@ -18917,6 +19544,74 @@ mod tests {
     }
 
     #[test]
+    fn install_proof_typed_errors_follow_terminal_precedence() {
+        let run = |replies: [super::Result<()>; 3], expected: super::Result<()>| {
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(replies)
+                .map(|(recorder_id, reply)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ScriptedInstallProofRecorder {
+                            recorder_id,
+                            entered: entered_tx.clone(),
+                            gate: None,
+                            reply,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            assert_eq!(
+                consensus.install_decision_proof_quorum(
+                    test_decision_proof(consensus.membership()),
+                    &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &AtomicBool::new(false),
+                ),
+                expected
+            );
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::TypedProofInstallRequired),
+            ],
+            Err(Error::TypedProofInstallRequired),
+        );
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Ok(()),
+                Err(Error::Io("transient install failure".into())),
+            ],
+            Err(Error::TypedProofInstallRequired),
+        );
+        run([Err(Error::TypedRecordRequired), Ok(()), Ok(())], Ok(()));
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::Rejected(RejectReason::AlreadyDecided)),
+                Err(Error::ProposeFailed),
+            ],
+            Err(Error::Rejected(RejectReason::AlreadyDecided)),
+        );
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::UnknownOutcome),
+                Err(Error::ProposeFailed),
+            ],
+            Err(Error::UnknownOutcome),
+        );
+    }
+
+    #[test]
     fn install_proof_preclosed_worker_is_arrival_order_independent() {
         let _blocking = lock_blocking_control_tests();
         let run = |n2_reply: super::Result<()>| {
@@ -20091,6 +20786,638 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_partial_proof_install_is_unknown_and_fences_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let n1 = RecorderFileStore::new_with_membership(
+            root.path().join("n1"),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let n3 = RecorderFileStore::new_with_membership(
+            root.path().join("n3"),
+            "n3",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let fail_install = Arc::new(AtomicBool::new(true));
+        let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
+        let (n2_release_tx, n2_release_rx) = mpsc::sync_channel(1);
+        let mut n2_release = ChannelRelease::new(n2_release_tx);
+        let first = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    (
+                        "n1".into(),
+                        Box::new(FailInstallFileStore {
+                            inner: n1.clone(),
+                            fail_install: Arc::clone(&fail_install),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
+                    (
+                        "n2".into(),
+                        Box::new(BlockingRecorder {
+                            recorder_id: "n2",
+                            started: n2_started_tx,
+                            release_first: Mutex::new(n2_release_rx),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
+                    (
+                        "n3".into(),
+                        Box::new(FailInstallFileStore {
+                            inner: n3.clone(),
+                            fail_install: Arc::clone(&fail_install),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+
+        // Hold n2's record worker on an unrelated request. The foreign
+        // FastPath is therefore exactly n1+n3, while every proof installer
+        // returns a bounded failure without a durable proof write.
+        let (background_tx, background_rx) = mpsc::sync_channel(1);
+        let background = record_requests(&first, 1).remove(1);
+        assert!(matches!(
+            first.record_workers[1].dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: background,
+                result: background_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert_eq!(n2_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(
+            first.propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::ReadBarrier, Vec::new()),
+            ),
+            Err(Error::UnknownOutcome),
+            "a decided FastPath with zero durable proof installs is not retryable"
+        );
+        assert_eq!(n1.inspect_decision_proof(2).unwrap(), None);
+        assert_eq!(n3.inspect_decision_proof(2).unwrap(), None);
+        assert_eq!(
+            first
+                .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+                .unwrap(),
+            None,
+            "an uninstalled FastPath proof is not a published proof"
+        );
+        fail_install.store(false, Ordering::Release);
+        n2_release.release();
+        assert!(background_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .1
+            .is_ok());
+
+        let n2 = RecorderFileStore::new_with_membership(
+            root.path().join("n2"),
+            "n2",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let second = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n2",
+            1,
+            1,
+            vec![
+                ("n1".into(), Box::new(n1.clone()) as Box<dyn RecorderRpc>),
+                ("n2".into(), Box::new(n2) as Box<dyn RecorderRpc>),
+                ("n3".into(), Box::new(n3.clone()) as Box<dyn RecorderRpc>),
+            ],
+        )
+        .unwrap();
+        let recovered = second
+            .inspect_certified_decision_at(&RecorderRpcContext::default_timeout(), 2, LogHash::ZERO)
+            .unwrap();
+        let CertifiedDecisionInspection::Committed(recovered) = recovered else {
+            panic!("the n1+n3 FastPath summaries must reconstruct the foreign decision");
+        };
+        let foreign = recovered.entry.clone();
+        assert!(matches!(recovered.proof, DecisionProof::FastPath { .. }));
+
+        let conflicting = second
+            .propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::Deterministic, b"conflicting".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(conflicting, foreign);
+        let published = second
+            .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+            .unwrap()
+            .expect("the recovered foreign decision must be published");
+        assert_eq!(
+            published.proposal().value,
+            recovered.proof.proposal().value,
+            "a later Phase2 certificate may replace the FastPath shape, but never its decision"
+        );
+        assert!(first.finish_pending_rpcs(Duration::from_secs(1)));
+        assert!(second.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn post_decision_unknown_recovers_only_from_a_certified_matching_entry() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(PersistThenUnknownInstallFileStore {
+                            inner: store.clone(),
+                            persist: true,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"durable-unknown".to_vec());
+        let entry = consensus
+            .propose_stored_at(
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+                command.clone(),
+            )
+            .expect("a quorum-certified durable matching proof resolves post-install ambiguity");
+        assert_eq!(entry.entry_type, command.entry_type);
+        assert_eq!(entry.payload, command.payload);
+        let CertifiedDecisionInspection::Committed(decision) = consensus
+            .inspect_certified_decision_at(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap()
+        else {
+            panic!("the reconciliation acknowledgement requires a certified decision");
+        };
+        assert_eq!(decision.entry, entry);
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert!(
+            consensus
+                .control_workers
+                .iter()
+                .all(|worker| !worker.state.quarantined.load(Ordering::Acquire)),
+            "an immediately drained lost response must not quarantine a reusable control worker"
+        );
+    }
+
+    #[test]
+    fn post_decision_unknown_never_acknowledges_a_certified_different_value() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let foreign = StoredCommand::new(EntryType::Command, b"foreign".to_vec());
+        let seed = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        seed.propose_stored_at(
+            RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+            1,
+            LogHash::ZERO,
+            foreign,
+        )
+        .unwrap();
+        drop(seed);
+
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(PersistThenUnknownInstallFileStore {
+                            inner: store.clone(),
+                            persist: false,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let offered = StoredCommand::new(EntryType::Command, b"offered".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &offered),
+        );
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: membership.members()[..membership.quorum_size()]
+                .iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.clone(),
+                    slot: 1,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            consensus.finish_decision_with_context(
+                proof,
+                Some(&offered),
+                false,
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            ),
+            Err(Error::ConflictingCertificates),
+            "a different certified value is safety evidence, never an acknowledgement of the offer"
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn post_decision_reconciliation_does_not_revive_a_cancelled_budget() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            membership
+                .members()
+                .iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.clone(),
+                        Box::new(SlotRecorder {
+                            recorder_id: match recorder_id.as_str() {
+                                "n1" => "n1",
+                                "n2" => "n2",
+                                "n3" => "n3",
+                                _ => unreachable!(),
+                            },
+                            reject_slot: None,
+                            observed: None,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"cancelled".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: membership.members()[..membership.quorum_size()]
+                .iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.clone(),
+                    slot: 1,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancelled),
+        );
+        let budget = ControlCallBudget::new(&context).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            consensus.reconcile_post_decision_unknown_outcome(
+                &budget,
+                &AtomicBool::new(true),
+                &proof,
+                &command,
+            ),
+            Err(Error::UnknownOutcome)
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fast_path_decision_is_durable_before_a_conflicting_slot_proposal() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let n1 = RecorderFileStore::new_with_membership(
+            root.path().join("n1"),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let n3 = RecorderFileStore::new_with_membership(
+            root.path().join("n3"),
+            "n3",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
+        let (n2_release_tx, n2_release_rx) = mpsc::sync_channel(1);
+        let mut n2_release = ChannelRelease::new(n2_release_tx);
+        let recorders = vec![
+            ("n1".into(), Box::new(n1.clone()) as Box<dyn RecorderRpc>),
+            (
+                "n2".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n2",
+                    started: n2_started_tx,
+                    release_first: Mutex::new(n2_release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            ("n3".into(), Box::new(n3.clone()) as Box<dyn RecorderRpc>),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+
+        // Occupy n2's record worker before the foreign proposal. Its slot-2
+        // hedge must remain queued, so n1+n3 are the exact FastPath quorum.
+        let (background_tx, background_rx) = mpsc::sync_channel(1);
+        let background = record_requests(&consensus, 1).remove(1);
+        assert!(matches!(
+            consensus.record_workers[1].dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: background,
+                result: background_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert_eq!(n2_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+
+        let foreign = consensus
+            .propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::ReadBarrier, Vec::new()),
+            )
+            .unwrap();
+        let foreign_proof = consensus
+            .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+            .unwrap()
+            .expect("a successful FastPath decision must be quorum-durable");
+        assert!(matches!(foreign_proof, DecisionProof::FastPath { .. }));
+        assert_eq!(
+            n1.inspect_decision_proof(2).unwrap(),
+            Some(foreign_proof.clone())
+        );
+        assert_eq!(
+            n3.inspect_decision_proof(2).unwrap(),
+            Some(foreign_proof.clone())
+        );
+
+        n2_release.release();
+        assert!(background_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .1
+            .is_ok());
+
+        let conflicting = consensus
+            .propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::Deterministic, b"conflicting".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(conflicting, foreign);
+        assert_eq!(
+            consensus
+                .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+                .unwrap(),
+            Some(foreign_proof)
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn concurrent_proposers_same_command_publish_one_durable_decision() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let proposer = |proposer_id| {
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                proposer_id,
+                1,
+                1,
+                ["n1", "n2", "n3"]
+                    .into_iter()
+                    .zip(stores.iter())
+                    .map(|(recorder_id, store)| {
+                        (
+                            recorder_id.into(),
+                            Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let consensuses = ["p1", "p2", "p3"].map(|proposer_id| Arc::new(proposer(proposer_id)));
+        let command = StoredCommand::new(EntryType::Command, b"same-concurrent-command".to_vec());
+        consensuses[0]
+            .register_command(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                command.hash(),
+                command.payload.clone(),
+            )
+            .unwrap();
+
+        let contexts: [RecorderRpcContext; 3] = std::array::from_fn(|_| {
+            RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(5),
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let record_probes: [Arc<TestControlOperationProbe>; 3] =
+            std::array::from_fn(|_| Arc::new(TestControlOperationProbe::default()));
+        let control_probes: [Arc<TestControlOperationProbe>; 3] =
+            std::array::from_fn(|_| Arc::new(TestControlOperationProbe::default()));
+        let _record_guards: [super::TestControlOperationProbeGuard; 3] =
+            std::array::from_fn(|index| {
+                consensuses[index]
+                    .install_test_record_operation_probe(1, Arc::clone(&record_probes[index]))
+                    .unwrap()
+            });
+        let _control_guards: [super::TestControlOperationProbeGuard; 3] =
+            std::array::from_fn(|index| {
+                super::install_test_control_operation_probe(
+                    &contexts[index],
+                    Arc::clone(&control_probes[index]),
+                )
+                .unwrap()
+            });
+        let start = Arc::new(Barrier::new(consensuses.len() + 1));
+        let callers: Vec<_> = consensuses
+            .iter()
+            .zip(contexts)
+            .map(|(consensus, context)| {
+                let consensus = Arc::clone(consensus);
+                let start = Arc::clone(&start);
+                let command = command.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    consensus.propose_stored_at(context, 1, LogHash::ZERO, command)
+                })
+            })
+            .collect();
+        start.wait();
+        let results: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect();
+
+        for consensus in &consensuses {
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        }
+        for (record, control) in record_probes.iter().zip(&control_probes) {
+            assert!(
+                record.dispatch_count() > 0,
+                "record broadcast was not admitted"
+            );
+            assert_eq!(record.pending(), 0);
+            assert_eq!(record.cancel_count(), 0);
+            assert_eq!(record.quarantine_count(), 0);
+            assert!(
+                control.dispatch_count() > 0,
+                "decision proof install was not admitted"
+            );
+            assert_eq!(control.pending(), 0);
+            assert_eq!(control.quarantine_count(), 0);
+        }
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent same-command proposal returned an ambiguous result; record/control dispatches: {:?}",
+            record_probes
+                .iter()
+                .zip(&control_probes)
+                .map(|(record, control)| (record.dispatch_count(), control.dispatch_count()))
+                .collect::<Vec<_>>(),
+        );
+        let entries: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        assert!(entries.iter().all(|entry| entry == &entries[0]));
+        let CertifiedDecisionInspection::Committed(decision) = consensuses[0]
+            .inspect_certified_decision_at(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap()
+        else {
+            panic!("a completed concurrent proposal must be authoritatively discoverable");
+        };
+        assert_eq!(decision.entry, entries[0]);
+    }
+
+    #[test]
     fn reclaimed_record_hedge_stays_retryable_across_two_hundred_operations() {
         let (started_tx, started_rx) = mpsc::sync_channel(512);
         let (_release_tx, release_rx) = mpsc::sync_channel(0);
@@ -20828,7 +22155,7 @@ mod tests {
                 1,
                 LogHash::ZERO,
             ),
-            Err(Error::NoQuorum)
+            Err(Error::TypedRecordRequired)
         );
     }
 
