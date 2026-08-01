@@ -21424,7 +21424,8 @@ mod tests {
     #[test]
     fn reclaimed_record_hedge_stays_retryable_across_two_hundred_operations() {
         let (started_tx, started_rx) = mpsc::sync_channel(512);
-        let (_release_tx, release_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let mut n2_release = ChannelRelease::new(release_tx);
         let recorders = vec![
             (
                 "n1".into(),
@@ -21454,13 +21455,18 @@ mod tests {
         let consensus =
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-        assert_eq!(
-            consensus
-                .record_broadcast(record_requests(&consensus, 1))
-                .unwrap()
-                .len(),
-            2
-        );
+        let background_request = record_requests(&consensus, 1).remove(1);
+        let background_expected = record_summary("n2", background_request.clone());
+        let (background_tx, background_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            consensus.record_workers[1].dispatch(super::RecordJob {
+                index: 1,
+                context: RecorderRpcContext::default_timeout(),
+                request: background_request,
+                result: background_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
         assert_eq!(
             consensus
@@ -21469,8 +21475,26 @@ mod tests {
                 .len(),
             2
         );
+        assert_eq!(
+            started_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "the slot-2 hedge must be reclaimed while n2 is occupied"
+        );
+        n2_release.release();
+        assert_eq!(
+            background_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((1, Ok(background_expected))),
+            "the occupied n2 worker must drain before retry traffic"
+        );
+        assert_eq!(
+            consensus
+                .record_broadcast(record_requests(&consensus, 3))
+                .unwrap()
+                .len(),
+            2
+        );
 
-        let failure = (3..=202).find_map(|slot| {
+        let failure = (4..=203).find_map(|slot| {
             let result = consensus.record_broadcast(record_requests(&consensus, slot));
             match &result {
                 Ok(replies)
