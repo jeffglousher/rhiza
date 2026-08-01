@@ -1056,6 +1056,7 @@ impl LadybugStateMachine {
                 hash,
             })
         })
+        .map_err(ladybug_read_only_error)
     }
 
     pub fn check_request(
@@ -4124,6 +4125,15 @@ fn ladybug_execution_error(error: lbug::Error) -> Error {
     }
 }
 
+fn ladybug_read_only_error(error: Error) -> Error {
+    match error {
+        Error::Ladybug(message) if is_ladybug_interruption(&message) => {
+            ladybug_execution_error(lbug::Error::FailedQuery(message))
+        }
+        error => error,
+    }
+}
+
 fn is_ladybug_interruption(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("interrupt") || message.contains("timed out") || message.contains("timeout")
@@ -5070,6 +5080,17 @@ mod query_tests {
                 "Interrupted while executing query".into()
             )),
             Error::ResourceExhausted(_)
+        ));
+        assert!(matches!(
+            ladybug_read_only_error(Error::Ladybug(
+                "Query execution failed: Interrupted.".into()
+            )),
+            Error::ResourceExhausted(message)
+                if message == "graph query timed out or was interrupted: Query execution failed: Interrupted."
+        ));
+        assert!(matches!(
+            ladybug_read_only_error(Error::Ladybug("storage".into())),
+            Error::Ladybug(message) if message == "storage"
         ));
     }
 
