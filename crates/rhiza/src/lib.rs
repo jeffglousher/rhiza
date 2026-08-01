@@ -1777,6 +1777,22 @@ mod tests {
                 .expect("owned gate waiter must not panic"),
                 "owned group {iteration} did not enter both slot-scoped quorum gates"
             );
+            assert!(
+                tokio::time::timeout(readiness_watchdog, async {
+                    while owned_group_probe.outstanding() != 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok(),
+                "owned recorder 2 did not drain before unowned dispatch: \
+                 dispatched={} max_outstanding={} outstanding={} drained={} workers={:?}",
+                owned_group_probe.dispatch_count(),
+                owned_group_probe.observed_max_outstanding(),
+                owned_group_probe.outstanding(),
+                owned_group_probe.drained_count(),
+                owned_group_probe.worker_transitions(),
+            );
             let (unrelated_started_tx, unrelated_started_rx) = std::sync::mpsc::sync_channel(1);
             let unrelated_consensus = consensus.clone();
             let unrelated = std::thread::spawn(move || {
