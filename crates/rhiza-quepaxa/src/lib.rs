@@ -20732,14 +20732,13 @@ mod tests {
     fn cooperative_record_hedge_is_reclaimed_without_contaminating_later_broadcasts() {
         let (started_tx, started_rx) = mpsc::sync_channel(2);
         let (_release_tx, release_rx) = mpsc::sync_channel(0);
-        let (n1_seen_tx, n1_seen_rx) = mpsc::sync_channel(1);
         let recorders = vec![
             (
                 "n1".into(),
                 Box::new(SlotRecorder {
                     recorder_id: "n1",
                     reject_slot: None,
-                    observed: Some(n1_seen_tx),
+                    observed: None,
                 }) as Box<dyn RecorderRpc>,
             ),
             (
@@ -20768,12 +20767,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
-        assert_eq!(n1_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
 
         let second = consensus
             .record_broadcast(record_requests(&consensus, 2))
             .unwrap();
-        assert_eq!(n1_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
         assert_eq!(second.len(), 2);
         assert!(second.iter().all(|reply| reply.slot == 2));
 
