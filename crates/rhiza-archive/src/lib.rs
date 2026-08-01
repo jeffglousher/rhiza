@@ -2,16 +2,21 @@ use rhiza_core::{
     ConfigId, Epoch, LogEntry, LogHash, LogIndex, RecoveryAnchor, Snapshot, SnapshotManifest,
     RECOVERY_ANCHOR_FORMAT_VERSION,
 };
-use rhiza_log::{decode_segment_for_cluster, encode_segment, SegmentFile};
+use rhiza_log::{
+    decode_segment_for_cluster_bounded, encode_segment, SegmentFile,
+    QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES,
+};
+#[cfg(test)]
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{
     collections::HashSet,
     process,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rhiza_obj_store::{
-    Error as ObjStoreError, ObjStore, ObjectMetadata, ObjectVersion, UpdateVersion,
+    Error as ObjStoreError, ObjStore, ObjectMetadata, ObjectVersion, UpdateVersion, VersionedObject,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,11 +24,51 @@ pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
 const CHECKPOINT_SEGMENT_FORMAT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_CAS_ATTEMPTS: usize = 16;
+const CHECKPOINT_RESTORE_LIMITS: CheckpointRestoreLimits = CheckpointRestoreLimits {
+    manifest_encoded_bytes: 1024 * 1024,
+    segment_count: 256,
+    object_count: 257,
+    object_encoded_bytes: 256 * 1024 * 1024,
+    aggregate_encoded_bytes: 512 * 1024 * 1024,
+    object_decoded_bytes: 256 * 1024 * 1024,
+    aggregate_decoded_bytes: 512 * 1024 * 1024,
+};
+// Stable aggregate allowance for the final restored suffix Vec. The qlog
+// budget separately covers each segment's LogEntry Vec and transient hash Vec;
+// retaining both charges is deliberately conservative across segment moves.
+const CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES: u64 = 256;
+const _: () = assert!(
+    std::mem::size_of::<LogEntry>() <= CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES as usize
+);
 const MAX_GC_CONTROL_CAS_ATTEMPTS: usize = 128;
 const GC_FORMAT_VERSION: u32 = 1;
+const GC_CONTROL_ENCODED_BYTES: u64 = 1024 * 1024;
 const DEFAULT_LEASE_MS: u64 = 60_000;
+// A reader can spend an arbitrarily long time awaiting one remote object.
+// Renew well before the lease expires so that a live fetch remains fenced from
+// GC, while leaving enough room for a transient control-plane retry.
+const READER_LEASE_RENEW_DIVISOR: u64 = 3;
 pub const DEFAULT_CHECKPOINT_COMPACTION_SEGMENTS: usize = 64;
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static NEXT_TEST_OBJECT_ARCHIVE_STORE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct CheckpointRestoreLimits {
+    manifest_encoded_bytes: u64,
+    segment_count: usize,
+    object_count: usize,
+    object_encoded_bytes: u64,
+    aggregate_encoded_bytes: u64,
+    object_decoded_bytes: u64,
+    aggregate_decoded_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointSnapshotPublicationPolicy {
+    allow_empty_baseline: bool,
+    limits: CheckpointRestoreLimits,
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -63,12 +108,20 @@ pub enum Error {
     },
     InvalidCheckpoint(String),
     LogDecode(String),
+    RestoreLimitExceeded {
+        resource: &'static str,
+        object_key: Option<String>,
+        limit: u64,
+        actual: u64,
+    },
+    RestoreSizeOverflow {
+        resource: &'static str,
+    },
     PublicationConflict {
         index: LogIndex,
         expected: String,
         actual: String,
     },
-    SnapshotBaseRequiresStructuredRestore,
     CheckpointBaseRegression {
         current: LogIndex,
         proposed: LogIndex,
@@ -85,6 +138,9 @@ pub enum Error {
     },
     GcBarrierBusy {
         until_ms: u64,
+    },
+    GcLeaseMissing {
+        lease_id: String,
     },
     GcPlanStale {
         message: String,
@@ -157,6 +213,27 @@ impl std::fmt::Display for Error {
             ),
             Self::InvalidCheckpoint(message) => write!(f, "invalid checkpoint: {message}"),
             Self::LogDecode(message) => write!(f, "checkpoint qlog decode failed: {message}"),
+            Self::RestoreLimitExceeded {
+                resource,
+                object_key,
+                limit,
+                actual,
+            } => {
+                if let Some(object_key) = object_key {
+                    write!(
+                        f,
+                        "checkpoint restore {resource} exceeds limit for {object_key}: limit {limit}, got at least {actual}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "checkpoint restore {resource} exceeds limit: limit {limit}, got at least {actual}"
+                    )
+                }
+            }
+            Self::RestoreSizeOverflow { resource } => {
+                write!(f, "checkpoint restore {resource} size overflow")
+            }
             Self::PublicationConflict {
                 index,
                 expected,
@@ -164,10 +241,6 @@ impl std::fmt::Display for Error {
             } => write!(
                 f,
                 "checkpoint publication conflicts at index {index}: expected hash {expected}, got {actual}"
-            ),
-            Self::SnapshotBaseRequiresStructuredRestore => write!(
-                f,
-                "checkpoint has a snapshot base; use restore_checkpoint_state to restore snapshot state and its log suffix"
             ),
             Self::CheckpointBaseRegression { current, proposed } => write!(
                 f,
@@ -188,6 +261,9 @@ impl std::fmt::Display for Error {
             }
             Self::GcBarrierBusy { until_ms } => {
                 write!(f, "object GC is waiting for leases until {until_ms}")
+            }
+            Self::GcLeaseMissing { lease_id } => {
+                write!(f, "object GC operation lease is no longer held: {lease_id}")
             }
             Self::GcPlanStale { message } => write!(f, "object GC plan is stale: {message}"),
             Self::GcPlanHashMismatch { expected, actual } => write!(
@@ -806,6 +882,101 @@ impl CheckpointManifest {
     }
 }
 
+struct CheckpointRestoreBudget {
+    limits: CheckpointRestoreLimits,
+    decoded_bytes: u64,
+}
+
+impl CheckpointRestoreBudget {
+    fn new(manifest: &CheckpointManifest, limits: CheckpointRestoreLimits) -> Result<Self> {
+        let decoded_bytes = manifest
+            .base
+            .snapshot()
+            .map_or(0, CheckpointSnapshotBase::size_bytes);
+        ensure_restore_limit(
+            "aggregate decoded bytes",
+            None,
+            decoded_bytes,
+            limits.aggregate_decoded_bytes,
+        )?;
+        Ok(Self {
+            limits,
+            decoded_bytes,
+        })
+    }
+
+    fn next_object_limit(&self) -> Result<u64> {
+        let aggregate_remaining = self
+            .limits
+            .aggregate_decoded_bytes
+            .checked_sub(self.decoded_bytes)
+            .ok_or(Error::RestoreSizeOverflow {
+                resource: "aggregate decoded bytes",
+            })?;
+        Ok(self.limits.object_decoded_bytes.min(aggregate_remaining))
+    }
+
+    fn charge(&mut self, object_key: &str, decoded_bytes: u64) -> Result<()> {
+        ensure_restore_limit(
+            "object decoded bytes",
+            Some(object_key),
+            decoded_bytes,
+            self.limits.object_decoded_bytes,
+        )?;
+        self.decoded_bytes =
+            checked_restore_add("aggregate decoded bytes", self.decoded_bytes, decoded_bytes)?;
+        ensure_restore_limit(
+            "aggregate decoded bytes",
+            None,
+            self.decoded_bytes,
+            self.limits.aggregate_decoded_bytes,
+        )
+    }
+
+    fn charge_aggregate(&mut self, decoded_bytes: u64) -> Result<()> {
+        self.decoded_bytes =
+            checked_restore_add("aggregate decoded bytes", self.decoded_bytes, decoded_bytes)?;
+        ensure_restore_limit(
+            "aggregate decoded bytes",
+            None,
+            self.decoded_bytes,
+            self.limits.aggregate_decoded_bytes,
+        )
+    }
+
+    const fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointSuffixShape {
+    entry_count: usize,
+    stable_outer_bytes: u64,
+}
+
+struct PreparedCheckpointAppend {
+    suffix_start: Option<usize>,
+    candidate: Option<PreparedCheckpointAppendCandidate>,
+}
+
+struct PreparedCheckpointAppendCandidate {
+    bytes: Vec<u8>,
+    record: CheckpointSegmentRecord,
+}
+
+struct FinalizedCheckpointAppend {
+    bytes: Vec<u8>,
+    next: CheckpointManifest,
+    next_bytes: Vec<u8>,
+}
+
+struct PreparedCheckpointSnapshot {
+    proposed: CheckpointBase,
+    next: Option<CheckpointManifest>,
+    next_bytes: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoredCheckpointSnapshot {
     anchor: RecoveryAnchor,
@@ -827,6 +998,32 @@ pub struct RestoredCheckpoint {
     snapshot: Option<RestoredCheckpointSnapshot>,
     suffix: Vec<LogEntry>,
     tip: CheckpointTip,
+}
+
+/// A checkpoint manifest and the state restored from that exact manifest.
+///
+/// The pair is assembled while one reader lease is held. The lease protects
+/// the manifest's referenced objects from GC, while the initially loaded
+/// manifest (including its version) pins the logical checkpoint that is
+/// restored. It does not freeze concurrent publication.
+#[derive(Debug)]
+pub struct LoadedCheckpointRestore {
+    loaded: LoadedCheckpointManifest,
+    restored: RestoredCheckpoint,
+}
+
+impl LoadedCheckpointRestore {
+    pub const fn loaded(&self) -> &LoadedCheckpointManifest {
+        &self.loaded
+    }
+
+    pub const fn restored(&self) -> &RestoredCheckpoint {
+        &self.restored
+    }
+
+    pub fn into_parts(self) -> (LoadedCheckpointManifest, RestoredCheckpoint) {
+        (self.loaded, self.restored)
+    }
 }
 
 impl RestoredCheckpoint {
@@ -1132,17 +1329,37 @@ impl CheckpointPublisher {
         }
         for flush in pending {
             let result = match &published {
-                Ok(loaded) => match self
-                    .store
-                    .publication_suffix_start(loaded.manifest(), &flush.entries)
-                    .await
-                {
-                    Ok(None) => Ok(loaded.clone()),
-                    Ok(Some(_)) => Err(Error::InvalidCheckpoint(
-                        "coalesced publication did not reach the requested index".into(),
-                    )),
-                    Err(error) => Err(error),
-                },
+                Ok(loaded) => {
+                    let proof = async {
+                        let prepared = self.store.prepare_local_checkpoint_append(
+                            loaded.manifest(),
+                            &flush.entries,
+                            CHECKPOINT_RESTORE_LIMITS,
+                        )?;
+                        self.store
+                            .renew_active_publisher_gc_lease(
+                                &self.lease_id,
+                                self.options.lease_duration_ms,
+                            )
+                            .await?;
+                        self.store
+                            .finalize_checkpoint_append_under_lease(
+                                loaded.manifest(),
+                                &flush.entries,
+                                prepared,
+                                CHECKPOINT_RESTORE_LIMITS,
+                            )
+                            .await
+                    }
+                    .await;
+                    match proof {
+                        Ok(None) => Ok(loaded.clone()),
+                        Ok(Some(_)) => Err(Error::InvalidCheckpoint(
+                            "coalesced publication did not reach the requested index".into(),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
                 Err(error) => Err(error.clone()),
             };
             let _ = flush.result.send(result);
@@ -1155,6 +1372,484 @@ pub struct ObjectArchiveStore {
     store: ObjStore,
     cluster_id: String,
     checkpoint_identity: Option<CheckpointIdentity>,
+    #[cfg(test)]
+    test_store_identity: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCheckpointDownloadGate {
+    store_identity: u64,
+    object_key: String,
+    after_create: bool,
+    entered: std::sync::mpsc::SyncSender<()>,
+    cancelled: std::sync::mpsc::SyncSender<()>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    release_notification: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestCheckpointDownloadGate {
+    fn new(
+        store_identity: u64,
+        object_key: impl Into<String>,
+    ) -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (entered, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (cancelled, cancelled_receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                store_identity,
+                object_key: object_key.into(),
+                after_create: false,
+                entered,
+                cancelled,
+                released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                release_notification: Arc::new(tokio::sync::Notify::new()),
+            },
+            entered_receiver,
+            cancelled_receiver,
+        )
+    }
+
+    fn after_create(
+        store_identity: u64,
+        object_key: impl Into<String>,
+    ) -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (mut gate, entered, cancelled) = Self::new(store_identity, object_key);
+        gate.after_create = true;
+        (gate, entered, cancelled)
+    }
+
+    fn release_guard(&self) -> TestCheckpointFetchRelease {
+        TestCheckpointFetchRelease {
+            released: Arc::clone(&self.released),
+            release_notification: Arc::clone(&self.release_notification),
+        }
+    }
+
+    async fn wait(&self) {
+        if self.entered.send(()).is_err() {
+            return;
+        }
+        let mut cancellation = TestCheckpointFetchCancellation {
+            released: Arc::clone(&self.released),
+            cancelled: self.cancelled.clone(),
+            armed: true,
+        };
+        loop {
+            if self.released.load(Ordering::Acquire) {
+                cancellation.armed = false;
+                return;
+            }
+            let notified = self.release_notification.notified();
+            if self.released.load(Ordering::Acquire) {
+                cancellation.armed = false;
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Releasing the test scope also releases a paused read if an assertion
+/// unwinds. The hook is test-only and keyed by the exact archive instance and
+/// object key below.
+#[cfg(test)]
+struct TestCheckpointFetchRelease {
+    released: Arc<std::sync::atomic::AtomicBool>,
+    release_notification: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl Drop for TestCheckpointFetchRelease {
+    fn drop(&mut self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notification.notify_waiters();
+    }
+}
+
+/// Signals that the pending object read was dropped while still paused. This
+/// makes the renewal-failure test prove cancellation rather than merely the
+/// error returned by its parent restore operation.
+#[cfg(test)]
+struct TestCheckpointFetchCancellation {
+    released: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: std::sync::mpsc::SyncSender<()>,
+    armed: bool,
+}
+
+#[cfg(test)]
+impl Drop for TestCheckpointFetchCancellation {
+    fn drop(&mut self) {
+        if self.armed && !self.released.load(Ordering::Acquire) {
+            let _ = self.cancelled.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InstalledTestCheckpointDownloadGate {
+    id: u64,
+}
+
+#[cfg(test)]
+type TestCheckpointDownloadGateRegistry = Vec<(u64, Arc<TestCheckpointDownloadGate>)>;
+
+#[cfg(test)]
+static TEST_CHECKPOINT_DOWNLOAD_GATES: OnceLock<Mutex<TestCheckpointDownloadGateRegistry>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static NEXT_TEST_CHECKPOINT_DOWNLOAD_GATE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+fn test_checkpoint_download_gates() -> &'static Mutex<TestCheckpointDownloadGateRegistry> {
+    TEST_CHECKPOINT_DOWNLOAD_GATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+impl Drop for InstalledTestCheckpointDownloadGate {
+    fn drop(&mut self) {
+        test_checkpoint_download_gates()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn install_test_checkpoint_download_gate(
+    gate: TestCheckpointDownloadGate,
+) -> InstalledTestCheckpointDownloadGate {
+    let id = NEXT_TEST_CHECKPOINT_DOWNLOAD_GATE.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "checkpoint download test gate identity exhausted");
+    let mut gates = test_checkpoint_download_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        !gates.iter().any(|(_, existing)| {
+            existing.store_identity == gate.store_identity
+                && existing.object_key == gate.object_key
+                && existing.after_create == gate.after_create
+        }),
+        "checkpoint download test gate already installed for this exact archive object"
+    );
+    gates.push((id, Arc::new(gate)));
+    InstalledTestCheckpointDownloadGate { id }
+}
+
+#[cfg(test)]
+async fn test_checkpoint_download_gate(store_identity: u64, object_key: &str) {
+    let gate = test_checkpoint_download_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|(_, gate)| {
+            gate.store_identity == store_identity
+                && gate.object_key == object_key
+                && !gate.after_create
+        })
+        .map(|(_, gate)| Arc::clone(gate));
+    if let Some(gate) = gate {
+        gate.wait().await;
+    }
+}
+
+#[cfg(test)]
+async fn test_checkpoint_object_created_gate(store_identity: u64, object_key: &str) {
+    let gate = test_checkpoint_download_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|(_, gate)| {
+            gate.store_identity == store_identity
+                && gate.object_key == object_key
+                && gate.after_create
+        })
+        .map(|(_, gate)| Arc::clone(gate));
+    if let Some(gate) = gate {
+        gate.wait().await;
+    }
+}
+
+/// A test-only pause at the checkpoint manifest read. It is scoped to one
+/// archive instance, not merely the logical manifest key, so parallel local
+/// fixtures cannot observe or unblock each other.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCheckpointManifestGate {
+    store_identity: u64,
+    entered: std::sync::mpsc::SyncSender<()>,
+    cancelled: std::sync::mpsc::SyncSender<()>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    release_notification: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestCheckpointManifestGate {
+    fn new(
+        store_identity: u64,
+    ) -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (entered, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (cancelled, cancelled_receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                store_identity,
+                entered,
+                cancelled,
+                released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                release_notification: Arc::new(tokio::sync::Notify::new()),
+            },
+            entered_receiver,
+            cancelled_receiver,
+        )
+    }
+
+    fn release_guard(&self) -> TestCheckpointFetchRelease {
+        TestCheckpointFetchRelease {
+            released: Arc::clone(&self.released),
+            release_notification: Arc::clone(&self.release_notification),
+        }
+    }
+
+    async fn wait(&self) {
+        if self.entered.send(()).is_err() {
+            return;
+        }
+        let mut cancellation = TestCheckpointFetchCancellation {
+            released: Arc::clone(&self.released),
+            cancelled: self.cancelled.clone(),
+            armed: true,
+        };
+        loop {
+            if self.released.load(Ordering::Acquire) {
+                cancellation.armed = false;
+                return;
+            }
+            let notified = self.release_notification.notified();
+            if self.released.load(Ordering::Acquire) {
+                cancellation.armed = false;
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InstalledTestCheckpointManifestGate {
+    id: u64,
+}
+
+#[cfg(test)]
+type TestCheckpointManifestGateRegistry = Vec<(u64, Arc<TestCheckpointManifestGate>)>;
+
+#[cfg(test)]
+static TEST_CHECKPOINT_MANIFEST_GATES: OnceLock<Mutex<TestCheckpointManifestGateRegistry>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn test_checkpoint_manifest_gates() -> &'static Mutex<TestCheckpointManifestGateRegistry> {
+    TEST_CHECKPOINT_MANIFEST_GATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+impl Drop for InstalledTestCheckpointManifestGate {
+    fn drop(&mut self) {
+        test_checkpoint_manifest_gates()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn install_test_checkpoint_manifest_gate(
+    gate: TestCheckpointManifestGate,
+) -> InstalledTestCheckpointManifestGate {
+    let id = NEXT_TEST_CHECKPOINT_DOWNLOAD_GATE.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "checkpoint manifest test gate identity exhausted");
+    let mut gates = test_checkpoint_manifest_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        !gates
+            .iter()
+            .any(|(_, existing)| existing.store_identity == gate.store_identity),
+        "checkpoint manifest test gate already installed for this exact archive instance"
+    );
+    gates.push((id, Arc::new(gate)));
+    InstalledTestCheckpointManifestGate { id }
+}
+
+#[cfg(test)]
+async fn test_checkpoint_manifest_gate(store_identity: u64) {
+    let gate = test_checkpoint_manifest_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|(_, gate)| gate.store_identity == store_identity)
+        .map(|(_, gate)| Arc::clone(gate));
+    if let Some(gate) = gate {
+        gate.wait().await;
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestGcControlOperation {
+    Load,
+    Update,
+    UpdateError,
+}
+
+/// A test-only pause inside one exact GC-control operation. The gate is
+/// installed only after Reader acquisition, so it cannot accidentally pause
+/// setup traffic for the same archive instance.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestGcControlGate {
+    store_identity: u64,
+    operation: TestGcControlOperation,
+    injected_error: Option<ObjStoreError>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    release_notification: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestGcControlGate {
+    fn new(
+        store_identity: u64,
+        operation: TestGcControlOperation,
+    ) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (entered, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                store_identity,
+                operation,
+                injected_error: None,
+                entered,
+                released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                release_notification: Arc::new(tokio::sync::Notify::new()),
+            },
+            entered_receiver,
+        )
+    }
+
+    fn failing_update(
+        store_identity: u64,
+        error: ObjStoreError,
+    ) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::UpdateError);
+        gate.injected_error = Some(error);
+        (gate, entered)
+    }
+
+    fn release_guard(&self) -> TestCheckpointFetchRelease {
+        TestCheckpointFetchRelease {
+            released: Arc::clone(&self.released),
+            release_notification: Arc::clone(&self.release_notification),
+        }
+    }
+
+    async fn wait(&self) -> Option<ObjStoreError> {
+        if matches!(
+            self.entered.try_send(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_))
+        ) {
+            return self.injected_error.clone();
+        }
+        loop {
+            if self.released.load(Ordering::Acquire) {
+                return self.injected_error.clone();
+            }
+            let notified = self.release_notification.notified();
+            if self.released.load(Ordering::Acquire) {
+                return self.injected_error.clone();
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InstalledTestGcControlGate {
+    id: u64,
+}
+
+#[cfg(test)]
+type TestGcControlGateRegistry = Vec<(u64, Arc<TestGcControlGate>)>;
+
+#[cfg(test)]
+static TEST_GC_CONTROL_GATES: OnceLock<Mutex<TestGcControlGateRegistry>> = OnceLock::new();
+
+#[cfg(test)]
+static NEXT_TEST_GC_CONTROL_GATE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+fn test_gc_control_gates() -> &'static Mutex<TestGcControlGateRegistry> {
+    TEST_GC_CONTROL_GATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+impl Drop for InstalledTestGcControlGate {
+    fn drop(&mut self) {
+        test_gc_control_gates()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn install_test_gc_control_gate(gate: TestGcControlGate) -> InstalledTestGcControlGate {
+    let id = NEXT_TEST_GC_CONTROL_GATE.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "GC-control test gate identity exhausted");
+    let mut gates = test_gc_control_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        !gates.iter().any(|(_, existing)| {
+            existing.store_identity == gate.store_identity && existing.operation == gate.operation
+        }),
+        "GC-control test gate already installed for this archive operation"
+    );
+    gates.push((id, Arc::new(gate)));
+    InstalledTestGcControlGate { id }
+}
+
+#[cfg(test)]
+async fn test_gc_control_gate(
+    store_identity: u64,
+    operation: TestGcControlOperation,
+) -> Option<ObjStoreError> {
+    let gate = test_gc_control_gates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|(_, gate)| gate.store_identity == store_identity && gate.operation == operation)
+        .map(|(_, gate)| Arc::clone(gate));
+    if let Some(gate) = gate {
+        gate.wait().await
+    } else {
+        None
+    }
 }
 
 impl ObjectArchiveStore {
@@ -1170,6 +1865,8 @@ impl ObjectArchiveStore {
             store,
             cluster_id: cluster_id.into(),
             checkpoint_identity: None,
+            #[cfg(test)]
+            test_store_identity: NEXT_TEST_OBJECT_ARCHIVE_STORE.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -1188,6 +1885,8 @@ impl ObjectArchiveStore {
             store,
             cluster_id: identity.cluster_id.clone(),
             checkpoint_identity: Some(identity),
+            #[cfg(test)]
+            test_store_identity: NEXT_TEST_OBJECT_ARCHIVE_STORE.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -1281,7 +1980,7 @@ impl ObjectArchiveStore {
         .await?;
         let identity = self.checkpoint_identity()?.clone();
         let manifest = CheckpointManifest::new(identity);
-        let bytes = serialize_json(&manifest)?;
+        let bytes = serialize_checkpoint_manifest(&manifest)?;
         let key = self.checkpoint_manifest_key()?;
 
         let loaded = match self.store.create(&key, bytes).await {
@@ -1308,16 +2007,82 @@ impl ObjectArchiveStore {
         self.load_checkpoint_unleased().await
     }
 
+    /// Loads one manifest and restores only the objects named by that manifest.
+    ///
+    /// A missing manifest is distinct from an initialized genesis manifest:
+    /// the former returns `None`, and the latter returns `Some` with a genesis
+    /// [`RestoredCheckpoint`]. Operation errors take precedence over a later
+    /// lease-release error, matching every other leased archive operation.
+    pub async fn load_checkpoint_restore(&self) -> Result<Option<LoadedCheckpointRestore>> {
+        self.load_checkpoint_restore_with_reader_lease_duration(DEFAULT_LEASE_MS)
+            .await
+    }
+
+    async fn load_checkpoint_restore_with_reader_lease_duration(
+        &self,
+        lease_duration_ms: u64,
+    ) -> Result<Option<LoadedCheckpointRestore>> {
+        // This private duration seam is exercised by short-lease tests. Keep
+        // a future caller that accidentally supplies zero from producing a
+        // zero-length interval or an immediately expired reader lease.
+        let lease_duration_ms = lease_duration_ms.max(1);
+        let hard_deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(lease_duration_ms))
+            .ok_or_else(|| Error::InvalidGc("reader lease deadline overflow".into()))?;
+        let acquired = self
+            .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), lease_duration_ms)
+            .await;
+        let acquired_at = tokio::time::Instant::now();
+        let lease = acquired?;
+        if acquired_at >= hard_deadline {
+            let _ = self.release_gc_lease(&lease.lease_id).await;
+            return Err(Error::GcLeaseMissing {
+                lease_id: lease.lease_id,
+            });
+        }
+        let result = self
+            .with_reader_lease_renewal(&lease.lease_id, lease_duration_ms, hard_deadline, async {
+                // This complete remote half, including the generation
+                // control read and manifest read, stays behind one reader
+                // lease. No local mutation is possible here.
+                self.ensure_generation_not_retired().await?;
+                let Some(loaded) = self.load_checkpoint_unleased().await? else {
+                    return Ok(None);
+                };
+                // `with_reader_lease_renewal` is the sole renewal owner for
+                // this complete remote restore. In particular, the object
+                // reads below must not start nested renewal loops: a single
+                // failed renewal has to cancel the whole pinned operation.
+                let restored = self
+                    .restore_loaded_checkpoint_with_active_reader_lease(&loaded)
+                    .await?;
+                Ok(Some(LoadedCheckpointRestore { loaded, restored }))
+            })
+            .await;
+        let release = self.release_gc_lease(&lease.lease_id).await;
+        match (result, release) {
+            (Ok(restored), Ok(())) => Ok(restored),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
     async fn load_checkpoint_unleased(&self) -> Result<Option<LoadedCheckpointManifest>> {
         self.checkpoint_identity()?;
+        #[cfg(test)]
+        test_checkpoint_manifest_gate(self.test_store_identity).await;
         let object = match self
             .store
-            .get_versioned(&self.checkpoint_manifest_key()?)
+            .get_with_version_bounded(
+                &self.checkpoint_manifest_key()?,
+                CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,
+            )
             .await
         {
             Ok(object) => object,
             Err(ObjStoreError::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(map_restore_object_error(error, "manifest encoded bytes"));
+            }
         };
         let manifest: CheckpointManifest = deserialize_json(object.bytes())?;
         self.validate_checkpoint_manifest(&manifest)?;
@@ -1331,13 +2096,37 @@ impl ObjectArchiveStore {
         &self,
         entries: &[LogEntry],
     ) -> Result<LoadedCheckpointManifest> {
+        self.publish_committed_with_limits(entries, CHECKPOINT_RESTORE_LIMITS)
+            .await
+    }
+
+    async fn publish_committed_with_limits(
+        &self,
+        entries: &[LogEntry],
+        limits: CheckpointRestoreLimits,
+    ) -> Result<LoadedCheckpointManifest> {
+        self.validate_publication_entries(entries)?;
         self.ensure_generation_not_retired().await?;
-        self.load_checkpoint().await?;
+        let observed = self.load_checkpoint_unleased().await?;
+        if let Some(loaded) = &observed {
+            self.prepare_local_checkpoint_append(loaded.manifest(), entries, limits)?;
+            if entries.is_empty() {
+                return Ok(loaded.clone());
+            }
+        } else {
+            let genesis = CheckpointManifest::new(self.checkpoint_identity()?.clone());
+            self.prepare_local_checkpoint_append(&genesis, entries, limits)?;
+        }
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
         let result = self
-            .publish_committed_unleased(entries, &lease.lease_id, DEFAULT_LEASE_MS)
+            .publish_committed_unleased_with_limits(
+                entries,
+                &lease.lease_id,
+                DEFAULT_LEASE_MS,
+                limits,
+            )
             .await;
         let release = self.release_gc_lease(&lease.lease_id).await;
         match (result, release) {
@@ -1346,18 +2135,31 @@ impl ObjectArchiveStore {
         }
     }
 
-    async fn publish_committed_unleased(
+    async fn publish_committed_unleased_with_limits(
         &self,
         entries: &[LogEntry],
         lease_id: &str,
         lease_duration_ms: u64,
+        limits: CheckpointRestoreLimits,
     ) -> Result<LoadedCheckpointManifest> {
         self.validate_publication_entries(entries)?;
-        let loaded = self
-            .initialize_checkpoint_unleased(lease_id, lease_duration_ms)
-            .await?;
-        self.publish_committed_from_loaded_unleased(entries, lease_id, lease_duration_ms, loaded)
-            .await
+        let loaded = if let Some(loaded) = self.load_checkpoint_unleased().await? {
+            self.prepare_local_checkpoint_append(loaded.manifest(), entries, limits)?;
+            loaded
+        } else {
+            let genesis = CheckpointManifest::new(self.checkpoint_identity()?.clone());
+            self.prepare_local_checkpoint_append(&genesis, entries, limits)?;
+            self.initialize_checkpoint_unleased(lease_id, lease_duration_ms)
+                .await?
+        };
+        self.publish_committed_from_loaded_unleased_with_limits(
+            entries,
+            lease_id,
+            lease_duration_ms,
+            loaded,
+            limits,
+        )
+        .await
     }
 
     async fn publish_committed_from_loaded_unleased(
@@ -1365,33 +2167,339 @@ impl ObjectArchiveStore {
         entries: &[LogEntry],
         lease_id: &str,
         lease_duration_ms: u64,
-        mut loaded: LoadedCheckpointManifest,
+        loaded: LoadedCheckpointManifest,
     ) -> Result<LoadedCheckpointManifest> {
-        self.ensure_generation_not_retired().await?;
-        self.renew_gc_lease(
-            GcLeaseKind::Publisher,
+        self.publish_committed_from_loaded_unleased_with_limits(
+            entries,
             lease_id,
-            now_ms(),
             lease_duration_ms,
+            loaded,
+            CHECKPOINT_RESTORE_LIMITS,
         )
-        .await?;
-        if entries.is_empty() {
-            return Ok(loaded);
-        }
+        .await
+    }
 
+    async fn publish_committed_from_loaded_unleased_with_limits(
+        &self,
+        entries: &[LogEntry],
+        lease_id: &str,
+        lease_duration_ms: u64,
+        mut loaded: LoadedCheckpointManifest,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<LoadedCheckpointManifest> {
         for _ in 0..MAX_CHECKPOINT_CAS_ATTEMPTS {
-            let suffix_start = self
-                .publication_suffix_start(loaded.manifest(), entries)
+            self.ensure_generation_not_retired().await?;
+            let prepared =
+                self.prepare_local_checkpoint_append(loaded.manifest(), entries, limits)?;
+            self.renew_active_publisher_gc_lease(lease_id, lease_duration_ms)
                 .await?;
-            let Some(suffix_start) = suffix_start else {
+            let Some(prepared) = self
+                .finalize_checkpoint_append_under_lease(
+                    loaded.manifest(),
+                    entries,
+                    prepared,
+                    limits,
+                )
+                .await?
+            else {
                 return Ok(loaded);
             };
-            let bytes = encode_segment(&entries[suffix_start..]);
-            let decoded =
-                decode_segment_for_cluster(&bytes, self.checkpoint_identity()?.cluster_id())
-                    .map_err(|error| Error::LogDecode(error.to_string()))?;
-            self.validate_decoded_entries(&decoded, loaded.manifest().tip())?;
-            let record = self.checkpoint_segment_record(&decoded, &bytes)?;
+            let record = prepared
+                .next
+                .segments
+                .last()
+                .expect("new checkpoint segment");
+            match self
+                .store
+                .create(record.object_key(), &prepared.bytes)
+                .await
+            {
+                Ok(_) => {}
+                Err(ObjStoreError::AlreadyExists { .. }) => {
+                    self.download_verified_with_limits(
+                        record.object_key(),
+                        record.size_bytes(),
+                        record.sha256(),
+                        limits,
+                    )
+                    .await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            self.renew_active_publisher_gc_lease(lease_id, lease_duration_ms)
+                .await?;
+            match self
+                .store
+                .update(
+                    &self.checkpoint_manifest_key()?,
+                    prepared.next_bytes,
+                    loaded.version.clone(),
+                )
+                .await
+            {
+                Ok(version) => {
+                    return Ok(LoadedCheckpointManifest {
+                        manifest: prepared.next,
+                        version,
+                    });
+                }
+                Err(ObjStoreError::Precondition { .. }) => {
+                    loaded = self.load_checkpoint_unleased().await?.ok_or_else(|| {
+                        Error::InvalidCheckpoint("manifest disappeared after stale CAS".into())
+                    })?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(Error::CompareAndSwapRetriesExhausted {
+            attempts: MAX_CHECKPOINT_CAS_ATTEMPTS,
+        })
+    }
+
+    fn prepare_checkpoint_snapshot_candidate(
+        &self,
+        anchor: &RecoveryAnchor,
+        snapshot_bytes: &[u8],
+        manifest: &CheckpointManifest,
+        policy: CheckpointSnapshotPublicationPolicy,
+    ) -> Result<PreparedCheckpointSnapshot> {
+        let CheckpointSnapshotPublicationPolicy {
+            allow_empty_baseline,
+            limits,
+        } = policy;
+        self.validate_recovery_anchor(anchor)?;
+        self.checkpoint_declared_decoded_budget(manifest, limits)?;
+        let digest = LogHash::digest(&[snapshot_bytes]);
+        if anchor.snapshot().digest() != digest {
+            return Err(Error::ChecksumMismatch {
+                object_key: anchor.snapshot().snapshot_id().to_string(),
+                expected: anchor.snapshot().digest().to_hex(),
+                actual: digest.to_hex(),
+            });
+        }
+        let snapshot_size =
+            u64::try_from(snapshot_bytes.len()).map_err(|_| Error::RestoreSizeOverflow {
+                resource: "object encoded bytes",
+            })?;
+        if anchor.snapshot().size_bytes() != snapshot_size {
+            return Err(Error::SizeMismatch {
+                object_key: anchor.snapshot().snapshot_id().to_string(),
+                expected: anchor.snapshot().size_bytes(),
+                actual: snapshot_size,
+            });
+        }
+        let snapshot = CheckpointSnapshotBase {
+            object_key: checkpoint_snapshot_key(self.checkpoint_identity()?, anchor),
+            executor_fingerprint: anchor.executor_fingerprint(),
+            anchor: anchor.clone(),
+            digest,
+            size_bytes: snapshot_size,
+        };
+        self.validate_checkpoint_snapshot_base(&snapshot)?;
+        ensure_restore_limit(
+            "object encoded bytes",
+            Some(&snapshot.object_key),
+            snapshot.size_bytes,
+            limits.object_encoded_bytes,
+        )?;
+        ensure_restore_limit(
+            "object decoded bytes",
+            Some(&snapshot.object_key),
+            snapshot.size_bytes,
+            limits.object_decoded_bytes,
+        )?;
+
+        let proposed = CheckpointBase::Snapshot(Box::new(snapshot));
+        let current_tip = manifest.base.tip();
+        let proposed_tip = proposed.tip();
+        if current_tip.index == proposed_tip.index {
+            if manifest.base == proposed {
+                return Ok(PreparedCheckpointSnapshot {
+                    proposed,
+                    next: None,
+                    next_bytes: None,
+                });
+            }
+            return Err(Error::CheckpointBaseConflict {
+                index: proposed_tip.index,
+            });
+        }
+        if current_tip.index > proposed_tip.index {
+            return Err(Error::CheckpointBaseRegression {
+                current: current_tip.index,
+                proposed: proposed_tip.index,
+            });
+        }
+
+        let mut next = manifest.clone();
+        let empty_baseline = allow_empty_baseline
+            && matches!(&manifest.base, CheckpointBase::Genesis)
+            && manifest.segments.is_empty()
+            && manifest.tip == CheckpointTip::new(0, LogHash::ZERO);
+        if empty_baseline {
+            next.base = proposed.clone();
+            next.tip = proposed_tip;
+        } else {
+            let boundary = manifest
+                .segments
+                .iter()
+                .find(|record| record.end_index == proposed_tip.index)
+                .ok_or_else(|| {
+                    Error::InvalidCheckpoint(format!(
+                        "snapshot anchor {} is not an exact segment boundary",
+                        proposed_tip.index
+                    ))
+                })?;
+            if boundary.last_hash != proposed_tip.hash {
+                return Err(Error::CheckpointBaseConflict {
+                    index: proposed_tip.index,
+                });
+            }
+            next.base = proposed.clone();
+            next.segments
+                .retain(|record| record.start_index > proposed_tip.index);
+        }
+        self.validate_checkpoint_manifest_with_limits(&next, limits)?;
+        self.checkpoint_declared_decoded_budget(&next, limits)?;
+        let next_bytes = serialize_checkpoint_manifest(&next)?;
+        Ok(PreparedCheckpointSnapshot {
+            proposed,
+            next: Some(next),
+            next_bytes: Some(next_bytes),
+        })
+    }
+
+    pub async fn publish_checkpoint_snapshot(
+        &self,
+        anchor: RecoveryAnchor,
+        snapshot_bytes: &[u8],
+    ) -> Result<LoadedCheckpointManifest> {
+        self.publish_checkpoint_snapshot_with_limits(
+            anchor,
+            snapshot_bytes,
+            CHECKPOINT_RESTORE_LIMITS,
+        )
+        .await
+    }
+
+    async fn publish_checkpoint_snapshot_with_limits(
+        &self,
+        anchor: RecoveryAnchor,
+        snapshot_bytes: &[u8],
+        limits: CheckpointRestoreLimits,
+    ) -> Result<LoadedCheckpointManifest> {
+        let policy = CheckpointSnapshotPublicationPolicy {
+            allow_empty_baseline: false,
+            limits,
+        };
+        self.ensure_generation_not_retired().await?;
+        let observed = self.load_checkpoint_unleased().await?;
+        let genesis;
+        let manifest = if let Some(loaded) = &observed {
+            loaded.manifest()
+        } else {
+            genesis = CheckpointManifest::new(self.checkpoint_identity()?.clone());
+            &genesis
+        };
+        self.prepare_checkpoint_snapshot_candidate(&anchor, snapshot_bytes, manifest, policy)?;
+        let lease = self
+            .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
+            .await?;
+        let result = self
+            .publish_checkpoint_snapshot_unleased_with_policy(
+                anchor,
+                snapshot_bytes,
+                &lease.lease_id,
+                DEFAULT_LEASE_MS,
+                policy,
+            )
+            .await;
+        let release = self.release_gc_lease(&lease.lease_id).await;
+        match (result, release) {
+            (Ok(loaded), Ok(())) => Ok(loaded),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    async fn publish_checkpoint_snapshot_unleased_with_policy(
+        &self,
+        anchor: RecoveryAnchor,
+        snapshot_bytes: &[u8],
+        lease_id: &str,
+        lease_duration_ms: u64,
+        policy: CheckpointSnapshotPublicationPolicy,
+    ) -> Result<LoadedCheckpointManifest> {
+        let loaded = if let Some(loaded) = self.load_checkpoint_unleased().await? {
+            self.prepare_checkpoint_snapshot_candidate(
+                &anchor,
+                snapshot_bytes,
+                loaded.manifest(),
+                policy,
+            )?;
+            loaded
+        } else {
+            let genesis = CheckpointManifest::new(self.checkpoint_identity()?.clone());
+            self.prepare_checkpoint_snapshot_candidate(&anchor, snapshot_bytes, &genesis, policy)?;
+            self.initialize_checkpoint_unleased(lease_id, lease_duration_ms)
+                .await?
+        };
+        self.publish_checkpoint_snapshot_from_loaded_unleased_with_limits(
+            anchor,
+            snapshot_bytes,
+            lease_id,
+            lease_duration_ms,
+            loaded,
+            policy,
+        )
+        .await
+    }
+
+    async fn publish_checkpoint_snapshot_from_loaded_unleased(
+        &self,
+        anchor: RecoveryAnchor,
+        snapshot_bytes: &[u8],
+        lease_id: &str,
+        lease_duration_ms: u64,
+        loaded: LoadedCheckpointManifest,
+        allow_empty_baseline: bool,
+    ) -> Result<LoadedCheckpointManifest> {
+        self.publish_checkpoint_snapshot_from_loaded_unleased_with_limits(
+            anchor,
+            snapshot_bytes,
+            lease_id,
+            lease_duration_ms,
+            loaded,
+            CheckpointSnapshotPublicationPolicy {
+                allow_empty_baseline,
+                limits: CHECKPOINT_RESTORE_LIMITS,
+            },
+        )
+        .await
+    }
+
+    async fn publish_checkpoint_snapshot_from_loaded_unleased_with_limits(
+        &self,
+        anchor: RecoveryAnchor,
+        snapshot_bytes: &[u8],
+        lease_id: &str,
+        lease_duration_ms: u64,
+        mut loaded: LoadedCheckpointManifest,
+        policy: CheckpointSnapshotPublicationPolicy,
+    ) -> Result<LoadedCheckpointManifest> {
+        let limits = policy.limits;
+        for _ in 0..MAX_CHECKPOINT_CAS_ATTEMPTS {
+            let prepared = self.prepare_checkpoint_snapshot_candidate(
+                &anchor,
+                snapshot_bytes,
+                loaded.manifest(),
+                policy,
+            )?;
+            self.ensure_generation_not_retired().await?;
+            let snapshot = prepared
+                .proposed
+                .snapshot()
+                .expect("proposed snapshot base");
             self.renew_gc_lease(
                 GcLeaseKind::Publisher,
                 lease_id,
@@ -1399,13 +2507,27 @@ impl ObjectArchiveStore {
                 lease_duration_ms,
             )
             .await?;
-            self.store.create(record.object_key(), &bytes).await?;
-
-            let mut next = loaded.manifest.clone();
-            next.tip = CheckpointTip::new(record.end_index, record.last_hash);
-            next.segments.push(record);
-            self.validate_checkpoint_manifest(&next)?;
-            let next_bytes = serialize_json(&next)?;
+            match self
+                .store
+                .create(snapshot.object_key(), snapshot_bytes)
+                .await
+            {
+                Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.download_verified_with_limits(
+                snapshot.object_key(),
+                snapshot.size_bytes(),
+                &snapshot.digest().to_hex(),
+                limits,
+            )
+            .await?;
+            let Some(next) = prepared.next else {
+                return Ok(loaded);
+            };
+            let next_bytes = prepared
+                .next_bytes
+                .expect("updated snapshot manifest serialization");
             self.renew_gc_lease(
                 GcLeaseKind::Publisher,
                 lease_id,
@@ -1436,231 +2558,9 @@ impl ObjectArchiveStore {
                 Err(error) => return Err(error.into()),
             }
         }
-
         Err(Error::CompareAndSwapRetriesExhausted {
             attempts: MAX_CHECKPOINT_CAS_ATTEMPTS,
         })
-    }
-
-    pub async fn publish_checkpoint_snapshot(
-        &self,
-        anchor: RecoveryAnchor,
-        snapshot_bytes: &[u8],
-    ) -> Result<LoadedCheckpointManifest> {
-        self.ensure_generation_not_retired().await?;
-        self.load_checkpoint().await?;
-        let lease = self
-            .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
-            .await?;
-        let result = self
-            .publish_checkpoint_snapshot_unleased(
-                anchor,
-                snapshot_bytes,
-                &lease.lease_id,
-                DEFAULT_LEASE_MS,
-            )
-            .await;
-        let release = self.release_gc_lease(&lease.lease_id).await;
-        match (result, release) {
-            (Ok(loaded), Ok(())) => Ok(loaded),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
-    }
-
-    async fn publish_checkpoint_snapshot_unleased(
-        &self,
-        anchor: RecoveryAnchor,
-        snapshot_bytes: &[u8],
-        lease_id: &str,
-        lease_duration_ms: u64,
-    ) -> Result<LoadedCheckpointManifest> {
-        let loaded = self
-            .initialize_checkpoint_unleased(lease_id, lease_duration_ms)
-            .await?;
-        self.publish_checkpoint_snapshot_from_loaded_unleased(
-            anchor,
-            snapshot_bytes,
-            lease_id,
-            lease_duration_ms,
-            loaded,
-            false,
-        )
-        .await
-    }
-
-    async fn publish_checkpoint_snapshot_from_loaded_unleased(
-        &self,
-        anchor: RecoveryAnchor,
-        snapshot_bytes: &[u8],
-        lease_id: &str,
-        lease_duration_ms: u64,
-        mut loaded: LoadedCheckpointManifest,
-        allow_empty_baseline: bool,
-    ) -> Result<LoadedCheckpointManifest> {
-        self.ensure_generation_not_retired().await?;
-        self.validate_recovery_anchor(&anchor)?;
-        let digest = LogHash::digest(&[snapshot_bytes]);
-        if anchor.snapshot().digest() != digest {
-            return Err(Error::ChecksumMismatch {
-                object_key: anchor.snapshot().snapshot_id().to_string(),
-                expected: anchor.snapshot().digest().to_hex(),
-                actual: digest.to_hex(),
-            });
-        }
-        if anchor.snapshot().size_bytes() != snapshot_bytes.len() as u64 {
-            return Err(Error::SizeMismatch {
-                object_key: anchor.snapshot().snapshot_id().to_string(),
-                expected: anchor.snapshot().size_bytes(),
-                actual: snapshot_bytes.len() as u64,
-            });
-        }
-
-        let snapshot = CheckpointSnapshotBase {
-            object_key: checkpoint_snapshot_key(self.checkpoint_identity()?, &anchor),
-            executor_fingerprint: anchor.executor_fingerprint(),
-            anchor,
-            digest,
-            size_bytes: snapshot_bytes.len() as u64,
-        };
-        self.validate_checkpoint_snapshot_base(&snapshot)?;
-        self.renew_gc_lease(
-            GcLeaseKind::Publisher,
-            lease_id,
-            now_ms(),
-            lease_duration_ms,
-        )
-        .await?;
-        match self
-            .store
-            .create(&snapshot.object_key, snapshot_bytes)
-            .await
-        {
-            Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.download_verified(
-            &snapshot.object_key,
-            snapshot.size_bytes,
-            &snapshot.digest.to_hex(),
-        )
-        .await?;
-
-        let proposed = CheckpointBase::Snapshot(Box::new(snapshot));
-        for _ in 0..MAX_CHECKPOINT_CAS_ATTEMPTS {
-            let current_tip = loaded.manifest.base.tip();
-            let proposed_tip = proposed.tip();
-            if current_tip.index == proposed_tip.index {
-                if loaded.manifest.base == proposed {
-                    return Ok(loaded);
-                }
-                return Err(Error::CheckpointBaseConflict {
-                    index: proposed_tip.index,
-                });
-            }
-            if current_tip.index > proposed_tip.index {
-                return Err(Error::CheckpointBaseRegression {
-                    current: current_tip.index,
-                    proposed: proposed_tip.index,
-                });
-            }
-
-            let mut next = loaded.manifest.clone();
-            let empty_baseline = allow_empty_baseline
-                && matches!(&loaded.manifest.base, CheckpointBase::Genesis)
-                && loaded.manifest.segments.is_empty()
-                && loaded.manifest.tip == CheckpointTip::new(0, LogHash::ZERO);
-            if empty_baseline {
-                next.base = proposed.clone();
-                next.tip = proposed_tip;
-            } else {
-                let boundary = loaded
-                    .manifest
-                    .segments
-                    .iter()
-                    .find(|record| record.end_index == proposed_tip.index)
-                    .ok_or_else(|| {
-                        Error::InvalidCheckpoint(format!(
-                            "snapshot anchor {} is not an exact segment boundary",
-                            proposed_tip.index
-                        ))
-                    })?;
-                if boundary.last_hash != proposed_tip.hash {
-                    return Err(Error::CheckpointBaseConflict {
-                        index: proposed_tip.index,
-                    });
-                }
-                next.base = proposed.clone();
-                next.segments
-                    .retain(|record| record.start_index > proposed_tip.index);
-            }
-            self.validate_checkpoint_manifest(&next)?;
-            self.renew_gc_lease(
-                GcLeaseKind::Publisher,
-                lease_id,
-                now_ms(),
-                lease_duration_ms,
-            )
-            .await?;
-            match self
-                .store
-                .update(
-                    &self.checkpoint_manifest_key()?,
-                    serialize_json(&next)?,
-                    loaded.version.clone(),
-                )
-                .await
-            {
-                Ok(version) => {
-                    return Ok(LoadedCheckpointManifest {
-                        manifest: next,
-                        version,
-                    });
-                }
-                Err(ObjStoreError::Precondition { .. }) => {
-                    loaded = self.load_checkpoint_unleased().await?.ok_or_else(|| {
-                        Error::InvalidCheckpoint("manifest disappeared after stale CAS".into())
-                    })?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(Error::CompareAndSwapRetriesExhausted {
-            attempts: MAX_CHECKPOINT_CAS_ATTEMPTS,
-        })
-    }
-
-    pub async fn restore_checkpoint(&self) -> Result<Vec<LogEntry>> {
-        let lease = self
-            .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
-            .await?;
-        let result = match self.ensure_generation_not_retired().await {
-            Ok(()) => match self.restore_checkpoint_unleased(&lease.lease_id).await {
-                Ok(restored) if restored.snapshot.is_none() => Ok(restored.suffix),
-                Ok(_) => Err(Error::SnapshotBaseRequiresStructuredRestore),
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        let release = self.release_gc_lease(&lease.lease_id).await;
-        match (result, release) {
-            (Ok(entries), Ok(())) => Ok(entries),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
-    }
-
-    pub async fn restore_checkpoint_state(&self) -> Result<RestoredCheckpoint> {
-        let lease = self
-            .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
-            .await?;
-        let result = match self.ensure_generation_not_retired().await {
-            Ok(()) => self.restore_checkpoint_unleased(&lease.lease_id).await,
-            Err(error) => Err(error),
-        };
-        let release = self.release_gc_lease(&lease.lease_id).await;
-        match (result, release) {
-            (Ok(restored), Ok(())) => Ok(restored),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
     }
 
     pub async fn roll_recovery_generation(
@@ -1691,9 +2591,18 @@ impl ObjectArchiveStore {
         target.ensure_generation_not_retired().await?;
         self.load_checkpoint().await?;
         target.load_checkpoint().await?;
+        let source_hard_deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(DEFAULT_LEASE_MS))
+            .ok_or_else(|| Error::InvalidGc("reader lease deadline overflow".into()))?;
         let source_lease = self
             .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
             .await?;
+        if tokio::time::Instant::now() >= source_hard_deadline {
+            let _ = self.release_gc_lease(&source_lease.lease_id).await;
+            return Err(Error::GcLeaseMissing {
+                lease_id: source_lease.lease_id,
+            });
+        }
         let target_lease = match target
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await
@@ -1705,7 +2614,12 @@ impl ObjectArchiveStore {
             }
         };
         let result = self
-            .copy_checkpoint_to_unleased(target, &source_lease.lease_id, &target_lease.lease_id)
+            .with_reader_lease_renewal(
+                &source_lease.lease_id,
+                DEFAULT_LEASE_MS,
+                source_hard_deadline,
+                self.copy_checkpoint_to_unleased(target, &target_lease.lease_id),
+            )
             .await;
         let source_release = self.release_gc_lease(&source_lease.lease_id).await;
         let target_release = target.release_gc_lease(&target_lease.lease_id).await;
@@ -1718,7 +2632,6 @@ impl ObjectArchiveStore {
     async fn copy_checkpoint_to_unleased(
         &self,
         target: &ObjectArchiveStore,
-        source_lease_id: &str,
         target_lease_id: &str,
     ) -> Result<LoadedCheckpointManifest> {
         self.ensure_generation_not_retired().await?;
@@ -1732,7 +2645,11 @@ impl ObjectArchiveStore {
                 "checkpoint copy requires the canonical checkpoint format".into(),
             ));
         }
-        self.restore_checkpoint_unleased(source_lease_id).await?;
+        target
+            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+            .await?;
+        self.restore_loaded_checkpoint_with_active_reader_lease(&source)
+            .await?;
         let target_identity = target.checkpoint_identity()?.clone();
         let base = match &source.manifest.base {
             CheckpointBase::Genesis => CheckpointBase::Genesis,
@@ -1760,6 +2677,9 @@ impl ObjectArchiveStore {
                     executor_fingerprint: snapshot.executor_fingerprint,
                 };
                 target
+                    .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+                    .await?;
+                target
                     .create_verified_checkpoint_object(
                         &copied.object_key,
                         &bytes,
@@ -1772,20 +2692,8 @@ impl ObjectArchiveStore {
         };
         let mut segments = Vec::with_capacity(source.manifest.segments.len());
         for record in &source.manifest.segments {
-            self.renew_gc_lease(
-                GcLeaseKind::Reader,
-                source_lease_id,
-                now_ms(),
-                DEFAULT_LEASE_MS,
-            )
-            .await?;
             target
-                .renew_gc_lease(
-                    GcLeaseKind::Publisher,
-                    target_lease_id,
-                    now_ms(),
-                    DEFAULT_LEASE_MS,
-                )
+                .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
                 .await?;
             let bytes = self
                 .download_verified(&record.object_key, record.size_bytes, &record.sha256)
@@ -1811,6 +2719,9 @@ impl ObjectArchiveStore {
             tip: source.manifest.tip,
         };
         target.validate_checkpoint_manifest(&manifest)?;
+        target
+            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+            .await?;
         if let Some(existing) = target.load_checkpoint_unleased().await? {
             return if existing.manifest == manifest {
                 target.register_generation(now_ms()).await?;
@@ -1822,7 +2733,10 @@ impl ObjectArchiveStore {
         let target_manifest_key = target.checkpoint_manifest_key()?;
         let version = match target
             .store
-            .create(&target_manifest_key, serialize_json(&manifest)?)
+            .create(
+                &target_manifest_key,
+                serialize_checkpoint_manifest(&manifest)?,
+            )
             .await
         {
             Ok(version) => version,
@@ -1869,29 +2783,73 @@ impl ObjectArchiveStore {
             Err(error) => return Err(error.into()),
         }
         self.download_verified(key, size_bytes, sha256).await?;
+        #[cfg(test)]
+        test_checkpoint_object_created_gate(self.test_store_identity, key).await;
         Ok(())
     }
 
-    async fn restore_checkpoint_unleased(&self, lease_id: &str) -> Result<RestoredCheckpoint> {
-        let Some(loaded) = self.load_checkpoint_unleased().await? else {
-            return Ok(RestoredCheckpoint {
-                snapshot: None,
-                suffix: Vec::new(),
-                tip: CheckpointTip::new(0, LogHash::ZERO),
-            });
-        };
-        let mut restored = Vec::new();
+    #[cfg(test)]
+    async fn restore_loaded_checkpoint_unleased(
+        &self,
+        loaded: &LoadedCheckpointManifest,
+        lease_id: &str,
+    ) -> Result<RestoredCheckpoint> {
+        self.restore_loaded_checkpoint_with_reader_lease_duration_unleased(
+            loaded,
+            lease_id,
+            DEFAULT_LEASE_MS,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn restore_loaded_checkpoint_with_reader_lease_duration_unleased(
+        &self,
+        loaded: &LoadedCheckpointManifest,
+        lease_id: &str,
+        lease_duration_ms: u64,
+    ) -> Result<RestoredCheckpoint> {
+        self.restore_loaded_checkpoint_with_reader_lease_duration_and_limits_unleased(
+            loaded,
+            lease_id,
+            lease_duration_ms,
+            CHECKPOINT_RESTORE_LIMITS,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn restore_loaded_checkpoint_with_reader_lease_duration_and_limits_unleased(
+        &self,
+        loaded: &LoadedCheckpointManifest,
+        lease_id: &str,
+        lease_duration_ms: u64,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<RestoredCheckpoint> {
+        let stable_budget = self.checkpoint_declared_decoded_budget(&loaded.manifest, limits)?;
+        let suffix_shape = checkpoint_suffix_shape(&loaded.manifest)?;
+        let (mut restored, restored_capacity, restored_outer_bytes) =
+            allocate_restored_suffix(suffix_shape)?;
         let mut expected_tip = loaded.manifest.base.tip();
+        let mut budget = CheckpointRestoreBudget::new(&loaded.manifest, limits)?;
+        budget.charge_aggregate(restored_outer_bytes)?;
+        ensure_restore_limit(
+            "stable aggregate decoded bytes",
+            None,
+            budget.decoded_bytes(),
+            stable_budget.decoded_bytes(),
+        )?;
         let snapshot = match &loaded.manifest.base {
             CheckpointBase::Genesis => None,
             CheckpointBase::Snapshot(snapshot) => {
-                self.renew_gc_lease(GcLeaseKind::Reader, lease_id, now_ms(), DEFAULT_LEASE_MS)
+                self.renew_gc_lease(GcLeaseKind::Reader, lease_id, now_ms(), lease_duration_ms)
                     .await?;
                 let bytes = self
-                    .download_verified(
+                    .download_verified_with_limits(
                         &snapshot.object_key,
                         snapshot.size_bytes,
                         &snapshot.digest.to_hex(),
+                        limits,
                     )
                     .await?;
                 Some(RestoredCheckpointSnapshot {
@@ -1901,21 +2859,180 @@ impl ObjectArchiveStore {
             }
         };
         for record in &loaded.manifest.segments {
-            self.renew_gc_lease(GcLeaseKind::Reader, lease_id, now_ms(), DEFAULT_LEASE_MS)
+            self.renew_gc_lease(GcLeaseKind::Reader, lease_id, now_ms(), lease_duration_ms)
                 .await?;
-            let entries = self.load_checkpoint_segment(record).await?;
+            let bytes = self
+                .download_verified_with_limits(
+                    record.object_key(),
+                    record.size_bytes(),
+                    record.sha256(),
+                    limits,
+                )
+                .await?;
+            let max_decoded_bytes = budget.next_object_limit()?;
+            let limit_resource = if max_decoded_bytes < limits.object_decoded_bytes {
+                "aggregate decoded bytes"
+            } else {
+                "object decoded bytes"
+            };
+            let (entries, decoded_bytes) = self.decode_checkpoint_segment_bounded(
+                record,
+                &bytes,
+                max_decoded_bytes,
+                limit_resource,
+            )?;
+            budget.charge(record.object_key(), decoded_bytes)?;
+            ensure_restore_limit(
+                "stable aggregate decoded bytes",
+                None,
+                budget.decoded_bytes(),
+                stable_budget.decoded_bytes(),
+            )?;
             self.validate_decoded_entries(&entries, &expected_tip)?;
             let last = entries
                 .last()
                 .ok_or_else(|| Error::InvalidCheckpoint("empty qlog segment".into()))?;
             expected_tip = CheckpointTip::new(last.index, last.hash);
             restored.extend(entries);
+            validate_restored_suffix_allocation(
+                restored.capacity(),
+                restored.len(),
+                restored_capacity,
+                suffix_shape,
+            )?;
         }
-        if expected_tip != loaded.manifest.tip {
+        if expected_tip != loaded.manifest.tip || restored.len() != suffix_shape.entry_count {
             return Err(Error::InvalidCheckpoint(
                 "restored entries do not match manifest tip".into(),
             ));
         }
+        validate_restored_suffix_allocation(
+            restored.capacity(),
+            restored.len(),
+            restored_capacity,
+            suffix_shape,
+        )?;
+        ensure_restore_limit(
+            "stable aggregate decoded bytes",
+            None,
+            budget.decoded_bytes(),
+            stable_budget.decoded_bytes(),
+        )?;
+        Ok(RestoredCheckpoint {
+            snapshot,
+            suffix: restored,
+            tip: expected_tip,
+        })
+    }
+
+    /// Restores a manifest while its caller owns one continuously renewed
+    /// reader lease. This deliberately contains no lease or timer operation:
+    /// [`with_reader_lease_renewal`] owns the entire remote lifetime, from the
+    /// generation check through every object download.
+    async fn restore_loaded_checkpoint_with_active_reader_lease(
+        &self,
+        loaded: &LoadedCheckpointManifest,
+    ) -> Result<RestoredCheckpoint> {
+        self.restore_loaded_checkpoint_with_active_reader_lease_and_limits(
+            loaded,
+            CHECKPOINT_RESTORE_LIMITS,
+        )
+        .await
+    }
+
+    async fn restore_loaded_checkpoint_with_active_reader_lease_and_limits(
+        &self,
+        loaded: &LoadedCheckpointManifest,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<RestoredCheckpoint> {
+        let stable_budget = self.checkpoint_declared_decoded_budget(&loaded.manifest, limits)?;
+        let suffix_shape = checkpoint_suffix_shape(&loaded.manifest)?;
+        let (mut restored, restored_capacity, restored_outer_bytes) =
+            allocate_restored_suffix(suffix_shape)?;
+        let mut expected_tip = loaded.manifest.base.tip();
+        let mut budget = CheckpointRestoreBudget::new(&loaded.manifest, limits)?;
+        budget.charge_aggregate(restored_outer_bytes)?;
+        ensure_restore_limit(
+            "stable aggregate decoded bytes",
+            None,
+            budget.decoded_bytes(),
+            stable_budget.decoded_bytes(),
+        )?;
+        let snapshot = match &loaded.manifest.base {
+            CheckpointBase::Genesis => None,
+            CheckpointBase::Snapshot(snapshot) => {
+                let bytes = self
+                    .download_verified_with_limits(
+                        &snapshot.object_key,
+                        snapshot.size_bytes,
+                        &snapshot.digest.to_hex(),
+                        limits,
+                    )
+                    .await?;
+                Some(RestoredCheckpointSnapshot {
+                    anchor: snapshot.anchor.clone(),
+                    bytes,
+                })
+            }
+        };
+        for record in &loaded.manifest.segments {
+            let bytes = self
+                .download_verified_with_limits(
+                    record.object_key(),
+                    record.size_bytes(),
+                    record.sha256(),
+                    limits,
+                )
+                .await?;
+            let max_decoded_bytes = budget.next_object_limit()?;
+            let limit_resource = if max_decoded_bytes < limits.object_decoded_bytes {
+                "aggregate decoded bytes"
+            } else {
+                "object decoded bytes"
+            };
+            let (entries, decoded_bytes) = self.decode_checkpoint_segment_bounded(
+                record,
+                &bytes,
+                max_decoded_bytes,
+                limit_resource,
+            )?;
+            budget.charge(record.object_key(), decoded_bytes)?;
+            ensure_restore_limit(
+                "stable aggregate decoded bytes",
+                None,
+                budget.decoded_bytes(),
+                stable_budget.decoded_bytes(),
+            )?;
+            self.validate_decoded_entries(&entries, &expected_tip)?;
+            let last = entries
+                .last()
+                .ok_or_else(|| Error::InvalidCheckpoint("empty qlog segment".into()))?;
+            expected_tip = CheckpointTip::new(last.index, last.hash);
+            restored.extend(entries);
+            validate_restored_suffix_allocation(
+                restored.capacity(),
+                restored.len(),
+                restored_capacity,
+                suffix_shape,
+            )?;
+        }
+        if expected_tip != loaded.manifest.tip || restored.len() != suffix_shape.entry_count {
+            return Err(Error::InvalidCheckpoint(
+                "restored entries do not match manifest tip".into(),
+            ));
+        }
+        validate_restored_suffix_allocation(
+            restored.capacity(),
+            restored.len(),
+            restored_capacity,
+            suffix_shape,
+        )?;
+        ensure_restore_limit(
+            "stable aggregate decoded bytes",
+            None,
+            budget.decoded_bytes(),
+            stable_budget.decoded_bytes(),
+        )?;
         Ok(RestoredCheckpoint {
             snapshot,
             suffix: restored,
@@ -1927,6 +3044,16 @@ impl ObjectArchiveStore {
         &self,
         epoch: u64,
         segment: &SegmentFile,
+    ) -> Result<SegmentRecord> {
+        self.publish_segment_with_limits(epoch, segment, CHECKPOINT_RESTORE_LIMITS)
+            .await
+    }
+
+    async fn publish_segment_with_limits(
+        &self,
+        epoch: u64,
+        segment: &SegmentFile,
+        limits: CheckpointRestoreLimits,
     ) -> Result<SegmentRecord> {
         let range = segment.range();
         let object_key = format!(
@@ -1943,8 +3070,18 @@ impl ObjectArchiveStore {
             end_index: range.end(),
             object_key,
             sha256: sha256_hex(segment.bytes()),
-            size_bytes: segment.bytes().len() as u64,
+            size_bytes: u64::try_from(segment.bytes().len()).map_err(|_| {
+                Error::RestoreSizeOverflow {
+                    resource: "object encoded bytes",
+                }
+            })?,
         };
+        ensure_restore_limit(
+            "object encoded bytes",
+            Some(record.object_key()),
+            record.size_bytes(),
+            limits.object_encoded_bytes,
+        )?;
         self.store
             .create(record.object_key(), segment.bytes())
             .await?;
@@ -1952,6 +3089,15 @@ impl ObjectArchiveStore {
     }
 
     pub async fn publish_snapshot(&self, snapshot: &Snapshot) -> Result<SnapshotRecord> {
+        self.publish_snapshot_with_limits(snapshot, CHECKPOINT_RESTORE_LIMITS)
+            .await
+    }
+
+    async fn publish_snapshot_with_limits(
+        &self,
+        snapshot: &Snapshot,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<SnapshotRecord> {
         let manifest = snapshot.manifest();
         self.validate_record(
             "snapshot record",
@@ -1964,8 +3110,24 @@ impl ObjectArchiveStore {
             manifest: manifest.clone(),
             object_key,
             sha256: sha256_hex(snapshot.db_bytes()),
-            size_bytes: snapshot.db_bytes().len() as u64,
+            size_bytes: u64::try_from(snapshot.db_bytes().len()).map_err(|_| {
+                Error::RestoreSizeOverflow {
+                    resource: "object encoded bytes",
+                }
+            })?,
         };
+        ensure_restore_limit(
+            "object encoded bytes",
+            Some(record.object_key()),
+            record.size_bytes(),
+            limits.object_encoded_bytes,
+        )?;
+        ensure_restore_limit(
+            "object decoded bytes",
+            Some(record.object_key()),
+            record.size_bytes(),
+            limits.object_decoded_bytes,
+        )?;
         self.store
             .create(record.object_key(), snapshot.db_bytes())
             .await?;
@@ -2118,7 +3280,9 @@ impl ObjectArchiveStore {
             return Err(Error::InvalidGc("root generation is retired".into()));
         }
         let root_key = checkpoint_namespace(&policy.root) + "/manifest.json";
-        let root_object = self.store.get_versioned(&root_key).await?;
+        let root_object = self
+            .get_checkpoint_manifest_versioned_bounded(&root_key)
+            .await?;
         let root_manifest: CheckpointManifest = deserialize_json(root_object.bytes())?;
         validate_checkpoint_identity(&policy.root, root_manifest.identity())?;
         self.validate_checkpoint_manifest(&root_manifest)?;
@@ -2463,6 +3627,9 @@ impl ObjectArchiveStore {
                 lease.fence = loaded.control.fence;
                 lease.expires_at_ms = expires_at_ms;
             } else {
+                // The established publisher/copy contract is deliberately
+                // forgiving: their next operation renews a missing or expired
+                // lease. Reader restore uses the stricter helper below.
                 loaded.control.leases.push(GcLease {
                     lease_id: lease_id.to_string(),
                     kind,
@@ -2477,6 +3644,225 @@ impl ObjectArchiveStore {
             }
             match self.update_gc_control(&loaded).await {
                 Ok(_) => return Ok(()),
+                Err(Error::ObjectStore(ObjStoreError::Precondition { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::CompareAndSwapRetriesExhausted {
+            attempts: MAX_GC_CONTROL_CAS_ATTEMPTS,
+        })
+    }
+
+    /// Renews the exact Publisher lease that already protects a publication
+    /// mutation or archived-overlap proof. Unlike the general publisher/copy
+    /// renewal contract, this fence must never recreate a missing or expired
+    /// lease after GC could have started deleting a referenced object.
+    async fn renew_active_publisher_gc_lease(
+        &self,
+        lease_id: &str,
+        duration_ms: u64,
+    ) -> Result<()> {
+        let identity = self.checkpoint_identity()?.clone();
+        let mut prior_hard_deadline = None;
+        let mut prior_expires_at_ms = None;
+        for _ in 0..MAX_GC_CONTROL_CAS_ATTEMPTS {
+            let loaded = self.load_gc_control().await;
+            let loaded_at = tokio::time::Instant::now();
+            let loaded_at_ms = now_ms();
+            let mut loaded = loaded?;
+            self.expire_gc_state(&mut loaded.control, loaded_at_ms);
+            if let Some(GenerationCatalogEntry {
+                lifecycle:
+                    GenerationLifecycle::Retired {
+                        plan_hash,
+                        retired_at_ms: _,
+                    },
+                ..
+            }) = loaded
+                .control
+                .generations
+                .iter()
+                .find(|entry| entry.identity == identity)
+            {
+                return Err(Error::GenerationRetired {
+                    generation: identity.recovery_generation(),
+                    plan_hash: plan_hash.clone(),
+                });
+            }
+            if let Some(active) = &loaded.control.active_gc {
+                if active.phase == GcBarrierPhase::Deleting {
+                    return Err(Error::GcBarrierActive {
+                        operation_id: active.operation_id.clone(),
+                    });
+                }
+            }
+            if prior_hard_deadline.is_some_and(|deadline| loaded_at >= deadline)
+                || prior_expires_at_ms.is_some_and(|expires_at_ms| loaded_at_ms >= expires_at_ms)
+            {
+                return Err(Error::GcLeaseMissing {
+                    lease_id: lease_id.to_string(),
+                });
+            }
+            let Some(lease) = loaded
+                .control
+                .leases
+                .iter_mut()
+                .find(|lease| lease.lease_id == lease_id)
+            else {
+                return Err(Error::GcLeaseMissing {
+                    lease_id: lease_id.to_string(),
+                });
+            };
+            if lease.kind != GcLeaseKind::Publisher {
+                return Err(Error::InvalidGc(
+                    "publisher proof renewal lease kind changed".into(),
+                ));
+            }
+            if prior_hard_deadline.is_none() {
+                let remaining_ms =
+                    lease
+                        .expires_at_ms
+                        .checked_sub(loaded_at_ms)
+                        .ok_or_else(|| Error::GcLeaseMissing {
+                            lease_id: lease_id.to_string(),
+                        })?;
+                prior_hard_deadline = Some(
+                    loaded_at
+                        .checked_add(Duration::from_millis(remaining_ms))
+                        .ok_or_else(|| {
+                            Error::InvalidGc("publisher lease deadline overflow".into())
+                        })?,
+                );
+                prior_expires_at_ms = Some(lease.expires_at_ms);
+            }
+            let expires_at_ms = loaded_at_ms.saturating_add(duration_ms);
+            let next_hard_deadline = loaded_at
+                .checked_add(Duration::from_millis(duration_ms))
+                .ok_or_else(|| Error::InvalidGc("publisher lease deadline overflow".into()))?;
+            lease.fence = loaded.control.fence;
+            lease.expires_at_ms = expires_at_ms;
+            if let Some(active) = loaded.control.active_gc.as_mut() {
+                active.expires_at_ms = active
+                    .expires_at_ms
+                    .max(expires_at_ms.saturating_add(DEFAULT_LEASE_MS));
+            }
+            let update = self.update_gc_control(&loaded).await;
+            let updated_at = tokio::time::Instant::now();
+            let updated_at_ms = now_ms();
+            let prior_elapsed = prior_hard_deadline.is_some_and(|deadline| updated_at >= deadline)
+                || prior_expires_at_ms.is_some_and(|expires_at_ms| updated_at_ms >= expires_at_ms);
+            let renewed_elapsed =
+                updated_at >= next_hard_deadline || updated_at_ms >= expires_at_ms;
+            match update {
+                Ok(_) if prior_elapsed || renewed_elapsed => {
+                    let _ = self.release_gc_lease(lease_id).await;
+                    return Err(Error::GcLeaseMissing {
+                        lease_id: lease_id.to_string(),
+                    });
+                }
+                Ok(_) => return Ok(()),
+                Err(Error::ObjectStore(ObjStoreError::Precondition { .. })) if prior_elapsed => {
+                    return Err(Error::GcLeaseMissing {
+                        lease_id: lease_id.to_string(),
+                    });
+                }
+                Err(Error::ObjectStore(ObjStoreError::Precondition { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::CompareAndSwapRetriesExhausted {
+            attempts: MAX_GC_CONTROL_CAS_ATTEMPTS,
+        })
+    }
+
+    /// Renews an already-active reader lease without changing the established
+    /// writer/publisher/copy renewal semantics. Missing or expired readers are
+    /// never recreated; a retired generation is rejected from the same
+    /// control-plane snapshot before a remote restore can continue.
+    async fn renew_active_reader_gc_lease(
+        &self,
+        lease_id: &str,
+        prior_hard_deadline: tokio::time::Instant,
+        duration_ms: u64,
+    ) -> Result<tokio::time::Instant> {
+        let identity = self.checkpoint_identity()?.clone();
+        for _ in 0..MAX_GC_CONTROL_CAS_ATTEMPTS {
+            let loaded = self.load_gc_control().await;
+            let loaded_at = tokio::time::Instant::now();
+            let mut loaded = loaded?;
+            let loaded_at_ms = now_ms();
+            self.expire_gc_state(&mut loaded.control, loaded_at_ms);
+            if let Some(GenerationCatalogEntry {
+                lifecycle:
+                    GenerationLifecycle::Retired {
+                        plan_hash,
+                        retired_at_ms: _,
+                    },
+                ..
+            }) = loaded
+                .control
+                .generations
+                .iter()
+                .find(|entry| entry.identity == identity)
+            {
+                return Err(Error::GenerationRetired {
+                    generation: identity.recovery_generation(),
+                    plan_hash: plan_hash.clone(),
+                });
+            }
+            if let Some(active) = &loaded.control.active_gc {
+                if active.phase == GcBarrierPhase::Deleting {
+                    return Err(Error::GcBarrierActive {
+                        operation_id: active.operation_id.clone(),
+                    });
+                }
+            }
+            if loaded_at >= prior_hard_deadline {
+                return Err(Error::GcLeaseMissing {
+                    lease_id: lease_id.to_string(),
+                });
+            }
+            let Some(lease) = loaded
+                .control
+                .leases
+                .iter_mut()
+                .find(|lease| lease.lease_id == lease_id)
+            else {
+                return Err(Error::GcLeaseMissing {
+                    lease_id: lease_id.to_string(),
+                });
+            };
+            if lease.kind != GcLeaseKind::Reader {
+                return Err(Error::InvalidGc("reader renewal lease kind changed".into()));
+            }
+            let expires_at_ms = loaded_at_ms.saturating_add(duration_ms);
+            lease.fence = loaded.control.fence;
+            lease.expires_at_ms = expires_at_ms;
+            if let Some(active) = loaded.control.active_gc.as_mut() {
+                active.expires_at_ms = active
+                    .expires_at_ms
+                    .max(expires_at_ms.saturating_add(DEFAULT_LEASE_MS));
+            }
+            let next_hard_deadline = loaded_at
+                .checked_add(Duration::from_millis(duration_ms))
+                .ok_or_else(|| Error::InvalidGc("reader lease deadline overflow".into()))?;
+            let update = self.update_gc_control(&loaded).await;
+            let updated_at = tokio::time::Instant::now();
+            match update {
+                Ok(_) if updated_at >= prior_hard_deadline => {
+                    let _ = self.release_gc_lease(lease_id).await;
+                    return Err(Error::GcLeaseMissing {
+                        lease_id: lease_id.to_string(),
+                    });
+                }
+                Ok(_) => return Ok(next_hard_deadline),
+                Err(Error::ObjectStore(ObjStoreError::Precondition { .. }))
+                    if updated_at >= prior_hard_deadline =>
+                {
+                    return Err(Error::GcLeaseMissing {
+                        lease_id: lease_id.to_string(),
+                    });
+                }
                 Err(Error::ObjectStore(ObjStoreError::Precondition { .. })) => continue,
                 Err(error) => return Err(error),
             }
@@ -2717,7 +4103,9 @@ impl ObjectArchiveStore {
     }
 
     async fn fence_gc_root(&self, plan: &GcPlan) -> Result<()> {
-        let object = self.store.get_versioned(&plan.root_manifest_key).await?;
+        let object = self
+            .get_checkpoint_manifest_versioned_bounded(&plan.root_manifest_key)
+            .await?;
         if sha256_hex(object.bytes()) != plan.root_manifest_sha256 {
             return Err(Error::GcPlanStale {
                 message: "root checkpoint manifest changed".into(),
@@ -2736,7 +4124,9 @@ impl ObjectArchiveStore {
         {
             Ok(_) => Ok(()),
             Err(ObjStoreError::Precondition { .. }) => {
-                let current = self.store.get_versioned(&plan.root_manifest_key).await?;
+                let current = self
+                    .get_checkpoint_manifest_versioned_bounded(&plan.root_manifest_key)
+                    .await?;
                 if sha256_hex(current.bytes()) == plan.root_manifest_sha256 {
                     Ok(())
                 } else {
@@ -2775,6 +4165,16 @@ impl ObjectArchiveStore {
             });
         }
         Ok(())
+    }
+
+    async fn get_checkpoint_manifest_versioned_bounded(
+        &self,
+        key: &str,
+    ) -> Result<VersionedObject> {
+        self.store
+            .get_with_version_bounded(key, CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes)
+            .await
+            .map_err(|error| map_restore_object_error(error, "manifest encoded bytes"))
     }
 
     async fn clear_gc_barrier(&self, plan: &GcPlan) -> Result<()> {
@@ -2863,7 +4263,7 @@ impl ObjectArchiveStore {
         };
         match self
             .store
-            .create(&self.gc_control_key(), serialize_json(&control)?)
+            .create(&self.gc_control_key(), serialize_gc_control(&control)?)
             .await
         {
             Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => Ok(()),
@@ -2872,7 +4272,12 @@ impl ObjectArchiveStore {
     }
 
     async fn load_gc_control(&self) -> Result<LoadedGcControl> {
-        let object = self.store.get_versioned(&self.gc_control_key()).await?;
+        #[cfg(test)]
+        let _ = test_gc_control_gate(self.test_store_identity, TestGcControlOperation::Load).await;
+        let object = self
+            .store
+            .get_with_version_bounded(&self.gc_control_key(), GC_CONTROL_ENCODED_BYTES)
+            .await?;
         let control: GcControl = deserialize_json(object.bytes())?;
         if control.format_version != GC_FORMAT_VERSION || control.cluster_id != self.cluster_id {
             return Err(Error::InvalidGc(
@@ -2886,14 +4291,28 @@ impl ObjectArchiveStore {
     }
 
     async fn update_gc_control(&self, loaded: &LoadedGcControl) -> Result<UpdateVersion> {
-        self.store
+        #[cfg(test)]
+        if let Some(error) = test_gc_control_gate(
+            self.test_store_identity,
+            TestGcControlOperation::UpdateError,
+        )
+        .await
+        {
+            return Err(error.into());
+        }
+        let result = self
+            .store
             .update(
                 &self.gc_control_key(),
-                serialize_json(&loaded.control)?,
+                serialize_gc_control(&loaded.control)?,
                 loaded.version.clone(),
             )
             .await
-            .map_err(Into::into)
+            .map_err(Into::into);
+        #[cfg(test)]
+        let _ =
+            test_gc_control_gate(self.test_store_identity, TestGcControlOperation::Update).await;
+        result
     }
 
     fn expire_gc_state(&self, control: &mut GcControl, now_ms: u64) {
@@ -2991,6 +4410,115 @@ impl ObjectArchiveStore {
         Ok(Some(0))
     }
 
+    fn prepare_local_checkpoint_append(
+        &self,
+        manifest: &CheckpointManifest,
+        entries: &[LogEntry],
+        limits: CheckpointRestoreLimits,
+    ) -> Result<PreparedCheckpointAppend> {
+        self.validate_publication_entries(entries)?;
+        if entries.is_empty() {
+            self.checkpoint_declared_decoded_budget(manifest, limits)?;
+            return Ok(PreparedCheckpointAppend {
+                suffix_start: None,
+                candidate: None,
+            });
+        }
+        let suffix_start = local_publication_suffix_start(manifest, entries)?;
+        let Some(suffix_start) = suffix_start else {
+            self.checkpoint_declared_decoded_budget(manifest, limits)?;
+            return Ok(PreparedCheckpointAppend {
+                suffix_start: None,
+                candidate: None,
+            });
+        };
+        let mut budget = self.checkpoint_declared_decoded_budget(manifest, limits)?;
+        let bytes = encode_segment(&entries[suffix_start..]);
+        let record =
+            self.checkpoint_segment_record_with_limits(&entries[suffix_start..], &bytes, limits)?;
+        let max_decoded_bytes = budget.next_object_limit()?;
+        let decoded_upper_bound = self.checkpoint_segment_decoded_upper_bound(&record)?;
+        budget.charge(record.object_key(), decoded_upper_bound)?;
+        let candidate_entry_count = record
+            .end_index()
+            .checked_sub(record.start_index())
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or(Error::RestoreSizeOverflow {
+                resource: "checkpoint suffix entry count",
+            })?;
+        budget.charge_aggregate(
+            candidate_entry_count
+                .checked_mul(CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES)
+                .ok_or(Error::RestoreSizeOverflow {
+                    resource: "restored suffix container bytes",
+                })?,
+        )?;
+        let limit_resource = if max_decoded_bytes < limits.object_decoded_bytes {
+            "aggregate decoded bytes"
+        } else {
+            "object decoded bytes"
+        };
+        let (decoded, decoded_bytes) = self.decode_checkpoint_segment_bounded(
+            &record,
+            &bytes,
+            max_decoded_bytes,
+            limit_resource,
+        )?;
+        if decoded != entries[suffix_start..] {
+            return Err(Error::InvalidCheckpoint(
+                "encoded checkpoint segment does not round-trip exactly".into(),
+            ));
+        }
+        if decoded_bytes > decoded_upper_bound {
+            return Err(Error::InvalidCheckpoint(format!(
+                "decoded checkpoint segment {} exceeds its stable publication budget",
+                record.object_key()
+            )));
+        }
+
+        Ok(PreparedCheckpointAppend {
+            suffix_start: Some(suffix_start),
+            candidate: Some(PreparedCheckpointAppendCandidate { bytes, record }),
+        })
+    }
+
+    async fn finalize_checkpoint_append_under_lease(
+        &self,
+        manifest: &CheckpointManifest,
+        entries: &[LogEntry],
+        prepared: PreparedCheckpointAppend,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<Option<FinalizedCheckpointAppend>> {
+        let proven_suffix_start = if entries.is_empty() {
+            None
+        } else {
+            self.publication_suffix_start(manifest, entries).await?
+        };
+        if proven_suffix_start != prepared.suffix_start {
+            return Err(Error::InvalidCheckpoint(
+                "local checkpoint suffix changed before archived proof".into(),
+            ));
+        }
+        let Some(candidate) = prepared.candidate else {
+            return Ok(None);
+        };
+        let suffix_start = prepared
+            .suffix_start
+            .expect("prepared append candidate has suffix");
+        self.validate_decoded_entries(&entries[suffix_start..], manifest.tip())?;
+        let mut next = manifest.clone();
+        next.tip = CheckpointTip::new(candidate.record.end_index, candidate.record.last_hash);
+        next.segments.push(candidate.record);
+        self.validate_checkpoint_manifest_with_limits(&next, limits)?;
+        self.checkpoint_declared_decoded_budget(&next, limits)?;
+        let next_bytes = serialize_checkpoint_manifest(&next)?;
+        Ok(Some(FinalizedCheckpointAppend {
+            bytes: candidate.bytes,
+            next,
+            next_bytes,
+        }))
+    }
+
     async fn archived_hash_at(
         &self,
         manifest: &CheckpointManifest,
@@ -3020,17 +4548,86 @@ impl ObjectArchiveStore {
         })
     }
 
+    fn checkpoint_declared_decoded_budget(
+        &self,
+        manifest: &CheckpointManifest,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<CheckpointRestoreBudget> {
+        self.validate_checkpoint_manifest_with_limits(manifest, limits)?;
+        let suffix_shape = checkpoint_suffix_shape(manifest)?;
+        let mut budget = CheckpointRestoreBudget::new(manifest, limits)?;
+        for record in &manifest.segments {
+            budget.charge(
+                record.object_key(),
+                self.checkpoint_segment_decoded_upper_bound(record)?,
+            )?;
+        }
+        budget.charge_aggregate(suffix_shape.stable_outer_bytes)?;
+        Ok(budget)
+    }
+
+    fn checkpoint_segment_decoded_upper_bound(
+        &self,
+        record: &CheckpointSegmentRecord,
+    ) -> Result<u64> {
+        let entry_count = record
+            .end_index()
+            .checked_sub(record.start_index())
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or_else(|| Error::InvalidCheckpoint("invalid segment range".into()))?;
+        let cluster_id_bytes = u64::try_from(self.checkpoint_identity()?.cluster_id().len())
+            .map_err(|_| Error::RestoreSizeOverflow {
+                resource: "segment decoded upper bound",
+            })?;
+        let per_entry = cluster_id_bytes
+            .checked_add(
+                u64::try_from(QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES).map_err(|_| {
+                    Error::RestoreSizeOverflow {
+                        resource: "segment decoded upper bound",
+                    }
+                })?,
+            )
+            .ok_or(Error::RestoreSizeOverflow {
+                resource: "segment decoded upper bound",
+            })?;
+        entry_count
+            .checked_mul(per_entry)
+            .and_then(|bytes| bytes.checked_add(record.size_bytes()))
+            .ok_or(Error::RestoreSizeOverflow {
+                resource: "segment decoded upper bound",
+            })
+    }
+
+    #[cfg(test)]
     fn checkpoint_segment_record(
         &self,
-        decoded: &[LogEntry],
+        entries: &[LogEntry],
         bytes: &[u8],
     ) -> Result<CheckpointSegmentRecord> {
-        let first = decoded
+        self.checkpoint_segment_record_with_limits(entries, bytes, CHECKPOINT_RESTORE_LIMITS)
+    }
+
+    fn checkpoint_segment_record_with_limits(
+        &self,
+        entries: &[LogEntry],
+        bytes: &[u8],
+        limits: CheckpointRestoreLimits,
+    ) -> Result<CheckpointSegmentRecord> {
+        let first = entries
             .first()
             .ok_or_else(|| Error::InvalidCheckpoint("refusing to publish empty segment".into()))?;
-        let last = decoded.last().expect("non-empty decoded segment");
+        let last = entries.last().expect("non-empty checkpoint segment");
         let object_key =
             checkpoint_segment_key(self.checkpoint_identity()?, first.index, last.index);
+        let size_bytes = u64::try_from(bytes.len()).map_err(|_| Error::RestoreSizeOverflow {
+            resource: "object encoded bytes",
+        })?;
+        ensure_restore_limit(
+            "object encoded bytes",
+            Some(&object_key),
+            size_bytes,
+            limits.object_encoded_bytes,
+        )?;
         Ok(CheckpointSegmentRecord {
             format_version: CHECKPOINT_SEGMENT_FORMAT_VERSION,
             start_index: first.index,
@@ -3039,7 +4636,7 @@ impl ObjectArchiveStore {
             last_hash: last.hash,
             object_key,
             sha256: sha256_hex(bytes),
-            size_bytes: bytes.len() as u64,
+            size_bytes,
         })
     }
 
@@ -3050,9 +4647,48 @@ impl ObjectArchiveStore {
         let bytes = self
             .download_verified(record.object_key(), record.size_bytes, &record.sha256)
             .await?;
+        self.decode_checkpoint_segment(record, bytes)
+    }
+
+    fn decode_checkpoint_segment(
+        &self,
+        record: &CheckpointSegmentRecord,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<LogEntry>> {
+        self.decode_checkpoint_segment_bounded(
+            record,
+            &bytes,
+            CHECKPOINT_RESTORE_LIMITS.object_decoded_bytes,
+            "object decoded bytes",
+        )
+        .map(|(entries, _)| entries)
+    }
+
+    fn decode_checkpoint_segment_bounded(
+        &self,
+        record: &CheckpointSegmentRecord,
+        bytes: &[u8],
+        max_decoded_bytes: u64,
+        limit_resource: &'static str,
+    ) -> Result<(Vec<LogEntry>, u64)> {
         let identity = self.checkpoint_identity()?;
-        let entries = decode_segment_for_cluster(&bytes, identity.cluster_id())
-            .map_err(|error| Error::LogDecode(error.to_string()))?;
+        let decoder_limit =
+            usize::try_from(max_decoded_bytes).map_err(|_| Error::RestoreSizeOverflow {
+                resource: limit_resource,
+            })?;
+        let (entries, decoded_bytes) =
+            match decode_segment_for_cluster_bounded(bytes, identity.cluster_id(), decoder_limit) {
+                Ok(decoded) => decoded,
+                Err(rhiza_log::Error::DecodeLimitExceeded { limit, actual }) => {
+                    return Err(Error::RestoreLimitExceeded {
+                        resource: limit_resource,
+                        object_key: Some(record.object_key.clone()),
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                        actual: u64::try_from(actual).unwrap_or(u64::MAX),
+                    });
+                }
+                Err(error) => return Err(Error::LogDecode(error.to_string())),
+            };
         for entry in &entries {
             validate_entry_identity(identity, entry)?;
         }
@@ -3076,7 +4712,11 @@ impl ObjectArchiveStore {
                 record.object_key
             )));
         }
-        Ok(entries)
+        let decoded_bytes =
+            u64::try_from(decoded_bytes).map_err(|_| Error::RestoreSizeOverflow {
+                resource: limit_resource,
+            })?;
+        Ok((entries, decoded_bytes))
     }
 
     fn validate_decoded_entries(
@@ -3116,6 +4756,14 @@ impl ObjectArchiveStore {
     }
 
     fn validate_checkpoint_manifest(&self, manifest: &CheckpointManifest) -> Result<()> {
+        self.validate_checkpoint_manifest_with_limits(manifest, CHECKPOINT_RESTORE_LIMITS)
+    }
+
+    fn validate_checkpoint_manifest_with_limits(
+        &self,
+        manifest: &CheckpointManifest,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<()> {
         if manifest.format_version != CHECKPOINT_FORMAT_VERSION {
             return Err(Error::UnsupportedFormatVersion {
                 object: "checkpoint manifest",
@@ -3124,8 +4772,47 @@ impl ObjectArchiveStore {
         }
         validate_checkpoint_identity(self.checkpoint_identity()?, &manifest.identity)?;
 
+        ensure_restore_count_limit(
+            "segment count",
+            manifest.segments.len(),
+            limits.segment_count,
+        )?;
+        let object_count = manifest
+            .segments
+            .len()
+            .checked_add(usize::from(manifest.base.snapshot().is_some()))
+            .ok_or(Error::RestoreSizeOverflow {
+                resource: "object count",
+            })?;
+        ensure_restore_count_limit("object count", object_count, limits.object_count)?;
+
+        let mut aggregate_encoded_bytes = 0_u64;
+        let mut declared_decoded_bytes = 0_u64;
+
         if let CheckpointBase::Snapshot(snapshot) = &manifest.base {
             self.validate_checkpoint_snapshot_base(snapshot)?;
+            ensure_restore_limit(
+                "object encoded bytes",
+                Some(snapshot.object_key()),
+                snapshot.size_bytes(),
+                limits.object_encoded_bytes,
+            )?;
+            ensure_restore_limit(
+                "object decoded bytes",
+                Some(snapshot.object_key()),
+                snapshot.size_bytes(),
+                limits.object_decoded_bytes,
+            )?;
+            aggregate_encoded_bytes = checked_restore_add(
+                "aggregate encoded bytes",
+                aggregate_encoded_bytes,
+                snapshot.size_bytes(),
+            )?;
+            declared_decoded_bytes = checked_restore_add(
+                "aggregate decoded bytes",
+                declared_decoded_bytes,
+                snapshot.size_bytes(),
+            )?;
         }
 
         let base_tip = manifest.base.tip();
@@ -3182,12 +4869,36 @@ impl ObjectArchiveStore {
                     record.object_key
                 )));
             }
+            ensure_restore_limit(
+                "object encoded bytes",
+                Some(record.object_key()),
+                record.size_bytes(),
+                limits.object_encoded_bytes,
+            )?;
+            aggregate_encoded_bytes = checked_restore_add(
+                "aggregate encoded bytes",
+                aggregate_encoded_bytes,
+                record.size_bytes(),
+            )?;
             expected_start = record
                 .end_index
                 .checked_add(1)
                 .ok_or_else(|| Error::InvalidCheckpoint("segment end index overflow".into()))?;
             expected_hash = record.last_hash;
         }
+
+        ensure_restore_limit(
+            "aggregate encoded bytes",
+            None,
+            aggregate_encoded_bytes,
+            limits.aggregate_encoded_bytes,
+        )?;
+        ensure_restore_limit(
+            "aggregate decoded bytes",
+            None,
+            declared_decoded_bytes,
+            limits.aggregate_decoded_bytes,
+        )?;
 
         let expected_tip = manifest
             .segments
@@ -3270,6 +4981,18 @@ impl ObjectArchiveStore {
                 "snapshot base size does not match its recovery anchor".into(),
             ));
         }
+        ensure_restore_limit(
+            "object encoded bytes",
+            Some(snapshot.object_key()),
+            snapshot.size_bytes(),
+            CHECKPOINT_RESTORE_LIMITS.object_encoded_bytes,
+        )?;
+        ensure_restore_limit(
+            "object decoded bytes",
+            Some(snapshot.object_key()),
+            snapshot.size_bytes(),
+            CHECKPOINT_RESTORE_LIMITS.object_decoded_bytes,
+        )?;
         let expected_key = checkpoint_snapshot_key(self.checkpoint_identity()?, &snapshot.anchor);
         if snapshot.object_key != expected_key {
             return Err(Error::InvalidCheckpoint(format!(
@@ -3347,7 +5070,35 @@ impl ObjectArchiveStore {
         expected_size: u64,
         expected_sha256: &str,
     ) -> Result<Vec<u8>> {
-        let bytes = self.store.get(object_key).await?;
+        self.download_verified_with_limits(
+            object_key,
+            expected_size,
+            expected_sha256,
+            CHECKPOINT_RESTORE_LIMITS,
+        )
+        .await
+    }
+
+    async fn download_verified_with_limits(
+        &self,
+        object_key: &str,
+        expected_size: u64,
+        expected_sha256: &str,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        test_checkpoint_download_gate(self.test_store_identity, object_key).await;
+        ensure_restore_limit(
+            "object encoded bytes",
+            Some(object_key),
+            expected_size,
+            limits.object_encoded_bytes,
+        )?;
+        let bytes = self
+            .store
+            .get_bounded(object_key, limits.object_encoded_bytes)
+            .await
+            .map_err(|error| map_restore_object_error(error, "object encoded bytes"))?;
         let actual_size = bytes.len() as u64;
         if actual_size != expected_size {
             return Err(Error::SizeMismatch {
@@ -3365,6 +5116,59 @@ impl ObjectArchiveStore {
             });
         }
         Ok(bytes)
+    }
+
+    /// Keeps one reader lease live while an arbitrary remote archive operation
+    /// is pending.
+    ///
+    /// The operation future is deliberately owned by this `select!`: a failed
+    /// renewal drops it before this method returns the renewal error. This
+    /// prevents a stale, later-completing manifest or object read from being
+    /// accepted after GC has crossed its deletion fence.
+    async fn with_reader_lease_renewal<T>(
+        &self,
+        lease_id: &str,
+        lease_duration_ms: u64,
+        mut hard_deadline: tokio::time::Instant,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let renewal_interval_ms = (lease_duration_ms / READER_LEASE_RENEW_DIVISOR).max(1);
+        let renewal_lead =
+            Duration::from_millis(lease_duration_ms.saturating_sub(renewal_interval_ms));
+
+        tokio::pin!(operation);
+        loop {
+            if tokio::time::Instant::now() >= hard_deadline {
+                return Err(Error::GcLeaseMissing {
+                    lease_id: lease_id.to_string(),
+                });
+            }
+            let renewal_at = hard_deadline
+                .checked_sub(renewal_lead)
+                .unwrap_or(hard_deadline);
+            tokio::select! {
+                // A completed operation is authoritative over a same-turn
+                // timer tick, but its data is accepted only while the prior
+                // hard deadline is still live.
+                biased;
+                result = &mut operation => {
+                    let completed_at = tokio::time::Instant::now();
+                    return match result {
+                        Ok(_) if completed_at >= hard_deadline => Err(Error::GcLeaseMissing {
+                            lease_id: lease_id.to_string(),
+                        }),
+                        result => result,
+                    };
+                },
+                _ = tokio::time::sleep_until(renewal_at) => {
+                    hard_deadline = self.renew_active_reader_gc_lease(
+                        lease_id,
+                        hard_deadline,
+                        lease_duration_ms,
+                    ).await?;
+                }
+            }
+        }
     }
 }
 
@@ -3401,6 +5205,126 @@ fn validate_checkpoint_identity(
         ));
     }
     Ok(())
+}
+
+fn ensure_restore_count_limit(resource: &'static str, actual: usize, limit: usize) -> Result<()> {
+    let actual = u64::try_from(actual).map_err(|_| Error::RestoreSizeOverflow { resource })?;
+    let limit = u64::try_from(limit).map_err(|_| Error::RestoreSizeOverflow { resource })?;
+    ensure_restore_limit(resource, None, actual, limit)
+}
+
+fn ensure_restore_limit(
+    resource: &'static str,
+    object_key: Option<&str>,
+    actual: u64,
+    limit: u64,
+) -> Result<()> {
+    if actual > limit {
+        return Err(Error::RestoreLimitExceeded {
+            resource,
+            object_key: object_key.map(str::to_string),
+            limit,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn checked_restore_add(resource: &'static str, left: u64, right: u64) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or(Error::RestoreSizeOverflow { resource })
+}
+
+fn checked_checkpoint_suffix_entry_count(manifest: &CheckpointManifest) -> Result<u64> {
+    manifest.segments.iter().try_fold(0_u64, |total, record| {
+        let count = record
+            .end_index()
+            .checked_sub(record.start_index())
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or(Error::RestoreSizeOverflow {
+                resource: "checkpoint suffix entry count",
+            })?;
+        checked_restore_add("checkpoint suffix entry count", total, count)
+    })
+}
+
+fn checkpoint_suffix_shape(manifest: &CheckpointManifest) -> Result<CheckpointSuffixShape> {
+    let entry_count = checked_checkpoint_suffix_entry_count(manifest)?;
+    let stable_outer_bytes = entry_count
+        .checked_mul(CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES)
+        .ok_or(Error::RestoreSizeOverflow {
+            resource: "restored suffix container bytes",
+        })?;
+    let entry_count = usize::try_from(entry_count).map_err(|_| Error::RestoreSizeOverflow {
+        resource: "checkpoint suffix entry count",
+    })?;
+    Ok(CheckpointSuffixShape {
+        entry_count,
+        stable_outer_bytes,
+    })
+}
+
+fn restored_suffix_outer_bytes(capacity: usize) -> Result<u64> {
+    capacity
+        .checked_mul(std::mem::size_of::<LogEntry>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(Error::RestoreSizeOverflow {
+            resource: "restored suffix container bytes",
+        })
+}
+
+fn validate_restored_suffix_allocation(
+    capacity: usize,
+    len: usize,
+    expected_capacity: usize,
+    shape: CheckpointSuffixShape,
+) -> Result<u64> {
+    if capacity != expected_capacity || capacity < shape.entry_count || len > shape.entry_count {
+        return Err(Error::InvalidCheckpoint(
+            "restored suffix container changed outside its exact allocation".into(),
+        ));
+    }
+    let actual = restored_suffix_outer_bytes(capacity)?;
+    ensure_restore_limit(
+        "restored suffix container bytes",
+        None,
+        actual,
+        shape.stable_outer_bytes,
+    )?;
+    Ok(actual)
+}
+
+fn allocate_restored_suffix(shape: CheckpointSuffixShape) -> Result<(Vec<LogEntry>, usize, u64)> {
+    let mut restored = Vec::new();
+    restored
+        .try_reserve_exact(shape.entry_count)
+        .map_err(|error| {
+            Error::InvalidCheckpoint(format!("checkpoint suffix allocation failed: {error}"))
+        })?;
+    let capacity = restored.capacity();
+    let outer_bytes = validate_restored_suffix_allocation(capacity, 0, capacity, shape)?;
+    Ok((restored, capacity, outer_bytes))
+}
+
+fn map_restore_object_error(error: ObjStoreError, resource: &'static str) -> Error {
+    match error {
+        ObjStoreError::ReadLimitExceeded { key, limit, actual } => Error::RestoreLimitExceeded {
+            resource,
+            object_key: Some(key),
+            limit,
+            actual,
+        },
+        ObjStoreError::ContentLengthMismatch {
+            key,
+            expected,
+            actual,
+        } => Error::SizeMismatch {
+            object_key: key,
+            expected,
+            actual,
+        },
+        error => Error::ObjectStore(error),
+    }
 }
 
 fn validate_entry_identity(identity: &CheckpointIdentity, entry: &LogEntry) -> Result<()> {
@@ -3451,6 +5375,46 @@ fn verify_publication_hash(index: LogIndex, expected: LogHash, actual: LogHash) 
     Ok(())
 }
 
+/// Determines the shape of a checkpoint append using only the manifest and
+/// the caller's batch. Hash equality at an archived overlap is deliberately
+/// not proven here: that proof can require downloading a segment, so it must
+/// be repeated while the exact Publisher lease is active.
+fn local_publication_suffix_start(
+    manifest: &CheckpointManifest,
+    entries: &[LogEntry],
+) -> Result<Option<usize>> {
+    let first = entries.first().expect("non-empty publication");
+    let last = entries.last().expect("non-empty publication");
+    let tip = manifest.tip;
+
+    if tip.index >= last.index {
+        return Ok(None);
+    }
+
+    let next_index = tip
+        .index
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidCheckpoint("checkpoint tip index overflow".into()))?;
+    if next_index < first.index {
+        return Err(Error::InvalidCheckpoint(format!(
+            "publication gap: checkpoint tip is {}, batch starts at {}",
+            tip.index, first.index
+        )));
+    }
+
+    if tip.index >= first.index {
+        let offset = usize::try_from(tip.index - first.index)
+            .map_err(|_| Error::InvalidCheckpoint("publication range is too large".into()))?;
+        entries.get(offset).ok_or_else(|| {
+            Error::InvalidCheckpoint("checkpoint tip is outside publication batch".into())
+        })?;
+        return Ok(Some(offset + 1));
+    }
+
+    verify_publication_hash(first.index.saturating_sub(1), tip.hash, first.prev_hash)?;
+    Ok(Some(0))
+}
+
 fn checkpoint_namespace(identity: &CheckpointIdentity) -> String {
     format!(
         "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}/generation-{:020}",
@@ -3485,6 +5449,31 @@ fn checkpoint_snapshot_key(identity: &CheckpointIdentity, anchor: &RecoveryAncho
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|error| Error::Serialization(error.to_string()))
+}
+
+fn serialize_checkpoint_manifest(manifest: &CheckpointManifest) -> Result<Vec<u8>> {
+    let bytes = serialize_json(manifest)?;
+    ensure_restore_limit(
+        "manifest encoded bytes",
+        None,
+        u64::try_from(bytes.len()).map_err(|_| Error::RestoreSizeOverflow {
+            resource: "manifest encoded bytes",
+        })?,
+        CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,
+    )?;
+    Ok(bytes)
+}
+
+fn serialize_gc_control(control: &GcControl) -> Result<Vec<u8>> {
+    let bytes = serialize_json(control)?;
+    let actual = u64::try_from(bytes.len())
+        .map_err(|_| Error::InvalidGc("control serialization size overflow".into()))?;
+    if actual > GC_CONTROL_ENCODED_BYTES {
+        return Err(Error::InvalidGc(format!(
+            "control encoded bytes exceed limit {GC_CONTROL_ENCODED_BYTES}: {actual}"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn deserialize_json<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
@@ -3617,8 +5606,88 @@ mod tests {
     use rhiza_core::{ConfigurationState, EntryType, LogAnchor, SnapshotIdentity};
     use rhiza_obj_store::{Error as ObjStoreError, ObjStoreConfig};
 
+    const TEST_READER_LEASE_MS: u64 = 60_000;
+
+    async fn wait_for_test_gate(entered: std::sync::mpsc::Receiver<()>, message: &'static str) {
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("test gate receiver task must not panic")
+            .expect(message);
+    }
+
+    async fn enqueue_publisher_flush(
+        publisher: &CheckpointPublisher,
+        entries: Vec<LogEntry>,
+    ) -> tokio::sync::oneshot::Receiver<Result<LoadedCheckpointManifest>> {
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        publisher
+            .state
+            .lock()
+            .await
+            .pending
+            .push(PendingPublisherFlush { entries, result });
+        receiver
+    }
+
+    async fn reader_renewal_fixture(
+        operation_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        ObjectArchiveStore,
+        GcPlan,
+        TestCheckpointManifestGate,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (directory, _store, archive) = fixture();
+        archive.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        archive.set_gc_root(identity(), now).await.unwrap();
+        let plan = archive
+            .plan_gc(GcPolicy::new(operation_id, identity(), 0, 0, 0), now)
+            .await
+            .unwrap();
+        let (manifest_gate, manifest_entered, manifest_cancelled) =
+            TestCheckpointManifestGate::new(archive.test_store_identity);
+        (
+            directory,
+            archive,
+            plan,
+            manifest_gate,
+            manifest_entered,
+            manifest_cancelled,
+        )
+    }
+
+    async fn complete_one_timely_reader_renewal(archive: &ObjectArchiveStore) {
+        let (control_gate, control_entered) =
+            TestGcControlGate::new(archive.test_store_identity, TestGcControlOperation::Update);
+        let installed_control = install_test_gc_control_gate(control_gate.clone());
+        let control_release = control_gate.release_guard();
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        wait_for_test_gate(
+            control_entered,
+            "Reader renewal did not reach its timely GC-control CAS",
+        )
+        .await;
+        drop(control_release);
+        tokio::task::yield_now().await;
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|lease| lease.kind == GcLeaseKind::Reader));
+        drop(installed_control);
+    }
+
     #[tokio::test]
-    async fn publisher_continues_when_lease_is_expired_or_missing() {
+    async fn publisher_explicit_renew_recovers_expired_or_missing_lease() {
         let (_dir, _store, archive) = fixture();
         let publisher = archive
             .open_checkpoint_publisher("publisher", CheckpointPublisherOptions::default())
@@ -3628,10 +5697,852 @@ mod tests {
         publisher.renew_at(100).await.unwrap();
         publisher.renew_at(60_101).await.unwrap();
         archive.release_gc_lease(&publisher.lease_id).await.unwrap();
-        publisher.renew_at(60_102).await.unwrap();
+        publisher.renew().await.unwrap();
 
         let loaded = publisher.publish_committed(&[entry()]).await.unwrap();
         assert_eq!(loaded.manifest().tip().index(), 1);
+    }
+
+    #[tokio::test]
+    async fn coalesced_replay_rejects_missing_or_expired_lease_before_archived_read() {
+        let (_directory, _store, archive) = fixture();
+        let first = entry();
+        let first_loaded = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let first_key = first_loaded.manifest().segments()[0]
+            .object_key()
+            .to_string();
+        let publisher = archive
+            .open_checkpoint_publisher("coalesced-replay", CheckpointPublisherOptions::default())
+            .await
+            .unwrap();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, first_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+
+        archive.release_gc_lease(&publisher.lease_id).await.unwrap();
+        let missing_control_before = archive.load_gc_control().await.unwrap();
+        let missing = enqueue_publisher_flush(&publisher, vec![first.clone()]).await;
+        tokio::time::timeout(Duration::from_secs(2), publisher.drive_flushes())
+            .await
+            .expect("missing Publisher replay proof must not deadlock");
+        assert!(matches!(
+            missing.await.unwrap(),
+            Err(Error::GcLeaseMissing { ref lease_id }) if lease_id == &publisher.lease_id
+        ));
+        let missing_control_after = archive.load_gc_control().await.unwrap();
+        assert_eq!(
+            missing_control_after.control,
+            missing_control_before.control
+        );
+        assert_eq!(
+            missing_control_after.version,
+            missing_control_before.version
+        );
+
+        publisher.renew_at(0).await.unwrap();
+        let expired_control_before = archive.load_gc_control().await.unwrap();
+        let expired = enqueue_publisher_flush(&publisher, vec![first]).await;
+        tokio::time::timeout(Duration::from_secs(2), publisher.drive_flushes())
+            .await
+            .expect("expired Publisher replay proof must not deadlock");
+        assert!(matches!(
+            expired.await.unwrap(),
+            Err(Error::GcLeaseMissing { ref lease_id }) if lease_id == &publisher.lease_id
+        ));
+        let expired_control_after = archive.load_gc_control().await.unwrap();
+        assert_eq!(
+            expired_control_after.control,
+            expired_control_before.control
+        );
+        assert_eq!(
+            expired_control_after.version,
+            expired_control_before.version
+        );
+        assert!(matches!(
+            entered.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn renewed_coalesced_replay_holds_gc_fence_during_archived_read() {
+        let (_directory, store, archive) = fixture();
+        let first = entry();
+        let first_loaded = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let first_key = first_loaded.manifest().segments()[0]
+            .object_key()
+            .to_string();
+        archive.set_gc_root(identity(), now_ms()).await.unwrap();
+        let plan_now = now_ms();
+        let plan = archive
+            .plan_gc(
+                GcPolicy::new("coalesced-replay-proof", identity(), 0, 0, 0),
+                plan_now,
+            )
+            .await
+            .unwrap();
+        let publisher = Arc::new(
+            archive
+                .open_checkpoint_publisher(
+                    "coalesced-replay",
+                    CheckpointPublisherOptions::default(),
+                )
+                .await
+                .unwrap(),
+        );
+        let receiver = enqueue_publisher_flush(&publisher, vec![first]).await;
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, first_key.clone());
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let drive_publisher = Arc::clone(&publisher);
+        let drive = tokio::spawn(async move {
+            drive_publisher.drive_flushes().await;
+        });
+        wait_for_test_gate(
+            entered,
+            "renewed coalesced replay did not reach the archived segment read",
+        )
+        .await;
+
+        let proof_now = now_ms();
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|lease| {
+                lease.lease_id == publisher.lease_id
+                    && lease.kind == GcLeaseKind::Publisher
+                    && lease.expires_at_ms > proof_now
+            }));
+        archive.acquire_gc_barrier(&plan, proof_now).await.unwrap();
+        let delete = archive.enter_delete_phase(&plan, proof_now).await;
+        assert!(matches!(delete, Err(Error::GcBarrierBusy { .. })));
+        assert!(store.get(&first_key).await.is_ok());
+
+        drop(release);
+        drive.await.unwrap();
+        assert_eq!(receiver.await.unwrap().unwrap(), first_loaded);
+        archive.abort_gc("coalesced-replay-proof").await.unwrap();
+        archive.release_gc_lease(&publisher.lease_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coherent_restore_distinguishes_missing_and_initialized_genesis() {
+        let (_dir, _store, archive) = fixture();
+        assert!(archive.load_checkpoint_restore().await.unwrap().is_none());
+
+        let initialized = archive.initialize_checkpoint().await.unwrap();
+        let restored = archive.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(restored.loaded(), &initialized);
+        assert_eq!(restored.restored().tip(), initialized.manifest().tip());
+        assert!(restored.restored().snapshot().is_none());
+        assert!(restored.restored().suffix().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coherent_restore_is_pinned_to_the_loaded_manifest_and_renews_reader_lease() {
+        let (_dir, _store, archive) = fixture();
+        let first = entry();
+        archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let loaded = archive.load_checkpoint_unleased().await.unwrap().unwrap();
+        let reader = archive
+            .acquire_operation_lease(GcLeaseKind::Reader, 100, 1)
+            .await
+            .unwrap();
+
+        let second = LogEntry {
+            index: 2,
+            prev_hash: first.hash,
+            hash: LogEntry::calculate_hash(
+                "cluster-a",
+                2,
+                7,
+                3,
+                EntryType::Command,
+                first.hash,
+                b"second",
+            ),
+            payload: b"second".to_vec(),
+            ..first.clone()
+        };
+        archive
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+
+        let restored = archive
+            .restore_loaded_checkpoint_unleased(&loaded, &reader.lease_id)
+            .await
+            .unwrap();
+        assert_eq!(restored.tip(), loaded.manifest().tip());
+        assert_eq!(restored.suffix(), std::slice::from_ref(&first));
+        let control = archive.load_gc_control().await.unwrap();
+        assert!(control
+            .control
+            .leases
+            .iter()
+            .any(|lease| lease.lease_id == reader.lease_id && lease.expires_at_ms > 100));
+        archive.release_gc_lease(&reader.lease_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_renewal_load_crossing_prior_hard_deadline_is_terminal_and_unblocks_gc() {
+        let (_directory, archive, plan, manifest_gate, manifest_entered, manifest_cancelled) =
+            reader_renewal_fixture("reader-late-load").await;
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let _manifest_release = manifest_gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            manifest_entered,
+            "Reader restore did not reach the manifest gate",
+        )
+        .await;
+        let reader_lease_id = archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .find(|lease| lease.kind == GcLeaseKind::Reader)
+            .expect("gated restore must hold one Reader lease")
+            .lease_id
+            .clone();
+        let (control_gate, control_entered) =
+            TestGcControlGate::new(archive.test_store_identity, TestGcControlOperation::Load);
+        let _installed_control = install_test_gc_control_gate(control_gate.clone());
+        let control_release = control_gate.release_guard();
+
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        wait_for_test_gate(
+            control_entered,
+            "Reader renewal did not reach the GC-control load gate",
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS - TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR + 1,
+        ))
+        .await;
+        drop(control_release);
+
+        let result = restore.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GcLeaseMissing { ref lease_id }) if lease_id == &reader_lease_id),
+            "a GC-control load completing after the prior hard deadline must terminate the Reader: {result:?}"
+        );
+        wait_for_test_gate(
+            manifest_cancelled,
+            "late Reader renewal did not cancel the protected manifest read",
+        )
+        .await;
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .is_empty());
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        archive.enter_delete_phase(&plan, now_ms()).await.unwrap();
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_renewal_cas_crossing_prior_hard_deadline_is_terminal_and_unblocks_gc() {
+        let (_directory, archive, plan, manifest_gate, manifest_entered, manifest_cancelled) =
+            reader_renewal_fixture("reader-late-cas").await;
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let _manifest_release = manifest_gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            manifest_entered,
+            "Reader restore did not reach the manifest gate",
+        )
+        .await;
+        let reader_lease_id = archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .find(|lease| lease.kind == GcLeaseKind::Reader)
+            .expect("gated restore must hold one Reader lease")
+            .lease_id
+            .clone();
+        let (control_gate, control_entered) =
+            TestGcControlGate::new(archive.test_store_identity, TestGcControlOperation::Update);
+        let _installed_control = install_test_gc_control_gate(control_gate.clone());
+        let control_release = control_gate.release_guard();
+
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        wait_for_test_gate(
+            control_entered,
+            "Reader renewal did not reach the GC-control CAS gate",
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS - TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR + 1,
+        ))
+        .await;
+        drop(control_release);
+
+        let result = restore.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GcLeaseMissing { ref lease_id }) if lease_id == &reader_lease_id),
+            "a Reader CAS completing after the prior hard deadline must be cleaned up and terminate: {result:?}"
+        );
+        wait_for_test_gate(
+            manifest_cancelled,
+            "late Reader CAS did not cancel the protected manifest read",
+        )
+        .await;
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .is_empty());
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        archive.enter_delete_phase(&plan, now_ms()).await.unwrap();
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_renewal_late_cas_error_preserves_exact_error_without_cleanup() {
+        let (_directory, _store, archive) = fixture();
+        archive.publish_committed(&[entry()]).await.unwrap();
+        let reader = archive
+            .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), TEST_READER_LEASE_MS)
+            .await
+            .unwrap();
+        let original_lease = archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .find(|lease| lease.lease_id == reader.lease_id)
+            .expect("acquired Reader lease must be stored")
+            .clone();
+        let prior_hard_deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(TEST_READER_LEASE_MS))
+            .unwrap();
+        let injected = ObjStoreError::Transport {
+            key: archive.gc_control_key(),
+            message: "injected Reader renewal CAS failure".into(),
+        };
+        let (control_gate, control_entered) =
+            TestGcControlGate::failing_update(archive.test_store_identity, injected.clone());
+        let installed_control = install_test_gc_control_gate(control_gate.clone());
+        let control_release = control_gate.release_guard();
+        let renewal_archive = archive.clone();
+        let renewal_lease_id = reader.lease_id.clone();
+        let renewal = tokio::spawn(async move {
+            renewal_archive
+                .renew_active_reader_gc_lease(
+                    &renewal_lease_id,
+                    prior_hard_deadline,
+                    TEST_READER_LEASE_MS,
+                )
+                .await
+        });
+        wait_for_test_gate(
+            control_entered,
+            "Reader renewal did not reach the injected CAS failure gate",
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(TEST_READER_LEASE_MS + 1)).await;
+        drop(control_release);
+
+        assert_eq!(renewal.await.unwrap(), Err(Error::ObjectStore(injected)));
+        drop(installed_control);
+        let stored_lease = archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .into_iter()
+            .find(|lease| lease.lease_id == reader.lease_id)
+            .expect("failed unwritten CAS must not clean up the existing Reader lease");
+        assert_eq!(stored_lease, original_lease);
+        archive.release_gc_lease(&reader.lease_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_reader_lease_cancels_protected_load_without_recreation() {
+        let (_directory, archive, plan, manifest_gate, manifest_entered, manifest_cancelled) =
+            reader_renewal_fixture("reader-missing").await;
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let _manifest_release = manifest_gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            manifest_entered,
+            "Reader restore did not reach the manifest gate",
+        )
+        .await;
+        let reader_lease_id = archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .find(|lease| lease.kind == GcLeaseKind::Reader)
+            .expect("gated restore must hold one Reader lease")
+            .lease_id
+            .clone();
+        archive.release_gc_lease(&reader_lease_id).await.unwrap();
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+
+        let result = restore.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GcLeaseMissing { ref lease_id }) if lease_id == &reader_lease_id),
+            "a missing Reader must remain terminal and must not be recreated: {result:?}"
+        );
+        wait_for_test_gate(
+            manifest_cancelled,
+            "missing Reader did not cancel the protected manifest read",
+        )
+        .await;
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .is_empty());
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        archive.enter_delete_phase(&plan, now_ms()).await.unwrap();
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_renewal_completed_before_prior_hard_deadline_keeps_gc_fenced() {
+        let (_directory, archive, plan, manifest_gate, manifest_entered, _manifest_cancelled) =
+            reader_renewal_fixture("reader-timely-cas").await;
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let manifest_release = manifest_gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            manifest_entered,
+            "Reader restore did not reach the manifest gate",
+        )
+        .await;
+        let (control_gate, control_entered) =
+            TestGcControlGate::new(archive.test_store_identity, TestGcControlOperation::Update);
+        let _installed_control = install_test_gc_control_gate(control_gate.clone());
+        let control_release = control_gate.release_guard();
+
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        wait_for_test_gate(
+            control_entered,
+            "Reader renewal did not reach the GC-control CAS gate",
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        drop(control_release);
+
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        let delete = archive.enter_delete_phase(&plan, now_ms()).await;
+        assert!(
+            matches!(delete, Err(Error::GcBarrierBusy { .. })),
+            "a timely Reader renewal must keep the generation protected: {delete:?}"
+        );
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+        drop(manifest_release);
+        let restored = restore.await.unwrap().unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&entry()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coherent_restore_renews_a_short_reader_lease_during_one_delayed_fetch() {
+        let (_dir, _store, archive) = fixture();
+        archive.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        archive.set_gc_root(identity(), now).await.unwrap();
+        let plan = archive
+            .plan_gc(GcPolicy::new("delayed-reader", identity(), 0, 0, 0), now)
+            .await
+            .unwrap();
+        let object_key = archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .segments()[0]
+            .object_key()
+            .to_owned();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, object_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(entered, "Reader restore did not reach the object gate").await;
+
+        // Three exact, timely control-store updates keep one Reader live while
+        // the object fetch remains paused beyond its original hard deadline.
+        for _ in 0..3 {
+            complete_one_timely_reader_renewal(&archive).await;
+        }
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        let delete = archive.enter_delete_phase(&plan, now_ms()).await;
+        assert!(
+            matches!(delete, Err(Error::GcBarrierBusy { .. })),
+            "{delete:?}"
+        );
+
+        drop(release);
+        let restored = restore.await.unwrap().unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&entry()));
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coherent_restore_keeps_one_reader_lease_live_across_a_long_manifest() {
+        let (_dir, _store, archive) = fixture();
+        let first = entry();
+        let second = next_entry(&first);
+        let third = next_entry(&second);
+        archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        archive
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        archive
+            .publish_committed(std::slice::from_ref(&third))
+            .await
+            .unwrap();
+        let now = now_ms();
+        archive.set_gc_root(identity(), now).await.unwrap();
+        let plan = archive
+            .plan_gc(
+                GcPolicy::new("long-manifest-reader", identity(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let final_object_key = archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .segments()
+            .last()
+            .expect("three independent publications create three manifest segments")
+            .object_key()
+            .to_owned();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, final_object_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            entered,
+            "Reader restore did not reach the final object gate",
+        )
+        .await;
+
+        // The first two objects have already been restored. Keeping the
+        // final fetch paused demonstrates that the one outer renewal owner
+        // covers the complete, multi-object manifest rather than each object
+        // opportunistically creating its own reader lease loop.
+        for _ in 0..3 {
+            complete_one_timely_reader_renewal(&archive).await;
+        }
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        let delete = archive.enter_delete_phase(&plan, now_ms()).await;
+        assert!(
+            matches!(delete, Err(Error::GcBarrierBusy { .. })),
+            "{delete:?}"
+        );
+
+        drop(release);
+        let restored = restore.await.unwrap().unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), &[first, second, third]);
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coherent_restore_renews_a_short_reader_lease_during_a_delayed_manifest_fetch() {
+        let (_dir, _store, archive) = fixture();
+        archive.initialize_checkpoint().await.unwrap();
+        let now = now_ms();
+        archive.set_gc_root(identity(), now).await.unwrap();
+        let plan = archive
+            .plan_gc(
+                GcPolicy::new("delayed-manifest-reader", identity(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let (gate, entered, _cancelled) =
+            TestCheckpointManifestGate::new(archive.test_store_identity);
+        let _installed = install_test_checkpoint_manifest_gate(gate.clone());
+        let release = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(entered, "Reader restore did not reach the manifest gate").await;
+
+        // The manifest remains pinned across three deterministic renewals and
+        // beyond the original hard deadline.
+        for _ in 0..3 {
+            complete_one_timely_reader_renewal(&archive).await;
+        }
+        archive.acquire_gc_barrier(&plan, now_ms()).await.unwrap();
+        let delete = archive.enter_delete_phase(&plan, now_ms()).await;
+        assert!(
+            matches!(delete, Err(Error::GcBarrierBusy { .. })),
+            "{delete:?}"
+        );
+
+        drop(release);
+        assert!(restore.await.unwrap().unwrap().is_some());
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_generation_cancels_a_delayed_manifest_fetch_without_reinserting_its_lease() {
+        let (_dir, store, archive) = fixture();
+        let root_identity = CheckpointIdentity::new("cluster-a", 7, 3, 3);
+        let root =
+            ObjectArchiveStore::new_checkpoint_for_single_process(store, root_identity.clone());
+        archive.publish_committed(&[entry()]).await.unwrap();
+        root.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        root.set_gc_root(root_identity.clone(), now.saturating_sub(1))
+            .await
+            .unwrap();
+        let plan = root
+            .plan_gc(
+                GcPolicy::new("actual-retirement-cancellation", root_identity, 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            plan.swept_generations.contains(&identity()),
+            "the actual GC plan must retire the restoring generation"
+        );
+        let (gate, entered, cancelled) =
+            TestCheckpointManifestGate::new(archive.test_store_identity);
+        let _installed = install_test_checkpoint_manifest_gate(gate.clone());
+        let _release_on_unwind = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            entered,
+            "retired-generation restore did not reach the manifest gate",
+        )
+        .await;
+
+        // The exact manifest gate gives us a live reader lease before any
+        // object read. Simulate its owner disappearing, then run the real GC
+        // execution path. The following periodic renewal must see the actual
+        // retirement and drop the gated read rather than reinserting a lease.
+        let reader_lease_id = archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.kind == GcLeaseKind::Reader)
+            .expect("paused restore must hold a reader lease")
+            .lease_id
+            .clone();
+        archive.release_gc_lease(&reader_lease_id).await.unwrap();
+        let (control_gate, control_entered) =
+            TestGcControlGate::new(archive.test_store_identity, TestGcControlOperation::Load);
+        let _installed_control = install_test_gc_control_gate(control_gate.clone());
+        let control_release = control_gate.release_guard();
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        wait_for_test_gate(
+            control_entered,
+            "retired-generation Reader did not reach the GC-control load gate",
+        )
+        .await;
+        root.execute_gc(plan.plan_hash(), now_ms()).await.unwrap();
+        drop(control_release);
+        let result = restore.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GenerationRetired { .. })),
+            "{result:?}"
+        );
+        wait_for_test_gate(
+            cancelled,
+            "generation retirement did not cancel the delayed manifest fetch",
+        )
+        .await;
+        let control = archive.load_gc_control().await.unwrap();
+        assert!(
+            control.control.leases.is_empty(),
+            "retired generation renewal must not leave or recreate a reader lease"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_reader_renewal_cancels_the_delayed_fetch_before_it_can_complete() {
+        let (_dir, _store, archive) = fixture();
+        archive.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        archive.set_gc_root(identity(), now).await.unwrap();
+        let plan = archive
+            .plan_gc(
+                GcPolicy::new("failed-delayed-reader", identity(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let object_key = archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .segments()[0]
+            .object_key()
+            .to_owned();
+        let (gate, entered, cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, object_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let _release_on_unwind = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(
+            entered,
+            "delete-barrier restore did not reach the object gate",
+        )
+        .await;
+
+        // Advance the control-plane timestamp beyond the short test lease,
+        // enter delete, then let the next periodic renewal fail. The gated
+        // object future must be dropped instead of completing after delete.
+        let delete_now = now_ms().saturating_add(TEST_READER_LEASE_MS + 1);
+        archive.acquire_gc_barrier(&plan, delete_now).await.unwrap();
+        archive.enter_delete_phase(&plan, delete_now).await.unwrap();
+        tokio::time::advance(Duration::from_millis(
+            TEST_READER_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        let result = restore.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GcBarrierActive { .. })),
+            "{result:?}"
+        );
+        wait_for_test_gate(
+            cancelled,
+            "reader renewal failure did not cancel the delayed fetch",
+        )
+        .await;
+        archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coherent_restore_stops_when_reader_renewal_hits_a_delete_barrier() {
+        let (_dir, _store, archive) = fixture();
+        let now = now_ms();
+        archive.publish_committed(&[entry()]).await.unwrap();
+        archive.set_gc_root(identity(), now).await.unwrap();
+        let plan = archive
+            .plan_gc(GcPolicy::new("restore-renewal", identity(), 0, 0, 0), now)
+            .await
+            .unwrap();
+        let reader = archive
+            .acquire_operation_lease(GcLeaseKind::Reader, now, 1)
+            .await
+            .unwrap();
+        archive.acquire_gc_barrier(&plan, now).await.unwrap();
+        archive.enter_delete_phase(&plan, now + 2).await.unwrap();
+        let loaded = archive.load_checkpoint_unleased().await.unwrap().unwrap();
+
+        let result = archive
+            .restore_loaded_checkpoint_unleased(&loaded, &reader.lease_id)
+            .await;
+        assert!(
+            matches!(result, Err(Error::GcBarrierActive { .. })),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -3672,9 +6583,9 @@ mod tests {
             CheckpointTip::new(3, compacted.hash())
         );
         assert!(loaded.manifest().segments().is_empty());
-        let restored = archive.restore_checkpoint_state().await.unwrap();
-        assert_eq!(restored.snapshot().unwrap().anchor(), &anchor);
-        assert_eq!(restored.snapshot().unwrap().bytes(), bytes);
+        let restored = archive.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(restored.restored().snapshot().unwrap().anchor(), &anchor);
+        assert_eq!(restored.restored().snapshot().unwrap().bytes(), bytes);
     }
 
     #[tokio::test]
@@ -3738,6 +6649,1217 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn gc_plan_rejects_oversized_root_manifest_before_parse_or_state_change() {
+        let (_dir, store, archive, _loaded, _next, plan) = gc_race_fixture().await;
+        let mut oversized =
+            vec![b' '; usize::try_from(CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,).unwrap()];
+        oversized.push(b' ');
+        store
+            .put(&plan.root_manifest_key, &oversized)
+            .await
+            .unwrap();
+        let control_before = archive.load_gc_control().await.unwrap().control;
+        let candidate_before = store.get(plan.candidates()[0].key()).await.unwrap();
+
+        assert_eq!(
+            archive
+                .plan_gc(GcPolicy::new("oversized-root", identity(), 0, 0, 0), 112)
+                .await
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "manifest encoded bytes",
+                object_key: Some(plan.root_manifest_key.clone()),
+                limit: CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,
+                actual: CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes + 1,
+            }
+        );
+        assert_eq!(
+            archive.load_gc_control().await.unwrap().control,
+            control_before
+        );
+        assert_eq!(
+            store.get(plan.candidates()[0].key()).await.unwrap(),
+            candidate_before
+        );
+        assert_eq!(store.get(&plan.root_manifest_key).await.unwrap(), oversized);
+    }
+
+    #[tokio::test]
+    async fn gc_fence_rejects_oversized_replacement_before_cas_or_delete() {
+        let (_dir, store, archive, _loaded, _next, plan) = gc_race_fixture().await;
+        let mut oversized =
+            vec![b' '; usize::try_from(CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,).unwrap()];
+        oversized.push(b' ');
+        store
+            .put(&plan.root_manifest_key, &oversized)
+            .await
+            .unwrap();
+        let root_before = store.get_versioned(&plan.root_manifest_key).await.unwrap();
+        let control_before = archive.load_gc_control().await.unwrap().control;
+        let candidate_before = store.get(plan.candidates()[0].key()).await.unwrap();
+
+        assert_eq!(
+            archive.fence_gc_root(&plan).await.unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "manifest encoded bytes",
+                object_key: Some(plan.root_manifest_key.clone()),
+                limit: CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,
+                actual: CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes + 1,
+            }
+        );
+        let root_after = store.get_versioned(&plan.root_manifest_key).await.unwrap();
+        assert_eq!(root_after.bytes(), root_before.bytes());
+        assert_eq!(root_after.version(), root_before.version());
+        assert_eq!(
+            archive.load_gc_control().await.unwrap().control,
+            control_before
+        );
+        assert_eq!(
+            store.get(plan.candidates()[0].key()).await.unwrap(),
+            candidate_before
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_manifest_read_accepts_exact_cap_and_rejects_one_byte_over() {
+        let (_dir, store, archive) = fixture();
+        let manifest = CheckpointManifest::new(identity());
+        let mut bytes = serialize_json(&manifest).unwrap();
+        bytes.resize(
+            usize::try_from(CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes).unwrap(),
+            b' ',
+        );
+        let key = archive.checkpoint_manifest_key().unwrap();
+        store.put(&key, &bytes).await.unwrap();
+        assert_eq!(
+            archive
+                .load_checkpoint_unleased()
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest(),
+            &manifest
+        );
+
+        bytes.push(b' ');
+        store.put(&key, &bytes).await.unwrap();
+        assert_eq!(
+            archive.load_checkpoint_unleased().await.unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "manifest encoded bytes",
+                object_key: Some(key),
+                limit: CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes,
+                actual: CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes + 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_control_read_accepts_exact_cap_and_rejects_declared_oversize() {
+        let (_dir, store, archive) = fixture();
+        archive.ensure_gc_control().await.unwrap();
+        let key = archive.gc_control_key();
+        let mut bytes = store.get(&key).await.unwrap();
+        bytes.resize(usize::try_from(GC_CONTROL_ENCODED_BYTES).unwrap(), b' ');
+        store.put(&key, &bytes).await.unwrap();
+        assert_eq!(archive.load_gc_control().await.unwrap().control.fence, 0);
+
+        bytes.push(b' ');
+        store.put(&key, &bytes).await.unwrap();
+        assert_eq!(
+            archive.load_gc_control().await.err(),
+            Some(Error::ObjectStore(ObjStoreError::ReadLimitExceeded {
+                key,
+                limit: GC_CONTROL_ENCODED_BYTES,
+                actual: GC_CONTROL_ENCODED_BYTES + 1,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_control_write_rejects_an_unreadable_control_envelope() {
+        let (_dir, store, archive) = fixture();
+        archive.ensure_gc_control().await.unwrap();
+        let mut loaded = archive.load_gc_control().await.unwrap();
+        let key = archive.gc_control_key();
+        let before = store.get_versioned(&key).await.unwrap();
+        loaded.control.leases.push(GcLease {
+            lease_id: "x".repeat(usize::try_from(GC_CONTROL_ENCODED_BYTES).unwrap()),
+            kind: GcLeaseKind::Reader,
+            fence: 0,
+            expires_at_ms: 0,
+        });
+
+        assert!(matches!(
+            archive.update_gc_control(&loaded).await,
+            Err(Error::InvalidGc(message)) if message.starts_with("control encoded bytes exceed limit")
+        ));
+        let after = store.get_versioned(&key).await.unwrap();
+        assert_eq!(after.bytes(), before.bytes());
+        assert_eq!(after.version(), before.version());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_manifest_rejects_segment_and_object_counts_before_object_reads() {
+        let (_dir, _store, archive) = fixture();
+        let loaded = archive.publish_committed(&[entry()]).await.unwrap();
+
+        let segment_limits = CheckpointRestoreLimits {
+            segment_count: 0,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        assert_eq!(
+            archive
+                .validate_checkpoint_manifest_with_limits(loaded.manifest(), segment_limits)
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "segment count",
+                object_key: None,
+                limit: 0,
+                actual: 1,
+            }
+        );
+
+        let object_limits = CheckpointRestoreLimits {
+            object_count: 0,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        assert_eq!(
+            archive
+                .validate_checkpoint_manifest_with_limits(loaded.manifest(), object_limits)
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object count",
+                object_key: None,
+                limit: 0,
+                actual: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_manifest_enforces_declared_object_and_aggregate_encoded_limits() {
+        let (_dir, _store, archive) = fixture();
+        let first = entry();
+        archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let second = next_entry(&first);
+        let loaded = archive
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        let records = loaded.manifest().segments();
+        let first_size = records[0].size_bytes();
+        let aggregate = records
+            .iter()
+            .try_fold(0_u64, |total, record| {
+                total.checked_add(record.size_bytes())
+            })
+            .unwrap();
+
+        let object_limits = CheckpointRestoreLimits {
+            object_encoded_bytes: first_size - 1,
+            aggregate_encoded_bytes: u64::MAX,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        assert_eq!(
+            archive
+                .validate_checkpoint_manifest_with_limits(loaded.manifest(), object_limits)
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object encoded bytes",
+                object_key: Some(records[0].object_key().to_string()),
+                limit: first_size - 1,
+                actual: first_size,
+            }
+        );
+
+        let aggregate_limits = CheckpointRestoreLimits {
+            object_encoded_bytes: u64::MAX,
+            aggregate_encoded_bytes: aggregate - 1,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        assert_eq!(
+            archive
+                .validate_checkpoint_manifest_with_limits(loaded.manifest(), aggregate_limits)
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "aggregate encoded bytes",
+                object_key: None,
+                limit: aggregate - 1,
+                actual: aggregate,
+            }
+        );
+
+        let exact_limits = CheckpointRestoreLimits {
+            object_encoded_bytes: records
+                .iter()
+                .map(CheckpointSegmentRecord::size_bytes)
+                .max()
+                .unwrap(),
+            aggregate_encoded_bytes: aggregate,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        archive
+            .validate_checkpoint_manifest_with_limits(loaded.manifest(), exact_limits)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_manifest_uses_checked_aggregate_arithmetic() {
+        let (_dir, _store, archive) = fixture();
+        let first = entry();
+        archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let second = next_entry(&first);
+        let loaded = archive
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        let mut manifest = loaded.manifest().clone();
+        manifest.segments[0].size_bytes = u64::MAX;
+        let limits = CheckpointRestoreLimits {
+            object_encoded_bytes: u64::MAX,
+            aggregate_encoded_bytes: u64::MAX,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+
+        assert_eq!(
+            archive
+                .validate_checkpoint_manifest_with_limits(&manifest, limits)
+                .unwrap_err(),
+            Error::RestoreSizeOverflow {
+                resource: "aggregate encoded bytes",
+            }
+        );
+    }
+
+    #[test]
+    fn checkpoint_decoded_budget_enforces_object_and_multi_object_aggregate_boundaries() {
+        let manifest = CheckpointManifest::new(identity());
+        let limits = CheckpointRestoreLimits {
+            object_decoded_bytes: 6,
+            aggregate_decoded_bytes: 10,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        let mut budget = CheckpointRestoreBudget::new(&manifest, limits).unwrap();
+        assert_eq!(budget.next_object_limit().unwrap(), 6);
+        budget.charge("one", 6).unwrap();
+        assert_eq!(budget.next_object_limit().unwrap(), 4);
+        budget.charge("two", 4).unwrap();
+        assert_eq!(budget.next_object_limit().unwrap(), 0);
+        assert_eq!(
+            budget.charge("three", 1).unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "aggregate decoded bytes",
+                object_key: None,
+                limit: 10,
+                actual: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn restored_suffix_allocation_rejects_allocator_overcapacity_and_count_overflow() {
+        let shape = CheckpointSuffixShape {
+            entry_count: 1,
+            stable_outer_bytes: CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES,
+        };
+        let oversized_capacity = usize::try_from(shape.stable_outer_bytes).unwrap()
+            / std::mem::size_of::<LogEntry>()
+            + 1;
+        let oversized_bytes = restored_suffix_outer_bytes(oversized_capacity).unwrap();
+        assert_eq!(
+            validate_restored_suffix_allocation(oversized_capacity, 0, oversized_capacity, shape,)
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "restored suffix container bytes",
+                object_key: None,
+                limit: shape.stable_outer_bytes,
+                actual: oversized_bytes,
+            }
+        );
+
+        let mut manifest = CheckpointManifest::new(identity());
+        manifest.segments = vec![
+            CheckpointSegmentRecord {
+                format_version: CHECKPOINT_SEGMENT_FORMAT_VERSION,
+                start_index: 0,
+                end_index: u64::MAX - 1,
+                first_prev_hash: LogHash::ZERO,
+                last_hash: LogHash::ZERO,
+                object_key: "one".into(),
+                sha256: LogHash::ZERO.to_hex(),
+                size_bytes: 1,
+            },
+            CheckpointSegmentRecord {
+                format_version: CHECKPOINT_SEGMENT_FORMAT_VERSION,
+                start_index: 0,
+                end_index: 0,
+                first_prev_hash: LogHash::ZERO,
+                last_hash: LogHash::ZERO,
+                object_key: "two".into(),
+                sha256: LogHash::ZERO.to_hex(),
+                size_bytes: 1,
+            },
+        ];
+        assert_eq!(
+            checked_checkpoint_suffix_entry_count(&manifest).unwrap_err(),
+            Error::RestoreSizeOverflow {
+                resource: "checkpoint suffix entry count",
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_segment_restore_accounts_for_the_final_suffix_container_on_both_paths() {
+        let (_directory, _store, archive) = fixture();
+        let first = entry();
+        archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let second = next_entry(&first);
+        let loaded = archive
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        assert_eq!(loaded.manifest().segments().len(), 2);
+        let stable_aggregate = archive
+            .checkpoint_declared_decoded_budget(
+                loaded.manifest(),
+                CheckpointRestoreLimits {
+                    object_decoded_bytes: u64::MAX,
+                    aggregate_decoded_bytes: u64::MAX,
+                    ..CHECKPOINT_RESTORE_LIMITS
+                },
+            )
+            .unwrap()
+            .decoded_bytes();
+        let exact_limits = CheckpointRestoreLimits {
+            object_decoded_bytes: u64::MAX,
+            aggregate_decoded_bytes: stable_aggregate,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        let lower_limits = CheckpointRestoreLimits {
+            aggregate_decoded_bytes: stable_aggregate - 1,
+            ..exact_limits
+        };
+
+        let reader = archive
+            .acquire_operation_lease(GcLeaseKind::Reader, now_ms(), DEFAULT_LEASE_MS)
+            .await
+            .unwrap();
+        let ordinary = archive
+            .restore_loaded_checkpoint_with_reader_lease_duration_and_limits_unleased(
+                &loaded,
+                &reader.lease_id,
+                DEFAULT_LEASE_MS,
+                exact_limits,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary.suffix(), &[first.clone(), second.clone()]);
+        assert_eq!(
+            archive
+                .restore_loaded_checkpoint_with_reader_lease_duration_and_limits_unleased(
+                    &loaded,
+                    &reader.lease_id,
+                    DEFAULT_LEASE_MS,
+                    lower_limits,
+                )
+                .await
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "aggregate decoded bytes",
+                object_key: None,
+                limit: stable_aggregate - 1,
+                actual: stable_aggregate,
+            }
+        );
+        archive.release_gc_lease(&reader.lease_id).await.unwrap();
+
+        let active = archive
+            .restore_loaded_checkpoint_with_active_reader_lease_and_limits(&loaded, exact_limits)
+            .await
+            .unwrap();
+        assert_eq!(active.suffix(), &[first, second]);
+        assert_eq!(
+            archive
+                .restore_loaded_checkpoint_with_active_reader_lease_and_limits(
+                    &loaded,
+                    lower_limits,
+                )
+                .await
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "aggregate decoded bytes",
+                object_key: None,
+                limit: stable_aggregate - 1,
+                actual: stable_aggregate,
+            }
+        );
+    }
+
+    #[test]
+    fn checkpoint_segment_decode_rejects_compact_repeated_identity_expansion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let cluster_id = "c".repeat(200);
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store,
+            CheckpointIdentity::new(&cluster_id, 7, 3, 1),
+        );
+        let payload = b"small".to_vec();
+        let hash = LogEntry::calculate_hash(
+            &cluster_id,
+            1,
+            7,
+            3,
+            EntryType::Command,
+            LogHash::ZERO,
+            &payload,
+        );
+        let entry = LogEntry {
+            cluster_id: cluster_id.clone(),
+            epoch: 7,
+            config_id: 3,
+            index: 1,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash: LogHash::ZERO,
+            hash,
+        };
+        let bytes = encode_segment(std::slice::from_ref(&entry));
+        let record = archive
+            .checkpoint_segment_record(std::slice::from_ref(&entry), &bytes)
+            .unwrap();
+        let (decoded, charged) = archive
+            .decode_checkpoint_segment_bounded(&record, &bytes, u64::MAX, "object decoded bytes")
+            .unwrap();
+        assert_eq!(decoded, vec![entry.clone()]);
+        let retained_bytes = decoded.capacity() * std::mem::size_of::<LogEntry>()
+            + decoded
+                .iter()
+                .map(|entry| entry.cluster_id.capacity() + entry.payload.capacity())
+                .sum::<usize>();
+        assert!(charged >= u64::try_from(retained_bytes).unwrap());
+        let conservative_charge = archive
+            .checkpoint_segment_decoded_upper_bound(&record)
+            .unwrap();
+        assert!(charged <= conservative_charge);
+
+        let (exact, exact_charge) = archive
+            .decode_checkpoint_segment_bounded(
+                &record,
+                &bytes,
+                conservative_charge,
+                "object decoded bytes",
+            )
+            .unwrap();
+        assert_eq!(exact, vec![entry]);
+        assert_eq!(exact_charge, charged);
+        assert_eq!(
+            archive
+                .decode_checkpoint_segment_bounded(
+                    &record,
+                    &bytes,
+                    conservative_charge - 1,
+                    "object decoded bytes",
+                )
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object decoded bytes",
+                object_key: Some(record.object_key().to_string()),
+                limit: conservative_charge - 1,
+                actual: conservative_charge,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publisher_rejects_decoded_upper_bound_before_object_visibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let cluster_id = "c".repeat(200);
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            CheckpointIdentity::new(&cluster_id, 7, 3, 1),
+        );
+        let loaded = archive.initialize_checkpoint().await.unwrap();
+        let payload = b"compact".to_vec();
+        let hash = LogEntry::calculate_hash(
+            &cluster_id,
+            1,
+            7,
+            3,
+            EntryType::Command,
+            LogHash::ZERO,
+            &payload,
+        );
+        let entry = LogEntry {
+            cluster_id,
+            epoch: 7,
+            config_id: 3,
+            index: 1,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash: LogHash::ZERO,
+            hash,
+        };
+        let bytes = encode_segment(std::slice::from_ref(&entry));
+        let record = archive
+            .checkpoint_segment_record(std::slice::from_ref(&entry), &bytes)
+            .unwrap();
+        let conservative_charge = archive
+            .checkpoint_segment_decoded_upper_bound(&record)
+            .unwrap();
+        let stable_aggregate = conservative_charge
+            .checked_add(CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES)
+            .unwrap();
+        let manifest_key = archive.checkpoint_manifest_key().unwrap();
+        let manifest_before = store.get_versioned(&manifest_key).await.unwrap();
+        let control_before = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        let rejected_limits = CheckpointRestoreLimits {
+            object_decoded_bytes: conservative_charge - 1,
+            aggregate_decoded_bytes: stable_aggregate,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+
+        assert_eq!(
+            archive
+                .publish_committed_with_limits(std::slice::from_ref(&entry), rejected_limits)
+                .await
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object decoded bytes",
+                object_key: Some(record.object_key().to_string()),
+                limit: conservative_charge - 1,
+                actual: conservative_charge,
+            }
+        );
+        assert!(matches!(
+            store.get(record.object_key()).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+        let manifest_after = store.get_versioned(&manifest_key).await.unwrap();
+        assert_eq!(manifest_after.bytes(), manifest_before.bytes());
+        assert_eq!(manifest_after.version(), manifest_before.version());
+        let control_after = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        assert_eq!(control_after.bytes(), control_before.bytes());
+        assert_eq!(control_after.version(), control_before.version());
+
+        let exact_limits = CheckpointRestoreLimits {
+            object_encoded_bytes: u64::try_from(bytes.len()).unwrap(),
+            aggregate_encoded_bytes: u64::try_from(bytes.len()).unwrap(),
+            object_decoded_bytes: conservative_charge,
+            aggregate_decoded_bytes: stable_aggregate,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        let published = archive
+            .publish_committed_with_limits(std::slice::from_ref(&entry), exact_limits)
+            .await
+            .unwrap();
+        let published_record = &published.manifest().segments()[0];
+        let downloaded = archive
+            .download_verified_with_limits(
+                published_record.object_key(),
+                published_record.size_bytes(),
+                published_record.sha256(),
+                exact_limits,
+            )
+            .await
+            .unwrap();
+        let (decoded, actual_charge) = archive
+            .decode_checkpoint_segment_bounded(
+                published_record,
+                &downloaded,
+                conservative_charge,
+                "object decoded bytes",
+            )
+            .unwrap();
+        assert_eq!(decoded, vec![entry]);
+        assert!(actual_charge <= conservative_charge);
+        assert_eq!(loaded.manifest().segments().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_snapshot_over_limit_does_not_touch_publisher_control() {
+        let (_directory, store, archive) = fixture();
+        archive.initialize_checkpoint().await.unwrap();
+        let snapshot_bytes = b"oversized local snapshot candidate";
+        let anchor = RecoveryAnchor::new(
+            "cluster-a",
+            7,
+            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            1,
+            LogAnchor::new(3, LogHash::digest(&[b"tip"])),
+            SnapshotIdentity::new(
+                "snapshot-over-limit",
+                LogHash::digest(&[snapshot_bytes]),
+                u64::try_from(snapshot_bytes.len()).unwrap(),
+                LogHash::digest(&[b"executor"]),
+            ),
+        );
+        let snapshot_key = checkpoint_snapshot_key(archive.checkpoint_identity().unwrap(), &anchor);
+        let manifest_key = archive.checkpoint_manifest_key().unwrap();
+        let manifest_before = store.get_versioned(&manifest_key).await.unwrap();
+        let control_before = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        let limit = u64::try_from(snapshot_bytes.len()).unwrap() - 1;
+
+        assert_eq!(
+            archive
+                .publish_checkpoint_snapshot_with_limits(
+                    anchor,
+                    snapshot_bytes,
+                    CheckpointRestoreLimits {
+                        object_encoded_bytes: limit,
+                        ..CHECKPOINT_RESTORE_LIMITS
+                    },
+                )
+                .await
+                .unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object encoded bytes",
+                object_key: Some(snapshot_key.clone()),
+                limit,
+                actual: u64::try_from(snapshot_bytes.len()).unwrap(),
+            }
+        );
+        assert!(matches!(
+            store.get(&snapshot_key).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+        let manifest_after = store.get_versioned(&manifest_key).await.unwrap();
+        assert_eq!(manifest_after.bytes(), manifest_before.bytes());
+        assert_eq!(manifest_after.version(), manifest_before.version());
+        let control_after = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        assert_eq!(control_after.bytes(), control_before.bytes());
+        assert_eq!(control_after.version(), control_before.version());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_overlap_over_limit_is_pure_before_publisher_lease() {
+        let (_directory, store, archive) = fixture();
+        let first = entry();
+        let first_loaded = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let first_key = first_loaded.manifest().segments()[0]
+            .object_key()
+            .to_string();
+        let second = next_entry(&first);
+        let second_bytes = encode_segment(std::slice::from_ref(&second));
+        let second_key = checkpoint_segment_key(
+            archive.checkpoint_identity().unwrap(),
+            second.index,
+            second.index,
+        );
+        let encoded_limit = u64::try_from(second_bytes.len()).unwrap() - 1;
+        let manifest_key = archive.checkpoint_manifest_key().unwrap();
+        let manifest_before = store.get_versioned(&manifest_key).await.unwrap();
+        let control_before = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, first_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            archive.publish_committed_with_limits(
+                &[first, second],
+                CheckpointRestoreLimits {
+                    object_encoded_bytes: encoded_limit,
+                    ..CHECKPOINT_RESTORE_LIMITS
+                },
+            ),
+        )
+        .await
+        .expect("local over-limit rejection must not await the archived overlap proof");
+        assert_eq!(
+            result.unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object encoded bytes",
+                object_key: Some(second_key.clone()),
+                limit: encoded_limit,
+                actual: u64::try_from(second_bytes.len()).unwrap(),
+            }
+        );
+        assert!(matches!(
+            entered.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            store.get(&second_key).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+        let manifest_after = store.get_versioned(&manifest_key).await.unwrap();
+        assert_eq!(manifest_after.bytes(), manifest_before.bytes());
+        assert_eq!(manifest_after.version(), manifest_before.version());
+        let control_after = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        assert_eq!(control_after.bytes(), control_before.bytes());
+        assert_eq!(control_after.version(), control_before.version());
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn stale_cas_reprepare_rejects_newer_over_limit_manifest_before_renewal() {
+        let (_directory, store, archive) = fixture();
+        let first = entry();
+        let stale = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let second = next_entry(&first);
+        let second_bytes = encode_segment(std::slice::from_ref(&second));
+        let second_record = archive
+            .checkpoint_segment_record(std::slice::from_ref(&second), &second_bytes)
+            .unwrap();
+        let object_encoded_limit = stale.manifest().segments()[0]
+            .size_bytes()
+            .max(second_record.size_bytes());
+        let snapshot_bytes =
+            vec![b'x'; usize::try_from(object_encoded_limit.checked_add(1).unwrap()).unwrap()];
+        let anchor = RecoveryAnchor::new(
+            "cluster-a",
+            7,
+            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            1,
+            LogAnchor::new(first.index, first.hash),
+            SnapshotIdentity::new(
+                "newer-over-limit",
+                LogHash::digest(&[snapshot_bytes.as_slice()]),
+                u64::try_from(snapshot_bytes.len()).unwrap(),
+                LogHash::digest(&[b"executor"]),
+            ),
+        );
+        let snapshot_key = checkpoint_snapshot_key(archive.checkpoint_identity().unwrap(), &anchor);
+        let prepared_snapshot = archive
+            .prepare_checkpoint_snapshot_candidate(
+                &anchor,
+                &snapshot_bytes,
+                stale.manifest(),
+                CheckpointSnapshotPublicationPolicy {
+                    allow_empty_baseline: false,
+                    limits: CHECKPOINT_RESTORE_LIMITS,
+                },
+            )
+            .unwrap();
+        let mut newer = prepared_snapshot.next.unwrap();
+        newer.tip = CheckpointTip::new(second.index, second.hash);
+        newer.segments.push(second_record.clone());
+        archive.validate_checkpoint_manifest(&newer).unwrap();
+        store.create(&snapshot_key, &snapshot_bytes).await.unwrap();
+        store
+            .create(second_record.object_key(), &second_bytes)
+            .await
+            .unwrap();
+        let manifest_key = archive.checkpoint_manifest_key().unwrap();
+        store
+            .update(
+                &manifest_key,
+                serialize_checkpoint_manifest(&newer).unwrap(),
+                stale.version().clone(),
+            )
+            .await
+            .unwrap();
+
+        let lease = archive
+            .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
+            .await
+            .unwrap();
+        let lease_id = lease.lease_id;
+        let (manifest_gate, manifest_entered, _manifest_cancelled) =
+            TestCheckpointManifestGate::new(archive.test_store_identity);
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let manifest_release = manifest_gate.release_guard();
+        let publish_archive = archive.clone();
+        let publish_lease_id = lease_id.clone();
+        let publish_second = second.clone();
+        let limits = CheckpointRestoreLimits {
+            object_encoded_bytes: object_encoded_limit,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        let publish = tokio::spawn(async move {
+            publish_archive
+                .publish_committed_from_loaded_unleased_with_limits(
+                    std::slice::from_ref(&publish_second),
+                    &publish_lease_id,
+                    DEFAULT_LEASE_MS,
+                    stale,
+                    limits,
+                )
+                .await
+        });
+        wait_for_test_gate(
+            manifest_entered,
+            "stale checkpoint CAS did not reach exact-manifest reload",
+        )
+        .await;
+
+        // Reaching the reload gate proves that the first attempt already
+        // completed exact AlreadyExists verification, its post-object strict
+        // renewal, and the stale CAS. Install the object gate only now so it
+        // observes the retry and cannot be satisfied by first-attempt work.
+        let (segment_gate, segment_entered, _segment_cancelled) = TestCheckpointDownloadGate::new(
+            archive.test_store_identity,
+            second_record.object_key(),
+        );
+        let _installed_segment = install_test_checkpoint_download_gate(segment_gate.clone());
+        let segment_release = segment_gate.release_guard();
+        // Everything captured here must remain byte/version exact when the
+        // reloaded manifest fails pure preparation on the next loop.
+        let control_before = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        let manifest_before = store.get_versioned(&manifest_key).await.unwrap();
+        let segment_before = store
+            .get_versioned(second_record.object_key())
+            .await
+            .unwrap();
+        drop(manifest_release);
+
+        let publish = tokio::time::timeout(Duration::from_secs(2), publish)
+            .await
+            .expect("newer over-limit retry must not deadlock")
+            .unwrap();
+        assert_eq!(
+            publish.unwrap_err(),
+            Error::RestoreLimitExceeded {
+                resource: "object encoded bytes",
+                object_key: Some(snapshot_key),
+                limit: object_encoded_limit,
+                actual: u64::try_from(snapshot_bytes.len()).unwrap(),
+            }
+        );
+        assert!(matches!(
+            segment_entered.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let control_after = store
+            .get_versioned(&archive.gc_control_key())
+            .await
+            .unwrap();
+        assert_eq!(control_after.bytes(), control_before.bytes());
+        assert_eq!(control_after.version(), control_before.version());
+        let manifest_after = store.get_versioned(&manifest_key).await.unwrap();
+        assert_eq!(manifest_after.bytes(), manifest_before.bytes());
+        assert_eq!(manifest_after.version(), manifest_before.version());
+        let segment_after = store
+            .get_versioned(second_record.object_key())
+            .await
+            .unwrap();
+        assert_eq!(segment_after.bytes(), segment_before.bytes());
+        assert_eq!(segment_after.version(), segment_before.version());
+        drop(segment_release);
+        archive.release_gc_lease(&lease_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_append_does_not_download_retained_segments() {
+        let (_directory, _store, archive) = fixture();
+        let first = entry();
+        let first_loaded = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let first_key = first_loaded.manifest().segments()[0]
+            .object_key()
+            .to_string();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, first_key);
+        let installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+
+        let second = next_entry(&first);
+        let published = tokio::time::timeout(
+            Duration::from_secs(2),
+            archive.publish_committed(std::slice::from_ref(&second)),
+        )
+        .await
+        .expect("append must not wait on a retained-segment object read")
+        .unwrap();
+        assert_eq!(published.manifest().tip().index(), second.index);
+        assert!(matches!(
+            entered.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(release);
+        drop(installed);
+    }
+
+    #[tokio::test]
+    async fn overlap_proof_holds_publisher_lease_across_snapshot_trim_and_gc() {
+        let (_directory, store, archive) = fixture();
+        let first = entry();
+        let first_loaded = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let first_key = first_loaded.manifest().segments()[0]
+            .object_key()
+            .to_string();
+        archive.set_gc_root(identity(), now_ms()).await.unwrap();
+
+        let second = next_entry(&first);
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, first_key.clone());
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let append_archive = archive.clone();
+        let append_first = first.clone();
+        let append_second = second.clone();
+        let append = tokio::spawn(async move {
+            append_archive
+                .publish_committed(&[append_first, append_second])
+                .await
+        });
+        wait_for_test_gate(
+            entered,
+            "overlap proof did not reach the archived segment read",
+        )
+        .await;
+
+        let proof_now = now_ms();
+        let control = archive.load_gc_control().await.unwrap();
+        assert!(control.control.leases.iter().any(|lease| {
+            lease.kind == GcLeaseKind::Publisher && lease.expires_at_ms > proof_now
+        }));
+
+        let snapshot_bytes = b"trimmed overlap base";
+        let anchor = RecoveryAnchor::new(
+            "cluster-a",
+            7,
+            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            1,
+            LogAnchor::new(first.index, first.hash),
+            SnapshotIdentity::new(
+                "overlap-trim",
+                LogHash::digest(&[snapshot_bytes]),
+                u64::try_from(snapshot_bytes.len()).unwrap(),
+                LogHash::digest(&[b"executor"]),
+            ),
+        );
+        let trimmed = archive
+            .publish_checkpoint_snapshot(anchor.clone(), snapshot_bytes)
+            .await
+            .unwrap();
+        assert_eq!(trimmed.manifest().base().tip().index(), first.index);
+        assert!(trimmed.manifest().segments().is_empty());
+
+        let gc_now = now_ms();
+        let blocked_plan = archive
+            .plan_gc(
+                GcPolicy::new("overlap-proof-pending", identity(), 0, 0, 0),
+                gc_now,
+            )
+            .await
+            .unwrap();
+        assert!(blocked_plan
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.key() == first_key));
+        let delete = archive
+            .execute_gc(blocked_plan.plan_hash(), blocked_plan.not_before_ms)
+            .await;
+        assert!(
+            matches!(delete, Err(Error::GcBarrierBusy { .. })),
+            "{delete:?}"
+        );
+        assert_eq!(
+            store.get(&first_key).await.unwrap(),
+            encode_segment(std::slice::from_ref(&first))
+        );
+
+        drop(release);
+        let published = append.await.unwrap().unwrap();
+        assert_eq!(published.manifest().base().tip().index(), first.index);
+        assert_eq!(published.manifest().segments().len(), 1);
+        assert_eq!(
+            published.manifest().segments()[0].start_index(),
+            second.index
+        );
+        assert_eq!(published.manifest().segments()[0].end_index(), second.index);
+        assert_eq!(
+            *published.manifest().tip(),
+            CheckpointTip::new(second.index, second.hash)
+        );
+
+        assert!(!archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|lease| lease.kind == GcLeaseKind::Publisher));
+        archive.abort_gc("overlap-proof-pending").await.unwrap();
+
+        let replayed = archive
+            .publish_committed(&[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(replayed, published);
+        let restored = archive.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(restored.restored().snapshot().unwrap().anchor(), &anchor);
+        assert_eq!(
+            restored.restored().snapshot().unwrap().bytes(),
+            snapshot_bytes
+        );
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&second));
+
+        let final_gc_now = now_ms();
+        let final_plan = archive
+            .plan_gc(
+                GcPolicy::new("overlap-proof-complete", identity(), 0, 0, 0),
+                final_gc_now,
+            )
+            .await
+            .unwrap();
+        assert!(final_plan
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.key() == first_key));
+        let report = archive
+            .execute_gc(final_plan.plan_hash(), final_plan.not_before_ms)
+            .await
+            .unwrap();
+        assert!(report.results().iter().any(|evidence| {
+            evidence.key == first_key && evidence.outcome == GcDeleteOutcome::Deleted
+        }));
+        assert!(matches!(
+            store.get(&first_key).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_publishers_match_their_bounded_reader_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let archive = ObjectArchiveStore::new_for_single_process(store.clone(), "cluster-a");
+        let segment = SegmentFile::new(
+            rhiza_log::IndexRange::new(1, 1).unwrap(),
+            b"segment".to_vec(),
+        );
+        let segment_size = u64::try_from(segment.bytes().len()).unwrap();
+        let segment_limits = CheckpointRestoreLimits {
+            object_encoded_bytes: segment_size,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        let record = archive
+            .publish_segment_with_limits(7, &segment, segment_limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            archive
+                .download_verified_with_limits(
+                    record.object_key(),
+                    record.size_bytes(),
+                    record.sha256(),
+                    segment_limits,
+                )
+                .await
+                .unwrap(),
+            segment.bytes()
+        );
+
+        let rejected = SegmentFile::new(
+            rhiza_log::IndexRange::new(2, 2).unwrap(),
+            b"too-large".to_vec(),
+        );
+        let rejected_key = format!(
+            "rhiza/cluster-a/archive/segments/epoch-{epoch:020}/{start:020}-{end:020}.qlog",
+            epoch = 7,
+            start = 2,
+            end = 2,
+        );
+        assert!(matches!(
+            archive
+                .publish_segment_with_limits(7, &rejected, segment_limits)
+                .await,
+            Err(Error::RestoreLimitExceeded {
+                resource: "object encoded bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.get(&rejected_key).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+
+        let snapshot_bytes = b"snapshot".to_vec();
+        let snapshot = Snapshot::new(
+            SnapshotManifest::new(
+                "cluster-a",
+                ConfigurationState::active(1, LogHash::ZERO),
+                7,
+                1,
+                LogHash::ZERO,
+                1,
+                "node-a",
+                LogHash::from_bytes([7; 32]),
+            ),
+            snapshot_bytes.clone(),
+        );
+        let snapshot_size = u64::try_from(snapshot_bytes.len()).unwrap();
+        let snapshot_limits = CheckpointRestoreLimits {
+            object_encoded_bytes: snapshot_size,
+            object_decoded_bytes: snapshot_size,
+            ..CHECKPOINT_RESTORE_LIMITS
+        };
+        let snapshot_record = archive
+            .publish_snapshot_with_limits(&snapshot, snapshot_limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            archive
+                .download_verified_with_limits(
+                    snapshot_record.object_key(),
+                    snapshot_record.size_bytes(),
+                    snapshot_record.sha256(),
+                    snapshot_limits,
+                )
+                .await
+                .unwrap(),
+            snapshot_bytes
+        );
+    }
+
     async fn gc_race_fixture() -> (
         tempfile::TempDir,
         ObjStore,
@@ -3766,6 +7888,188 @@ mod tests {
             .unwrap();
         assert_eq!(plan.candidates().len(), 1);
         (dir, store, archive, loaded, next, plan)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_roll_does_not_revive_an_expired_source_reader() {
+        let (_source_directory, source_store, source) = fixture();
+        let source_checkpoint = source.publish_committed(&[entry()]).await.unwrap();
+        let source_root_identity = CheckpointIdentity::new("cluster-a", 7, 3, 2);
+        let source_root = ObjectArchiveStore::new_checkpoint_for_single_process(
+            source_store.clone(),
+            source_root_identity.clone(),
+        );
+        source_root.initialize_checkpoint().await.unwrap();
+        source_root
+            .set_gc_root(source_root_identity.clone(), now_ms())
+            .await
+            .unwrap();
+
+        let target_directory = tempfile::tempdir().unwrap();
+        let target_store = ObjStore::new(ObjStoreConfig::Local {
+            root: target_directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let target = ObjectArchiveStore::new_checkpoint_for_single_process(
+            target_store,
+            CheckpointIdentity::new("cluster-a", 7, 3, 2),
+        );
+        let source_segment_key = source_checkpoint.manifest().segments()[0]
+            .object_key()
+            .to_owned();
+        let (gate, entered, cancelled) =
+            TestCheckpointDownloadGate::new(source.test_store_identity, source_segment_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let _release_on_unwind = gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(
+            entered,
+            "recovery roll did not reach its source object read",
+        )
+        .await;
+
+        let mut control = source.load_gc_control().await.unwrap();
+        let source_lease = control
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.kind == GcLeaseKind::Reader)
+            .expect("paused copy must hold its source Reader lease");
+        source_lease.expires_at_ms = 0;
+        source.update_gc_control(&control).await.unwrap();
+        let plan = source_root
+            .plan_gc(
+                GcPolicy::new("copy-source-expired", source_root_identity, 0, 0, 0),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        source_root
+            .execute_gc(plan.plan_hash(), now_ms())
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_millis(
+            DEFAULT_LEASE_MS / READER_LEASE_RENEW_DIVISOR,
+        ))
+        .await;
+        let result = copy.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GenerationRetired { generation: 1, .. })),
+            "source Reader retirement must abort the copy without recreation: {result:?}"
+        );
+        wait_for_test_gate(
+            cancelled,
+            "strict source renewal did not cancel the paused source object read",
+        )
+        .await;
+        assert!(!source
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|lease| lease.kind == GcLeaseKind::Reader));
+        assert!(target.load_checkpoint_unleased().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_aborts_when_target_gc_retires_a_copied_object_mid_copy() {
+        let (_source_directory, _source_store, source) = fixture();
+        let first = entry();
+        let second = next_entry(&first);
+        let source_checkpoint = source
+            .publish_committed(&[first.clone(), second])
+            .await
+            .unwrap();
+
+        let target_directory = tempfile::tempdir().unwrap();
+        let target_store = ObjStore::new(ObjStoreConfig::Local {
+            root: target_directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let target_identity = CheckpointIdentity::new("cluster-a", 7, 3, 2);
+        let target = ObjectArchiveStore::new_checkpoint_for_single_process(
+            target_store.clone(),
+            target_identity.clone(),
+        );
+        // The copied generation is intentionally cataloged but has no
+        // manifest yet, so GC can classify its just-created object as a
+        // superseded generation after the copy lease expires.
+        target.ensure_gc_control().await.unwrap();
+        target.register_generation(now_ms()).await.unwrap();
+        let root_identity = CheckpointIdentity::new("cluster-a", 7, 3, 3);
+        let root = ObjectArchiveStore::new_checkpoint_for_single_process(
+            target_store.clone(),
+            root_identity.clone(),
+        );
+        root.initialize_checkpoint().await.unwrap();
+        root.set_gc_root(root_identity.clone(), now_ms())
+            .await
+            .unwrap();
+
+        let source_first_segment = &source_checkpoint.manifest().segments()[0];
+        let copied_first_key = checkpoint_segment_key(
+            &target_identity,
+            source_first_segment.start_index(),
+            source_first_segment.end_index(),
+        );
+        let (gate, entered, _cancelled) = TestCheckpointDownloadGate::after_create(
+            target.test_store_identity,
+            copied_first_key.clone(),
+        );
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(
+            entered,
+            "recovery roll did not create and verify its first target object",
+        )
+        .await;
+
+        let mut control = target.load_gc_control().await.unwrap();
+        let target_lease = control
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.kind == GcLeaseKind::Publisher)
+            .expect("paused copy must hold its target Publisher lease");
+        target_lease.expires_at_ms = 0;
+        target.update_gc_control(&control).await.unwrap();
+        let plan = root
+            .plan_gc(
+                GcPolicy::new("copy-target-expired", root_identity, 0, 0, 0),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(plan
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.key() == copied_first_key));
+        let report = root.execute_gc(plan.plan_hash(), now_ms()).await.unwrap();
+        assert!(report.results().iter().any(|evidence| {
+            evidence.key == copied_first_key && evidence.outcome == GcDeleteOutcome::Deleted
+        }));
+
+        drop(release);
+        let result = copy.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::GenerationRetired { generation: 2, .. })),
+            "a target generation retired after object copy must abort before manifest publication: {result:?}"
+        );
+        assert!(target.load_checkpoint_unleased().await.unwrap().is_none());
+        assert!(matches!(
+            target_store.get(&copied_first_key).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
     }
 
     fn fixture() -> (tempfile::TempDir, ObjStore, ObjectArchiveStore) {
@@ -3802,6 +8106,30 @@ mod tests {
             entry_type: EntryType::Command,
             payload,
             prev_hash: LogHash::ZERO,
+            hash,
+        }
+    }
+
+    fn next_entry(previous: &LogEntry) -> LogEntry {
+        let index = previous.index + 1;
+        let payload = format!("entry-{index}").into_bytes();
+        let hash = LogEntry::calculate_hash(
+            "cluster-a",
+            index,
+            7,
+            3,
+            EntryType::Command,
+            previous.hash,
+            &payload,
+        );
+        LogEntry {
+            cluster_id: "cluster-a".into(),
+            epoch: 7,
+            config_id: 3,
+            index,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash: previous.hash,
             hash,
         }
     }

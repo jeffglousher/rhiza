@@ -14,7 +14,10 @@ use rhiza_node::{
     PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
+use rhiza_quepaxa::{
+    Error as QuePaxaError, Membership, RecordRequest, RecordSummary, RecorderFileStore,
+    RecorderRpc, RecorderRpcContext, ThreeNodeConsensus,
+};
 
 const CLUSTER_ID: &str = "rhiza:kv:cluster-a";
 
@@ -82,8 +85,12 @@ fn kv_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
 fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() {
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
-    let runtime =
-        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let runtime = NodeRuntime::open(
+        config.clone(),
+        consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
+        &[],
+    )
+    .unwrap();
     let first = runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
@@ -92,7 +99,6 @@ fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() 
         .unwrap();
     drop(runtime);
 
-    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
@@ -121,6 +127,43 @@ fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() 
             .value,
         Some(b"third".to_vec())
     );
+}
+
+#[test]
+fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders() {
+    for attempt in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let config = kv_config(dir.path());
+        let runtime = NodeRuntime::open(
+            config.clone(),
+            consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
+            &[],
+        )
+        .unwrap();
+        runtime
+            .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+            .unwrap();
+        let second = runtime
+            .mutate_kv(
+                KvCommandV1::put("request-2", b"other".to_vec(), b"second".to_vec()).unwrap(),
+            )
+            .unwrap();
+        drop(runtime);
+
+        std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
+        std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
+
+        let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[])
+            .unwrap_or_else(|error| panic!("recovery attempt {attempt} failed: {error}"));
+        let key = reopened.get_kv(b"key", ReadConsistency::Local).unwrap();
+        let other = reopened.get_kv(b"other", ReadConsistency::Local).unwrap();
+        assert_eq!(key.value, Some(b"value".to_vec()), "attempt {attempt}");
+        assert_eq!(other.value, Some(b"second".to_vec()), "attempt {attempt}");
+        assert_eq!(key.applied_index, 2, "attempt {attempt}");
+        assert_eq!(other.applied_index, 2, "attempt {attempt}");
+        assert_eq!(key.hash, second.hash(), "attempt {attempt}");
+        assert_eq!(other.hash, second.hash(), "attempt {attempt}");
+    }
 }
 
 #[test]
@@ -184,22 +227,36 @@ fn missing_partial_and_identity_invalid_unanchored_kv_rebuild_from_qlog() {
 fn corrupt_unanchored_kv_fails_closed_when_only_one_recorder_has_the_tail() {
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
-    let runtime =
-        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let runtime = NodeRuntime::open(
+        config.clone(),
+        consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
+        &[],
+    )
+    .unwrap();
     runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
     drop(runtime);
 
     std::fs::remove_dir_all(dir.path().join("recorders/n2")).unwrap();
-    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
-    assert!(matches!(
-        NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]),
-        Err(NodeError::Unavailable(_))
-    ));
+    let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]);
+    let classification = match &reopened {
+        Ok(_) => "ok",
+        Err(NodeError::Unavailable(_)) => "unavailable",
+        Err(NodeError::Reconciliation(_)) => "reconciliation",
+        Err(_) => "other_error",
+    };
+    let diagnostic = match &reopened {
+        Ok(_) => "Ok(NodeRuntime)".to_owned(),
+        Err(error) => format!("Err({error:?})"),
+    };
+    assert!(
+        matches!(&reopened, Err(NodeError::Unavailable(_))),
+        "expected fail-closed Unavailable; result={diagnostic}; classification={classification}; tail_recorder_count=1; local_consensus_log=removed; kv_cache=corrupt"
+    );
 }
 
 #[tokio::test]
@@ -233,13 +290,13 @@ async fn corrupt_anchored_kv_requires_snapshot_without_quarantining_the_view() {
         NodeError::SnapshotRequired(Box::new(anchor))
     );
     assert!(config.data_dir().join("kv").is_dir());
-    assert!(!std::fs::read_dir(config.data_dir())
-        .unwrap()
-        .any(|entry| entry
+    assert!(!std::fs::read_dir(config.data_dir()).unwrap().any(|entry| {
+        entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with("kv.quarantine-")));
+            .starts_with("kv.quarantine-")
+    }));
 }
 
 #[test]
@@ -278,13 +335,13 @@ fn corrupt_qlog_fails_before_kv_quarantine_and_preserves_both_views() {
         std::fs::read(config.data_dir().join("kv/data.redb")).unwrap(),
         corrupt_kv
     );
-    assert!(!std::fs::read_dir(config.data_dir())
-        .unwrap()
-        .any(|entry| entry
+    assert!(!std::fs::read_dir(config.data_dir()).unwrap().any(|entry| {
+        entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with("kv.quarantine-")));
+            .starts_with("kv.quarantine-")
+    }));
 }
 
 #[test]
@@ -612,24 +669,24 @@ async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
         post_kv_put(&client, addr, &first_body),
         post_kv_put(&client, addr, &second_body)
     );
-    let first = first.json::<KvMutationResponse>().await.unwrap();
-    let second = second.json::<KvMutationResponse>().await.unwrap();
+    let first = kv_mutation_response(first, "first concurrent write").await;
+    let second = kv_mutation_response(second, "second concurrent write").await;
 
     assert_eq!(first.applied_index, second.applied_index);
     assert_eq!(first.hash, second.hash);
     assert_ne!(first.result, second.result);
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
 
-    let first_retry = post_kv_put(&client, addr, &first_body)
-        .await
-        .json::<KvMutationResponse>()
-        .await
-        .unwrap();
-    let second_retry = post_kv_put(&client, addr, &second_body)
-        .await
-        .json::<KvMutationResponse>()
-        .await
-        .unwrap();
+    let first_retry = kv_mutation_response(
+        post_kv_put(&client, addr, &first_body).await,
+        "first write retry",
+    )
+    .await;
+    let second_retry = kv_mutation_response(
+        post_kv_put(&client, addr, &second_body).await,
+        "second write retry",
+    )
+    .await;
     assert_eq!(first_retry, first);
     assert_eq!(second_retry, second);
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -790,6 +847,35 @@ async fn post_kv_put(
         .unwrap()
 }
 
+async fn kv_mutation_response(response: reqwest::Response, request: &str) -> KvMutationResponse {
+    const MAX_ERROR_BODY_BYTES: usize = 1024;
+
+    let status = response.status();
+    if status.is_success() {
+        return response.json::<KvMutationResponse>().await.unwrap_or_else(|error| {
+            panic!("{request} returned success status {status} but invalid mutation response: {error}")
+        });
+    }
+
+    let content_length = response.content_length();
+    let mut response = response;
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let Some(chunk) = response.chunk().await.unwrap_or_else(|error| {
+            panic!("{request} response body read failed after status {status}: {error}")
+        }) else {
+            break;
+        };
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+
+    panic!(
+        "{request} returned status {status} (content-length {content_length:?}): {}",
+        String::from_utf8_lossy(&body),
+    );
+}
+
 fn restore_archive(archive_root: &Path, archive_backup: &Path) {
     std::fs::remove_file(archive_root).unwrap();
     let link = archive_root.with_extension("restore-link");
@@ -831,6 +917,67 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
             ],
             1,
             LogHash::ZERO,
+        )
+        .unwrap(),
+    )
+}
+
+struct UnavailableRecorder;
+
+impl RecorderRpc for UnavailableRecorder {
+    fn record(
+        &self,
+        _context: &RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, QuePaxaError> {
+        Err(QuePaxaError::ProposeFailed)
+    }
+
+    fn inspect_record_summary(
+        &self,
+        _context: &RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<RecordSummary>, QuePaxaError> {
+        Err(QuePaxaError::ProposeFailed)
+    }
+}
+
+fn consensus_with_unavailable_third_recorder(
+    root: &Path,
+    recorder_dir: &str,
+) -> Arc<ThreeNodeConsensus> {
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let recorder = |recorder_id| {
+        RecorderFileStore::new_with_membership(
+            root.join(recorder_dir).join(recorder_id),
+            recorder_id,
+            CLUSTER_ID,
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap()
+    };
+    Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            CLUSTER_ID,
+            "n1",
+            1,
+            1,
+            vec![
+                (
+                    "n1".into(),
+                    Box::new(recorder("n1")) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(recorder("n2")) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(UnavailableRecorder) as Box<dyn RecorderRpc>,
+                ),
+            ],
         )
         .unwrap(),
     )

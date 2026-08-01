@@ -4,15 +4,23 @@
 )]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex, MutexGuard, OnceLock,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt as WindowsMetadataExt, OpenOptionsExt};
 
 #[cfg(any(feature = "sql", feature = "kv"))]
 use std::collections::VecDeque;
@@ -20,19 +28,19 @@ use std::collections::VecDeque;
 #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
 compile_error!("rhiza-node requires at least one execution profile feature: sql, graph, or kv");
 
-#[cfg(feature = "graph")]
-use std::collections::BTreeMap;
 #[cfg(any(feature = "sql", feature = "kv", test))]
 use std::sync::atomic::AtomicUsize;
 
 use axum::{
+    body::{Body, Bytes, HttpBody},
     extract::{rejection::JsonRejection, DefaultBodyLimit, Extension, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use http_body::Frame;
 #[cfg(feature = "sql")]
 use rhiza_archive::SnapshotRecord;
 use rhiza_core::{
@@ -57,12 +65,11 @@ use rhiza_log::{decode_segment_for_cluster, write_segment_file};
 use rhiza_log::{FileLogStore, IndexRange, LogStore};
 #[cfg(feature = "sql")]
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-#[cfg(feature = "sql")]
-use rhiza_quepaxa::Consensus;
 use rhiza_quepaxa::{
     CertifiedDecisionInspection, DecisionInspection, DecisionProof, Membership,
     ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
-    RecorderRpc, RejectReason, ThreeNodeConsensus,
+    RecorderRpc, RecorderRpcContext, RejectReason, ThreeNodeConsensus,
+    DEFAULT_RECORDER_RPC_TIMEOUT,
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{
@@ -81,11 +88,15 @@ mod graph;
 #[cfg(feature = "kv")]
 mod kv;
 mod learner;
+mod recorder_decode;
 mod recorder_tcp;
 pub use admin::*;
 pub use durability::{
-    restore_checkpoint_to_fresh_data_dir, restore_checkpoint_to_fresh_data_dir_for_node,
-    CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode,
+    capture_expected_local_restore_state,
+    install_prepared_checkpoint_for_rejoin_preserving_recorder,
+    install_prepared_checkpoint_to_fresh_data_dir, prepare_checkpoint_restore,
+    CheckpointCoordinator, CheckpointInstallMode, DurabilityError, DurabilityHealth,
+    DurabilityMode, ExpectedLocalRestoreState, PreparedCheckpointRestore, RestoreCompletionMarker,
     SuccessorRestorePreparation,
 };
 #[cfg(feature = "graph")]
@@ -101,6 +112,7 @@ pub use recorder_tcp::{
 };
 pub use recorder_tcp::{
     serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
+    RecorderIngressExit, RecorderIngressLifecycle, RecorderTaskDisposition,
     RecorderTlsClientConfig, RecorderTlsServerConfig, TcpPostcardRecorderClient,
 };
 
@@ -112,8 +124,10 @@ pub const MAX_VALUE_BYTES: usize = 240 * 1024;
 pub const MAX_HTTP_BODY_BYTES: usize = MAX_COMMAND_BYTES * 6 + 16 * 1024;
 pub const DEFAULT_CLIENT_CONCURRENCY: usize = 16;
 pub const DEFAULT_PEER_CONCURRENCY: usize = 32;
+pub const HTTP_RECORDER_MAX_CONCURRENT_WORKERS: usize = DEFAULT_PEER_CONCURRENCY;
 pub const DEFAULT_WRITER_BATCH_MAX: usize = 8;
 const MAX_WRITE_BATCH_MEMBERS: usize = 64;
+const PEER_RESPONSE_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(feature = "sql")]
 const MAX_SQL_WRITE_BATCH_MEMBERS: usize = MAX_QWAL_V3_RECEIPTS;
 #[cfg(feature = "sql")]
@@ -137,12 +151,380 @@ const KV_GROUP_COMMIT_QUEUE_CAPACITY: usize = 64;
 const MAX_KV_GROUP_COMMIT_PENDING_BYTES: usize = KV_GROUP_COMMIT_QUEUE_CAPACITY * MAX_COMMAND_BYTES;
 pub const DEFAULT_WRITER_BATCH_WINDOW: Duration = Duration::from_micros(500);
 pub const PROTOCOL_VERSION: &str = "1";
-pub const RECORDER_PROTOCOL_VERSION: &str = "3";
-const RECORDER_WIRE_VERSION: u16 = 3;
+pub const RECORDER_PROTOCOL_VERSION: &str = "5";
+const RECORDER_WIRE_VERSION: u16 = 5;
 pub const VERSION_HEADER: &str = "x-rhiza-version";
 pub const NODE_ID_HEADER: &str = "x-rhiza-node-id";
 pub const RECOVERY_GENERATION_HEADER: &str = "x-rhiza-recovery-generation";
 pub const RECORDER_IDENTITY_PATH: &str = "/v2/quepaxa/recorder/identity";
+
+pub(crate) const NODE_DATA_ROOT_LOCK_FILE: &str = ".node.lock";
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+
+// Open the final component itself on Windows so a reparse point cannot turn a
+// checked `.node.lock` pathname into a different target between metadata
+// validation and handle identity validation.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Mirrors Windows `FILE_ID_INFO`: a 64-bit volume serial followed by the
+/// full 128-bit file ID returned by `GetFileInformationByHandleEx(FileIdInfo)`.
+/// The older BY_HANDLE_FILE_INFORMATION FileIndex is only 64 bits and is not
+/// collision-safe on filesystems such as ReFS, so it is deliberately unused.
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileIdInfo {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+const _: [(); 24] = [(); std::mem::size_of::<WindowsFileIdInfo>()];
+
+#[cfg(windows)]
+const WINDOWS_FILE_ID_INFO_CLASS: i32 = 18;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetFileInformationByHandleEx(
+        file: *mut std::ffi::c_void,
+        information_class: i32,
+        information: *mut std::ffi::c_void,
+        information_size: u32,
+    ) -> i32;
+}
+
+/// An identity derived from the exact file handle whose advisory lock is
+/// held. Pathname metadata such as length or mtime is not an identity: a
+/// replacement zero-length lock must never become interchangeable with the
+/// locked inode/file object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NodeDataPathIdentity {
+    #[cfg(unix)]
+    Unix { dev: u64, ino: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
+}
+
+/// The only cross-process mutation lock for a node data root. Runtime open
+/// and checkpoint restore intentionally share this helper so neither can
+/// observe or modify qlog/materializer state while the other owns it.
+#[derive(Debug)]
+pub(crate) enum NodeDataRootLockError {
+    Locked,
+    Invalid(String),
+    Io(std::io::Error),
+}
+
+pub(crate) struct NodeDataRootLock {
+    file: fs::File,
+    created: bool,
+    identity: NodeDataPathIdentity,
+}
+
+impl NodeDataRootLock {
+    pub(crate) const fn was_created(&self) -> bool {
+        self.created
+    }
+
+    /// Verifies that `path` still resolves to the exact file object locked by
+    /// this guard. This is intentionally no-follow and must run under the
+    /// guard before an installer trusts or mutates the data root.
+    pub(crate) fn revalidate_path(&self, path: &Path) -> Result<(), NodeDataRootLockError> {
+        let metadata = fs::symlink_metadata(path).map_err(NodeDataRootLockError::Io)?;
+        validate_node_data_root_lock_metadata(
+            &metadata,
+            "node data lock changed to an invalid form",
+        )?;
+        let current = open_node_data_root_lock(path, false)?;
+        let opened = current.metadata().map_err(NodeDataRootLockError::Io)?;
+        validate_node_data_root_lock_metadata(
+            &opened,
+            "node data lock changed to an invalid form before revalidation",
+        )?;
+        if node_data_path_identity(&current)? != self.identity {
+            return Err(NodeDataRootLockError::Invalid(
+                "node data lock path does not identify the acquired lock".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_file(self) -> fs::File {
+        self.file
+    }
+}
+
+impl fmt::Display for NodeDataRootLockError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Locked => formatter.write_str("node data root is already locked"),
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for NodeDataRootLockError {}
+
+fn node_data_path_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn validate_node_data_root_lock_metadata(
+    metadata: &fs::Metadata,
+    message: &str,
+) -> Result<(), NodeDataRootLockError> {
+    if node_data_path_is_reparse_point(metadata)
+        || metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != 0
+    {
+        return Err(NodeDataRootLockError::Invalid(message.into()));
+    }
+    Ok(())
+}
+
+fn validate_node_data_path_metadata(
+    metadata: &fs::Metadata,
+    directory: bool,
+    message: &str,
+) -> Result<(), NodeDataRootLockError> {
+    if node_data_path_is_reparse_point(metadata)
+        || metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err(NodeDataRootLockError::Invalid(message.into()));
+    }
+    Ok(())
+}
+
+fn open_node_data_root_lock(
+    path: &Path,
+    create_new: bool,
+) -> Result<fs::File, NodeDataRootLockError> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .create_new(create_new);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    options.custom_flags(O_NOFOLLOW_FLAG);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path).map_err(NodeDataRootLockError::Io)
+}
+
+/// Captures an exact object identity through a no-follow handle. The restore
+/// expected-state token uses this for every path it may trust or mutate, so
+/// replacement by an equal-length file or a different directory cannot evade
+/// its stale-state fence on Windows or Unix.
+pub(crate) fn capture_node_data_path_identity(
+    path: &Path,
+    directory: bool,
+) -> Result<NodeDataPathIdentity, NodeDataRootLockError> {
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, directory);
+        return Err(NodeDataRootLockError::Invalid(
+            "node data path filesystem identity is unsupported on this platform".into(),
+        ));
+    }
+    #[cfg(any(unix, windows))]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        options.custom_flags(O_NOFOLLOW_FLAG);
+        #[cfg(windows)]
+        options.custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+        );
+        let file = options.open(path).map_err(NodeDataRootLockError::Io)?;
+        let metadata = file.metadata().map_err(NodeDataRootLockError::Io)?;
+        validate_node_data_path_metadata(
+            &metadata,
+            directory,
+            "node data path changed to an invalid form before identity capture",
+        )?;
+        node_data_path_identity(&file)
+    }
+}
+
+fn node_data_path_identity(file: &fs::File) -> Result<NodeDataPathIdentity, NodeDataRootLockError> {
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata().map_err(NodeDataRootLockError::Io)?;
+        Ok(NodeDataPathIdentity::Unix {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut information = std::mem::MaybeUninit::<WindowsFileIdInfo>::zeroed();
+        let information_size = u32::try_from(std::mem::size_of::<WindowsFileIdInfo>())
+            .expect("Windows FILE_ID_INFO size always fits in u32");
+        // SAFETY: the OS owns the raw handle borrowed from `file`; the output
+        // pointer and buffer length exactly describe one FILE_ID_INFO, and
+        // FileIdInfo requests its complete 128-bit object identity.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                WINDOWS_FILE_ID_INFO_CLASS,
+                information.as_mut_ptr().cast(),
+                information_size,
+            )
+        };
+        if result == 0 {
+            return Err(NodeDataRootLockError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: a nonzero GetFileInformationByHandleEx result initializes
+        // the complete FILE_ID_INFO output structure.
+        let information = unsafe { information.assume_init() };
+        Ok(NodeDataPathIdentity::Windows {
+            volume_serial_number: information.volume_serial_number,
+            file_id: information.file_id,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(NodeDataRootLockError::Invalid(
+            "node data lock filesystem identity is unsupported on this platform".into(),
+        ))
+    }
+}
+
+/// Creates the configured data directory if absent and acquires its only
+/// runtime/restore lock. The lock is a zero-length regular file opened with
+/// no-follow semantics; hostile file types and a changed lock identity fail
+/// before a caller may mutate recovery state.
+pub(crate) fn acquire_node_data_root_lock(
+    data_dir: &Path,
+) -> Result<NodeDataRootLock, NodeDataRootLockError> {
+    fs::create_dir_all(data_dir).map_err(NodeDataRootLockError::Io)?;
+    let data_metadata = fs::symlink_metadata(data_dir).map_err(NodeDataRootLockError::Io)?;
+    if data_metadata.file_type().is_symlink() || !data_metadata.is_dir() {
+        return Err(NodeDataRootLockError::Invalid(
+            "node data directory is not a regular directory".into(),
+        ));
+    }
+
+    let lock_path = data_dir.join(NODE_DATA_ROOT_LOCK_FILE);
+    let before = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            validate_node_data_root_lock_metadata(
+                &metadata,
+                "node data lock is not a zero-length regular file",
+            )?;
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(NodeDataRootLockError::Io(error)),
+    };
+
+    let (file, created) = if before.is_none() {
+        match open_node_data_root_lock(&lock_path, true) {
+            Ok(file) => (file, true),
+            Err(NodeDataRootLockError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let metadata =
+                    fs::symlink_metadata(&lock_path).map_err(NodeDataRootLockError::Io)?;
+                validate_node_data_root_lock_metadata(
+                    &metadata,
+                    "node data lock appeared in an invalid form",
+                )?;
+                (open_node_data_root_lock(&lock_path, false)?, false)
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        (open_node_data_root_lock(&lock_path, false)?, false)
+    };
+    let opened = file.metadata().map_err(NodeDataRootLockError::Io)?;
+    validate_node_data_root_lock_metadata(
+        &opened,
+        "node data lock changed to an invalid form before open",
+    )?;
+    #[cfg(unix)]
+    if let Some(before) = before {
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err(NodeDataRootLockError::Invalid(
+                "node data lock changed before no-follow open".into(),
+            ));
+        }
+    }
+    let identity = node_data_path_identity(&file)?;
+    match file.try_lock() {
+        Ok(()) => {
+            let lock = NodeDataRootLock {
+                file,
+                created,
+                identity,
+            };
+            lock.revalidate_path(&lock_path)?;
+            Ok(lock)
+        }
+        Err(fs::TryLockError::WouldBlock) => Err(NodeDataRootLockError::Locked),
+        Err(fs::TryLockError::Error(error)) => Err(NodeDataRootLockError::Io(error)),
+    }
+}
 
 /// A bounded, clone-shared observer for successful physical SQL write batches.
 ///
@@ -309,14 +691,6 @@ const CLIENT_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const SYNC_FLUSH_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const SYNC_FLUSH_RETRY_MAX: Duration = Duration::from_secs(1);
 
-fn map_quorum_record_transport_error(error: rhiza_quepaxa::Error) -> rhiza_quepaxa::Error {
-    match error {
-        rhiza_quepaxa::Error::Io(_) | rhiza_quepaxa::Error::Decode(_) => {
-            rhiza_quepaxa::Error::ProposeFailed
-        }
-        error => error,
-    }
-}
 #[cfg(feature = "sql")]
 pub const DEFAULT_SQL_MAX_ROWS: u32 = 1_000;
 #[cfg(feature = "sql")]
@@ -581,12 +955,376 @@ pub trait LogPeer: Send + Sync {
     fn fetch_log(&self, request: FetchLogRequest) -> Result<FetchLogResponse, FetchLogError>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct StartupCancellationToken {
+    generation: u64,
+}
+
+impl fmt::Debug for StartupCancellationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StartupCancellationToken(..)")
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupCancellationAuthority {
+    Internal,
+    External,
+}
+
+impl StartupCancellationAuthority {
+    #[doc(hidden)]
+    pub fn replaces(
+        self,
+        current: Self,
+        requested_deadline: Instant,
+        current_deadline: Instant,
+    ) -> bool {
+        matches!((self, current), (Self::External, Self::Internal))
+            || (self == current && requested_deadline < current_deadline)
+    }
+}
+
+#[derive(Clone)]
+struct StartupCancellation {
+    token: StartupCancellationToken,
+    deadline: Instant,
+    authority: StartupCancellationAuthority,
+    receipt: StartupCloseReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupCloseReceipt {
+    context_id: u64,
+    receipt_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupCloseOutcome {
+    Drained,
+    Replaced,
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupIoGate {
+    Open,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupCloseAttribution {
+    /// The receipt currently owns the closed startup-I/O gate.  Only this
+    /// receipt's deadline may prove an effect unresolved.
+    Active,
+    /// The receipt was superseded (or never won installation).  It remains
+    /// recognizable so its waiter can observe `Replaced`, but its deadline is
+    /// no longer part of the current close proof.
+    Retired,
+    /// This receipt's active deadline reached an extant effect before it could
+    /// be replaced.  That failed proof is permanently attributable to this
+    /// receipt as well as globally sticky.
+    Unresolved,
+}
+
+#[derive(Clone)]
+struct StartupCloseRecord {
+    deadline: Instant,
+    attribution: StartupCloseAttribution,
+}
+
+struct StartupIoState {
+    cancellation: Option<StartupCancellation>,
+    stage: &'static str,
+    gate: StartupIoGate,
+    effects: BTreeMap<u64, &'static str>,
+    receipts: BTreeMap<u64, StartupCloseRecord>,
+    next_receipt_id: u64,
+    unresolved: bool,
+    // Preserve the oldest effect that was still active at the exact point a
+    // close deadline became conclusive.  In particular, a final permit drop
+    // must not erase the diagnostic evidence before it latches unresolved.
+    unresolved_stage: Option<&'static str>,
+}
+
+static NEXT_STARTUP_CANCELLATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_STARTUP_IO_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_STARTUP_LOCAL_IO_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct StartupIoInner {
+    context_id: u64,
+    state: Mutex<StartupIoState>,
+    changes: tokio::sync::watch::Sender<u64>,
+    recorder_cancelled: Arc<AtomicBool>,
+}
+
+pub struct StartupLocalIoPermit {
+    inner: Arc<StartupIoInner>,
+    effect_id: u64,
+}
+
+impl fmt::Debug for StartupLocalIoPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StartupLocalIoPermit(..)")
+    }
+}
+
+impl Drop for StartupLocalIoPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // This is deliberately before removing `effect_id`: a runtime may
+        // have been unable to poll `await_close` across the deadline, but the
+        // effect itself still provides decisive proof when it finishes.
+        state.latch_expired_active_close(Instant::now());
+        let removed = state.effects.remove(&self.effect_id);
+        debug_assert!(removed.is_some(), "startup local I/O permit dropped twice");
+        drop(state);
+        self.inner.notify();
+    }
+}
+
+impl StartupIoState {
+    fn oldest_effect_stage(&self) -> Option<&'static str> {
+        self.effects.first_key_value().map(|(_, stage)| *stage)
+    }
+
+    /// Linearize expiry only for the receipt that currently owns the closed
+    /// gate.  Retired receipts deliberately remain observable as `Replaced`,
+    /// but can never turn a newer close receipt unresolved.
+    fn latch_expired_active_close(&mut self, now: Instant) -> bool {
+        if self.unresolved {
+            return true;
+        }
+        let Some(cancellation) = self.cancellation.as_ref() else {
+            return false;
+        };
+        let Some(receipt_id) = cancellation.receipt.receipt_id else {
+            self.unresolved = true;
+            self.unresolved_stage = self.oldest_effect_stage();
+            return true;
+        };
+        let Some(record) = self.receipts.get(&receipt_id) else {
+            self.unresolved = true;
+            self.unresolved_stage = self.oldest_effect_stage();
+            return true;
+        };
+        let deadline = record.deadline;
+        if record.attribution != StartupCloseAttribution::Active {
+            self.unresolved = true;
+            self.unresolved_stage = self.oldest_effect_stage();
+            return true;
+        }
+        if now >= deadline && !self.effects.is_empty() {
+            self.unresolved = true;
+            self.unresolved_stage = self.oldest_effect_stage();
+            // `receipt_id` was observed as the current active attribution
+            // above, so preserve that fact even after a later replacement.
+            self.receipts
+                .get_mut(&receipt_id)
+                .expect("active startup close receipt must remain recorded")
+                .attribution = StartupCloseAttribution::Unresolved;
+        }
+        self.unresolved
+    }
+
+    fn retire_current_close(&mut self) {
+        let Some(cancellation) = self.cancellation.as_ref() else {
+            return;
+        };
+        let Some(receipt_id) = cancellation.receipt.receipt_id else {
+            self.unresolved = true;
+            self.unresolved_stage = self.oldest_effect_stage();
+            return;
+        };
+        let Some(record) = self.receipts.get_mut(&receipt_id) else {
+            self.unresolved = true;
+            self.unresolved_stage = self.oldest_effect_stage();
+            return;
+        };
+        match record.attribution {
+            StartupCloseAttribution::Active => {
+                record.attribution = if self.unresolved {
+                    StartupCloseAttribution::Unresolved
+                } else {
+                    StartupCloseAttribution::Retired
+                };
+            }
+            // `latch_expired_active_close` already bound this receipt to the
+            // failed proof while it was active.  Replacement must preserve,
+            // rather than overwrite, that ordering evidence.
+            StartupCloseAttribution::Unresolved => debug_assert!(self.unresolved),
+            StartupCloseAttribution::Retired => {
+                debug_assert!(false, "current startup close receipt was already retired")
+            }
+        }
+    }
+}
+
+impl StartupIoInner {
+    fn notify(&self) {
+        self.changes.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestStartupLocalIoHook {
+    context_id: u64,
+    stage: &'static str,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+static TEST_STARTUP_LOCAL_IO_HOOK: OnceLock<Mutex<Option<Arc<TestStartupLocalIoHook>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static TEST_STARTUP_PERSISTENCE_HOOK: OnceLock<Mutex<Option<Arc<TestStartupPersistenceHook>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static TEST_STARTUP_EFFECT_HOOK_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestStartupPersistenceHook {
+    context_id: u64,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    error: NodeError,
+}
+
+#[cfg(test)]
+fn test_startup_effect_hook_lock() -> &'static tokio::sync::Mutex<()> {
+    TEST_STARTUP_EFFECT_HOOK_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+fn test_startup_local_io_hook_slot() -> &'static Mutex<Option<Arc<TestStartupLocalIoHook>>> {
+    TEST_STARTUP_LOCAL_IO_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn test_startup_persistence_hook_slot() -> &'static Mutex<Option<Arc<TestStartupPersistenceHook>>> {
+    TEST_STARTUP_PERSISTENCE_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+struct TestStartupLocalIoHookGuard;
+
+#[cfg(test)]
+impl Drop for TestStartupLocalIoHookGuard {
+    fn drop(&mut self) {
+        *test_startup_local_io_hook_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+#[cfg(test)]
+fn install_test_startup_local_io_hook(hook: TestStartupLocalIoHook) -> TestStartupLocalIoHookGuard {
+    let mut slot = test_startup_local_io_hook_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(slot.is_none(), "startup local I/O hook already installed");
+    *slot = Some(Arc::new(hook));
+    TestStartupLocalIoHookGuard
+}
+
+#[cfg(test)]
+struct TestStartupPersistenceHookGuard;
+
+#[cfg(test)]
+impl Drop for TestStartupPersistenceHookGuard {
+    fn drop(&mut self) {
+        *test_startup_persistence_hook_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+#[cfg(test)]
+fn install_test_startup_persistence_hook(
+    hook: TestStartupPersistenceHook,
+) -> TestStartupPersistenceHookGuard {
+    let mut slot = test_startup_persistence_hook_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(slot.is_none(), "startup persistence hook already installed");
+    *slot = Some(Arc::new(hook));
+    TestStartupPersistenceHookGuard
+}
+
+#[cfg(test)]
+fn test_startup_local_io_hook_after_admission(context_id: u64, stage: &'static str) {
+    let Some(hook) = test_startup_local_io_hook_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return;
+    };
+    if hook.context_id != context_id || hook.stage != stage {
+        return;
+    }
+    hook.entered
+        .send(())
+        .expect("startup local I/O test receiver");
+    let (released, condition) = &*hook.release;
+    let mut released = released
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+#[cfg(test)]
+fn test_startup_persistence_hook_after_qlog_append(context_id: u64) -> Result<(), NodeError> {
+    let Some(hook) = test_startup_persistence_hook_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return Ok(());
+    };
+    if hook.context_id != context_id {
+        return Ok(());
+    }
+    hook.entered
+        .send(())
+        .expect("startup persistence test receiver");
+    let (released, condition) = &*hook.release;
+    let mut released = released
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    Err(hook.error.clone())
+}
+
+#[derive(Clone)]
 pub struct StartupIoContext {
-    cancelled: Arc<AtomicBool>,
-    deadline: Arc<OnceLock<Instant>>,
-    stage: Arc<Mutex<&'static str>>,
-    mutation_admission: Arc<Mutex<()>>,
+    inner: Arc<StartupIoInner>,
+}
+
+impl fmt::Debug for StartupIoContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StartupIoContext(..)")
+    }
 }
 
 impl Default for StartupIoContext {
@@ -596,71 +1334,298 @@ impl Default for StartupIoContext {
 }
 
 impl StartupIoContext {
+    #[doc(hidden)]
+    pub fn recorder_context(&self) -> RecorderRpcContext {
+        RecorderRpcContext::with_timeout_and_cancellation(
+            DEFAULT_RECORDER_RPC_TIMEOUT,
+            Arc::clone(&self.inner.recorder_cancelled),
+        )
+    }
+
     pub fn new() -> Self {
+        let (changes, _) = tokio::sync::watch::channel(0_u64);
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            deadline: Arc::new(OnceLock::new()),
-            stage: Arc::new(Mutex::new("runtime initialization")),
-            mutation_admission: Arc::new(Mutex::new(())),
+            inner: Arc::new(StartupIoInner {
+                context_id: allocate_startup_cancellation_generation(
+                    &NEXT_STARTUP_IO_CONTEXT_GENERATION,
+                ),
+                state: Mutex::new(StartupIoState {
+                    cancellation: None,
+                    stage: "runtime initialization",
+                    gate: StartupIoGate::Open,
+                    effects: BTreeMap::new(),
+                    receipts: BTreeMap::new(),
+                    next_receipt_id: 1,
+                    unresolved: false,
+                    unresolved_stage: None,
+                }),
+                changes,
+                recorder_cancelled: Arc::new(AtomicBool::new(false)),
+            }),
         }
     }
 
-    pub fn cancel(&self, deadline: Instant) {
-        self.cancelled.store(true, Ordering::Release);
-        let _ = self.deadline.set(deadline);
+    pub fn cancel(&self, deadline: Instant) -> StartupCloseReceipt {
+        self.cancel_for_shutdown(
+            Self::issue_cancellation_token(),
+            deadline,
+            StartupCancellationAuthority::Internal,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn issue_cancellation_token() -> StartupCancellationToken {
+        let generation =
+            allocate_startup_cancellation_generation(&NEXT_STARTUP_CANCELLATION_GENERATION);
+        StartupCancellationToken { generation }
+    }
+
+    #[doc(hidden)]
+    pub fn cancel_for_shutdown(
+        &self,
+        token: StartupCancellationToken,
+        deadline: Instant,
+        authority: StartupCancellationAuthority,
+    ) -> StartupCloseReceipt {
+        let mut state = self.lock_state();
+        let replace = state.cancellation.as_ref().is_none_or(|existing| {
+            authority.replaces(existing.authority, deadline, existing.deadline)
+        });
+        if !replace
+            && state
+                .cancellation
+                .as_ref()
+                .is_some_and(|existing| existing.token == token)
+        {
+            return state
+                .cancellation
+                .as_ref()
+                .expect("checked cancellation exists")
+                .receipt
+                .clone();
+        }
+
+        // A replacement is ordered after the active receipt's deadline check.
+        // This makes deadline-first sticky while allowing a replacement that
+        // wins before the old deadline to retire the old receipt cleanly.
+        if replace {
+            state.latch_expired_active_close(Instant::now());
+        }
+
+        let receipt = if state.next_receipt_id == 0 {
+            // A close receipt must never be reused: the only safe result once
+            // its namespace is exhausted is a permanent inability to prove
+            // that startup effects drained.
+            state.unresolved = true;
+            StartupCloseReceipt {
+                context_id: self.inner.context_id,
+                receipt_id: None,
+            }
+        } else {
+            let receipt_id = state.next_receipt_id;
+            state.next_receipt_id = state.next_receipt_id.checked_add(1).unwrap_or(0);
+            state.receipts.insert(
+                receipt_id,
+                StartupCloseRecord {
+                    deadline,
+                    attribution: if replace {
+                        StartupCloseAttribution::Active
+                    } else {
+                        // A lower-precedence close request is recognized
+                        // but never owns the gate.
+                        StartupCloseAttribution::Retired
+                    },
+                },
+            );
+            StartupCloseReceipt {
+                context_id: self.inner.context_id,
+                receipt_id: Some(receipt_id),
+            }
+        };
+        state.gate = StartupIoGate::Closed;
+        if replace {
+            state.retire_current_close();
+            state.cancellation = Some(StartupCancellation {
+                token,
+                deadline,
+                authority,
+                receipt: receipt.clone(),
+            });
+            // Installing an already-expired deadline is itself conclusive
+            // when any local I/O effect remains active; it must not depend on
+            // an awaiter getting CPU time later.
+            state.latch_expired_active_close(Instant::now());
+        }
+        drop(state);
+        self.inner.recorder_cancelled.store(true, Ordering::Release);
+        self.inner.notify();
+        receipt
+    }
+
+    #[doc(hidden)]
+    pub fn is_cancelled_by(&self, token: &StartupCancellationToken) -> bool {
+        self.lock_state()
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| &cancellation.token == token)
     }
 
     pub fn unfinished_stage(&self) -> &'static str {
-        *self.lock_stage()
+        let state = self.lock_state();
+        if let Some(stage) = state.unresolved_stage {
+            return stage;
+        }
+        state
+            .effects
+            .first_key_value()
+            .map_or(state.stage, |(_, stage)| *stage)
     }
 
     pub fn check(&self, stage: &'static str) -> Result<(), NodeError> {
-        *self.lock_stage() = stage;
-        if self.cancelled.load(Ordering::Acquire)
-            || self
-                .deadline
-                .get()
-                .is_some_and(|deadline| Instant::now() >= *deadline)
-        {
-            return Err(NodeError::Unavailable(format!(
-                "startup cancelled during {stage}"
-            )));
+        let mut state = self.lock_state();
+        state.stage = stage;
+        if let Some(cancellation) = state.cancellation.as_ref() {
+            return Err(NodeError::StartupCancelled {
+                token: cancellation.token.clone(),
+                stage: stage.into(),
+            });
         }
         Ok(())
     }
 
-    fn persist<T>(
-        &self,
-        stage: &'static str,
-        operation: impl FnOnce() -> Result<T, NodeError>,
-    ) -> Result<T, NodeError> {
-        *self.lock_stage() = stage;
-        let _permit = self
-            .mutation_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.cancelled.load(Ordering::Acquire)
-            || self
-                .deadline
-                .get()
-                .is_some_and(|deadline| Instant::now() >= *deadline)
-        {
-            return Err(NodeError::Unavailable(format!(
-                "startup cancelled before {stage}"
-            )));
+    /// Waits until startup closes, using the same state transition feed as
+    /// close receipts without creating a second cancellation mechanism.
+    #[doc(hidden)]
+    pub async fn wait_for_cancellation(&self, stage: &'static str) -> NodeError {
+        let mut changes = self.inner.changes.subscribe();
+        loop {
+            if let Err(error) = self.check(stage) {
+                return error;
+            }
+            if changes.changed().await.is_err() {
+                return NodeError::Invariant(
+                    "startup cancellation state channel closed unexpectedly".into(),
+                );
+            }
         }
-        operation()
     }
 
-    fn cancellation_flag(&self) -> &AtomicBool {
-        self.cancelled.as_ref()
+    pub fn admit_local_io(&self, stage: &'static str) -> Result<StartupLocalIoPermit, NodeError> {
+        let mut state = self.lock_state();
+        state.stage = stage;
+        if state.gate == StartupIoGate::Closed {
+            let cancellation = state
+                .cancellation
+                .as_ref()
+                .expect("closed startup I/O gate must have cancellation attribution");
+            return Err(NodeError::StartupCancelled {
+                token: cancellation.token.clone(),
+                stage: format!("before {stage}"),
+            });
+        }
+        let effect_id = allocate_startup_local_io_effect_id(&NEXT_STARTUP_LOCAL_IO_EFFECT_ID)?;
+        let replaced = state.effects.insert(effect_id, stage);
+        debug_assert!(replaced.is_none(), "startup local I/O effect id was reused");
+        drop(state);
+        self.inner.notify();
+        #[cfg(test)]
+        test_startup_local_io_hook_after_admission(self.inner.context_id, stage);
+        Ok(StartupLocalIoPermit {
+            inner: Arc::clone(&self.inner),
+            effect_id,
+        })
     }
 
-    fn lock_stage(&self) -> std::sync::MutexGuard<'_, &'static str> {
-        self.stage
+    pub async fn await_close(&self, receipt: &StartupCloseReceipt) -> StartupCloseOutcome {
+        let mut changes = self.inner.changes.subscribe();
+        loop {
+            let decision = {
+                let mut state = self.lock_state();
+                if receipt.context_id != self.inner.context_id {
+                    Some(StartupCloseOutcome::Unresolved)
+                } else {
+                    let Some(receipt_id) = receipt.receipt_id else {
+                        return StartupCloseOutcome::Unresolved;
+                    };
+                    let Some(record) = state.receipts.get(&receipt_id) else {
+                        return StartupCloseOutcome::Unresolved;
+                    };
+                    if record.attribution == StartupCloseAttribution::Unresolved {
+                        Some(StartupCloseOutcome::Unresolved)
+                    } else if record.attribution == StartupCloseAttribution::Retired {
+                        Some(StartupCloseOutcome::Replaced)
+                    } else if state.unresolved {
+                        Some(StartupCloseOutcome::Unresolved)
+                    } else if state
+                        .cancellation
+                        .as_ref()
+                        .is_none_or(|current| current.receipt != *receipt)
+                    {
+                        Some(StartupCloseOutcome::Replaced)
+                    } else if state.latch_expired_active_close(Instant::now()) {
+                        Some(StartupCloseOutcome::Unresolved)
+                    } else if state.effects.is_empty() {
+                        Some(StartupCloseOutcome::Drained)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(outcome) = decision {
+                if outcome == StartupCloseOutcome::Unresolved {
+                    self.inner.notify();
+                }
+                return outcome;
+            }
+
+            let deadline = {
+                let state = self.lock_state();
+                state
+                    .receipts
+                    .get(&receipt.receipt_id.expect("pending receipt has an id"))
+                    .expect("pending startup close receipt must remain recognized")
+                    .deadline
+            };
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return StartupCloseOutcome::Unresolved;
+                    }
+                }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+            }
+        }
+    }
+
+    pub fn recognizes_close_receipt(&self, receipt: &StartupCloseReceipt) -> bool {
+        receipt.context_id == self.inner.context_id
+            && receipt
+                .receipt_id
+                .is_some_and(|receipt_id| self.lock_state().receipts.contains_key(&receipt_id))
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, StartupIoState> {
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn allocate_startup_cancellation_generation(next: &AtomicU64) -> u64 {
+    match next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+        (generation != 0).then(|| generation.checked_add(1).unwrap_or(0))
+    }) {
+        Ok(generation) => generation,
+        Err(_) => panic!("startup cancellation generation exhausted"),
+    }
+}
+
+fn allocate_startup_local_io_effect_id(next: &AtomicU64) -> Result<u64, NodeError> {
+    next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |effect_id| {
+        (effect_id != 0).then(|| effect_id.checked_add(1).unwrap_or(0))
+    })
+    .map_err(|_| NodeError::Invariant("startup local I/O effect id exhausted".into()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -723,15 +1688,376 @@ impl LogPeer for InMemoryLogPeer {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct RecorderWire<T> {
     version: u16,
+    /// The caller's remaining budget at serialization time.  This is a
+    /// duration, rather than a clock timestamp, because peers do not share a
+    /// wall clock.  Servers reconstruct a local absolute deadline from it.
+    remaining_deadline_ms: u32,
     body: T,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+impl<T> RecorderWire<T> {
+    fn rpc_context(&self) -> rhiza_quepaxa::Result<rhiza_quepaxa::RecorderRpcContext> {
+        let budget = Duration::from_millis(u64::from(self.remaining_deadline_ms));
+        if budget.is_zero() {
+            return Err(rhiza_quepaxa::Error::RpcDeadlineExceeded);
+        }
+        Ok(rhiza_quepaxa::RecorderRpcContext::with_timeout(
+            budget.min(HTTP_REQUEST_TIMEOUT),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "status", content = "body")]
 enum RecorderV2Result<T> {
     Ok(T),
     Rejected(RejectReason),
-    Error(String),
+    Error(RecorderWireError),
+}
+
+#[derive(serde::Deserialize)]
+enum RecorderV2Status {
+    Ok,
+    Rejected,
+    Error,
+}
+
+enum RecorderV2Field {
+    Status,
+    Body,
+}
+
+impl<'de> serde::Deserialize<'de> for RecorderV2Field {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldVisitor {
+            type Value = RecorderV2Field;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("the recorder result status or body field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "status" => Ok(RecorderV2Field::Status),
+                    "body" => Ok(RecorderV2Field::Body),
+                    _ => Err(E::custom("unknown recorder result field")),
+                }
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for RecorderV2Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_struct(
+                "RecorderV2Result",
+                &["status", "body"],
+                RecorderV2HumanVisitor(std::marker::PhantomData),
+            )
+        } else {
+            deserializer.deserialize_enum(
+                "RecorderV2Result",
+                &["Ok", "Rejected", "Error"],
+                RecorderV2PostcardVisitor(std::marker::PhantomData),
+            )
+        }
+    }
+}
+
+struct RecorderV2HumanVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T> serde::de::Visitor<'de> for RecorderV2HumanVisitor<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    type Value = RecorderV2Result<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a recorder result object with status followed by body")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let Some(RecorderV2Field::Status) = map.next_key()? else {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "recorder result must start with status",
+            ));
+        };
+        let status: RecorderV2Status = map.next_value()?;
+        let Some(RecorderV2Field::Body) = map.next_key()? else {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "recorder result must contain body immediately after status",
+            ));
+        };
+        let result = match status {
+            RecorderV2Status::Ok => Self::Value::Ok(map.next_value()?),
+            RecorderV2Status::Rejected => Self::Value::Rejected(map.next_value()?),
+            RecorderV2Status::Error => Self::Value::Error(map.next_value()?),
+        };
+        if map.next_key::<RecorderV2Field>()?.is_some() {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "recorder result has extra or duplicate fields",
+            ));
+        }
+        Ok(result)
+    }
+}
+
+struct RecorderV2PostcardVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T> serde::de::Visitor<'de> for RecorderV2PostcardVisitor<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    type Value = RecorderV2Result<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a recorder result status followed by its body")
+    }
+
+    fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::EnumAccess<'de>,
+    {
+        let (status, variant) = data.variant::<RecorderV2Status>()?;
+        match status {
+            RecorderV2Status::Ok => Ok(Self::Value::Ok(serde::de::VariantAccess::newtype_variant(
+                variant,
+            )?)),
+            RecorderV2Status::Rejected => Ok(Self::Value::Rejected(
+                serde::de::VariantAccess::newtype_variant(variant)?,
+            )),
+            RecorderV2Status::Error => Ok(Self::Value::Error(
+                serde::de::VariantAccess::newtype_variant(variant)?,
+            )),
+        }
+    }
+}
+
+/// Stable recorder-RPC error identity shared by HTTP and both framed
+/// transports. Text remains diagnostic only; callers must not parse it to
+/// decide retry or recovery behavior.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct RecorderWireError {
+    code: RecorderWireErrorCode,
+    message: String,
+    detail: Option<RecorderWireErrorDetail>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) enum RecorderWireErrorCode {
+    ChainConflict,
+    CommandHashMismatch,
+    CommandTooLarge,
+    RpcCancelled,
+    RpcDeadlineExceeded,
+    Cancelled,
+    ConflictingCertificates,
+    DuplicateRecorderIdentity,
+    EmptyRecorderIdentity,
+    EmptyFixedMembership,
+    InvalidFixedMembershipSize,
+    InvalidRecoveredTip,
+    RandomnessUnavailable,
+    RecorderRootLocked,
+    Rejected,
+    ReadFenceUnsupported,
+    TypedProofInstallRequired,
+    TypedRecordRequired,
+    UnknownOutcome,
+    Io,
+    Decode,
+    NoQuorum,
+    ProposeFailed,
+    CommandUnavailable,
+    Other,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) enum RecorderWireErrorDetail {
+    ChainConflict {
+        slot: u64,
+        expected_prev_hash: LogHash,
+        actual_prev_hash: LogHash,
+    },
+    CommandTooLarge {
+        actual: usize,
+        limit: usize,
+    },
+    Message(String),
+    Path(PathBuf),
+    Rejected(RejectReason),
+}
+
+pub(crate) fn recorder_wire_error(error: rhiza_quepaxa::Error) -> RecorderWireError {
+    use rhiza_quepaxa::Error;
+    let (code, detail) = match &error {
+        Error::ChainConflict {
+            slot,
+            expected_prev_hash,
+            actual_prev_hash,
+        } => (
+            RecorderWireErrorCode::ChainConflict,
+            Some(RecorderWireErrorDetail::ChainConflict {
+                slot: *slot,
+                expected_prev_hash: *expected_prev_hash,
+                actual_prev_hash: *actual_prev_hash,
+            }),
+        ),
+        Error::CommandHashMismatch => (RecorderWireErrorCode::CommandHashMismatch, None),
+        Error::CommandTooLarge { actual, limit } => (
+            RecorderWireErrorCode::CommandTooLarge,
+            Some(RecorderWireErrorDetail::CommandTooLarge {
+                actual: *actual,
+                limit: *limit,
+            }),
+        ),
+        Error::CommandUnavailable => (RecorderWireErrorCode::CommandUnavailable, None),
+        Error::Cancelled => (RecorderWireErrorCode::Cancelled, None),
+        Error::RpcCancelled => (RecorderWireErrorCode::RpcCancelled, None),
+        Error::RpcDeadlineExceeded => (RecorderWireErrorCode::RpcDeadlineExceeded, None),
+        Error::ConflictingCertificates => (RecorderWireErrorCode::ConflictingCertificates, None),
+        Error::Decode(message) => (
+            RecorderWireErrorCode::Decode,
+            Some(RecorderWireErrorDetail::Message(message.clone())),
+        ),
+        Error::DuplicateRecorderIdentity => {
+            (RecorderWireErrorCode::DuplicateRecorderIdentity, None)
+        }
+        Error::EmptyRecorderIdentity => (RecorderWireErrorCode::EmptyRecorderIdentity, None),
+        Error::EmptyFixedMembership => (RecorderWireErrorCode::EmptyFixedMembership, None),
+        Error::InvalidFixedMembershipSize => {
+            (RecorderWireErrorCode::InvalidFixedMembershipSize, None)
+        }
+        Error::InvalidRecoveredTip => (RecorderWireErrorCode::InvalidRecoveredTip, None),
+        Error::Io(message) => (
+            RecorderWireErrorCode::Io,
+            Some(RecorderWireErrorDetail::Message(message.clone())),
+        ),
+        Error::NoQuorum => (RecorderWireErrorCode::NoQuorum, None),
+        Error::ProposeFailed => (RecorderWireErrorCode::ProposeFailed, None),
+        Error::RandomnessUnavailable(message) => (
+            RecorderWireErrorCode::RandomnessUnavailable,
+            Some(RecorderWireErrorDetail::Message(message.clone())),
+        ),
+        Error::RecorderRootLocked(path) => (
+            RecorderWireErrorCode::RecorderRootLocked,
+            Some(RecorderWireErrorDetail::Path(path.clone())),
+        ),
+        Error::Rejected(reason) => (
+            RecorderWireErrorCode::Rejected,
+            Some(RecorderWireErrorDetail::Rejected(reason.clone())),
+        ),
+        Error::ReadFenceUnsupported => (RecorderWireErrorCode::ReadFenceUnsupported, None),
+        Error::TypedProofInstallRequired => {
+            (RecorderWireErrorCode::TypedProofInstallRequired, None)
+        }
+        Error::TypedRecordRequired => (RecorderWireErrorCode::TypedRecordRequired, None),
+        Error::UnknownOutcome => (RecorderWireErrorCode::UnknownOutcome, None),
+    };
+    RecorderWireError {
+        code,
+        message: error.to_string(),
+        detail,
+    }
+}
+
+pub(crate) fn recorder_error_from_wire(error: RecorderWireError) -> rhiza_quepaxa::Error {
+    use rhiza_quepaxa::Error;
+    let invalid = || Error::Decode(format!("invalid recorder error payload: {}", error.message));
+    match (error.code, error.detail) {
+        (
+            RecorderWireErrorCode::ChainConflict,
+            Some(RecorderWireErrorDetail::ChainConflict {
+                slot,
+                expected_prev_hash,
+                actual_prev_hash,
+            }),
+        ) => Error::ChainConflict {
+            slot,
+            expected_prev_hash,
+            actual_prev_hash,
+        },
+        (RecorderWireErrorCode::CommandHashMismatch, None) => Error::CommandHashMismatch,
+        (
+            RecorderWireErrorCode::CommandTooLarge,
+            Some(RecorderWireErrorDetail::CommandTooLarge { actual, limit }),
+        ) => Error::CommandTooLarge { actual, limit },
+        (RecorderWireErrorCode::RpcCancelled, None) => Error::RpcCancelled,
+        (RecorderWireErrorCode::RpcDeadlineExceeded, None) => Error::RpcDeadlineExceeded,
+        (RecorderWireErrorCode::CommandUnavailable, None) => Error::CommandUnavailable,
+        (RecorderWireErrorCode::Cancelled, None) => Error::Cancelled,
+        (RecorderWireErrorCode::ConflictingCertificates, None) => Error::ConflictingCertificates,
+        (RecorderWireErrorCode::Decode, Some(RecorderWireErrorDetail::Message(message))) => {
+            Error::Decode(message)
+        }
+        (RecorderWireErrorCode::DuplicateRecorderIdentity, None) => {
+            Error::DuplicateRecorderIdentity
+        }
+        (RecorderWireErrorCode::EmptyRecorderIdentity, None) => Error::EmptyRecorderIdentity,
+        (RecorderWireErrorCode::EmptyFixedMembership, None) => Error::EmptyFixedMembership,
+        (RecorderWireErrorCode::InvalidFixedMembershipSize, None) => {
+            Error::InvalidFixedMembershipSize
+        }
+        (RecorderWireErrorCode::InvalidRecoveredTip, None) => Error::InvalidRecoveredTip,
+        (RecorderWireErrorCode::Io, Some(RecorderWireErrorDetail::Message(message))) => {
+            Error::Io(message)
+        }
+        (RecorderWireErrorCode::NoQuorum, None) => Error::NoQuorum,
+        (RecorderWireErrorCode::ProposeFailed, None) => Error::ProposeFailed,
+        (
+            RecorderWireErrorCode::RandomnessUnavailable,
+            Some(RecorderWireErrorDetail::Message(message)),
+        ) => Error::RandomnessUnavailable(message),
+        (RecorderWireErrorCode::RecorderRootLocked, Some(RecorderWireErrorDetail::Path(path))) => {
+            Error::RecorderRootLocked(path)
+        }
+        (RecorderWireErrorCode::Rejected, Some(RecorderWireErrorDetail::Rejected(reason))) => {
+            Error::Rejected(reason)
+        }
+        (RecorderWireErrorCode::ReadFenceUnsupported, None) => Error::ReadFenceUnsupported,
+        (RecorderWireErrorCode::TypedProofInstallRequired, None) => {
+            Error::TypedProofInstallRequired
+        }
+        (RecorderWireErrorCode::TypedRecordRequired, None) => Error::TypedRecordRequired,
+        (RecorderWireErrorCode::UnknownOutcome, None) => Error::UnknownOutcome,
+        _ => invalid(),
+    }
+}
+
+pub(crate) fn preserve_mutation_outcome(error: rhiza_quepaxa::Error) -> rhiza_quepaxa::Error {
+    match error {
+        rhiza_quepaxa::Error::RpcCancelled
+        | rhiza_quepaxa::Error::RpcDeadlineExceeded
+        | rhiza_quepaxa::Error::UnknownOutcome => rhiza_quepaxa::Error::UnknownOutcome,
+        error => error,
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -764,13 +2090,266 @@ struct InstallProofV2 {
     members: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpRecorderClient {
     base_url: String,
     local_node_id: String,
     peer_token: String,
     recovery_generation: u64,
-    client: Arc<std::sync::OnceLock<reqwest::blocking::Client>>,
+    shared: Arc<HttpRecorderShared>,
+}
+
+struct HttpRecorderShared {
+    client: OnceLock<reqwest::blocking::Client>,
+    client_initialization: Mutex<()>,
+    available_workers: Mutex<usize>,
+    workers_available: Condvar,
+}
+
+struct HttpRecorderWorkerPermit {
+    shared: Arc<HttpRecorderShared>,
+}
+
+enum HttpCall<U> {
+    Response(StatusCode, RecorderWire<RecorderV2Result<U>>),
+    Transport(String),
+    Decode(String),
+}
+
+const RECORDER_HTTP_REQUEST_LIMIT_ERROR: &str = "recorder HTTP request body exceeds limit";
+const RECORDER_HTTP_RESPONSE_LIMIT_ERROR: &str = "recorder HTTP response body exceeds limit";
+
+/// Counts JSON bytes without retaining them. `serde_json::to_writer` otherwise
+/// grows an allocation before callers can enforce the transport body cap.
+struct BoundedJsonSize {
+    size: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedJsonSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(size) = self.size.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON body exceeds limit",
+            ));
+        };
+        if size > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON body exceeds limit",
+            ));
+        }
+        self.size = size;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes the second serialization pass into its exactly sized allocation.
+struct ExactJsonBuffer<'a> {
+    bytes: &'a mut [u8],
+    written: usize,
+}
+
+impl Write for ExactJsonBuffer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(end) = self.written.checked_add(bytes.len()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON serialization size changed",
+            ));
+        };
+        let Some(target) = self.bytes.get_mut(self.written..end) else {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON serialization size changed",
+            ));
+        };
+        target.copy_from_slice(bytes);
+        self.written = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json_size<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+    limit_error: &'static str,
+) -> Result<usize, String> {
+    let mut counter = BoundedJsonSize {
+        size: 0,
+        limit,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        return Err(if counter.exceeded {
+            limit_error.into()
+        } else {
+            error.to_string()
+        });
+    }
+    Ok(counter.size)
+}
+
+fn bounded_json_encode<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+    limit_error: &'static str,
+) -> Result<Vec<u8>, String> {
+    let size = bounded_json_size(value, limit, limit_error)?;
+    let mut encoded = vec![0_u8; size];
+    let mut writer = ExactJsonBuffer {
+        bytes: &mut encoded,
+        written: 0,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+    if writer.written != encoded.len() {
+        return Err("recorder HTTP JSON serialization size changed".into());
+    }
+    Ok(encoded)
+}
+
+impl fmt::Debug for HttpRecorderClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpRecorderClient")
+            .field("base_url", &self.base_url)
+            .field("local_node_id", &self.local_node_id)
+            .field("peer_token", &"[redacted]")
+            .field("recovery_generation", &self.recovery_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpRecorderShared {
+    fn new() -> Self {
+        Self {
+            client: OnceLock::new(),
+            client_initialization: Mutex::new(()),
+            available_workers: Mutex::new(HTTP_RECORDER_MAX_CONCURRENT_WORKERS),
+            workers_available: Condvar::new(),
+        }
+    }
+
+    fn acquire_worker(
+        self: &Arc<Self>,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<HttpRecorderWorkerPermit> {
+        let mut available = self
+            .available_workers
+            .lock()
+            .map_err(|_| rhiza_quepaxa::Error::Io("recorder HTTP worker slots poisoned".into()))?;
+        loop {
+            context.check()?;
+            if *available > 0 {
+                *available -= 1;
+                return Ok(HttpRecorderWorkerPermit {
+                    shared: Arc::clone(self),
+                });
+            }
+            let Some(remaining) = context.remaining() else {
+                return Err(rhiza_quepaxa::Error::RpcDeadlineExceeded);
+            };
+            let (next, _) = self
+                .workers_available
+                .wait_timeout(available, remaining.min(Duration::from_millis(10)))
+                .map_err(|_| {
+                    rhiza_quepaxa::Error::Io("recorder HTTP worker slots poisoned".into())
+                })?;
+            available = next;
+        }
+    }
+
+    fn client(&self) -> rhiza_quepaxa::Result<reqwest::blocking::Client> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
+        let _initializing = self.client_initialization.lock().map_err(|_| {
+            rhiza_quepaxa::Error::Io("recorder HTTP client initialization poisoned".into())
+        })?;
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|error| rhiza_quepaxa::Error::Io(error.to_string()))?;
+        self.client
+            .set(client)
+            .expect("HTTP client initialization lock serializes initialization");
+        Ok(self.client.get().expect("HTTP client initialized").clone())
+    }
+}
+
+impl Drop for HttpRecorderShared {
+    fn drop(&mut self) {
+        let client = self.client.take();
+        let Some(client) = client else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // reqwest's blocking client owns a Tokio runtime and panics if the
+            // final handle is dropped from an async context. Its final drop is
+            // short and joined, so it neither leaks nor outlives this client.
+            if let Ok(join) = std::thread::Builder::new()
+                .name("rhiza-recorder-http-drop".into())
+                .spawn(move || drop(client))
+            {
+                let _ = join.join();
+            }
+        } else {
+            drop(client);
+        }
+    }
+}
+
+impl Drop for HttpRecorderWorkerPermit {
+    fn drop(&mut self) {
+        if let Ok(mut available) = self.shared.available_workers.lock() {
+            *available += 1;
+            debug_assert!(*available <= HTTP_RECORDER_MAX_CONCURRENT_WORKERS);
+            self.shared.workers_available.notify_one();
+        }
+    }
+}
+
+fn read_bounded_http_recorder_response<U>(response: reqwest::blocking::Response) -> HttpCall<U>
+where
+    RecorderWire<RecorderV2Result<U>>: recorder_decode::RecorderWireRoot,
+{
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > u64::try_from(MAX_HTTP_BODY_BYTES).unwrap_or(u64::MAX))
+    {
+        return HttpCall::Decode("recorder HTTP response body exceeds limit".into());
+    }
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_HTTP_BODY_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
+    if let Err(error) = response.take(limit).read_to_end(&mut bytes) {
+        return HttpCall::Transport(error.to_string());
+    }
+    if bytes.len() > MAX_HTTP_BODY_BYTES {
+        return HttpCall::Decode("recorder HTTP response body exceeds limit".into());
+    }
+    match recorder_decode::decode_json_exact_bounded::<RecorderWire<RecorderV2Result<U>>>(
+        &bytes,
+        recorder_decode::RecorderDecodeLimits::for_wire_bytes(MAX_HTTP_BODY_BYTES),
+    ) {
+        Ok(wire) => HttpCall::Response(status, wire),
+        Err(error) => HttpCall::Decode(error.to_string()),
+    }
 }
 
 impl HttpRecorderClient {
@@ -795,7 +2374,7 @@ impl HttpRecorderClient {
             local_node_id: peer.node_id,
             peer_token: peer.token,
             recovery_generation,
-            client: Arc::new(std::sync::OnceLock::new()),
+            shared: Arc::new(HttpRecorderShared::new()),
         })
     }
 
@@ -812,82 +2391,203 @@ impl HttpRecorderClient {
         format!("{}{}", self.base_url, path)
     }
 
-    fn client(&self) -> rhiza_quepaxa::Result<&reqwest::blocking::Client> {
-        if self.client.get().is_none() {
-            let client = reqwest::blocking::Client::builder()
-                .connect_timeout(HTTP_CONNECT_TIMEOUT)
-                .timeout(HTTP_REQUEST_TIMEOUT)
-                .build()
-                .map_err(|error| rhiza_quepaxa::Error::Io(error.to_string()))?;
-            let _ = self.client.set(client);
-        }
-        self.client
-            .get()
-            .ok_or_else(|| rhiza_quepaxa::Error::Io("HTTP client initialization failed".into()))
-    }
-
-    fn post_v2<T, U>(&self, path: &str, body: T) -> rhiza_quepaxa::Result<U>
+    fn post_v2<T, U>(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        path: &str,
+        body: T,
+        mutating: bool,
+    ) -> rhiza_quepaxa::Result<U>
     where
-        T: serde::Serialize,
-        U: serde::de::DeserializeOwned,
+        T: serde::Serialize + Send + 'static,
+        U: serde::de::DeserializeOwned + Send + 'static,
+        RecorderWire<RecorderV2Result<U>>: recorder_decode::RecorderWireRoot,
     {
-        self.post_v2_with_timeout(path, body, HTTP_REQUEST_TIMEOUT)
+        self.post_v2_with_timeout(context, path, body, HTTP_REQUEST_TIMEOUT, mutating)
     }
 
     fn post_v2_with_timeout<T, U>(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         path: &str,
         body: T,
-        timeout: Duration,
+        transport_cap: Duration,
+        mutating: bool,
     ) -> rhiza_quepaxa::Result<U>
     where
-        T: serde::Serialize,
-        U: serde::de::DeserializeOwned,
+        T: serde::Serialize + Send + 'static,
+        U: serde::de::DeserializeOwned + Send + 'static,
+        RecorderWire<RecorderV2Result<U>>: recorder_decode::RecorderWireRoot,
     {
-        let response = self
-            .client()?
-            .post(self.url(path))
-            .timeout(timeout)
-            .header(VERSION_HEADER, RECORDER_PROTOCOL_VERSION)
-            .header(NODE_ID_HEADER, &self.local_node_id)
-            .header(
-                RECOVERY_GENERATION_HEADER,
-                self.recovery_generation.to_string(),
-            )
-            .bearer_auth(&self.peer_token)
-            .json(&RecorderWire {
+        context.check()?;
+        // Count a maximum-width deadline envelope before worker admission. The
+        // final envelope is encoded after this preflight so its advertised
+        // deadline cannot go stale while an oversized caller is rejected.
+        bounded_json_size(
+            &RecorderWire {
                 version: RECORDER_WIRE_VERSION,
-                body,
-            })
-            .send()
-            .map_err(|error| rhiza_quepaxa::Error::Io(error.to_string()))?;
-        let status = response.status();
-        let wire = response
-            .json::<RecorderWire<RecorderV2Result<U>>>()
-            .map_err(|error| rhiza_quepaxa::Error::Decode(error.to_string()))?;
-        if wire.version != RECORDER_WIRE_VERSION {
-            return Err(rhiza_quepaxa::Error::Decode(
-                "recorder wire version mismatch".into(),
-            ));
+                remaining_deadline_ms: u32::MAX,
+                body: &body,
+            },
+            MAX_HTTP_BODY_BYTES,
+            RECORDER_HTTP_REQUEST_LIMIT_ERROR,
+        )
+        .map_err(rhiza_quepaxa::Error::Decode)?;
+        context.check()?;
+        let timeout = context
+            .remaining()
+            .ok_or(rhiza_quepaxa::Error::RpcDeadlineExceeded)?
+            .min(transport_cap);
+        if timeout.is_zero() {
+            return Err(rhiza_quepaxa::Error::RpcDeadlineExceeded);
         }
-        match wire.body {
-            RecorderV2Result::Ok(value) if status.is_success() => Ok(value),
-            RecorderV2Result::Ok(_) => Err(rhiza_quepaxa::Error::Io(format!(
-                "recorder rpc returned HTTP {status}"
-            ))),
-            RecorderV2Result::Rejected(reason) => Err(rhiza_quepaxa::Error::Rejected(reason)),
-            RecorderV2Result::Error(message) => Err(rhiza_quepaxa::Error::Io(message)),
+        let remaining_deadline_ms = u32::try_from(timeout.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        // Serialize before worker admission or networking. A caller body that
+        // cannot fit the transport cap is a definite local Decode error even
+        // for mutations, rather than an ambiguous remote outcome.
+        let request = bounded_json_encode(
+            &RecorderWire {
+                version: RECORDER_WIRE_VERSION,
+                remaining_deadline_ms,
+                body,
+            },
+            MAX_HTTP_BODY_BYTES,
+            RECORDER_HTTP_REQUEST_LIMIT_ERROR,
+        )
+        .map_err(rhiza_quepaxa::Error::Decode)?;
+        // Admission is shared by all public clones. Waiting is deliberately
+        // context-polled before any thread is created, so a cancelled or
+        // expired caller is a definite local failure rather than an outcome
+        // ambiguity.
+        context.check()?;
+        let permit = self.shared.acquire_worker(context)?;
+        context.check()?;
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        let url = self.url(path);
+        let shared = Arc::clone(&self.shared);
+        let local_node_id = self.local_node_id.clone();
+        let recovery_generation = self.recovery_generation;
+        let peer_token = self.peer_token.clone();
+        std::thread::Builder::new()
+            .name("rhiza-recorder-http".into())
+            .spawn(move || {
+                let _permit = permit;
+                let outcome = match shared.client() {
+                    Ok(client) => match client
+                        .post(url)
+                        .timeout(timeout)
+                        .header(VERSION_HEADER, RECORDER_PROTOCOL_VERSION)
+                        .header(NODE_ID_HEADER, local_node_id)
+                        .header(RECOVERY_GENERATION_HEADER, recovery_generation.to_string())
+                        .bearer_auth(peer_token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(request)
+                        .send()
+                    {
+                        Ok(response) => read_bounded_http_recorder_response(response),
+                        Err(error) => HttpCall::Transport(error.to_string()),
+                    },
+                    Err(error) => HttpCall::Transport(error.to_string()),
+                };
+                let _ = reply.send(outcome);
+            })
+            .map_err(|error| rhiza_quepaxa::Error::Io(error.to_string()))?;
+        let outcome = loop {
+            match context.check() {
+                Ok(()) => {}
+                Err(_) if mutating => return Err(rhiza_quepaxa::Error::UnknownOutcome),
+                Err(error) => return Err(error),
+            }
+            let Some(remaining) = context.remaining() else {
+                return Err(if mutating {
+                    rhiza_quepaxa::Error::UnknownOutcome
+                } else {
+                    rhiza_quepaxa::Error::RpcDeadlineExceeded
+                });
+            };
+            match receive.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(outcome) => break outcome,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(if mutating {
+                        rhiza_quepaxa::Error::UnknownOutcome
+                    } else {
+                        rhiza_quepaxa::Error::Io("recorder HTTP worker closed".into())
+                    });
+                }
+            }
+        };
+        let (status, wire) = match outcome {
+            HttpCall::Response(status, wire) => (status, wire),
+            HttpCall::Transport(error) => {
+                return Err(if mutating {
+                    rhiza_quepaxa::Error::UnknownOutcome
+                } else {
+                    rhiza_quepaxa::Error::Io(error)
+                });
+            }
+            HttpCall::Decode(error) => {
+                return Err(if mutating {
+                    rhiza_quepaxa::Error::UnknownOutcome
+                } else {
+                    rhiza_quepaxa::Error::Decode(error)
+                });
+            }
+        };
+        if wire.version != RECORDER_WIRE_VERSION {
+            return Err(if mutating {
+                rhiza_quepaxa::Error::UnknownOutcome
+            } else {
+                rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into())
+            });
+        }
+        let envelope_mismatch = || {
+            if mutating {
+                rhiza_quepaxa::Error::UnknownOutcome
+            } else {
+                rhiza_quepaxa::Error::Decode("recorder HTTP status/envelope mismatch".into())
+            }
+        };
+        let result = match wire.body {
+            RecorderV2Result::Ok(value) if status == StatusCode::OK => Ok(value),
+            RecorderV2Result::Rejected(reason) if status == StatusCode::CONFLICT => {
+                Err(rhiza_quepaxa::Error::Rejected(reason))
+            }
+            RecorderV2Result::Error(error)
+                if matches!(
+                    status,
+                    StatusCode::BAD_REQUEST
+                        | StatusCode::REQUEST_TIMEOUT
+                        | StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::SERVICE_UNAVAILABLE
+                        | StatusCode::INTERNAL_SERVER_ERROR
+                ) =>
+            {
+                Err(recorder_error_from_wire(error))
+            }
+            _ => Err(envelope_mismatch()),
+        };
+        if mutating {
+            result.map_err(preserve_mutation_outcome)
+        } else {
+            result
         }
     }
 }
 
 impl RecorderRpc for HttpRecorderClient {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
-        self.post_v2(RECORDER_IDENTITY_PATH, ())
+    fn recorder_id(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
+        self.post_v2(context, RECORDER_IDENTITY_PATH, (), false)
     }
 
     fn store_command_for(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -896,6 +2596,7 @@ impl RecorderRpc for HttpRecorderClient {
         command: StoredCommand,
     ) -> rhiza_quepaxa::Result<()> {
         self.post_v2(
+            context,
             RECORDER_STORE_COMMAND_PATH,
             StoreCommandV2 {
                 cluster_id,
@@ -905,11 +2606,13 @@ impl RecorderRpc for HttpRecorderClient {
                 command_hash,
                 command,
             },
+            true,
         )
     }
 
     fn fetch_command_for(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -917,6 +2620,7 @@ impl RecorderRpc for HttpRecorderClient {
         command_hash: LogHash,
     ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
         self.post_v2(
+            context,
             RECORDER_FETCH_COMMAND_PATH,
             FetchCommandV2 {
                 cluster_id,
@@ -925,34 +2629,65 @@ impl RecorderRpc for HttpRecorderClient {
                 config_digest,
                 command_hash,
             },
+            false,
         )
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-        self.post_v2_with_timeout(RECORDER_RECORD_PATH, request, QUORUM_RECORD_REQUEST_TIMEOUT)
-            .map_err(map_quorum_record_transport_error)
+    fn record(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
+        self.post_v2_with_timeout(
+            context,
+            RECORDER_RECORD_PATH,
+            request,
+            QUORUM_RECORD_REQUEST_TIMEOUT,
+            true,
+        )
     }
 
     fn install_decision_proof(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
         self.post_v2(
+            context,
             RECORDER_INSTALL_PROOF_PATH,
             InstallProofV2 {
                 proof,
                 members: membership.members().to_vec(),
             },
+            true,
         )
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
-        self.post_v2(RECORDER_INSPECT_PROOF_PATH, InspectProofV2 { slot })
+    fn inspect_decision_proof(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        self.post_v2(
+            context,
+            RECORDER_INSPECT_PROOF_PATH,
+            InspectProofV2 { slot },
+            false,
+        )
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-        self.post_v2(RECORDER_INSPECT_RECORD_PATH, InspectProofV2 { slot })
+    fn inspect_record_summary(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        self.post_v2(
+            context,
+            RECORDER_INSPECT_RECORD_PATH,
+            InspectProofV2 { slot },
+            false,
+        )
     }
 
     fn supports_context_read_fence(&self) -> bool {
@@ -961,12 +2696,15 @@ impl RecorderRpc for HttpRecorderClient {
 
     fn observe_read_fence(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
         self.post_v2_with_timeout(
+            context,
             RECORDER_READ_FENCE_PATH,
             request,
             READ_FENCE_REQUEST_TIMEOUT,
+            false,
         )
     }
 }
@@ -1077,6 +2815,73 @@ impl LogPeer for HttpLogPeer {
 struct RecorderRouteState<R> {
     recorder: R,
     peers: Vec<PeerConfig>,
+    decode_slots: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestHttpDecodeHook {
+    request_ids: Arc<HashSet<usize>>,
+    entered: tokio::sync::mpsc::UnboundedSender<usize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static TEST_HTTP_DECODE_HOOK: OnceLock<std::sync::Mutex<Option<Arc<TestHttpDecodeHook>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static TEST_HTTP_DECODE_HOOK_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_http_decode_hook_slot() -> &'static std::sync::Mutex<Option<Arc<TestHttpDecodeHook>>> {
+    TEST_HTTP_DECODE_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn test_http_decode_hook_lock() -> &'static tokio::sync::Mutex<()> {
+    TEST_HTTP_DECODE_HOOK_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+struct TestHttpDecodeHookGuard;
+
+#[cfg(test)]
+impl Drop for TestHttpDecodeHookGuard {
+    fn drop(&mut self) {
+        *test_http_decode_hook_slot().lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+fn install_test_http_decode_hook(hook: TestHttpDecodeHook) -> TestHttpDecodeHookGuard {
+    let mut slot = test_http_decode_hook_slot().lock().unwrap();
+    assert!(
+        slot.is_none(),
+        "HTTP recorder decode hook already installed"
+    );
+    *slot = Some(Arc::new(hook));
+    TestHttpDecodeHookGuard
+}
+
+#[cfg(test)]
+async fn test_http_decode_hook_after_permit(headers: &HeaderMap) {
+    let Some(request_id) = header_text(headers, "x-rhiza-test-decode-id")
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let Some(hook) = test_http_decode_hook_slot().lock().unwrap().clone() else {
+        return;
+    };
+    if !hook.request_ids.contains(&request_id) {
+        return;
+    }
+    let released = hook.release.notified();
+    tokio::pin!(released);
+    released.as_mut().enable();
+    let _ = hook.entered.send(request_id);
+    released.await;
 }
 
 #[derive(Clone)]
@@ -1874,6 +3679,71 @@ struct PeerGateState {
     slots: Arc<tokio::sync::Semaphore>,
 }
 
+struct PeerPermitBody {
+    inner: Body,
+    pending_data: Option<axum::body::Bytes>,
+    permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl HttpBody for PeerPermitBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        loop {
+            if let Some(data) = self.pending_data.as_mut() {
+                let chunk = data.split_to(data.len().min(PEER_RESPONSE_CHUNK_BYTES));
+                if data.is_empty() {
+                    self.pending_data = None;
+                }
+                return Poll::Ready(Some(Ok(Frame::data(chunk))));
+            }
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Ready(None) => {
+                    self.permit.take();
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.permit.take();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) if data.is_empty() => continue,
+                    Ok(data) => self.pending_data = Some(data),
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.pending_data.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn retain_peer_permit_until_response_body_complete(
+    response: Response,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(PeerPermitBody {
+            inner: body,
+            pending_data: None,
+            permit: Some(permit),
+        }),
+    )
+}
+
 #[derive(Clone)]
 struct ClientGateState {
     runtime: Arc<NodeRuntime>,
@@ -1965,6 +3835,24 @@ where
         peers.into(),
         recovery_generation,
         Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY)),
+    )
+    .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+}
+
+#[cfg(test)]
+fn recorder_router_with_test_peer_concurrency<R>(
+    recorder: R,
+    peers: Vec<PeerConfig>,
+    peer_concurrency: usize,
+) -> Router
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    recorder_routes(
+        recorder,
+        peers,
+        1,
+        Arc::new(tokio::sync::Semaphore::new(peer_concurrency)),
     )
     .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
 }
@@ -2283,7 +4171,54 @@ where
         .with_state(RecorderRouteState {
             recorder,
             peers: recorder_peers,
+            decode_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         })
+}
+
+async fn decode_recorder_json<T, R>(
+    state: &RecorderRouteState<R>,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<RecorderWire<T>, Response>
+where
+    RecorderWire<T>: recorder_decode::RecorderWireRoot,
+{
+    if !recorder_json_content_type(headers) {
+        return Err(recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode(
+                "recorder requests require Content-Type: application/json".into(),
+            ),
+        ));
+    }
+    let _permit = state.decode_slots.acquire().await.map_err(|_| {
+        recorder_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            rhiza_quepaxa::Error::Decode("recorder decode semaphore closed".into()),
+        )
+    })?;
+    #[cfg(test)]
+    test_http_decode_hook_after_permit(headers).await;
+    recorder_decode::decode_json_exact_bounded(
+        &body,
+        recorder_decode::RecorderDecodeLimits::for_wire_bytes(MAX_HTTP_BODY_BYTES),
+    )
+    .map_err(|error| {
+        recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode(error.to_string()),
+        )
+    })
+}
+
+fn recorder_json_content_type(headers: &HeaderMap) -> bool {
+    header_text(headers, CONTENT_TYPE.as_str()).is_some_and(|value| {
+        value
+            .split_once(';')
+            .map_or(value, |(media_type, _)| media_type)
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    })
 }
 
 fn log_routes<P>(
@@ -2312,19 +4247,31 @@ where
 async fn handle_recorder_identity<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    Json(request): Json<RecorderWire<()>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<(), _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     let recorder = state.recorder;
     recorder_v2_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            recorder.recorder_id()
+            recorder.recorder_id(&context)
         })
         .await,
     )
@@ -2333,20 +4280,33 @@ where
 async fn handle_recorder_store_command<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    Json(request): Json<RecorderWire<StoreCommandV2>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<StoreCommandV2, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION || !valid_recorder_command(&request.body.command) {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("invalid recorder request".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     let recorder = state.recorder;
-    recorder_v2_response(
+    recorder_v2_mutation_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let body = request.body;
             recorder.store_command_for(
+                &context,
                 body.cluster_id,
                 body.epoch,
                 body.config_id,
@@ -2362,20 +4322,33 @@ where
 async fn handle_recorder_fetch_command<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    Json(request): Json<RecorderWire<FetchCommandV2>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<FetchCommandV2, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     let recorder = state.recorder;
     recorder_v2_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let body = request.body;
             recorder.fetch_command_for(
+                &context,
                 body.cluster_id,
                 body.epoch,
                 body.config_id,
@@ -2390,19 +4363,31 @@ where
 async fn handle_recorder_inspect_proof<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    Json(request): Json<RecorderWire<InspectProofV2>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<InspectProofV2, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     let recorder = state.recorder;
     recorder_v2_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            recorder.inspect_decision_proof(request.body.slot)
+            recorder.inspect_decision_proof(&context, request.body.slot)
         })
         .await,
     )
@@ -2411,19 +4396,31 @@ where
 async fn handle_recorder_inspect_record<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    Json(request): Json<RecorderWire<InspectProofV2>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<InspectProofV2, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     let recorder = state.recorder;
     recorder_v2_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            recorder.inspect_record_summary(request.body.slot)
+            recorder.inspect_record_summary(&context, request.body.slot)
         })
         .await,
     )
@@ -2432,19 +4429,31 @@ where
 async fn handle_recorder_read_fence<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    Json(request): Json<RecorderWire<ReadFenceRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<ReadFenceRequest, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     let recorder = state.recorder;
     recorder_v2_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            recorder.observe_read_fence(request.body)
+            recorder.observe_read_fence(&context, request.body)
         })
         .await,
     )
@@ -2454,14 +4463,26 @@ async fn handle_recorder_record<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
     Extension(authenticated_peer): Extension<AuthenticatedPeer>,
-    Json(request): Json<RecorderWire<RecordRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<RecordRequest, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION || !valid_recorder_record(&request.body) {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("invalid recorder request".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     if !authenticated_proposer_admitted(
         &authenticated_peer.0,
         &request.body.proposal.proposer_id,
@@ -2472,10 +4493,10 @@ where
         ))));
     }
     let recorder = state.recorder;
-    recorder_v2_response(
+    recorder_v2_mutation_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            recorder.record(request.body)
+            recorder.record(&context, request.body)
         })
         .await,
     )
@@ -2508,14 +4529,26 @@ async fn handle_recorder_install_proof<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
     Extension(authenticated_peer): Extension<AuthenticatedPeer>,
-    Json(request): Json<RecorderWire<InstallProofV2>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let request = match decode_recorder_json::<InstallProofV2, _>(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     if request.version != RECORDER_WIRE_VERSION {
-        return StatusCode::BAD_REQUEST.into_response();
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
     }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
     if !authenticated_proposer_admitted(
         &authenticated_peer.0,
         &request.body.proof.proposal().proposer_id,
@@ -2526,11 +4559,11 @@ where
         ))));
     }
     let recorder = state.recorder;
-    recorder_v2_response(
+    recorder_v2_mutation_response(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let membership = Membership::from_voters(request.body.members)?;
-            recorder.install_decision_proof(request.body.proof, &membership)
+            recorder.install_decision_proof(&context, request.body.proof, &membership)
         })
         .await,
     )
@@ -2546,21 +4579,89 @@ fn recorder_v2_response<T: serde::Serialize>(
         }
         Ok(Err(error)) => (
             recorder_error_status(&error),
-            RecorderV2Result::Error(error.to_string()),
+            RecorderV2Result::Error(recorder_wire_error(error)),
         ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            RecorderV2Result::Error(error.to_string()),
+            RecorderV2Result::Error(RecorderWireError {
+                code: RecorderWireErrorCode::ProposeFailed,
+                message: error.to_string(),
+                detail: None,
+            }),
         ),
     };
-    (
+    recorder_v2_json_response(
         status,
-        Json(RecorderWire {
-            version: RECORDER_WIRE_VERSION,
-            body,
-        }),
+        body,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        rhiza_quepaxa::Error::Decode(RECORDER_HTTP_RESPONSE_LIMIT_ERROR.into()),
     )
-        .into_response()
+}
+
+fn recorder_v2_mutation_response<T: serde::Serialize>(
+    result: Result<rhiza_quepaxa::Result<T>, tokio::task::JoinError>,
+) -> Response {
+    match result {
+        // The backend has completed successfully at this point. If its success
+        // body cannot reach the peer, the peer cannot distinguish that from a
+        // completed mutation whose response was lost.
+        Ok(Ok(value)) => recorder_v2_json_response(
+            StatusCode::OK,
+            RecorderV2Result::Ok(value),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            rhiza_quepaxa::Error::UnknownOutcome,
+        ),
+        Ok(Err(error)) => recorder_v2_response::<T>(Ok(Err(error))),
+        Err(_) => recorder_v2_response::<T>(Ok(Err(rhiza_quepaxa::Error::UnknownOutcome))),
+    }
+}
+
+fn recorder_v2_error_response(status: StatusCode, error: rhiza_quepaxa::Error) -> Response {
+    recorder_v2_json_response(
+        status,
+        RecorderV2Result::<()>::Error(recorder_wire_error(error)),
+        status,
+        rhiza_quepaxa::Error::Decode(RECORDER_HTTP_RESPONSE_LIMIT_ERROR.into()),
+    )
+}
+
+fn recorder_v2_json_response<T: serde::Serialize>(
+    status: StatusCode,
+    body: RecorderV2Result<T>,
+    overflow_status: StatusCode,
+    overflow_error: rhiza_quepaxa::Error,
+) -> Response {
+    let wire = RecorderWire {
+        version: RECORDER_WIRE_VERSION,
+        remaining_deadline_ms: 0,
+        body,
+    };
+    let encoded = match bounded_json_encode(
+        &wire,
+        MAX_HTTP_BODY_BYTES,
+        RECORDER_HTTP_RESPONSE_LIMIT_ERROR,
+    ) {
+        Ok(encoded) => return recorder_v2_json_bytes(status, encoded),
+        Err(_) => RecorderWire {
+            version: RECORDER_WIRE_VERSION,
+            remaining_deadline_ms: 0,
+            body: RecorderV2Result::<T>::Error(recorder_wire_error(overflow_error)),
+        },
+    };
+    match bounded_json_encode(
+        &encoded,
+        MAX_HTTP_BODY_BYTES,
+        RECORDER_HTTP_RESPONSE_LIMIT_ERROR,
+    ) {
+        Ok(encoded) => recorder_v2_json_bytes(overflow_status, encoded),
+        // The fallback contains only fixed protocol fields. Do not recurse if
+        // a future serializer change somehow makes even it unrepresentable.
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn recorder_v2_json_bytes(status: StatusCode, encoded: Vec<u8>) -> Response {
+    (status, [(CONTENT_TYPE, "application/json")], encoded).into_response()
 }
 
 async fn handle_fetch_log<P>(
@@ -2640,7 +4741,7 @@ async fn handle_sql_execute(
         Ok(_) => {
             return node_error_response(NodeError::InvalidRequest(format!(
                 "command exceeds {MAX_COMMAND_BYTES} bytes"
-            )))
+            )));
         }
         Err(error) => return node_error_response(error),
     };
@@ -2947,7 +5048,7 @@ async fn execute_graph_mutation(
         Ok(_) => {
             return node_error_response(NodeError::InvalidRequest(format!(
                 "command exceeds {MAX_COMMAND_BYTES} bytes"
-            )))
+            )));
         }
         Err(error) => return node_error_response(NodeError::InvalidRequest(error.to_string())),
     };
@@ -3118,7 +5219,7 @@ async fn execute_kv_mutation(
         Ok(_) => {
             return node_error_response(NodeError::InvalidRequest(format!(
                 "command exceeds {MAX_COMMAND_BYTES} bytes"
-            )))
+            )));
         }
         Err(error) => return node_error_response(NodeError::InvalidRequest(error.to_string())),
     };
@@ -3223,7 +5324,7 @@ async fn handle_kv_scan(
         _ => {
             return node_error_response(NodeError::InvalidRequest(
                 "provide either prefix alone or start with optional end".into(),
-            ))
+            ));
         }
     };
     let runtime = state.runtime;
@@ -3317,13 +5418,23 @@ async fn peer_gate(
     };
     let permit = match state.slots.try_acquire_owned() {
         Ok(permit) => Arc::new(permit),
+        Err(_)
+            if request.uri().path().starts_with("/v2/quepaxa/recorder/")
+                || request.uri().path().starts_with("/v3/quepaxa/recorder/") =>
+        {
+            return recorder_v2_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                rhiza_quepaxa::Error::Io("recorder RPC overloaded".into()),
+            );
+        }
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
+    let response_permit = Arc::clone(&permit);
     request.extensions_mut().insert(permit);
     request
         .extensions_mut()
         .insert(AuthenticatedPeer(authenticated_peer));
-    next.run(request).await
+    retain_peer_permit_until_response_body_complete(next.run(request).await, response_permit)
 }
 
 async fn client_gate(
@@ -3366,7 +5477,7 @@ async fn client_gate(
                 true,
                 "client request capacity is exhausted",
                 None,
-            )
+            );
         }
     };
     request.extensions_mut().insert(permit);
@@ -3442,7 +5553,7 @@ pub async fn confirm_write_durability(
                 return Err(DurabilityError::LocalLogGap {
                     expected: index,
                     actual: Some(tip.index()),
-                })
+                });
             }
             Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
                 let cancelled = runtime.operation_cancelled_notify.notified();
@@ -3530,6 +5641,7 @@ fn node_error_response(error: NodeError) -> Response {
         NodeError::PreconditionFailed(_) => (StatusCode::CONFLICT, None),
         NodeError::SnapshotRequired(_)
         | NodeError::Unavailable(_)
+        | NodeError::StartupCancelled { .. }
         | NodeError::ResourceExhausted(_)
         | NodeError::ConfigurationTransition { .. }
         | NodeError::Contention(_)
@@ -4497,6 +6609,10 @@ pub enum NodeError {
     Reconciliation(String),
     Invariant(String),
     Unavailable(String),
+    StartupCancelled {
+        token: StartupCancellationToken,
+        stage: String,
+    },
     ResourceExhausted(String),
     ConfigurationTransition {
         state: Box<ConfigurationState>,
@@ -4540,6 +6656,9 @@ impl fmt::Display for NodeError {
             Self::Reconciliation(message) => write!(f, "node reconciliation failed: {message}"),
             Self::Invariant(message) => write!(f, "node invariant failed: {message}"),
             Self::Unavailable(message) => write!(f, "node unavailable: {message}"),
+            Self::StartupCancelled { stage, .. } => {
+                write!(f, "node unavailable: startup cancelled {stage}")
+            }
             Self::ResourceExhausted(message) => {
                 write!(f, "node query resources exhausted: {message}")
             }
@@ -4579,6 +6698,7 @@ impl NodeError {
             Self::PreconditionFailed(_) => ("precondition_failed", false),
             Self::SnapshotRequired(_) => ("snapshot_required", false),
             Self::Unavailable(_) => ("unavailable", true),
+            Self::StartupCancelled { .. } => ("unavailable", true),
             Self::ResourceExhausted(_) => ("resource_exhausted", true),
             Self::ConfigurationTransition { .. } => ("configuration_transition", true),
             Self::Contention(_) => ("contention", true),
@@ -5672,7 +7792,7 @@ impl Materializer {
                         Ok(state) => state,
                         Err(_) => match recovery_anchor {
                             Some(anchor) => {
-                                return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())))
+                                return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())));
                             }
                             _ => {
                                 quarantine_materializer(config.data_dir(), "kv")?;
@@ -6146,7 +8266,7 @@ pub struct NodeRuntime {
     kv_group_commit: KvGroupCommitQueue,
     read_barriers: ReadBarrierRounds,
     checkpointing: AtomicBool,
-    operation_cancelled: AtomicBool,
+    operation_cancelled: Arc<AtomicBool>,
     operation_cancelled_notify: tokio::sync::Notify,
     ready: AtomicBool,
     fatal: AtomicBool,
@@ -6159,6 +8279,8 @@ pub struct NodeRuntime {
     kv_group_commit_before_execute_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(test, feature = "kv"))]
     kv_group_commit_after_execute_hook: Option<KvGroupCommitAfterExecuteHook>,
+    #[cfg(all(test, any(feature = "graph", feature = "kv")))]
+    read_barrier_before_snapshot_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     _data_root_lock: fs::File,
 }
 
@@ -6339,6 +8461,13 @@ impl fmt::Debug for NodeRuntime {
 }
 
 impl NodeRuntime {
+    fn consensus_context(&self) -> RecorderRpcContext {
+        RecorderRpcContext::with_timeout_and_cancellation(
+            DEFAULT_RECORDER_RPC_TIMEOUT,
+            Arc::clone(&self.operation_cancelled),
+        )
+    }
+
     pub fn open(
         config: NodeConfig,
         consensus: Arc<ThreeNodeConsensus>,
@@ -6358,47 +8487,47 @@ impl NodeRuntime {
             return Err(NodeError::UnsupportedAckMode(AckMode::DrStrong));
         }
         Materializer::ensure_profile_available(config.execution_profile())?;
-        startup.check("runtime data directory creation")?;
-        fs::create_dir_all(&config.data_dir)
-            .map_err(|error| NodeError::Storage(error.to_string()))?;
-        startup.check("runtime data lock acquisition")?;
-        let lock_path = config.data_dir.join(".node.lock");
-        let data_root_lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| NodeError::Storage(error.to_string()))?;
-        match data_root_lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(NodeError::DataRootLocked(config.data_dir.clone()));
-            }
-            Err(fs::TryLockError::Error(error)) => {
-                return Err(NodeError::Storage(error.to_string()));
-            }
+        {
+            let _permit = startup.admit_local_io("runtime data directory creation")?;
+            fs::create_dir_all(&config.data_dir)
+                .map_err(|error| NodeError::Storage(error.to_string()))?;
         }
+        let data_root_lock = {
+            let _permit = startup.admit_local_io("runtime data lock acquisition")?;
+            match acquire_node_data_root_lock(&config.data_dir) {
+                Ok(lock) => lock.into_file(),
+                Err(NodeDataRootLockError::Locked) => {
+                    return Err(NodeError::DataRootLocked(config.data_dir.clone()));
+                }
+                Err(error) => return Err(NodeError::Storage(error.to_string())),
+            }
+        };
 
-        startup.check("qlog open and recovery")?;
-        let log_store = FileLogStore::open_with_configuration(
-            config.data_dir.join("consensus/log"),
-            &config.cluster_id,
-            config.epoch,
-            config.log_initial_configuration.clone(),
-        )
-        .map_err(|error| NodeError::Storage(error.to_string()))?;
-        let persisted_configuration = log_store
-            .configuration_state()
+        let (log_store, persisted_configuration, recovery_anchor) = {
+            let _permit = startup.admit_local_io("qlog open and recovery")?;
+            let log_store = FileLogStore::open_with_configuration(
+                config.data_dir.join("consensus/log"),
+                &config.cluster_id,
+                config.epoch,
+                config.log_initial_configuration.clone(),
+            )
             .map_err(|error| NodeError::Storage(error.to_string()))?;
-        let recovery_anchor = log_store
-            .logical_state()
-            .map_err(|error| NodeError::Storage(error.to_string()))?
-            .anchor;
-        startup.check("materializer open and reconciliation")?;
-        let materializer =
-            Materializer::open(&config, &persisted_configuration, recovery_anchor.as_ref())?;
-        reconcile_local_storage(&config, &log_store, &materializer)?;
+            let persisted_configuration = log_store
+                .configuration_state()
+                .map_err(|error| NodeError::Storage(error.to_string()))?;
+            let recovery_anchor = log_store
+                .logical_state()
+                .map_err(|error| NodeError::Storage(error.to_string()))?
+                .anchor;
+            (log_store, persisted_configuration, recovery_anchor)
+        };
+        let materializer = {
+            let _permit = startup.admit_local_io("materializer open and reconciliation")?;
+            let materializer =
+                Materializer::open(&config, &persisted_configuration, recovery_anchor.as_ref())?;
+            reconcile_local_storage(&config, &log_store, &materializer)?;
+            materializer
+        };
         startup.check("peer recovery")?;
         recover_peer_candidates(
             &config,
@@ -6429,7 +8558,7 @@ impl NodeRuntime {
             commit: Mutex::new(()),
             read_barriers: ReadBarrierRounds::new(READ_BARRIER_COALESCE_WINDOW),
             checkpointing: AtomicBool::new(false),
-            operation_cancelled: AtomicBool::new(false),
+            operation_cancelled: Arc::new(AtomicBool::new(false)),
             operation_cancelled_notify: tokio::sync::Notify::new(),
             ready: AtomicBool::new(true),
             fatal: AtomicBool::new(false),
@@ -6442,6 +8571,8 @@ impl NodeRuntime {
             kv_group_commit_before_execute_hook: None,
             #[cfg(all(test, feature = "kv"))]
             kv_group_commit_after_execute_hook: None,
+            #[cfg(all(test, any(feature = "graph", feature = "kv")))]
+            read_barrier_before_snapshot_hook: None,
             _data_root_lock: data_root_lock,
         })
     }
@@ -6532,11 +8663,11 @@ impl NodeRuntime {
             })?;
             let entry = self
                 .consensus
-                .propose_at_cancellable(
+                .propose_at(
+                    self.consensus_context(),
                     slot,
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
-                    &self.operation_cancelled,
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
             self.persist_entry(&entry, slot, last_hash)?;
@@ -6675,11 +8806,11 @@ impl NodeRuntime {
             })?;
             let entry = self
                 .consensus
-                .propose_at_cancellable(
+                .propose_at(
+                    self.consensus_context(),
                     slot,
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
-                    &self.operation_cancelled,
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
             self.persist_entry(&entry, slot, last_hash)?;
@@ -7210,7 +9341,7 @@ impl NodeRuntime {
                         break (None, Vec::new());
                     }
                     Some(payload) if payload.len() <= MAX_COMMAND_BYTES => {
-                        break (Some(payload), proposed)
+                        break (Some(payload), proposed);
                     }
                     Some(_) if attempt_count > 1 => {
                         for index in attempted {
@@ -7252,11 +9383,11 @@ impl NodeRuntime {
                 }
             };
             let consensus_mark = profile.mark();
-            let entry = self.consensus.propose_at_cancellable(
+            let entry = self.consensus.propose_at(
+                self.consensus_context(),
                 slot,
                 last_hash,
                 Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                &self.operation_cancelled,
             );
             profile.add_consensus_propose(consensus_mark);
             let entry = match entry {
@@ -7653,16 +9784,7 @@ impl NodeRuntime {
             let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
                 (commands.len(), full_payload)
             } else {
-                let mut prefix = None;
-                for count in (2..commands.len()).rev() {
-                    let payload = encode_replicated_graph_batch(&commands[..count])
-                        .expect("the validated graph batch prefix remains valid");
-                    if payload.len() <= MAX_COMMAND_BYTES {
-                        prefix = Some((count, payload));
-                        break;
-                    }
-                }
-                let Some(prefix) = prefix else {
+                let Some(prefix) = largest_fitting_graph_batch_prefix(&commands) else {
                     let index = pending.remove(0);
                     results[index] = Some(self.execute_profile_member_locked(&members[index]));
                     continue;
@@ -7689,11 +9811,11 @@ impl NodeRuntime {
                     break;
                 }
             };
-            let entry = match self.consensus.propose_at_cancellable(
+            let entry = match self.consensus.propose_at(
+                self.consensus_context(),
                 slot,
                 last_hash,
                 Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                &self.operation_cancelled,
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -7885,11 +10007,11 @@ impl NodeRuntime {
                     break;
                 }
             };
-            let entry = match self.consensus.propose_at_cancellable(
+            let entry = match self.consensus.propose_at(
+                self.consensus_context(),
                 slot,
                 last_hash,
                 Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                &self.operation_cancelled,
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -8104,11 +10226,11 @@ impl NodeRuntime {
             })?;
             let entry = self
                 .consensus
-                .propose_at_cancellable(
+                .propose_at(
+                    self.consensus_context(),
                     slot,
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                    &self.operation_cancelled,
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
             let sql_result = self.persist_entry(&entry, slot, last_hash)?;
@@ -8249,11 +10371,11 @@ impl NodeRuntime {
             })?;
             let entry = self
                 .consensus
-                .propose_at_cancellable(
+                .propose_at(
+                    self.consensus_context(),
                     slot,
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                    &self.operation_cancelled,
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
             self.persist_entry(&entry, slot, last_hash)?;
@@ -8393,7 +10515,7 @@ impl NodeRuntime {
             .ok_or_else(|| self.latch(NodeError::Invariant("qlog index is exhausted".into())))?;
         match self
             .consensus
-            .inspect_decision_at(slot, last_hash)
+            .inspect_decision_at(&self.consensus_context(), slot, last_hash)
             .map_err(|error| self.map_consensus_error(error))?
         {
             DecisionInspection::Committed(entry) => {
@@ -8535,7 +10657,12 @@ impl NodeRuntime {
                 .ok_or_else(|| NodeError::Invariant("qlog index is exhausted".into()))?;
             let entry = self
                 .consensus
-                .propose_stored_at(slot, last_hash, stop_command.clone())
+                .propose_stored_at(
+                    self.consensus_context(),
+                    slot,
+                    last_hash,
+                    stop_command.clone(),
+                )
                 .map_err(|error| self.map_consensus_error(error))?;
             self.persist_entry(&entry, slot, last_hash)?;
             let decided = StoredCommand::new(entry.entry_type, entry.payload.clone());
@@ -8550,7 +10677,7 @@ impl NodeRuntime {
             }
             let proof = self
                 .consensus
-                .inspect_decision_proof_at(slot)
+                .inspect_decision_proof_at(&self.consensus_context(), slot)
                 .map_err(|error| self.map_consensus_error(error))?
                 .ok_or_else(|| {
                     NodeError::Unavailable("durable Stop proof is unavailable".into())
@@ -8608,7 +10735,7 @@ impl NodeRuntime {
         let stop_entry = self.recover_stop_entry(stop)?;
         let entry = self
             .consensus
-            .propose_activation_for_stop_entry(&stop_entry)
+            .propose_activation_for_stop_entry(self.consensus_context(), &stop_entry)
             .map_err(|error| self.map_consensus_error(error))?;
         self.persist_entry(&entry, stop.index() + 1, stop.hash())?;
         Ok(entry)
@@ -8634,7 +10761,7 @@ impl NodeRuntime {
         }
         let proof = self
             .consensus
-            .inspect_decision_proof_at(stop.index())
+            .inspect_decision_proof_at(&self.consensus_context(), stop.index())
             .map_err(|error| self.map_consensus_error(error))?
             .ok_or_else(|| NodeError::Unavailable("durable Stop proof is unavailable".into()))?;
         let value = proof
@@ -8649,7 +10776,7 @@ impl NodeRuntime {
             })?;
         match self
             .consensus
-            .inspect_decision_at(stop.index(), value.prev_hash)
+            .inspect_decision_at(&self.consensus_context(), stop.index(), value.prev_hash)
             .map_err(|error| self.map_consensus_error(error))?
         {
             DecisionInspection::Committed(entry) if entry.hash == stop.hash() => Ok(entry),
@@ -8662,6 +10789,36 @@ impl NodeRuntime {
                 "Stop decision differs from compacted anchor".into(),
             ))),
         }
+    }
+
+    /// Returns the exact Stop entry only when this process already holds it in
+    /// its local qlog or immutable startup configuration.  Status observation
+    /// must never consult recorders or latch runtime state merely to describe
+    /// a compacted predecessor transition.
+    pub(crate) fn observe_stop_entry_locally(
+        &self,
+        stop: LogAnchor,
+    ) -> Result<LogEntry, NodeError> {
+        if let Some(entry) = self
+            .log_store
+            .read(stop.index())
+            .map_err(|error| NodeError::Storage(error.to_string()))?
+            .filter(|entry| entry.hash == stop.hash())
+        {
+            return Ok(entry);
+        }
+        if let Some(entry) = self
+            .config
+            .predecessor_stop_entry
+            .as_ref()
+            .filter(|entry| entry.index == stop.index() && entry.hash == stop.hash())
+        {
+            validate_entry_envelope(&self.config, entry, entry.index, entry.prev_hash)?;
+            return Ok(entry.clone());
+        }
+        Err(NodeError::Unavailable(
+            "locally retained Stop command is unavailable".into(),
+        ))
     }
 
     pub fn log_root(&self) -> Result<LogAnchor, NodeError> {
@@ -9025,6 +11182,10 @@ impl NodeRuntime {
             self.ensure_writes_active()?;
             self.validate_read_barrier_qlog_descendant_locked(anchor)?;
         }
+        #[cfg(test)]
+        if let Some(hook) = &self.read_barrier_before_snapshot_hook {
+            hook();
+        }
         Ok(())
     }
 
@@ -9148,7 +11309,7 @@ impl NodeRuntime {
             let inspection = if context_read_fence {
                 match self
                     .consensus
-                    .inspect_context_read_fence_at(slot, last_hash)
+                    .inspect_context_read_fence_at(&self.consensus_context(), slot, last_hash)
                     .map_err(|error| self.map_consensus_error(error))?
                 {
                     CertifiedDecisionInspection::Committed(certified) => {
@@ -9160,7 +11321,7 @@ impl NodeRuntime {
                 }
             } else {
                 self.consensus
-                    .inspect_decision_at(slot, last_hash)
+                    .inspect_decision_at(&self.consensus_context(), slot, last_hash)
                     .map_err(|error| self.map_consensus_error(error))?
             };
             match inspection {
@@ -9177,11 +11338,11 @@ impl NodeRuntime {
                 DecisionInspection::Pending => {
                     let entry = self
                         .consensus
-                        .propose_at_cancellable(
+                        .propose_at(
+                            self.consensus_context(),
                             slot,
                             last_hash,
                             Command::new(CommandKind::ReadBarrier, Vec::new()),
-                            &self.operation_cancelled,
                         )
                         .map_err(|error| self.map_consensus_error(error))?;
                     self.persist_entry(&entry, slot, last_hash)?;
@@ -9192,11 +11353,11 @@ impl NodeRuntime {
                 DecisionInspection::Empty => {
                     let entry = self
                         .consensus
-                        .propose_at_cancellable(
+                        .propose_at(
+                            self.consensus_context(),
                             slot,
                             last_hash,
                             Command::new(CommandKind::ReadBarrier, Vec::new()),
-                            &self.operation_cancelled,
                         )
                         .map_err(|error| self.map_consensus_error(error))?;
                     let is_barrier =
@@ -9405,6 +11566,19 @@ impl NodeRuntime {
             .map_err(|_| self.latch(NodeError::Invariant("commit mutex is poisoned".into())))
     }
 
+    /// Acquires commit only for a read-only status observation.
+    ///
+    /// A poisoned observation lock is deliberately reported without changing
+    /// readiness or installing a fatal latch: status must fail closed without
+    /// turning an observational failure into a runtime transition.
+    pub(crate) fn lock_commit_for_status_observation(
+        &self,
+    ) -> Result<MutexGuard<'_, ()>, NodeError> {
+        self.commit
+            .lock()
+            .map_err(|_| NodeError::Invariant("commit mutex is poisoned".into()))
+    }
+
     fn lock_materializer(&self) -> Result<MutexGuard<'_, Materializer>, NodeError> {
         self.materializer.lock().map_err(|_| {
             self.latch(NodeError::Invariant(
@@ -9517,9 +11691,12 @@ impl NodeRuntime {
             | rhiza_quepaxa::Error::ProposeFailed
             | rhiza_quepaxa::Error::CommandUnavailable
             | rhiza_quepaxa::Error::Cancelled
+            | rhiza_quepaxa::Error::RpcCancelled
+            | rhiza_quepaxa::Error::RpcDeadlineExceeded
             | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
             rhiza_quepaxa::Error::ConflictingCertificates
-            | rhiza_quepaxa::Error::ChainConflict { .. } => {
+            | rhiza_quepaxa::Error::ChainConflict { .. }
+            | rhiza_quepaxa::Error::UnknownOutcome => {
                 self.latch(NodeError::Reconciliation(error.to_string()))
             }
             other => self.latch(NodeError::Invariant(other.to_string())),
@@ -9577,26 +11754,31 @@ pub fn rehydrate_recorder_after_checkpoint(
                 ))
             })?;
         startup.check("recorder rehydration decision inspection")?;
+        // The call-local consensus budget/group retains every admitted
+        // inspection until its bounded drain completes. Sharing the startup
+        // context therefore preserves cancellation certainty without letting
+        // rehydration return while a recorder worker can still persist later.
+        let inspection_context = startup.recorder_context();
         let certified = match runtime
             .consensus()
-            .inspect_certified_decision_at(index, entry.prev_hash)
+            .inspect_certified_decision_at(&inspection_context, index, entry.prev_hash)
             .map_err(startup_consensus_error)?
         {
             CertifiedDecisionInspection::Committed(certified) => certified,
             CertifiedDecisionInspection::Empty => {
                 return Err(NodeError::Reconciliation(format!(
                     "qlog entry {index} has no recorder decision certificate"
-                )))
+                )));
             }
             CertifiedDecisionInspection::Pending => {
                 return Err(NodeError::Reconciliation(format!(
                     "qlog entry {index} has only a pending recorder decision"
-                )))
+                )));
             }
             CertifiedDecisionInspection::Unavailable => {
                 return Err(NodeError::Unavailable(format!(
                     "recorder decision certificate is unavailable at qlog index {index}"
-                )))
+                )));
             }
         };
         startup.check("recorder rehydration decision inspection")?;
@@ -9607,33 +11789,36 @@ pub fn rehydrate_recorder_after_checkpoint(
         }
         let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
         let proof = certified.proof.clone();
-        startup.persist("recorder rehydration persistence", || {
-            recorder
-                .store_command(command.hash(), command)
-                .map_err(|error| {
-                    NodeError::Reconciliation(format!(
-                        "cannot restore recorder command at qlog index {index}: {error}"
-                    ))
-                })?;
-            recorder
-                .install_decision_proof_record(proof, runtime.consensus().membership())
-                .map_err(|error| {
-                    NodeError::Reconciliation(format!(
-                        "cannot install recorder decision at qlog index {index}: {error}"
-                    ))
-                })
-        })?;
+        // Recorder rehydration is outside the local startup-I/O publication
+        // fence. It retains its existing cooperative cancellation check, but
+        // does not claim quiescence for recorder persistence here.
+        startup.check("recorder rehydration persistence")?;
+        recorder
+            .store_command(command.hash(), command)
+            .map_err(|error| {
+                NodeError::Reconciliation(format!(
+                    "cannot restore recorder command at qlog index {index}: {error}"
+                ))
+            })?;
+        recorder
+            .install_decision_proof_record(proof, runtime.consensus().membership())
+            .map_err(|error| {
+                NodeError::Reconciliation(format!(
+                    "cannot install recorder decision at qlog index {index}: {error}"
+                ))
+            })?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
+    use axum::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
 
     use rhiza_core::{
         Command, CommandKind, ConfigurationState, EntryType, ErrorCategory, ErrorClassification,
-        ExecutionProfile, LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
+        ExecutionProfile, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
+        StoredCommand,
     };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
@@ -9641,12 +11826,17 @@ mod tests {
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
     use rhiza_quepaxa::{
-        AcceptedValue, Membership, Proposal, ProposalPriority, RecordRequest, RecordSummary,
-        RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
+        AcceptedValue, DecisionProof, Membership, Proposal, ProposalPriority, RecordRequest,
+        RecordSummary, RecorderFileStore, RecorderRpc, RecorderSummary, ThreeNodeConsensus,
     };
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Arc, Barrier, Condvar, Mutex,
+    #[cfg(all(feature = "sql", unix))]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        fs,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            mpsc, Arc, Barrier, Condvar, Mutex,
+        },
     };
 
     #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
@@ -9655,13 +11845,55 @@ mod tests {
     use super::with_graph_client_permit;
     use super::ReadBarrierRounds;
     use super::{
-        client_authenticated, next_sync_flush_retry, run_read_operation, sql_query_http_response,
-        valid_recorder_record, Duration, FileLogStore, HeaderMap, Instant, NodeError,
-        ReadConsistency, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler,
-        MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC,
-        SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+        allocate_startup_cancellation_generation, allocate_startup_local_io_effect_id,
+        install_test_http_decode_hook, install_test_startup_local_io_hook,
+        install_test_startup_persistence_hook, persist_startup_entry, recorder_router,
+        recorder_router_with_test_peer_concurrency, recorder_routes, test_http_decode_hook_lock,
+        test_startup_effect_hook_lock, ConfigError, HttpRecorderClient, NodeConfig, NodeRuntime,
+        NodeService, PeerConfig, StartupCancellationAuthority, StartupCloseOutcome,
+        StartupIoContext, TestHttpDecodeHook, TestStartupLocalIoHook, TestStartupPersistenceHook,
+        HTTP_RECORDER_MAX_CONCURRENT_WORKERS, MAX_HTTP_BODY_BYTES, RECORDER_FETCH_COMMAND_PATH,
+        RECORDER_IDENTITY_PATH, RECORDER_INSPECT_PROOF_PATH, RECORDER_INSTALL_PROOF_PATH,
+        RECORDER_PROTOCOL_VERSION, RECORDER_RECORD_PATH, RECORDER_WIRE_VERSION,
     };
-    use super::{ConfigError, NodeConfig, NodeRuntime, NodeService, StartupIoContext};
+    use super::{
+        client_authenticated, next_sync_flush_retry, post,
+        retain_peer_permit_until_response_body_complete, run_read_operation,
+        sql_query_http_response, valid_recorder_record, Body, Duration, FileLogStore, HeaderMap,
+        Instant, Json, NodeError, ReadConsistency, Request, Response, Router, SqlCommand,
+        SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
+        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
+        VERSION_HEADER,
+    };
+
+    struct PendingThenDataBody {
+        state: u8,
+    }
+
+    impl http_body::Body for PendingThenDataBody {
+        type Data = axum::body::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.state {
+                0 => {
+                    self.state = 1;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                1 => {
+                    self.state = 2;
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
+                        axum::body::Bytes::from_static(b"response"),
+                    ))))
+                }
+                _ => std::task::Poll::Ready(None),
+            }
+        }
+    }
 
     struct BlockingStartupInspection {
         recorder: RecorderFileStore,
@@ -9669,13 +11901,119 @@ mod tests {
         gate: Arc<(Mutex<bool>, Condvar)>,
     }
 
+    #[derive(Clone)]
+    struct HttpIdentityRecorder;
+
+    impl RecorderRpc for HttpIdentityRecorder {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            Ok("node-1".into())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingHttpIdentity {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for CountingHttpIdentity {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("node-1".into())
+        }
+
+        fn install_decision_proof(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct OversizedHttpFetch {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for OversizedHttpFetch {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            Ok("node-1".into())
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(StoredCommand::new(
+                EntryType::Command,
+                vec![0_u8; MAX_HTTP_BODY_BYTES],
+            )))
+        }
+    }
+
+    #[derive(Clone)]
+    struct OversizedHttpRecord {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for OversizedHttpRecord {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            Ok("node-1".into())
+        }
+
+        fn record(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RecordSummary {
+                recorder_id: "x".repeat(MAX_HTTP_BODY_BYTES),
+                slot: request.slot,
+                config_id: request.config_id,
+                config_digest: request.config_digest,
+                step: request.step,
+                first_current: Some(request.proposal),
+                aggregate_prior: None,
+                decided: None,
+            })
+        }
+    }
+
     impl RecorderRpc for BlockingStartupInspection {
-        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
-            self.recorder.recorder_id()
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(
+                &self.recorder,
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            )
         }
 
         fn inspect_record_summary(
             &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
             slot: u64,
         ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
             self.started.send(()).unwrap();
@@ -9684,18 +12022,25 @@ mod tests {
             while !*released {
                 released = condition.wait(released).unwrap();
             }
-            self.recorder.inspect_record_summary(slot)
+            RecorderRpc::inspect_record_summary(
+                &self.recorder,
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                slot,
+            )
         }
 
         fn fetch_command_for(
             &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
             cluster_id: String,
             epoch: u64,
             config_id: u64,
             config_digest: LogHash,
             command_hash: LogHash,
         ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
-            self.recorder.fetch_command_for(
+            RecorderRpc::fetch_command_for(
+                &self.recorder,
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                 cluster_id,
                 epoch,
                 config_id,
@@ -9745,6 +12090,7 @@ mod tests {
         .unwrap();
         seed_consensus
             .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                 1,
                 LogHash::ZERO,
                 Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -9800,12 +12146,7 @@ mod tests {
         condition.notify_all();
 
         let error = attempt.join().unwrap().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("startup cancelled during recorder decision inspection"),
-            "{error}"
-        );
+        assert!(matches!(error, NodeError::Unavailable(_)), "{error}");
         let log_store = FileLogStore::open_with_configuration(
             config.data_dir.join("consensus/log"),
             &config.cluster_id,
@@ -9817,7 +12158,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_cancellation_closes_mutation_admission_after_an_active_write_finishes() {
+    fn startup_cancellation_closes_local_io_admission_after_an_active_effect_finishes() {
         let startup = StartupIoContext::new();
         let attempt_startup = startup.clone();
         let writes = Arc::new(AtomicUsize::new(0));
@@ -9826,16 +12167,15 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let attempt_gate = Arc::clone(&gate);
         let attempt = std::thread::spawn(move || {
-            attempt_startup.persist("test persistence", || {
-                entered.send(()).unwrap();
-                let (released, condition) = &*attempt_gate;
-                let mut released = released.lock().unwrap();
-                while !*released {
-                    released = condition.wait(released).unwrap();
-                }
-                attempt_writes.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            })
+            let _permit = attempt_startup.admit_local_io("test local effect")?;
+            entered.send(()).unwrap();
+            let (released, condition) = &*attempt_gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            attempt_writes.fetch_add(1, Ordering::AcqRel);
+            Ok::<(), NodeError>(())
         });
 
         active.recv().unwrap();
@@ -9845,13 +12185,660 @@ mod tests {
         condition.notify_all();
         attempt.join().unwrap().unwrap();
 
-        assert!(startup
-            .persist("late persistence", || {
-                writes.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            })
-            .is_err());
+        assert!(startup.admit_local_io("late local effect").is_err());
         assert_eq!(writes.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_admit_first_drains_and_close_never_reopens() {
+        let startup = StartupIoContext::new();
+        let permit = startup.admit_local_io("admitted local effect").unwrap();
+        let receipt = startup.cancel(Instant::now() + Duration::from_secs(1));
+
+        let waiting_startup = startup.clone();
+        let waiting_receipt = receipt.clone();
+        let waiting =
+            tokio::spawn(async move { waiting_startup.await_close(&waiting_receipt).await });
+        tokio::task::yield_now().await;
+        drop(permit);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap(),
+            StartupCloseOutcome::Drained
+        );
+        assert!(startup.recognizes_close_receipt(&receipt));
+        assert!(startup.admit_local_io("must remain closed").is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_close_first_has_zero_effects_and_is_immediately_drained() {
+        let startup = StartupIoContext::new();
+        let receipt = startup.cancel(Instant::now() + Duration::from_secs(1));
+
+        assert_eq!(
+            startup.await_close(&receipt).await,
+            StartupCloseOutcome::Drained
+        );
+        assert!(startup.admit_local_io("close-first effect").is_err());
+    }
+
+    #[test]
+    fn startup_local_io_unfinished_stage_is_the_oldest_remaining_effect() {
+        let startup = StartupIoContext::new();
+        let oldest = startup.admit_local_io("oldest local effect").unwrap();
+        let newer = startup.admit_local_io("newer local effect").unwrap();
+
+        assert_eq!(startup.unfinished_stage(), "oldest local effect");
+        drop(oldest);
+        assert_eq!(startup.unfinished_stage(), "newer local effect");
+        drop(newer);
+        assert_eq!(startup.unfinished_stage(), "newer local effect");
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_permit_drops_during_panic_and_cloned_contexts_share_effects() {
+        let startup = StartupIoContext::new();
+        let panic_startup = startup.clone();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = panic_startup.admit_local_io("panic local effect").unwrap();
+            panic!("test local effect panic");
+        }))
+        .is_err());
+        assert!(startup.lock_state().effects.is_empty());
+
+        let permit = startup.admit_local_io("shared local effect").unwrap();
+        let closer = startup.clone();
+        let receipt = closer.cancel(Instant::now() + Duration::from_secs(1));
+        let waiter = tokio::spawn(async move { closer.await_close(&receipt).await });
+        tokio::task::yield_now().await;
+        drop(permit);
+        assert_eq!(waiter.await.unwrap(), StartupCloseOutcome::Drained);
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_close_receipts_replace_without_reopening_and_unresolved_is_sticky() {
+        let startup = StartupIoContext::new();
+        let internal = StartupIoContext::issue_cancellation_token();
+        let old = startup.cancel_for_shutdown(
+            internal,
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::Internal,
+        );
+        let external = StartupIoContext::issue_cancellation_token();
+        let current = startup.cancel_for_shutdown(
+            external,
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::External,
+        );
+
+        assert_eq!(
+            startup.await_close(&old).await,
+            StartupCloseOutcome::Replaced
+        );
+        assert!(startup.recognizes_close_receipt(&old));
+        assert!(startup.recognizes_close_receipt(&current));
+        assert_eq!(
+            startup.await_close(&current).await,
+            StartupCloseOutcome::Drained
+        );
+        assert!(startup.admit_local_io("replacement cannot reopen").is_err());
+
+        let sticky = StartupIoContext::new();
+        let permit = sticky
+            .admit_local_io("non-preemptible local effect")
+            .unwrap();
+        let expired = sticky.cancel(Instant::now());
+        let replacement = sticky.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::External,
+        );
+        assert_eq!(
+            sticky.await_close(&expired).await,
+            StartupCloseOutcome::Unresolved
+        );
+        drop(permit);
+        assert_eq!(
+            sticky.await_close(&replacement).await,
+            StartupCloseOutcome::Unresolved
+        );
+        assert_eq!(sticky.unfinished_stage(), "non-preemptible local effect");
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_drop_latches_an_expired_deadline_when_the_awaiter_is_starved() {
+        let startup = StartupIoContext::new();
+        let permit = startup.admit_local_io("starved local I/O effect").unwrap();
+        let receipt = startup.cancel(Instant::now() + Duration::from_millis(10));
+
+        // Poll exactly once so `await_close` has installed its sleep, then
+        // block the current-thread runtime across D.  The permit drop, rather
+        // than the delayed awaiter, must establish the close proof.
+        let mut close = Box::pin(startup.await_close(&receipt));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert_eq!(
+            std::future::Future::poll(std::pin::Pin::as_mut(&mut close), &mut context),
+            std::task::Poll::Pending
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        drop(permit);
+
+        assert_eq!(close.await, StartupCloseOutcome::Unresolved);
+        assert_eq!(startup.unfinished_stage(), "starved local I/O effect");
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_replacement_before_old_deadline_retires_old_deadline_proof() {
+        let startup = StartupIoContext::new();
+        let permit = startup
+            .admit_local_io("replacement race local I/O effect")
+            .unwrap();
+        let old = startup.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::Internal,
+        );
+        let current = startup.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_millis(30),
+            StartupCancellationAuthority::External,
+        );
+
+        // The old deadline has not reached D, but the replacement's deadline
+        // has.  A later permit drop is governed solely by the active current
+        // receipt: old remains `Replaced` even though current is unresolved.
+        std::thread::sleep(Duration::from_millis(60));
+        drop(permit);
+
+        assert_eq!(
+            startup.await_close(&old).await,
+            StartupCloseOutcome::Replaced
+        );
+        assert_eq!(
+            startup.await_close(&current).await,
+            StartupCloseOutcome::Unresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_old_deadline_before_replacement_latches_unresolved() {
+        let startup = StartupIoContext::new();
+        let permit = startup
+            .admit_local_io("old deadline local I/O effect")
+            .unwrap();
+        let old = startup.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_millis(10),
+            StartupCancellationAuthority::Internal,
+        );
+
+        // D linearizes while the old receipt still owns the gate.  The
+        // replacement below observes that fact under the same mutex before it
+        // retires the old receipt, so the result remains sticky.
+        std::thread::sleep(Duration::from_millis(30));
+        let current = startup.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::External,
+        );
+        drop(permit);
+
+        assert_eq!(
+            startup.await_close(&old).await,
+            StartupCloseOutcome::Unresolved
+        );
+        assert_eq!(
+            startup.await_close(&current).await,
+            StartupCloseOutcome::Unresolved
+        );
+        assert_eq!(startup.unfinished_stage(), "old deadline local I/O effect");
+    }
+
+    #[tokio::test]
+    async fn startup_local_io_close_does_not_lose_a_drop_after_subscription() {
+        let startup = StartupIoContext::new();
+        let permit = startup.admit_local_io("lost wake local effect").unwrap();
+        let receipt = startup.cancel(Instant::now() + Duration::from_secs(1));
+
+        let mut changes = startup.inner.changes.subscribe();
+        {
+            let state = startup.lock_state();
+            assert_eq!(state.effects.len(), 1);
+        }
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            startup.await_close(&receipt).await,
+            StartupCloseOutcome::Drained
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_local_io_spawn_blocking_abort_leaves_a_stable_unresolved_receipt() {
+        let startup = StartupIoContext::new();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let worker_startup = startup.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = worker_startup
+                .admit_local_io("spawn blocking local effect")
+                .unwrap();
+            started.send(()).unwrap();
+            let (released, condition) = &*worker_gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+        });
+        started_rx.await.unwrap();
+        worker.abort();
+
+        let receipt = startup.cancel(Instant::now() + Duration::from_millis(20));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), startup.await_close(&receipt))
+                .await
+                .unwrap(),
+            StartupCloseOutcome::Unresolved
+        );
+        let (released, condition) = &*gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        worker.await.unwrap();
+        assert_eq!(
+            startup.await_close(&receipt).await,
+            StartupCloseOutcome::Unresolved
+        );
+    }
+
+    #[test]
+    fn startup_local_io_effect_id_overflow_fails_without_reuse() {
+        let allocator = AtomicU64::new(u64::MAX);
+        assert_eq!(
+            allocate_startup_local_io_effect_id(&allocator).unwrap(),
+            u64::MAX
+        );
+        assert!(matches!(
+            allocate_startup_local_io_effect_id(&allocator),
+            Err(NodeError::Invariant(message)) if message == "startup local I/O effect id exhausted"
+        ));
+        assert!(matches!(
+            allocate_startup_local_io_effect_id(&allocator),
+            Err(NodeError::Invariant(message)) if message == "startup local I/O effect id exhausted"
+        ));
+        assert_eq!(allocator.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_close_receipt_overflow_fails_closed_without_reuse() {
+        let startup = StartupIoContext::new();
+        startup.lock_state().next_receipt_id = u64::MAX;
+        let final_receipt = startup.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::Internal,
+        );
+        let overflow = startup.cancel_for_shutdown(
+            StartupIoContext::issue_cancellation_token(),
+            Instant::now() + Duration::from_secs(1),
+            StartupCancellationAuthority::External,
+        );
+
+        assert!(startup.recognizes_close_receipt(&final_receipt));
+        assert!(!startup.recognizes_close_receipt(&overflow));
+        assert_ne!(final_receipt, overflow);
+        assert_eq!(
+            startup.await_close(&final_receipt).await,
+            StartupCloseOutcome::Unresolved
+        );
+        assert_eq!(
+            startup.await_close(&overflow).await,
+            StartupCloseOutcome::Unresolved
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    fn startup_local_io_runtime_parts(
+        root: &tempfile::TempDir,
+        name: &str,
+    ) -> (NodeConfig, Arc<ThreeNodeConsensus>) {
+        let cluster_id = format!("rhiza:sql:startup-local-io-{name}");
+        let config = NodeConfig::new_embedded(
+            &cluster_id,
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                &cluster_id,
+                "n1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/n1"),
+                    root.path().join("recorders/n2"),
+                    root.path().join("recorders/n3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        (config, consensus)
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn runtime_open_close_first_retries_with_the_same_context_create_no_node_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, consensus) = startup_local_io_runtime_parts(&root, "close-first");
+        let startup = StartupIoContext::new();
+        let receipt = startup.cancel(Instant::now() + Duration::from_secs(1));
+
+        let first =
+            NodeRuntime::open_cancellable(config.clone(), Arc::clone(&consensus), &[], &startup)
+                .unwrap_err();
+        let retry =
+            NodeRuntime::open_cancellable(config.clone(), consensus, &[], &startup).unwrap_err();
+        assert!(
+            matches!(first, NodeError::StartupCancelled { .. }),
+            "{first}"
+        );
+        assert!(
+            matches!(retry, NodeError::StartupCancelled { .. }),
+            "{retry}"
+        );
+        assert!(!config.data_dir().exists());
+        assert!(startup.recognizes_close_receipt(&receipt));
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_lock_effect_admitted_before_close_drains_after_file_lock_completes() {
+        let _hook_lock = test_startup_effect_hook_lock().lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let (config, consensus) = startup_local_io_runtime_parts(&root, "lock-drain");
+        let startup = StartupIoContext::new();
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _hook = install_test_startup_local_io_hook(TestStartupLocalIoHook {
+            context_id: startup.inner.context_id,
+            stage: "runtime data lock acquisition",
+            entered,
+            release: Arc::clone(&release),
+        });
+        let worker_config = config.clone();
+        let worker_startup = startup.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            NodeRuntime::open_cancellable(worker_config, consensus, &[], &worker_startup)
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let receipt = startup.cancel(Instant::now() + Duration::from_secs(1));
+        let mut close = Box::pin(startup.await_close(&receipt));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut close)
+                .await
+                .is_err(),
+            "close must wait for the admitted lock effect"
+        );
+        assert!(config.data_dir().exists());
+        assert!(!config.data_dir().join(".node.lock").exists());
+
+        let (released, condition) = &*release;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        let error = worker.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, NodeError::StartupCancelled { .. }),
+            "{error}"
+        );
+        assert!(config.data_dir().join(".node.lock").exists());
+        assert_eq!(close.await, StartupCloseOutcome::Drained);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_persist_partial_qlog_append_preserves_injected_materializer_source_and_drains()
+    {
+        let _hook_lock = test_startup_effect_hook_lock().lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let (config, _consensus) = startup_local_io_runtime_parts(&root, "persist-partial");
+        fs::create_dir_all(config.data_dir()).unwrap();
+        let log_store = FileLogStore::open_with_configuration(
+            config.data_dir().join("consensus/log"),
+            config.cluster_id(),
+            config.epoch(),
+            config.log_initial_configuration().clone(),
+        )
+        .unwrap();
+        let materializer =
+            super::Materializer::open(&config, config.log_initial_configuration(), None).unwrap();
+        let payload = Vec::new();
+        let entry = LogEntry {
+            cluster_id: config.cluster_id().to_owned(),
+            epoch: config.epoch(),
+            config_id: config.config_id(),
+            index: 1,
+            entry_type: EntryType::Noop,
+            prev_hash: LogHash::ZERO,
+            hash: LogEntry::calculate_hash(
+                config.cluster_id(),
+                1,
+                config.epoch(),
+                config.config_id(),
+                EntryType::Noop,
+                LogHash::ZERO,
+                &payload,
+            ),
+            payload,
+        };
+        let injected = NodeError::Reconciliation("injected materializer apply source".into());
+        let startup = StartupIoContext::new();
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _hook = install_test_startup_persistence_hook(TestStartupPersistenceHook {
+            context_id: startup.inner.context_id,
+            entered,
+            release: Arc::clone(&release),
+            error: injected.clone(),
+        });
+        let worker_config = config.clone();
+        let worker_startup = startup.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            persist_startup_entry(
+                &worker_config,
+                &log_store,
+                &materializer,
+                &entry,
+                1,
+                LogHash::ZERO,
+                &worker_startup,
+            )
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let receipt = startup.cancel(Instant::now() + Duration::from_secs(1));
+        let mut close = Box::pin(startup.await_close(&receipt));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut close)
+                .await
+                .is_err(),
+            "close must wait after qlog append until the persistence effect returns"
+        );
+        let (released, condition) = &*release;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        assert_eq!(worker.await.unwrap().unwrap_err(), injected);
+        let appended = FileLogStore::open_with_configuration(
+            config.data_dir().join("consensus/log"),
+            config.cluster_id(),
+            config.epoch(),
+            config.log_initial_configuration().clone(),
+        )
+        .unwrap();
+        assert_eq!(appended.last_index().unwrap(), Some(1));
+        assert_eq!(close.await, StartupCloseOutcome::Drained);
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn runtime_qlog_open_failure_preserves_source_and_retry_uses_the_same_context() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, consensus) = startup_local_io_runtime_parts(&root, "qlog-retry");
+        fs::create_dir_all(config.data_dir()).unwrap();
+        fs::write(config.data_dir().join("consensus"), b"not a directory").unwrap();
+        let expected = FileLogStore::open_with_configuration(
+            config.data_dir().join("consensus/log"),
+            config.cluster_id(),
+            config.epoch(),
+            config.log_initial_configuration().clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        let startup = StartupIoContext::new();
+
+        let error =
+            NodeRuntime::open_cancellable(config.clone(), Arc::clone(&consensus), &[], &startup)
+                .unwrap_err();
+        assert_eq!(error, NodeError::Storage(expected));
+        assert!(startup.lock_state().effects.is_empty());
+
+        fs::remove_file(config.data_dir().join("consensus")).unwrap();
+        let runtime = NodeRuntime::open_cancellable(config, consensus, &[], &startup).unwrap();
+        assert!(runtime.is_ready());
+    }
+
+    #[cfg(all(feature = "sql", unix))]
+    #[test]
+    fn runtime_materializer_open_failure_preserves_its_exact_source() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, consensus) = startup_local_io_runtime_parts(&root, "materializer-source");
+        fs::create_dir_all(config.data_dir()).unwrap();
+        FileLogStore::open_with_configuration(
+            config.data_dir().join("consensus/log"),
+            config.cluster_id(),
+            config.epoch(),
+            config.log_initial_configuration().clone(),
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(config.data_dir().join(".node.lock"))
+            .unwrap();
+        let original_permissions = fs::metadata(config.data_dir()).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o500);
+        fs::set_permissions(config.data_dir(), read_only).unwrap();
+
+        let expected =
+            match super::Materializer::open(&config, config.log_initial_configuration(), None) {
+                Ok(_) => panic!("materializer open unexpectedly succeeded"),
+                Err(error) => error,
+            };
+        let actual =
+            NodeRuntime::open_cancellable(config.clone(), consensus, &[], &StartupIoContext::new())
+                .unwrap_err();
+        fs::set_permissions(config.data_dir(), original_permissions).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn startup_cancellation_publication_and_precedence_are_atomic() {
+        for _ in 0..1_000 {
+            let startup = StartupIoContext::new();
+            let internal = StartupIoContext::issue_cancellation_token();
+            let external = StartupIoContext::issue_cancellation_token();
+            let internal_deadline = Instant::now() + Duration::from_secs(25);
+            let external_deadline = Instant::now() + Duration::from_millis(250);
+            startup.cancel_for_shutdown(
+                internal.clone(),
+                internal_deadline,
+                StartupCancellationAuthority::Internal,
+            );
+
+            let barrier = Arc::new(Barrier::new(2));
+            let checker_startup = startup.clone();
+            let checker_internal = internal.clone();
+            let checker_external = external.clone();
+            let checker_barrier = Arc::clone(&barrier);
+            let checker = std::thread::spawn(move || {
+                checker_barrier.wait();
+                for _ in 0..8 {
+                    match checker_startup.check("concurrent startup cancellation check") {
+                        Err(NodeError::StartupCancelled { token, .. }) => {
+                            assert!(token == checker_internal || token == checker_external);
+                        }
+                        result => {
+                            panic!("cancellation metadata was not atomically published: {result:?}")
+                        }
+                    }
+                }
+            });
+            barrier.wait();
+            startup.cancel_for_shutdown(
+                external.clone(),
+                external_deadline,
+                StartupCancellationAuthority::External,
+            );
+            checker.join().unwrap();
+            let state = startup.lock_state();
+            let cancellation = state.cancellation.as_ref().unwrap();
+            assert_eq!(cancellation.token, external);
+            assert_eq!(cancellation.deadline, external_deadline);
+            assert_eq!(
+                cancellation.authority,
+                StartupCancellationAuthority::External
+            );
+            drop(state);
+
+            let later_internal = StartupIoContext::issue_cancellation_token();
+            startup.cancel_for_shutdown(
+                later_internal,
+                Instant::now(),
+                StartupCancellationAuthority::Internal,
+            );
+            let state = startup.lock_state();
+            let cancellation = state.cancellation.as_ref().unwrap();
+            assert_eq!(cancellation.token, external);
+            assert_eq!(cancellation.deadline, external_deadline);
+        }
+    }
+
+    #[test]
+    fn startup_cancellation_allocator_exhausts_without_reusing_a_generation() {
+        let allocator = AtomicU64::new(u64::MAX);
+        let last = allocate_startup_cancellation_generation(&allocator);
+        assert_eq!(last, u64::MAX);
+        assert_eq!(allocator.load(Ordering::Acquire), 0);
+        assert!(std::panic::catch_unwind(|| {
+            allocate_startup_cancellation_generation(&allocator)
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            allocate_startup_cancellation_generation(&allocator)
+        })
+        .is_err());
+        assert_eq!(allocator.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -10941,6 +13928,44 @@ mod tests {
         assert!(slots.try_acquire().is_ok());
     }
 
+    #[test]
+    fn peer_permit_body_holds_capacity_through_frames_until_eof_or_drop() {
+        use http_body::Body as _;
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let response = Response::new(Body::new(PendingThenDataBody { state: 0 }));
+        let mut body =
+            retain_peer_permit_until_response_body_complete(response, permit).into_body();
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+
+        assert!(slots.try_acquire().is_err());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(slots.try_acquire().is_err());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut context),
+            std::task::Poll::Ready(Some(Ok(_)))
+        ));
+        assert!(slots.try_acquire().is_err());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut context),
+            std::task::Poll::Ready(None)
+        ));
+        assert!(slots.try_acquire().is_ok());
+
+        let dropped_permit = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let dropped_response = Response::new(Body::new(PendingThenDataBody { state: 0 }));
+        let dropped_body =
+            retain_peer_permit_until_response_body_complete(dropped_response, dropped_permit);
+        assert!(slots.try_acquire().is_err());
+        drop(dropped_body);
+        assert!(slots.try_acquire().is_ok());
+    }
+
     #[cfg(feature = "graph")]
     #[test]
     fn graph_client_query_error_returns_400_without_latching_readiness() {
@@ -11427,6 +14452,74 @@ mod tests {
                 .len()
                 > MAX_COMMAND_BYTES
         );
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_largest_fitting_prefix_is_exact_for_large_grouped_batch() {
+        let commands = (0..64)
+            .map(|id| {
+                GraphCommandV1::put_document(
+                    format!("graph-prefix-{id:04}"),
+                    format!("document-{id:04}"),
+                    GraphValueV1::String("x".repeat(16 * 1024)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            super::encode_replicated_graph_batch(&commands)
+                .unwrap()
+                .len()
+                > MAX_COMMAND_BYTES
+        );
+        let expected = (2..commands.len())
+            .rev()
+            .find(|count| {
+                super::encode_replicated_graph_batch(&commands[..*count])
+                    .unwrap()
+                    .len()
+                    <= MAX_COMMAND_BYTES
+            })
+            .unwrap();
+
+        let (count, payload) = super::largest_fitting_graph_batch_prefix(&commands).unwrap();
+
+        assert_eq!(count, expected);
+        assert_eq!(
+            payload,
+            super::encode_replicated_graph_batch(&commands[..count]).unwrap()
+        );
+        assert!(payload.len() <= MAX_COMMAND_BYTES);
+        assert!(
+            super::encode_replicated_graph_batch(&commands[..count + 1])
+                .unwrap()
+                .len()
+                > MAX_COMMAND_BYTES
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_largest_fitting_prefix_returns_none_when_no_multi_command_prefix_fits() {
+        let commands = (0..3)
+            .map(|id| {
+                GraphCommandV1::put_document(
+                    format!("graph-single-{id}"),
+                    format!("document-{id}"),
+                    GraphValueV1::String("x".repeat(256 * 1024)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            super::encode_replicated_graph_batch(&commands)
+                .unwrap()
+                .len()
+                > MAX_COMMAND_BYTES
+        );
+        assert_eq!(super::largest_fitting_graph_batch_prefix(&commands), None);
     }
 
     #[cfg(feature = "kv")]
@@ -12272,6 +15365,7 @@ mod tests {
         let winner = runtime
             .consensus()
             .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                 2,
                 schema.hash,
                 Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -12725,6 +15819,1021 @@ mod tests {
         let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
         (dir, runtime)
     }
+
+    #[test]
+    fn recorder_wire_preserves_rpc_error_kinds() {
+        for error in [
+            rhiza_quepaxa::Error::RpcCancelled,
+            rhiza_quepaxa::Error::RpcDeadlineExceeded,
+            rhiza_quepaxa::Error::UnknownOutcome,
+            rhiza_quepaxa::Error::Io("definite transport failure".into()),
+        ] {
+            let decoded = super::recorder_error_from_wire(super::recorder_wire_error(error));
+            assert!(matches!(
+                decoded,
+                rhiza_quepaxa::Error::RpcCancelled
+                    | rhiza_quepaxa::Error::RpcDeadlineExceeded
+                    | rhiza_quepaxa::Error::UnknownOutcome
+                    | rhiza_quepaxa::Error::Io(_)
+            ));
+        }
+        let chain = rhiza_quepaxa::Error::ChainConflict {
+            slot: 7,
+            expected_prev_hash: LogHash::ZERO,
+            actual_prev_hash: LogHash::digest(&[b"conflict"]),
+        };
+        assert_eq!(
+            super::recorder_error_from_wire(super::recorder_wire_error(chain.clone())),
+            chain
+        );
+        assert_eq!(
+            super::recorder_error_from_wire(super::recorder_wire_error(
+                rhiza_quepaxa::Error::ConflictingCertificates,
+            )),
+            rhiza_quepaxa::Error::ConflictingCertificates
+        );
+        assert!(matches!(
+            super::recorder_error_from_wire(super::RecorderWireError {
+                code: super::RecorderWireErrorCode::Other,
+                message: "unknown future safety code".into(),
+                detail: None,
+            }),
+            rhiza_quepaxa::Error::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn bounded_json_encoder_accepts_exact_output_and_rejects_one_byte_over() {
+        let value = vec!["x"; 31];
+        let expected = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            super::bounded_json_encode(
+                &value,
+                expected.len(),
+                super::RECORDER_HTTP_REQUEST_LIMIT_ERROR,
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(super::bounded_json_encode(
+            &value,
+            expected.len() - 1,
+            super::RECORDER_HTTP_REQUEST_LIMIT_ERROR,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn oversized_http_mutation_is_definite_before_worker_or_network_admission() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let command = StoredCommand::new(EntryType::Command, vec![0_u8; MAX_HTTP_BODY_BYTES]);
+        let result = client.store_command_for(
+            &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+            "rhiza:sql:cluster-a".into(),
+            1,
+            1,
+            LogHash::ZERO,
+            command.hash(),
+            command,
+        );
+        assert!(matches!(
+            result,
+            Err(rhiza_quepaxa::Error::Decode(message))
+                if message == super::RECORDER_HTTP_REQUEST_LIMIT_ERROR
+        ));
+        assert_eq!(
+            *client.shared.available_workers.lock().unwrap(),
+            HTTP_RECORDER_MAX_CONCURRENT_WORKERS
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_rejects_schema_valid_many_member_request_at_decode_budget_and_recovers()
+    {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                recorder_router(
+                    CountingHttpIdentity {
+                        calls: server_calls,
+                    },
+                    vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()],
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let body = super::RecorderWire {
+            version: RECORDER_WIRE_VERSION,
+            remaining_deadline_ms: 1_000,
+            body: super::InstallProofV2 {
+                proof: DecisionProof::FastPath {
+                    cluster_id: "cluster".into(),
+                    slot: 1,
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    proposal: Proposal::nil(),
+                    summaries: Vec::new(),
+                },
+                // The request is schema-valid. Empty members would be
+                // rejected later by Membership::from_voters, but this
+                // many-small Vec<String> must fail first at the bounded
+                // owned-decode allocation gate.
+                members: vec![String::new(); 200_000],
+            },
+        };
+        let encoded = serde_json::to_vec(&body).unwrap();
+        assert!(encoded.len() < MAX_HTTP_BODY_BYTES);
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}{RECORDER_INSTALL_PROOF_PATH}"))
+            .header(VERSION_HEADER, RECORDER_PROTOCOL_VERSION)
+            .header(super::NODE_ID_HEADER, "node-2")
+            .header(super::RECOVERY_GENERATION_HEADER, "1")
+            .bearer_auth("peer-token-2")
+            .header(CONTENT_TYPE, "application/json")
+            .body(encoded)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let error = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(error["body"]["status"], "Error");
+        assert_eq!(error["body"]["body"]["code"], "Decode");
+        assert_eq!(
+            error["body"]["body"]["detail"],
+            serde_json::json!({"Message": "recorder decode heap budget exceeded"})
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let recovered = tokio::task::spawn_blocking(move || {
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2")
+                .unwrap()
+                .recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered.unwrap(), "node-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_shared_decode_gate_is_32_and_recovers_after_release() {
+        let _lock = test_http_decode_hook_lock().lock().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _hook = install_test_http_decode_hook(TestHttpDecodeHook {
+            request_ids: Arc::new((0..33).collect()),
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                recorder_router_with_test_peer_concurrency(
+                    CountingHttpIdentity {
+                        calls: server_calls,
+                    },
+                    vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()],
+                    40,
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let http = reqwest::Client::new();
+        let mut requests = tokio::task::JoinSet::new();
+        for request_id in 0..33 {
+            let http = http.clone();
+            let url = format!("http://{address}{RECORDER_IDENTITY_PATH}");
+            requests.spawn(async move {
+                http.post(url)
+                    .header(VERSION_HEADER, RECORDER_PROTOCOL_VERSION)
+                    .header(super::NODE_ID_HEADER, "node-2")
+                    .header(super::RECOVERY_GENERATION_HEADER, "1")
+                    .header("x-rhiza-test-decode-id", request_id.to_string())
+                    .bearer_auth("peer-token-2")
+                    .json(&serde_json::json!({
+                        "version": RECORDER_WIRE_VERSION,
+                        "remaining_deadline_ms": 10_000,
+                        "body": null,
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            });
+        }
+        let mut entered = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let request_id = tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+                .await
+                .expect("decode gate did not admit 32 requests")
+                .expect("decode hook event channel closed");
+            assert!(
+                entered.insert(request_id),
+                "duplicate decode event {request_id}"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), entered_rx.recv())
+                .await
+                .is_err(),
+            "33rd request entered the 32-slot decode gate"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        release.notify_waiters();
+        let last = tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("33rd request did not enter after a decode permit was released")
+            .expect("decode hook event channel closed");
+        assert!(entered.insert(last));
+        assert_eq!(entered.len(), 33);
+        release.notify_waiters();
+        while let Some(result) = requests.join_next().await {
+            assert_eq!(result.unwrap(), StatusCode::OK);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 33);
+
+        let recovered = http
+            .post(format!("http://{address}{RECORDER_IDENTITY_PATH}"))
+            .header(VERSION_HEADER, RECORDER_PROTOCOL_VERSION)
+            .header(super::NODE_ID_HEADER, "node-2")
+            .header(super::RECOVERY_GENERATION_HEADER, "1")
+            .bearer_auth("peer-token-2")
+            .json(&serde_json::json!({
+                "version": RECORDER_WIRE_VERSION,
+                "remaining_deadline_ms": 1_000,
+                "body": null,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 34);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_http_backend_fetch_is_typed_decode_json_with_canonical_status() {
+        let response = super::recorder_v2_response::<Option<StoredCommand>>(Ok(Ok(Some(
+            StoredCommand::new(EntryType::Command, vec![0_u8; MAX_HTTP_BODY_BYTES]),
+        ))));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<super::RecorderWire<
+                super::RecorderV2Result<Option<StoredCommand>>,
+            >>(&body)
+            .unwrap()
+            .body,
+            super::RecorderV2Result::Error(error)
+                if matches!(error.code, super::RecorderWireErrorCode::Decode)
+                    && matches!(
+                        &error.detail,
+                        Some(super::RecorderWireErrorDetail::Message(message))
+                            if message == super::RECORDER_HTTP_RESPONSE_LIMIT_ERROR
+                    )
+        ));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                recorder_router(
+                    OversizedHttpFetch {
+                        calls: server_calls,
+                    },
+                    vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()],
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            client.fetch_command_for(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                "rhiza:sql:cluster-a".into(),
+                1,
+                1,
+                LogHash::ZERO,
+                LogHash::ZERO,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(rhiza_quepaxa::Error::Decode(message))
+                if message == super::RECORDER_HTTP_RESPONSE_LIMIT_ERROR
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_http_backend_record_is_typed_unknown_outcome_json() {
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"record".to_vec());
+        let request = RecordRequest {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot: 1,
+            step: 1,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "node-2",
+                1,
+                AcceptedValue::from_command(
+                    "rhiza:sql:cluster-a",
+                    1,
+                    1,
+                    1,
+                    LogHash::ZERO,
+                    &command,
+                ),
+            ),
+            command: Some(command),
+        };
+        let summary = RecordSummary {
+            recorder_id: "node-1".into(),
+            slot: request.slot,
+            config_id: request.config_id,
+            config_digest: request.config_digest,
+            step: request.step,
+            first_current: Some(request.proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let under_bound = super::recorder_v2_mutation_response(Ok(Ok(summary)));
+        assert_eq!(under_bound.status(), StatusCode::OK);
+        assert_eq!(
+            under_bound.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+
+        let oversized = RecordSummary {
+            recorder_id: "x".repeat(MAX_HTTP_BODY_BYTES),
+            slot: request.slot,
+            config_id: request.config_id,
+            config_digest: request.config_digest,
+            step: request.step,
+            first_current: Some(request.proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let response = super::recorder_v2_mutation_response(Ok(Ok(oversized)));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<super::RecorderWire<
+                super::RecorderV2Result<RecordSummary>,
+            >>(&body)
+            .unwrap()
+            .body,
+            super::RecorderV2Result::Error(error)
+                if matches!(error.code, super::RecorderWireErrorCode::UnknownOutcome)
+                    && error.detail.is_none()
+        ));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                recorder_router(
+                    OversizedHttpRecord {
+                        calls: server_calls,
+                    },
+                    vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()],
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            client.record(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                request,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(rhiza_quepaxa::Error::UnknownOutcome)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_clones_share_bounded_workers_and_cancel_waiters_without_spawning() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let blackhole = std::thread::spawn(move || {
+            let mut streams = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().unwrap();
+                if release_rx.try_recv().is_ok() {
+                    return;
+                }
+                accepted_tx.send(()).unwrap();
+                streams.push(stream);
+            }
+        });
+        let client = Arc::new(
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap(),
+        );
+        let active = (0..HTTP_RECORDER_MAX_CONCURRENT_WORKERS)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                std::thread::spawn(move || {
+                    client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                        Duration::from_secs(5),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..HTTP_RECORDER_MAX_CONCURRENT_WORKERS {
+            accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiting_client = client.as_ref().clone();
+        let waiting_cancelled = Arc::clone(&cancelled);
+        let waiting = std::thread::spawn(move || {
+            waiting_client.recorder_id(
+                &rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+                    Duration::from_secs(5),
+                    waiting_cancelled,
+                ),
+            )
+        });
+        let started = Instant::now();
+        cancelled.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            waiting.join().unwrap(),
+            Err(rhiza_quepaxa::Error::RpcCancelled)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "cancelled waiter did not observe the 10ms admission poll promptly"
+        );
+        assert!(
+            accepted_rx.try_recv().is_err(),
+            "a cancelled waiter spawned an HTTP worker despite no available slot"
+        );
+
+        let expired_client = client.as_ref().clone();
+        let expired = std::thread::spawn(move || {
+            expired_client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                Duration::from_millis(20),
+            ))
+        });
+        assert!(matches!(
+            expired.join().unwrap(),
+            Err(rhiza_quepaxa::Error::RpcDeadlineExceeded)
+        ));
+        assert!(
+            accepted_rx.try_recv().is_err(),
+            "an expired waiter spawned an HTTP worker despite no available slot"
+        );
+
+        release_tx.send(()).unwrap();
+        let _ = std::net::TcpStream::connect(address);
+        blackhole.join().unwrap();
+        for call in active {
+            assert!(call.join().unwrap().is_err());
+        }
+
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let recovered_server = tokio::spawn(async move {
+            let peers =
+                vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()];
+            axum::serve(listener, recorder_router(HttpIdentityRecorder, peers))
+                .await
+                .unwrap();
+        });
+        let recovered = Arc::clone(&client);
+        assert_eq!(
+            tokio::task::spawn_blocking(move || {
+                recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                    Duration::from_secs(2),
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap(),
+            "node-1"
+        );
+        recovered_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_rejects_content_length_oversize_before_body_read() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_HTTP_BODY_BYTES + 1
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                Duration::from_secs(2),
+            ))
+        });
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(rhiza_quepaxa::Error::Decode(_))
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "content-length oversize should reject before waiting for a body"
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_bounds_chunked_oversize_and_preserves_mutation_ambiguity() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let body = vec![b'x'; MAX_HTTP_BODY_BYTES + 1];
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+                let _ = stream.write_all(b"\r\n0\r\n\r\n");
+                let _ = stream.flush();
+            }
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let read_client = client.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                Duration::from_secs(2),
+            ))
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(read, Err(rhiza_quepaxa::Error::Decode(_))),
+            "chunked oversized read result: {read:?}"
+        );
+
+        let mutation = tokio::task::spawn_blocking(move || {
+            client.record(
+                &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    slot: 1,
+                    step: 1,
+                    proposal: rhiza_quepaxa::Proposal::nil(),
+                    command: None,
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            mutation,
+            Err(rhiza_quepaxa::Error::UnknownOutcome)
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_response_wire_mismatch_is_unknown_only_for_a_mutation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let malicious = || async {
+            Json(serde_json::json!({
+                "version": RECORDER_WIRE_VERSION - 1,
+                "remaining_deadline_ms": 1_000,
+                "body": {
+                    "status": "error",
+                    "body": {"code": "Other", "message": "wrong response envelope"}
+                }
+            }))
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(RECORDER_IDENTITY_PATH, post(malicious))
+                    .route(RECORDER_RECORD_PATH, post(malicious)),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let read_client = client.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                Duration::from_secs(2),
+            ))
+        })
+        .await
+        .unwrap();
+        assert!(matches!(read, Err(rhiza_quepaxa::Error::Decode(_))));
+
+        let mutation = tokio::task::spawn_blocking(move || {
+            client.record(
+                &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    slot: 1,
+                    step: 1,
+                    proposal: rhiza_quepaxa::Proposal::nil(),
+                    command: None,
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            mutation,
+            Err(rhiza_quepaxa::Error::UnknownOutcome)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_recorder_bounded_response_decode_keeps_local_and_declared_errors_distinct() {
+        type ProofResponse = super::RecorderWire<super::RecorderV2Result<Option<DecisionProof>>>;
+        let summary = RecorderSummary {
+            recorder_id: "r".into(),
+            slot: 1,
+            step: 1,
+            first_current: None,
+            aggregate_prior: None,
+        };
+        let per_summary = std::mem::size_of::<RecorderSummary>() * 3;
+        let summary_count = MAX_HTTP_BODY_BYTES
+            .saturating_mul(4)
+            .checked_div(per_summary)
+            .unwrap()
+            .saturating_add(1);
+        let response = ProofResponse {
+            version: RECORDER_WIRE_VERSION,
+            remaining_deadline_ms: 1_000,
+            body: super::RecorderV2Result::Ok(Some(DecisionProof::FastPath {
+                cluster_id: "cluster".into(),
+                slot: 1,
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                proposal: Proposal::nil(),
+                summaries: vec![summary; summary_count],
+            })),
+        };
+        let response = Arc::new(serde_json::to_vec(&response).unwrap());
+        assert!(response.len() < MAX_HTTP_BODY_BYTES);
+        assert!(matches!(
+            super::recorder_decode::decode_json_exact_bounded::<ProofResponse>(
+                response.as_ref(),
+                super::recorder_decode::RecorderDecodeLimits::for_wire_bytes(MAX_HTTP_BODY_BYTES),
+            ),
+            Err(super::recorder_decode::RecorderDecodeError::Decode(message))
+                if message == "recorder decode heap budget exceeded"
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let inspect_response = Arc::clone(&response);
+        let inspect_observed = observed_tx.clone();
+        let record_response = Arc::clone(&response);
+        let record_observed = observed_tx;
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        RECORDER_INSPECT_PROOF_PATH,
+                        post(move |request: Request| {
+                            let response = Arc::clone(&inspect_response);
+                            let observed = inspect_observed.clone();
+                            async move {
+                                let _ = observed.send((
+                                    request.uri().path().to_owned(),
+                                    request
+                                        .headers()
+                                        .get(VERSION_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                    request
+                                        .headers()
+                                        .get(super::NODE_ID_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                    request
+                                        .headers()
+                                        .get(super::RECOVERY_GENERATION_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                    request
+                                        .headers()
+                                        .get(CONTENT_TYPE)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                ));
+                                (
+                                    StatusCode::OK,
+                                    [(CONTENT_TYPE, "application/json")],
+                                    response.as_ref().clone(),
+                                )
+                            }
+                        }),
+                    )
+                    .route(
+                        RECORDER_RECORD_PATH,
+                        post(move |request: Request| {
+                            let response = Arc::clone(&record_response);
+                            let observed = record_observed.clone();
+                            async move {
+                                let _ = observed.send((
+                                    request.uri().path().to_owned(),
+                                    request
+                                        .headers()
+                                        .get(VERSION_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                    request
+                                        .headers()
+                                        .get(super::NODE_ID_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                    request
+                                        .headers()
+                                        .get(super::RECOVERY_GENERATION_HEADER)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                    request
+                                        .headers()
+                                        .get(CONTENT_TYPE)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned),
+                                ));
+                                (
+                                    StatusCode::OK,
+                                    [(CONTENT_TYPE, "application/json")],
+                                    response.as_ref().clone(),
+                                )
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let read_client = client.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_client.inspect_decision_proof(
+                &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                1,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            read,
+            Err(rhiza_quepaxa::Error::Decode(message))
+                if message == "recorder decode heap budget exceeded"
+        ));
+        let mutation = tokio::task::spawn_blocking(move || {
+            client.record(
+                &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    slot: 1,
+                    step: 1,
+                    proposal: rhiza_quepaxa::Proposal::nil(),
+                    command: None,
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            mutation,
+            Err(rhiza_quepaxa::Error::UnknownOutcome)
+        ));
+        let mut paths = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let (path, version, node_id, generation, content_type) =
+                tokio::time::timeout(Duration::from_secs(2), observed_rx.recv())
+                    .await
+                    .expect("fake peer did not observe the public HTTP client request")
+                    .expect("fake peer observation channel closed");
+            assert_eq!(version.as_deref(), Some(RECORDER_PROTOCOL_VERSION));
+            assert_eq!(node_id.as_deref(), Some("node-2"));
+            assert_eq!(generation.as_deref(), Some("1"));
+            assert_eq!(content_type.as_deref(), Some("application/json"));
+            paths.insert(path);
+        }
+        assert_eq!(
+            paths,
+            std::collections::HashSet::from([
+                RECORDER_INSPECT_PROOF_PATH.to_owned(),
+                RECORDER_RECORD_PATH.to_owned(),
+            ])
+        );
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    RECORDER_FETCH_COMMAND_PATH,
+                    post(|| async {
+                        super::recorder_v2_response::<Option<StoredCommand>>(Ok(Err(
+                            rhiza_quepaxa::Error::Decode("declared recorder decode".into()),
+                        )))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let typed = tokio::task::spawn_blocking(move || {
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2")
+                .unwrap()
+                .fetch_command_for(
+                    &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                    "cluster".into(),
+                    1,
+                    1,
+                    LogHash::ZERO,
+                    LogHash::ZERO,
+                )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            typed,
+            Err(rhiza_quepaxa::Error::Decode(message)) if message == "declared recorder decode"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_authenticated_recorder_saturation_is_a_definite_mutation_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let peers =
+                vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()];
+            axum::serve(
+                listener,
+                recorder_routes(
+                    HttpIdentityRecorder,
+                    peers,
+                    1,
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2")
+                .unwrap()
+                .record(
+                    &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                    RecordRequest {
+                        cluster_id: "cluster".into(),
+                        epoch: 1,
+                        config_id: 1,
+                        config_digest: LogHash::ZERO,
+                        slot: 1,
+                        step: 1,
+                        proposal: rhiza_quepaxa::Proposal::nil(),
+                        command: None,
+                    },
+                )
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(rhiza_quepaxa::Error::Io(_))),
+            "saturated mutation result: {result:?}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn startup_consensus_error_keeps_retry_and_reconciliation_classes() {
+        assert!(matches!(
+            super::startup_consensus_error(rhiza_quepaxa::Error::RpcCancelled),
+            NodeError::Unavailable(_)
+        ));
+        assert!(matches!(
+            super::startup_consensus_error(rhiza_quepaxa::Error::RpcDeadlineExceeded),
+            NodeError::Unavailable(_)
+        ));
+        assert!(matches!(
+            super::startup_consensus_error(rhiza_quepaxa::Error::UnknownOutcome),
+            NodeError::Reconciliation(_)
+        ));
+        assert!(matches!(
+            super::startup_consensus_error(rhiza_quepaxa::Error::ConflictingCertificates),
+            NodeError::Reconciliation(_)
+        ));
+        assert!(matches!(
+            super::startup_consensus_error(rhiza_quepaxa::Error::ChainConflict {
+                slot: 9,
+                expected_prev_hash: LogHash::ZERO,
+                actual_prev_hash: LogHash::digest(&[b"conflict"]),
+            }),
+            NodeError::Reconciliation(_)
+        ));
+    }
 }
 
 #[cfg(feature = "kv")]
@@ -12747,6 +16856,18 @@ fn largest_fitting_kv_batch_prefix(commands: &[KvCommandV1]) -> Option<(usize, V
         }
     }
     largest
+}
+
+#[cfg(feature = "graph")]
+fn largest_fitting_graph_batch_prefix(commands: &[GraphCommandV1]) -> Option<(usize, Vec<u8>)> {
+    for count in (2..commands.len()).rev() {
+        let payload = encode_replicated_graph_batch(&commands[..count])
+            .expect("the validated graph batch prefix remains valid");
+        if payload.len() <= MAX_COMMAND_BYTES {
+            return Some((count, payload));
+        }
+    }
+    None
 }
 
 #[cfg(feature = "graph")]
@@ -13048,7 +17169,11 @@ fn recover_peer_candidates(
         for candidate in candidates {
             startup.check("peer decision inspection")?;
             match consensus
-                .inspect_decision_at(expected_index, expected_prev_hash)
+                .inspect_decision_at(
+                    &startup.recorder_context(),
+                    expected_index,
+                    expected_prev_hash,
+                )
                 .map_err(startup_consensus_error)?
             {
                 DecisionInspection::Committed(committed) if committed == candidate => {
@@ -13104,7 +17229,7 @@ fn recover_startup_decisions(
         })?;
         startup.check("recorder decision inspection")?;
         match consensus
-            .inspect_decision_at(slot, last_hash)
+            .inspect_decision_at(&startup.recorder_context(), slot, last_hash)
             .map_err(startup_consensus_error)?
         {
             DecisionInspection::Committed(entry) => {
@@ -13121,11 +17246,11 @@ fn recover_startup_decisions(
             }
             DecisionInspection::Pending => {
                 let entry = consensus
-                    .propose_at_cancellable(
+                    .propose_at(
+                        startup.recorder_context(),
                         slot,
                         last_hash,
                         Command::new(CommandKind::ReadBarrier, Vec::new()),
-                        startup.cancellation_flag(),
                     )
                     .map_err(startup_consensus_error)?;
                 startup.check("recorder pending decision recovery")?;
@@ -13161,25 +17286,26 @@ fn persist_startup_entry(
     expected_prev_hash: LogHash,
     startup: &StartupIoContext,
 ) -> Result<(), NodeError> {
-    startup.persist("startup qlog and materializer persistence", || {
-        let configuration_state = log_store
-            .configuration_state()
-            .map_err(|error| NodeError::Storage(error.to_string()))?;
-        validate_runtime_entry(
-            config,
-            &configuration_state,
-            entry,
-            expected_index,
-            expected_prev_hash,
-        )?;
-        log_store
-            .append(entry)
-            .map_err(|error| NodeError::Storage(error.to_string()))?;
-        materializer
-            .apply_entry(entry)
-            .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
-        Ok(())
-    })
+    let _permit = startup.admit_local_io("startup qlog and materializer persistence")?;
+    let configuration_state = log_store
+        .configuration_state()
+        .map_err(|error| NodeError::Storage(error.to_string()))?;
+    validate_runtime_entry(
+        config,
+        &configuration_state,
+        entry,
+        expected_index,
+        expected_prev_hash,
+    )?;
+    log_store
+        .append(entry)
+        .map_err(|error| NodeError::Storage(error.to_string()))?;
+    #[cfg(test)]
+    test_startup_persistence_hook_after_qlog_append(startup.inner.context_id)?;
+    materializer
+        .apply_entry(entry)
+        .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+    Ok(())
 }
 
 fn static_log_tip(log_store: &FileLogStore) -> Result<(LogIndex, LogHash), NodeError> {
@@ -13271,9 +17397,13 @@ pub(crate) fn validate_profile_entry_shape(
 fn startup_consensus_error(error: rhiza_quepaxa::Error) -> NodeError {
     match error {
         rhiza_quepaxa::Error::NoQuorum
+        | rhiza_quepaxa::Error::ProposeFailed
         | rhiza_quepaxa::Error::CommandUnavailable
         | rhiza_quepaxa::Error::Cancelled
+        | rhiza_quepaxa::Error::RpcCancelled
+        | rhiza_quepaxa::Error::RpcDeadlineExceeded
         | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
+        rhiza_quepaxa::Error::UnknownOutcome => NodeError::Reconciliation(error.to_string()),
         other => NodeError::Reconciliation(other.to_string()),
     }
 }
@@ -13326,7 +17456,10 @@ pub async fn run_e2e(config: E2eConfig) -> Result<E2eReport, Box<dyn std::error:
         0,
         LogHash::ZERO,
     )?;
-    let base_entry = consensus.propose(Command::new(CommandKind::Deterministic, base_effect))?;
+    let base_entry = consensus.propose(
+        RecorderRpcContext::default_timeout(),
+        Command::new(CommandKind::Deterministic, base_effect),
+    )?;
     db.apply_entry(&base_entry)?;
     let snapshot = db.create_snapshot(base_entry.index)?;
 
@@ -13339,7 +17472,10 @@ pub async fn run_e2e(config: E2eConfig) -> Result<E2eReport, Box<dyn std::error:
         base_entry.index,
         base_entry.hash,
     )?;
-    let tail_entry = consensus.propose(Command::new(CommandKind::Deterministic, tail_effect))?;
+    let tail_entry = consensus.propose(
+        RecorderRpcContext::default_timeout(),
+        Command::new(CommandKind::Deterministic, tail_effect),
+    )?;
     let segment_path = write_segment_file(&log_dir, std::slice::from_ref(&tail_entry))?;
     let segment = rhiza_log::SegmentFile::new(
         IndexRange::new(tail_entry.index, tail_entry.index)?,

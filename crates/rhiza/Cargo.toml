@@ -19,9 +19,14 @@ default = ["sql"]
 sql = ["dep:rhiza-sql", "rhiza-node/sql"]
 graph = ["dep:rhiza-graph", "rhiza-node/graph"]
 recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
+# Non-production synchronization API used only by integration tests that must
+# pause the real service activation boundary.
+test-hooks = ["rhiza-node/test-hooks"]
 
 [dependencies]
 axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 rhiza-graph = { version = "0.2.0", path = "../rhiza-graph", optional = true }
@@ -32,7 +37,10 @@ rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tower.workspace = true
 
 [dev-dependencies]
+rcgen = "0.14"
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
+rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa", features = ["test-hooks"] }
 tempfile.workspace = true

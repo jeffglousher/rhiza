@@ -78,7 +78,15 @@ embedded facade and is consumed through `rhiza-client` or the HTTP API.
 values are weak handles that stop working after owner shutdown. Keep the owner
 alive while serving requests, drain the server first during planned shutdown,
 then call `shutdown().await` so durability and worker errors are reported.
-Dropping the owner only signals shutdown and cannot report those errors.
+Dropping the owner first closes admission and installs one shutdown deadline
+for the service, Recorder, and startup paths. It then gives the retained
+supervisor to its original Tokio runtime for cleanup only until that same
+deadline. Drop cannot report cleanup errors and, at the deadline, requests
+cancellation without claiming that non-preemptible blocking work or any late
+effects have completed. Planned shutdown must therefore await
+`shutdown().await`. A publication fence for effects produced after an
+uninterruptible blocking task is deliberately deferred; callers must not
+interpret Drop as proof that such late effects are impossible.
 
 ### 5-minute consumer app
 
@@ -221,9 +229,10 @@ Recorder-before-runtime ordering, checkpoint restore, successor proof
 installation, Recorder rehydration, runtime retry, and
 `CheckpointCoordinator` construction. The embedding application supplies
 provider configuration, prebound listeners, configuration-scoped Recorder and
-log-peer clients, and its process shutdown signal. Dropping `HaNode` requests
-best-effort shutdown but cannot report cleanup failures, so planned shutdown
-must always await `HaNode::shutdown`.
+log-peer clients, and its process shutdown signal. Dropping `HaNode` closes
+admission and starts same-deadline cleanup on the owner runtime, but cannot
+report cleanup failures or prove that non-preemptible blocking work has no
+late effects. Planned shutdown must always await `HaNode::shutdown`.
 
 Membership replacement moves restore and catch-up out of the Stop fence through
 `HaSuccessorPrestageConfig::start_live`. The returned `HaSuccessorNode` keeps

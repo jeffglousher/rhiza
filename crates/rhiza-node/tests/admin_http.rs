@@ -7,7 +7,7 @@ use axum::{
     Router,
 };
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_core::{ConfigurationState, LogAnchor, LogHash};
+use rhiza_core::{ConfigurationState, LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity};
 use rhiza_log::{IndexRange, LogStore};
 use rhiza_node::{
     install_successor_recorder, node_router, node_router_with_admin,
@@ -298,7 +298,10 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
     assert_eq!(status.node.stop_anchor, Some(stop_anchor));
     assert_eq!(status.members, old_membership().members());
     assert_eq!(status.qlog_root, stop_anchor);
-    assert_eq!(status.stopped_transition.as_ref().unwrap().stop, first.stop);
+    assert_eq!(
+        status.stopped_transition.as_ref().unwrap().stop_entry,
+        first.stop.entry
+    );
     assert_eq!(
         status.stopped_transition.as_ref().unwrap().successor,
         first.successor
@@ -318,6 +321,76 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
         .unwrap();
     assert_eq!(write.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(runtime.applied_index().unwrap(), first.stop.entry.index);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compacted_stop_status_fails_closed_without_remote_stop_recovery_or_latching() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+    let stopped = admin_post(
+        addr,
+        ADMIN_STOP_PATH,
+        &AdminStopRequest {
+            operation_id: "compacted-stop-status".into(),
+            expected_config_id: 1,
+            successor: successor_bundle(2, old_membership()),
+        },
+    )
+    .await;
+    assert_eq!(stopped.status(), reqwest::StatusCode::OK);
+    let stopped = stopped.json::<AdminStopResponse>().await.unwrap();
+    let stop_anchor = LogAnchor::new(stopped.stop.entry.index, stopped.stop.entry.hash);
+    let compacted = RecoveryAnchor::new(
+        "rhiza:sql:cluster-a",
+        1,
+        runtime.configuration_state().unwrap(),
+        1,
+        stop_anchor,
+        SnapshotIdentity::new(
+            "admin-status-local-observation",
+            LogHash::digest(&[b"admin-status-local-observation"]),
+            1,
+            rhiza_sql::sql_executor_fingerprint().unwrap(),
+        ),
+    );
+    runtime.log_store().compact_prefix(&compacted).unwrap();
+    assert!(runtime
+        .log_store()
+        .read(stop_anchor.index())
+        .unwrap()
+        .is_none());
+
+    let status = reqwest::Client::new()
+        .get(format!("http://{addr}{ADMIN_STATUS_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        status
+            .json::<rhiza_node::AdminErrorResponse>()
+            .await
+            .unwrap()
+            .code,
+        rhiza_node::AdminErrorCode::Unavailable
+    );
+    assert!(
+        runtime.is_ready(),
+        "status observation must not latch readiness"
+    );
+    assert!(!runtime.is_fatal());
     server.abort();
 }
 

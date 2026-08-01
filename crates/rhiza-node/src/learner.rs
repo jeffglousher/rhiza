@@ -307,7 +307,7 @@ async fn handle_certified_tail(
 fn read_certified_tail(
     state: &TailReaderState,
     request: CertifiedTailRequest,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
     deadline: Instant,
 ) -> Result<CertifiedTailResponse, TailReadError> {
     ensure_tail_read_active(cancelled, deadline)?;
@@ -364,9 +364,17 @@ fn read_certified_tail(
         {
             return Err(TailReadError::DecisionMismatch);
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TailReadError::Unavailable);
+        }
+        let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+            remaining,
+            Arc::clone(cancelled),
+        );
         let inspection = state
             .consensus
-            .inspect_certified_decision_at(index, local.prev_hash)
+            .inspect_certified_decision_at(&context, index, local.prev_hash)
             .map_err(|_| TailReadError::Unavailable)?;
         let CertifiedDecisionInspection::Committed(certified) = inspection else {
             break;

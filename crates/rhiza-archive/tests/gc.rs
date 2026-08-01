@@ -1,6 +1,6 @@
 use rhiza_archive::{
     CheckpointIdentity, CheckpointPublisherOptions, Error, GcLeaseKind, GcPolicy,
-    ObjectArchiveStore,
+    ObjectArchiveStore, RestoredCheckpoint,
 };
 use rhiza_core::{
     ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
@@ -14,6 +14,16 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+async fn load_restored_for_test(archive: &ObjectArchiveStore) -> RestoredCheckpoint {
+    archive
+        .load_checkpoint_restore()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .1
 }
 
 #[tokio::test]
@@ -125,7 +135,7 @@ async fn planning_does_not_block_publish_or_restore() {
         .unwrap();
 
     publish_result(&root).await.unwrap();
-    assert_eq!(root.restore_checkpoint().await.unwrap(), entries());
+    assert_eq!(load_restored_for_test(&root).await.suffix(), entries());
     root.execute_gc(plan.plan_hash(), NOW + 101).await.unwrap();
 }
 
@@ -249,8 +259,8 @@ async fn retained_generation_restores_while_retired_generation_fails_before_obje
         .unwrap();
     root.execute_gc(plan.plan_hash(), NOW + 2).await.unwrap();
 
-    assert_eq!(root.restore_checkpoint().await.unwrap(), entries());
-    assert_eq!(retained.restore_checkpoint().await.unwrap(), entries());
+    assert_eq!(load_restored_for_test(&root).await.suffix(), entries());
+    assert_eq!(load_restored_for_test(&retained).await.suffix(), entries());
     store
         .put(
             &retired.checkpoint_manifest_key().unwrap(),
@@ -259,7 +269,7 @@ async fn retained_generation_restores_while_retired_generation_fails_before_obje
         .await
         .unwrap();
     assert!(matches!(
-        retired.restore_checkpoint().await,
+        retired.load_checkpoint_restore().await,
         Err(Error::GenerationRetired { .. })
     ));
     assert!(matches!(
@@ -322,9 +332,8 @@ async fn gc_preserves_active_snapshot_and_collects_orphans_after_grace() {
     root.execute_gc(plan.plan_hash(), NOW + 11).await.unwrap();
     assert!(store.get(&active_key).await.is_ok());
     assert_eq!(
-        root.restore_checkpoint_state()
+        load_restored_for_test(&root)
             .await
-            .unwrap()
             .snapshot()
             .unwrap()
             .bytes(),

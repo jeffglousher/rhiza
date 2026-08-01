@@ -3,9 +3,11 @@ use std::{
     fmt, fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
 };
+#[cfg(test)]
+use std::{future::Future, pin::Pin};
 
 use axum::{
     extract::{rejection::JsonRejection, Extension, Request, State},
@@ -32,6 +34,11 @@ pub const ADMIN_STOP_PATH: &str = "/v1/admin/membership/stop";
 pub const ADMIN_INSTALL_SUCCESSOR_PATH: &str = "/v1/admin/membership/install-successor";
 pub const ADMIN_ACTIVATE_PATH: &str = "/v1/admin/membership/activate";
 pub const ADMIN_COMPACT_PATH: &str = "/v1/admin/checkpoint/compact";
+const ADMIN_STATUS_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ADMIN_STATUS_SNAPSHOT_MAX_IN_FLIGHT: usize = 1;
+
+#[cfg(test)]
+type StatusRefreshHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AdminConfig {
@@ -87,7 +94,7 @@ pub struct AdminStopResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct AdminStoppedTransition {
-    pub stop: StopInformation,
+    pub stop_entry: LogEntry,
     pub successor: AdminSuccessorBundle,
 }
 
@@ -175,9 +182,36 @@ pub struct AdminTaskTracker {
 }
 
 struct AdminTaskState {
-    accepting: AtomicBool,
-    active: AtomicUsize,
+    /// One atomic state word: the high bit closes admission and every lower
+    /// bit counts an already-admitted task.  Splitting these facts into two
+    /// atomics admits a task after shutdown has observed admission closed.
+    ///
+    /// Each successful compare-and-swap below is the operation's
+    /// linearization point.  In particular, either `try_start` increments
+    /// this word before `stop_admission` clears the high bit, or its CAS
+    /// retries against the closed word and declines admission.
+    state: AtomicUsize,
     changed: tokio::sync::watch::Sender<()>,
+    #[cfg(test)]
+    before_admission_cas: std::sync::Mutex<Option<AdminAdmissionCasHook>>,
+}
+
+const ADMIN_ADMISSION_OPEN: usize = 1usize << (usize::BITS - 1);
+const ADMIN_ACTIVE_MASK: usize = !ADMIN_ADMISSION_OPEN;
+
+#[cfg(test)]
+type AdminAdmissionCasHook = Arc<dyn Fn() + Send + Sync>;
+
+fn admin_accepting(state: usize) -> bool {
+    state & ADMIN_ADMISSION_OPEN != 0
+}
+
+fn admin_active(state: usize) -> usize {
+    state & ADMIN_ACTIVE_MASK
+}
+
+fn admin_is_quiescent(state: usize) -> bool {
+    !admin_accepting(state) && admin_active(state) == 0
 }
 
 impl AdminTaskTracker {
@@ -185,36 +219,73 @@ impl AdminTaskTracker {
         let (changed, _) = tokio::sync::watch::channel(());
         Self {
             state: Arc::new(AdminTaskState {
-                accepting: AtomicBool::new(true),
-                active: AtomicUsize::new(0),
+                state: AtomicUsize::new(ADMIN_ADMISSION_OPEN),
                 changed,
+                #[cfg(test)]
+                before_admission_cas: std::sync::Mutex::new(None),
             }),
         }
     }
 
     fn try_start(&self) -> Option<AdminTaskGuard> {
-        if !self.state.accepting.load(Ordering::Acquire) {
-            return None;
-        }
-        self.state.active.fetch_add(1, Ordering::AcqRel);
-        if self.state.accepting.load(Ordering::Acquire) {
-            Some(AdminTaskGuard {
-                state: Arc::clone(&self.state),
-            })
-        } else {
-            finish_admin_task(&self.state);
-            None
+        let mut observed = self.state.state.load(Ordering::Acquire);
+        loop {
+            if !admin_accepting(observed) || admin_active(observed) == ADMIN_ACTIVE_MASK {
+                return None;
+            }
+            #[cfg(test)]
+            self.run_before_admission_cas_hook();
+            match self.state.state.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.state.changed.send_replace(());
+                    return Some(AdminTaskGuard {
+                        state: Arc::clone(&self.state),
+                    });
+                }
+                Err(current) => observed = current,
+            }
         }
     }
 
     pub fn stop_admission(&self) {
-        self.state.accepting.store(false, Ordering::Release);
+        let mut observed = self.state.state.load(Ordering::Acquire);
+        loop {
+            if !admin_accepting(observed) {
+                return;
+            }
+            let closed = observed & ADMIN_ACTIVE_MASK;
+            match self.state.state.compare_exchange_weak(
+                observed,
+                closed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // A waiter may have observed an open-but-idle state.
+                    // Publish the close transition as well as completion so
+                    // the subscribe-then-observe wait protocol cannot lose
+                    // the only transition to quiescence.
+                    self.state.changed.send_replace(());
+                    return;
+                }
+                Err(current) => observed = current,
+            }
+        }
     }
 
+    /// Waits until admission is closed *and* every task admitted before that
+    /// closing transition has dropped its guard.  The watcher is subscribed
+    /// before the state read: a transition after subscription advances the
+    /// watch version, while a transition before it is reflected in the read.
     pub async fn wait_for_idle(&self) {
         let mut changed = self.state.changed.subscribe();
         loop {
-            if self.state.active.load(Ordering::Acquire) == 0 {
+            if admin_is_quiescent(self.state.state.load(Ordering::Acquire)) {
                 return;
             }
             if changed.changed().await.is_err() {
@@ -222,10 +293,62 @@ impl AdminTaskTracker {
             }
         }
     }
+
+    /// Constructs an admission tracker for cross-crate lifecycle tests.
+    ///
+    /// This is intentionally unavailable in production builds; production
+    /// trackers are created only by the authenticated admin router.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_tracker() -> Self {
+        Self::new()
+    }
+
+    /// Starts a synthetic *already-admitted* admin operation for a lifecycle
+    /// test. New admission still goes through the real authenticated router.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_start_admitted(&self) -> Option<AdminTestTaskGuard> {
+        self.try_start()
+            .map(|guard| AdminTestTaskGuard { _guard: guard })
+    }
+
+    #[cfg(test)]
+    fn with_before_admission_cas_hook(hook: AdminAdmissionCasHook) -> Self {
+        let tracker = Self::new();
+        *tracker
+            .state
+            .before_admission_cas
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+        tracker
+    }
+
+    #[cfg(test)]
+    fn run_before_admission_cas_hook(&self) {
+        let hook = self
+            .state
+            .before_admission_cas
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 struct AdminTaskGuard {
     state: Arc<AdminTaskState>,
+}
+
+/// Test-only RAII proof of an admin task that passed admission before HA
+/// shutdown began. Dropping it is the same completion transition used by the
+/// real middleware permit.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct AdminTestTaskGuard {
+    _guard: AdminTaskGuard,
 }
 
 impl Drop for AdminTaskGuard {
@@ -235,8 +358,25 @@ impl Drop for AdminTaskGuard {
 }
 
 fn finish_admin_task(state: &AdminTaskState) {
-    if state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-        state.changed.send_replace(());
+    let mut observed = state.state.load(Ordering::Acquire);
+    loop {
+        let active = admin_active(observed);
+        assert!(active > 0, "admin task guard completed more than once");
+        match state.state.compare_exchange_weak(
+            observed,
+            observed - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Notify every state transition, not only 1 -> 0. This keeps
+                // the watcher protocol valid even when stop and completion
+                // race on opposite sides of its state observation.
+                state.changed.send_replace(());
+                return;
+            }
+            Err(current) => observed = current,
+        }
     }
 }
 
@@ -250,6 +390,13 @@ struct AdminRouteState {
     runtime: Arc<NodeRuntime>,
     recorder: RecorderFileStore,
     coordinator: Option<Arc<CheckpointCoordinator>>,
+    status_snapshots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    status_snapshot_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_refresh_durable_tip_hook: Option<StatusRefreshHook>,
+    #[cfg(test)]
+    status_snapshot_timeout: std::time::Duration,
     operations: Arc<tokio::sync::Mutex<Option<HashMap<String, OperationRecord>>>>,
     ledger_path: PathBuf,
 }
@@ -347,6 +494,15 @@ fn admin_router(
         runtime,
         recorder,
         coordinator,
+        status_snapshots: Arc::new(tokio::sync::Semaphore::new(
+            ADMIN_STATUS_SNAPSHOT_MAX_IN_FLIGHT,
+        )),
+        #[cfg(test)]
+        status_snapshot_hook: None,
+        #[cfg(test)]
+        before_refresh_durable_tip_hook: None,
+        #[cfg(test)]
+        status_snapshot_timeout: ADMIN_STATUS_SNAPSHOT_TIMEOUT,
         operations: Arc::new(tokio::sync::Mutex::new(operations)),
         ledger_path,
     };
@@ -396,10 +552,22 @@ async fn handle_status(
     State(state): State<AdminRouteState>,
     Extension(_permit): Extension<Arc<AdminPermit>>,
 ) -> Response {
-    let _operations = state.operations.lock().await;
-    match status_response(&state).await {
+    let deadline = tokio::time::Instant::now() + status_snapshot_timeout(&state);
+    match status_response(&state, deadline).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => node_admin_error(error),
+    }
+}
+
+fn status_snapshot_timeout(state: &AdminRouteState) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        state.status_snapshot_timeout
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        ADMIN_STATUS_SNAPSHOT_TIMEOUT
     }
 }
 
@@ -645,28 +813,125 @@ fn store_result<R: Serialize>(
     (status, Json(body)).into_response()
 }
 
-async fn status_response(state: &AdminRouteState) -> Result<AdminStatusResponse, NodeError> {
+async fn status_response(
+    state: &AdminRouteState,
+    deadline: tokio::time::Instant,
+) -> Result<AdminStatusResponse, NodeError> {
+    let admission = admit_status_snapshot(Arc::clone(&state.status_snapshots))?;
     let checkpoint_root = match state.coordinator.as_ref() {
         Some(coordinator) => {
-            let tip = coordinator
-                .refresh_durable_tip()
+            #[cfg(test)]
+            if let Some(hook) = state.before_refresh_durable_tip_hook.as_ref() {
+                tokio::time::timeout_at(deadline, hook())
+                    .await
+                    .map_err(|_| {
+                        NodeError::Unavailable(
+                            "admin status refresh exceeded its response deadline".into(),
+                        )
+                    })?;
+            }
+            let tip = tokio::time::timeout_at(deadline, coordinator.refresh_durable_tip())
                 .await
+                .map_err(|_| {
+                    NodeError::Unavailable(
+                        "admin status refresh exceeded its response deadline".into(),
+                    )
+                })?
                 .map_err(|error| NodeError::Unavailable(error.to_string()))?;
             Some(LogAnchor::new(tip.index(), tip.hash()))
         }
         None => None,
     };
-    let _commit = state.runtime.lock_commit()?;
-    let node = state.runtime.status()?;
-    let qlog_root = state.runtime.log_root_unlocked()?;
-    let stopped_transition = stopped_transition(&state.runtime)?;
+    let runtime = Arc::clone(&state.runtime);
+    #[cfg(test)]
+    let status_snapshot_hook = state.status_snapshot_hook.clone();
+    run_status_snapshot_until(deadline, move || {
+        // This permit intentionally belongs to the blocking closure, rather
+        // than the response future.  A timed-out or disconnected caller must
+        // not admit another snapshot until this one has actually stopped.
+        let _admission = admission;
+        #[cfg(test)]
+        if let Some(hook) = status_snapshot_hook {
+            hook();
+        }
+        status_snapshot(&runtime, checkpoint_root)
+    })
+    .await
+}
+
+fn admit_status_snapshot(
+    admission: Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, NodeError> {
+    admission
+        .try_acquire_owned()
+        .map_err(|_| NodeError::Unavailable("admin status snapshot capacity is exhausted".into()))
+}
+
+// Status collection reads only local qlog and immutable predecessor Stop
+// evidence under the commit lock. Keep that synchronous observation off an
+// async request worker; dropping the returned future detaches the read-only
+// task instead of joining it indefinitely.
+#[cfg(test)]
+async fn run_status_snapshot<T>(
+    snapshot: impl FnOnce() -> Result<T, NodeError> + Send + 'static,
+) -> Result<T, NodeError>
+where
+    T: Send + 'static,
+{
+    run_status_snapshot_until(
+        tokio::time::Instant::now() + ADMIN_STATUS_SNAPSHOT_TIMEOUT,
+        snapshot,
+    )
+    .await
+}
+
+async fn run_status_snapshot_until<T>(
+    deadline: tokio::time::Instant,
+    snapshot: impl FnOnce() -> Result<T, NodeError> + Send + 'static,
+) -> Result<T, NodeError>
+where
+    T: Send + 'static,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return Err(NodeError::Unavailable(
+            "admin status snapshot exceeded its response deadline".into(),
+        ));
+    }
+    // `timeout` drops the JoinHandle on expiry.  Tokio cannot interrupt a
+    // running blocking closure, so it may finish later; this particular
+    // closure is a read-only status snapshot and holds an Arc<NodeRuntime>,
+    // never an admin mutation permit or a write capability.
+    match tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(snapshot)).await {
+        Ok(result) => result.map_err(status_snapshot_join_error)?,
+        Err(_) => Err(NodeError::Unavailable(
+            "admin status snapshot exceeded its response deadline".into(),
+        )),
+    }
+}
+
+fn status_snapshot_join_error(error: tokio::task::JoinError) -> NodeError {
+    if error.is_cancelled() {
+        NodeError::Unavailable("admin status snapshot task was cancelled".into())
+    } else {
+        NodeError::Fatal(format!("admin status snapshot task panicked: {error}"))
+    }
+}
+
+fn status_snapshot(
+    runtime: &NodeRuntime,
+    checkpoint_root: Option<LogAnchor>,
+) -> Result<AdminStatusResponse, NodeError> {
+    let _commit = runtime.lock_commit_for_status_observation()?;
+    let node = runtime.status()?;
+    let qlog_root = runtime.log_root_unlocked()?;
+    let stopped_transition = stopped_transition(runtime)?;
     Ok(AdminStatusResponse {
-        cluster_id: state.runtime.config.cluster_id().to_owned(),
-        execution_profile: state.runtime.config.execution_profile(),
-        epoch: state.runtime.config.epoch(),
+        cluster_id: runtime.config.cluster_id().to_owned(),
+        execution_profile: runtime.config.execution_profile(),
+        epoch: runtime.config.epoch(),
         node,
-        members: state.runtime.config.membership().members().to_vec(),
-        recovery_generation: state.runtime.config.recovery_generation(),
+        members: runtime.config.membership().members().to_vec(),
+        recovery_generation: runtime.config.recovery_generation(),
         qlog_root,
         checkpoint_root,
         stopped_transition,
@@ -681,15 +946,10 @@ fn stopped_transition(runtime: &NodeRuntime) -> Result<Option<AdminStoppedTransi
     if configuration.config_id() != runtime.consensus.config_id() {
         return Ok(None);
     }
-    let entry = runtime.recover_stop_entry(anchor)?;
+    let entry = runtime.observe_stop_entry_locally(anchor)?;
     let successor = successor_from_entry(&entry)?;
-    let proof = runtime
-        .consensus
-        .inspect_decision_proof_at(entry.index)
-        .map_err(|error| NodeError::Unavailable(error.to_string()))?
-        .ok_or_else(|| NodeError::Unavailable("durable Stop proof is unavailable".into()))?;
     Ok(Some(AdminStoppedTransition {
-        stop: StopInformation { entry, proof },
+        stop_entry: entry,
         successor,
     }))
 }
@@ -876,6 +1136,7 @@ fn node_admin_status(error: &NodeError) -> (StatusCode, AdminErrorCode) {
         #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed),
         NodeError::Unavailable(_)
+        | NodeError::StartupCancelled { .. }
         | NodeError::ResourceExhausted(_)
         | NodeError::Contention(_)
         | NodeError::WinnerLimitExceeded => {
@@ -904,11 +1165,252 @@ fn error_value(code: AdminErrorCode) -> Value {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Barrier, Condvar, Mutex,
+    };
+    use std::time::Duration;
+    use std::{collections::HashMap, path::Path, thread::JoinHandle};
+
+    use axum::{body::Body, http::Request, middleware, routing::get, Extension, Router};
+    use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+    use rhiza_obj_store::{ObjStore, ObjStoreConfig};
+    use rhiza_quepaxa::{Membership, RecorderFileStore, ThreeNodeConsensus};
+    use tower::ServiceExt;
+
+    use crate::{CheckpointCoordinator, DurabilityMode, NodeConfig, NodeRuntime};
+
+    use super::{
+        admin_gate, admit_status_snapshot, handle_status, node_admin_status, run_status_snapshot,
+        run_status_snapshot_until, status_snapshot_join_error, AdminErrorCode, AdminGateState,
+        AdminPermit, AdminRouteState, AdminTaskTracker, NodeError, OperationLedger,
+        StatusRefreshHook, ADMIN_ACTIVE_MASK, ADMIN_ADMISSION_OPEN, ADMIN_STATUS_PATH,
+        ADMIN_STATUS_SNAPSHOT_TIMEOUT,
     };
 
-    use super::{AdminTaskTracker, OperationLedger};
+    fn release_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, changed) = &**gate;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+    }
+
+    struct GateRelease(Arc<(Mutex<bool>, Condvar)>);
+
+    impl GateRelease {
+        fn new(gate: Arc<(Mutex<bool>, Condvar)>) -> Self {
+            Self(gate)
+        }
+    }
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            release_gate(&self.0);
+        }
+    }
+
+    struct CommitPoisoner {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl CommitPoisoner {
+        fn start(runtime: Arc<NodeRuntime>) -> (Self, std::sync::mpsc::Receiver<()>) {
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let worker_gate = Arc::clone(&gate);
+            let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+            let thread = std::thread::spawn(move || {
+                let _commit = runtime.lock_commit().unwrap();
+                locked_tx.send(()).unwrap();
+                await_gate(&worker_gate);
+                panic!("test-only commit lock poisoner");
+            });
+            (
+                Self {
+                    gate,
+                    thread: Some(thread),
+                },
+                locked_rx,
+            )
+        }
+
+        fn release_and_join(&mut self) {
+            release_gate(&self.gate);
+            let result = self
+                .thread
+                .take()
+                .expect("commit poisoner must be joined exactly once")
+                .join();
+            assert!(result.is_err(), "commit poisoner must panic while locked");
+        }
+    }
+
+    impl Drop for CommitPoisoner {
+        fn drop(&mut self) {
+            release_gate(&self.gate);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    struct CompletionBeforePermitDrop {
+        completed: std::sync::mpsc::SyncSender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Drop for CompletionBeforePermitDrop {
+        fn drop(&mut self) {
+            let _ = self.completed.send(());
+            await_gate(&self.gate);
+        }
+    }
+
+    fn await_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, changed) = &**gate;
+        let mut released = released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn status_test_state(
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> (tempfile::TempDir, AdminRouteState, Arc<AdminPermit>) {
+        status_test_state_with_options(hook, None, None, ADMIN_STATUS_SNAPSHOT_TIMEOUT)
+    }
+
+    fn status_test_state_with_options(
+        hook: Arc<dyn Fn() + Send + Sync>,
+        coordinator: Option<Arc<CheckpointCoordinator>>,
+        before_refresh_durable_tip_hook: Option<StatusRefreshHook>,
+        status_snapshot_timeout: Duration,
+    ) -> (tempfile::TempDir, AdminRouteState, Arc<AdminPermit>) {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let config = NodeConfig::new_embedded(
+            "admin-status-hook",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            membership.members().iter().map(String::as_str),
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                config.cluster_id(),
+                "n1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/n1"),
+                    root.path().join("recorders/n2"),
+                    root.path().join("recorders/n3"),
+                ],
+                1,
+                crate::LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+        let recorder = RecorderFileStore::new_with_membership(
+            root.path().join("admin-recorder"),
+            "n1",
+            runtime.config().cluster_id(),
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let tasks = AdminTaskTracker::new();
+        let permit = Arc::new(AdminPermit {
+            _admission: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+            _task: tasks.try_start().unwrap(),
+        });
+        let ledger_path = root.path().join("admin-operations-v1.json");
+        (
+            root,
+            AdminRouteState {
+                runtime,
+                recorder,
+                coordinator,
+                status_snapshots: Arc::new(tokio::sync::Semaphore::new(1)),
+                status_snapshot_hook: Some(hook),
+                before_refresh_durable_tip_hook,
+                status_snapshot_timeout,
+                operations: Arc::new(tokio::sync::Mutex::new(Some(HashMap::new()))),
+                ledger_path,
+            },
+            permit,
+        )
+    }
+
+    async fn status_test_coordinator(root: &Path) -> Arc<CheckpointCoordinator> {
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: root.to_path_buf(),
+        })
+        .unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store,
+            CheckpointIdentity::new("rhiza:sql:admin-status-test", 1, 1, 1),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        Arc::new(
+            CheckpointCoordinator::open(archive, DurabilityMode::Sync)
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn assert_router_status_offloads_while_blocked() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _gate_release = GateRelease::new(Arc::clone(&gate));
+        let worker_gate = Arc::clone(&gate);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let hook = Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            await_gate(&worker_gate);
+        });
+        let (_root, state, permit) = status_test_state(hook);
+        let router = Router::new()
+            .route("/status", get(handle_status))
+            .layer(Extension(permit))
+            .with_state(state);
+        let status =
+            tokio::spawn(router.oneshot(Request::get("/status").body(Body::empty()).unwrap()));
+
+        let entered_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match entered_rx.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if tokio::time::Instant::now() < entered_deadline =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("status snapshot hook did not enter: {error}"),
+            }
+        }
+        let (health_tx, health_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            health_tx.send(()).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(1), health_rx)
+            .await
+            .expect("unrelated health task must progress while the handler snapshot blocks")
+            .unwrap();
+
+        release_gate(&gate);
+        let response = status.await.unwrap().unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
 
     #[test]
     fn operation_ledger_has_one_strict_canonical_shape() {
@@ -967,5 +1469,768 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), idle)
             .await
             .expect("last task completion must wake the shutdown waiter");
+    }
+
+    #[test]
+    fn admin_tracker_state_machine_exhaustively_preserves_shutdown_quiescence() {
+        #[derive(Clone, Copy, Debug)]
+        struct ModelState {
+            accepting: bool,
+            active: usize,
+        }
+
+        impl ModelState {
+            fn word(self) -> usize {
+                (if self.accepting {
+                    ADMIN_ADMISSION_OPEN
+                } else {
+                    0
+                }) | self.active
+            }
+
+            fn start(self) -> (Self, bool) {
+                if self.accepting {
+                    (
+                        Self {
+                            active: self.active + 1,
+                            ..self
+                        },
+                        true,
+                    )
+                } else {
+                    (self, false)
+                }
+            }
+
+            fn stop(self) -> Self {
+                Self {
+                    accepting: false,
+                    ..self
+                }
+            }
+
+            fn finish(self) -> Self {
+                Self {
+                    active: self.active - 1,
+                    ..self
+                }
+            }
+        }
+
+        fn explore(state: ModelState, remaining: usize) {
+            let word = state.word();
+            assert_eq!(word & ADMIN_ADMISSION_OPEN != 0, state.accepting);
+            assert_eq!(word & ADMIN_ACTIVE_MASK, state.active);
+            assert_eq!(
+                word == 0,
+                !state.accepting && state.active == 0,
+                "the packed word has exactly one quiescent state"
+            );
+            if remaining == 0 {
+                return;
+            }
+
+            let (started, admitted) = state.start();
+            assert_eq!(admitted, state.accepting);
+            // A completed admission CAS is the only successful admission
+            // transition; after Stop its result must be a rejection.
+            if !state.accepting {
+                assert_eq!(started.word(), state.word());
+            }
+            explore(started, remaining - 1);
+
+            explore(state.stop(), remaining - 1);
+            if state.active > 0 {
+                explore(state.finish(), remaining - 1);
+            }
+        }
+
+        // This visits every legal Start/Stop/Finish schedule through seven
+        // linearization points. Loom is not a dependency in this workspace;
+        // the companion Barrier test below covers the stale-CAS race in the
+        // concrete atomic implementation.
+        explore(
+            ModelState {
+                accepting: true,
+                active: 0,
+            },
+            7,
+        );
+    }
+
+    #[test]
+    fn stop_admission_rejects_a_stale_concurrent_admission_cas() {
+        let observed_open = Arc::new(Barrier::new(2));
+        let release_admission = Arc::new(Barrier::new(2));
+        let hook = {
+            let observed_open = Arc::clone(&observed_open);
+            let release_admission = Arc::clone(&release_admission);
+            Arc::new(move || {
+                observed_open.wait();
+                release_admission.wait();
+            })
+        };
+        let tracker = AdminTaskTracker::with_before_admission_cas_hook(hook);
+        let racing_tracker = tracker.clone();
+        let racing_admission = std::thread::spawn(move || racing_tracker.try_start().is_some());
+
+        // The candidate has read the open word but cannot execute its CAS.
+        // Stop linearizes first, so the candidate must retry against the
+        // closed word and reject rather than increment active.
+        observed_open.wait();
+        tracker.stop_admission();
+        release_admission.wait();
+        assert!(!racing_admission.join().unwrap());
+        assert_eq!(
+            tracker.state.state.load(Ordering::Acquire),
+            0,
+            "a stale admission cannot survive the stop linearization point"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_keep_alive_admin_request_is_rejected_after_admission_stops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tasks = AdminTaskTracker::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let router = {
+            let calls = Arc::clone(&calls);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Router::new()
+                .route(
+                    ADMIN_STATUS_PATH,
+                    get(move || {
+                        let calls = Arc::clone(&calls);
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        async move {
+                            calls.fetch_add(1, Ordering::AcqRel);
+                            entered.notify_one();
+                            release
+                                .lock()
+                                .await
+                                .take()
+                                .expect("only the admitted handler reaches the test gate")
+                                .await
+                                .expect("test gate release sender remains alive");
+                            "first admin request completed"
+                        }
+                    }),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    AdminGateState {
+                        token: "admin-test-token".into(),
+                        admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                        tasks: tasks.clone(),
+                    },
+                    admin_gate,
+                ))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+        let entered_wait = entered.notified();
+        connection
+            .write_all(
+                b"GET /v1/admin/membership/status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-test-token\r\nx-rhiza-version: 1\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("authenticated first request was not admitted");
+
+        tasks.stop_admission();
+        connection
+            .write_all(
+                b"GET /v1/admin/membership/status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-test-token\r\nx-rhiza-version: 1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "the queued keep-alive request has not passed admission"
+        );
+
+        release_tx.send(()).unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.read_to_end(&mut response),
+        )
+        .await
+        .expect("keep-alive connection did not close after the second request")
+        .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("200 OK"), "first response: {response}");
+        assert!(
+            response.contains("503 Service Unavailable"),
+            "post-stop response: {response}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "post-stop request must not enter the handler body"
+        );
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("admin test server did not stop")
+            .unwrap();
+    }
+
+    #[test]
+    fn status_snapshot_offloads_on_current_thread_runtime_without_stalling_health() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let _gate_release = GateRelease::new(Arc::clone(&gate));
+            let worker_gate = Arc::clone(&gate);
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (health_tx, health_rx) = tokio::sync::oneshot::channel();
+            let caller = std::thread::current().id();
+            let snapshot = tokio::spawn(run_status_snapshot(move || {
+                let worker = std::thread::current().id();
+                entered_tx.send(()).unwrap();
+                await_gate(&worker_gate);
+                Ok(worker)
+            }));
+
+            entered_rx.await.unwrap();
+            tokio::spawn(async move {
+                health_tx.send(()).unwrap();
+            });
+            tokio::time::timeout(Duration::from_secs(1), health_rx)
+                .await
+                .expect("unrelated async health work must run while snapshot blocks")
+                .unwrap();
+
+            release_gate(&gate);
+            assert_ne!(snapshot.await.unwrap().unwrap(), caller);
+        });
+    }
+
+    #[test]
+    fn router_status_handler_offloads_on_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(assert_router_status_offloads_while_blocked());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn router_status_handler_offloads_on_one_worker_runtime() {
+        assert_router_status_offloads_while_blocked().await;
+    }
+
+    #[tokio::test]
+    async fn router_status_refresh_deadline_is_absolute_and_never_starts_snapshot() {
+        let archive = tempfile::tempdir().unwrap();
+        let coordinator = status_test_coordinator(archive.path()).await;
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls_for_hook = Arc::clone(&refresh_calls);
+        let refresh_hook: StatusRefreshHook = Arc::new(move || {
+            refresh_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            Box::pin(std::future::pending())
+        });
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot_calls_for_hook = Arc::clone(&snapshot_calls);
+        let snapshot_hook = Arc::new(move || {
+            snapshot_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+        });
+        let (_root, state, permit) = status_test_state_with_options(
+            snapshot_hook,
+            Some(coordinator),
+            Some(refresh_hook),
+            Duration::from_millis(25),
+        );
+        let router = Router::new()
+            .route("/status", get(handle_status))
+            .layer(Extension(permit))
+            .with_state(state);
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.oneshot(Request::get("/status").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("the injected absolute deadline must bound refresh")
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(refresh_calls.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_router_status_never_overadmits_detached_snapshot_work() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _gate_release = GateRelease::new(Arc::clone(&gate));
+        let worker_gate = Arc::clone(&gate);
+        let started = Arc::new(AtomicUsize::new(0));
+        let worker_started = Arc::clone(&started);
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let worker_peak = Arc::clone(&peak);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let hook = Arc::new(move || {
+            worker_started.fetch_add(1, Ordering::AcqRel);
+            let now_active = worker_active.fetch_add(1, Ordering::AcqRel) + 1;
+            worker_peak.fetch_max(now_active, Ordering::AcqRel);
+            await_gate(&worker_gate);
+            worker_active.fetch_sub(1, Ordering::AcqRel);
+            finished_tx.send(()).unwrap();
+        });
+        let (_root, state, permit) =
+            status_test_state_with_options(hook, None, None, Duration::from_millis(25));
+        let router = Router::new()
+            .route("/status", get(handle_status))
+            .layer(Extension(permit))
+            .with_state(state);
+
+        let first = router
+            .clone()
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(started.load(Ordering::Acquire), 1);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+
+        for _ in 0..20 {
+            let repeated = router
+                .clone()
+                .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                repeated.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(started.load(Ordering::Acquire), 1);
+            assert!(active.load(Ordering::Acquire) <= 1);
+        }
+
+        release_gate(&gate);
+        let finished_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match finished_rx.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if tokio::time::Instant::now() < finished_deadline =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("timed-out status snapshot did not drain: {error}"),
+            }
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(peak.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_router_status_recovers_snapshot_permit_after_closure_finishes() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _gate_release = GateRelease::new(Arc::clone(&gate));
+        let worker_gate = Arc::clone(&gate);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let hook_entered = Arc::clone(&entered);
+        let finished = Arc::new(tokio::sync::Semaphore::new(0));
+        let hook_finished = Arc::clone(&finished);
+        let hook = Arc::new(move || {
+            hook_entered.add_permits(1);
+            await_gate(&worker_gate);
+            hook_finished.add_permits(1);
+        });
+        let (_root, state, permit) = status_test_state(hook);
+        let snapshots = Arc::clone(&state.status_snapshots);
+        let router = Router::new()
+            .route("/status", get(handle_status))
+            .layer(Extension(permit))
+            .with_state(state);
+        let caller = tokio::spawn(
+            router
+                .clone()
+                .oneshot(Request::get("/status").body(Body::empty()).unwrap()),
+        );
+
+        let entered_permit =
+            tokio::time::timeout(Duration::from_secs(1), Arc::clone(&entered).acquire_owned())
+                .await
+                .expect("status snapshot hook did not enter")
+                .expect("entry event semaphore must remain open");
+        drop(entered_permit);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        let rejected = router
+            .clone()
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        release_gate(&gate);
+        let finished_permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&finished).acquire_owned(),
+        )
+        .await
+        .expect("cancelled status snapshot did not leave the hook")
+        .expect("completion event semaphore must remain open");
+        drop(finished_permit);
+
+        // The hook's completion event is inside the blocking closure, before
+        // `_admission` drops.  Taking and returning this permit is the
+        // observable boundary that proves the detached closure has exited,
+        // rather than racing a new request against its final destructor.
+        let returned_admission = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&snapshots).acquire_owned(),
+        )
+        .await
+        .expect("cancelled status snapshot did not return its admission permit")
+        .expect("snapshot admission semaphore must remain open");
+        drop(returned_admission);
+
+        let recovered = router
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn panicked_router_status_recovers_snapshot_permit() {
+        let panic_once = Arc::new(AtomicBool::new(false));
+        let panic_once_for_hook = Arc::clone(&panic_once);
+        let hook = Arc::new(move || {
+            if !panic_once_for_hook.swap(true, Ordering::AcqRel) {
+                panic!("test-only status snapshot panic");
+            }
+        });
+        let (_root, state, permit) = status_test_state(hook);
+        let router = Router::new()
+            .route("/status", get(handle_status))
+            .layer(Extension(permit))
+            .with_state(state);
+
+        let panicked = router
+            .clone()
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            panicked.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let recovered = router
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poisoned_commit_observation_is_500_without_latching_or_overadmission() {
+        let snapshot_started = Arc::new(AtomicUsize::new(0));
+        let snapshot_started_for_hook = Arc::clone(&snapshot_started);
+        let snapshot_hook = Arc::new(move || {
+            snapshot_started_for_hook.fetch_add(1, Ordering::AcqRel);
+        });
+        let (_root, state, permit) =
+            status_test_state_with_options(snapshot_hook, None, None, Duration::from_millis(25));
+        let runtime = Arc::clone(&state.runtime);
+        let fatal_reason_before = runtime.fatal_reason();
+        let (mut poisoner, locked) = CommitPoisoner::start(Arc::clone(&runtime));
+        let lock_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match locked.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if tokio::time::Instant::now() < lock_deadline =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("commit poisoner did not acquire the lock: {error}"),
+            }
+        }
+        let snapshots = Arc::clone(&state.status_snapshots);
+        let router = Router::new()
+            .route("/status", get(handle_status))
+            .layer(Extension(permit))
+            .with_state(state);
+        let first = tokio::spawn(
+            router
+                .clone()
+                .oneshot(Request::get("/status").body(Body::empty()).unwrap()),
+        );
+
+        let snapshot_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while snapshot_started.load(Ordering::Acquire) == 0 {
+            assert!(
+                tokio::time::Instant::now() < snapshot_deadline,
+                "actual status handler did not reach the blocked commit observation"
+            );
+            tokio::task::yield_now().await;
+        }
+        let timed_out = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("the status response must respect its single deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timed_out.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(snapshots.available_permits(), 0);
+
+        poisoner.release_and_join();
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while snapshots.available_permits() != 1 {
+            assert!(
+                tokio::time::Instant::now() < drain_deadline,
+                "detached status closure did not release its permit after poison"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+        assert_eq!(runtime.fatal_reason(), fatal_reason_before);
+
+        for _ in 0..200 {
+            let poisoned = router
+                .clone()
+                .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                poisoned.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(snapshots.available_permits(), 1);
+            assert!(runtime.is_ready());
+            assert!(!runtime.is_fatal());
+            assert_eq!(runtime.fatal_reason(), fatal_reason_before);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_event_precedes_actual_permit_drop_without_overadmission_under_stress() {
+        for _ in 0..200 {
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let _gate_release = GateRelease::new(Arc::clone(&gate));
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = admit_status_snapshot(Arc::clone(&admission)).unwrap();
+            let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+            let worker_gate = Arc::clone(&gate);
+            let snapshot = tokio::spawn(run_status_snapshot_until(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                move || {
+                    let _permit = permit;
+                    let _completion = CompletionBeforePermitDrop {
+                        completed: completed_tx,
+                        gate: worker_gate,
+                    };
+                    Ok(())
+                },
+            ));
+
+            let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                match completed_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                        if tokio::time::Instant::now() < completion_deadline =>
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("completion notification was not observed: {error}"),
+                }
+            }
+            assert!(matches!(
+                admit_status_snapshot(Arc::clone(&admission)),
+                Err(NodeError::Unavailable(message)) if message.contains("capacity")
+            ));
+
+            release_gate(&gate);
+            assert_eq!(snapshot.await.unwrap(), Ok(()));
+            let recovered = tokio::time::timeout(Duration::from_secs(1), admission.acquire_owned())
+                .await
+                .expect("permit must drop when the closure actually exits")
+                .expect("semaphore must remain open");
+            drop(recovered);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_preserves_exact_node_error() {
+        let expected = NodeError::Storage("exact snapshot source".into());
+        assert_eq!(
+            run_status_snapshot(move || Err::<(), _>(expected)).await,
+            Err(NodeError::Storage("exact snapshot source".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_join_errors_keep_transport_error_classes() {
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.unwrap_err();
+        let cancelled = status_snapshot_join_error(cancelled);
+        assert!(matches!(
+            &cancelled,
+            NodeError::Unavailable(message) if message.contains("cancelled")
+        ));
+        assert_eq!(
+            node_admin_status(&cancelled),
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                AdminErrorCode::Unavailable
+            )
+        );
+
+        let panicked = tokio::task::spawn_blocking(|| panic!("snapshot worker panic"))
+            .await
+            .unwrap_err();
+        let panicked = status_snapshot_join_error(panicked);
+        assert!(matches!(
+            &panicked,
+            NodeError::Fatal(message) if message.contains("panicked")
+        ));
+        assert_eq!(
+            node_admin_status(&panicked),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                AdminErrorCode::Internal
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_status_snapshot_returns_without_joining_and_drains_late_read_only_work() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _gate_release = GateRelease::new(Arc::clone(&gate));
+        let worker_gate = Arc::clone(&gate);
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(run_status_snapshot(move || {
+            worker_active.fetch_add(1, Ordering::AcqRel);
+            entered_tx.send(()).unwrap();
+            await_gate(&worker_gate);
+            worker_completed.store(true, Ordering::Release);
+            worker_active.fetch_sub(1, Ordering::AcqRel);
+            finished_tx.send(()).unwrap();
+            Ok(())
+        }));
+        entered_rx.await.unwrap();
+
+        caller.abort();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), caller)
+            .await
+            .expect("cancelling the caller must not wait for the blocking snapshot")
+            .expect_err("caller task must be cancelled");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert!(!completed.load(Ordering::Acquire));
+
+        release_gate(&gate);
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("detached read-only snapshot must drain after its gate opens")
+            .unwrap();
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_snapshot_deadline_holds_closure_admission_until_late_work_drains() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _gate_release = GateRelease::new(Arc::clone(&gate));
+        let worker_gate = Arc::clone(&gate);
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admit_status_snapshot(Arc::clone(&admission)).unwrap();
+        let tasks = AdminTaskTracker::new();
+        let response_task = tasks.try_start().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let result = tokio::spawn(run_status_snapshot_until(
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            move || {
+                let _permit = permit;
+                worker_active.fetch_add(1, Ordering::AcqRel);
+                entered_tx.send(()).unwrap();
+                await_gate(&worker_gate);
+                worker_active.fetch_sub(1, Ordering::AcqRel);
+                finished_tx.send(()).unwrap();
+                Ok(())
+            },
+        ));
+        entered_rx.await.unwrap();
+
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(NodeError::Unavailable(message)) if message.contains("deadline")
+        ));
+        assert_eq!(active.load(Ordering::Acquire), 1);
+
+        // The response task may finish during shutdown without an unbounded
+        // blocking join, while the closure-held permit still prevents another
+        // detached snapshot from accumulating.
+        drop(response_task);
+        tasks.stop_admission();
+        tokio::time::timeout(Duration::from_secs(1), tasks.wait_for_idle())
+            .await
+            .expect("shutdown must not wait for a detached read-only snapshot");
+        assert!(matches!(
+            admit_status_snapshot(Arc::clone(&admission)),
+            Err(NodeError::Unavailable(message)) if message.contains("capacity")
+        ));
+
+        release_gate(&gate);
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("deadline-detached read-only snapshot must drain after release")
+            .unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let recovered = tokio::time::timeout(Duration::from_secs(1), admission.acquire_owned())
+            .await
+            .expect("snapshot capacity must recover after the closure drops its permit")
+            .expect("semaphore must remain open");
+        drop(recovered);
     }
 }

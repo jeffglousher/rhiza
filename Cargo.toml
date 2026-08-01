@@ -28,6 +28,9 @@ axum = "0.8"
 bytes = "1"
 futures = "0.3"
 getrandom = "0.3"
+http-body = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
 postcard = { version = "1", features = ["alloc"] }
 postcard-rpc = { version = "=0.12.1", features = ["use-std"] }

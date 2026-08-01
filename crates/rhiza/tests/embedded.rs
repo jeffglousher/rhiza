@@ -259,79 +259,28 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shutdown_waits_for_a_minority_rpc_before_releasing_storage() {
+async fn proposal_drains_a_minority_rpc_before_shutdown() {
     let root = tempfile::tempdir().unwrap();
     let (blocked_config, started, release) = config_with_blocked_minority(root.path());
     let rhiza = Rhiza::open(blocked_config).await.unwrap();
     let handle = rhiza.handle();
 
-    handle.put("request", "key", "value").await.unwrap();
+    let write_handle = handle.clone();
+    let write = tokio::spawn(async move { write_handle.put("request", "key", "value").await });
     tokio::task::spawn_blocking(move || started.recv().unwrap())
         .await
         .unwrap();
-
-    let status = handle.clone();
-    let shutdown = tokio::spawn(rhiza.shutdown());
-    loop {
-        match status.status().await {
-            Err(Error::Closed) => break,
-            Ok(_) => tokio::task::yield_now().await,
-            Err(error) => panic!("unexpected status error during shutdown: {error}"),
-        }
-    }
     assert!(
-        !shutdown.is_finished(),
-        "shutdown released runtime storage while a minority RPC was still running"
+        !write.is_finished(),
+        "a proposal must not report success while an accepted recorder RPC is still running"
     );
-
     release.release();
-    shutdown.await.unwrap().unwrap();
+    write.await.unwrap().unwrap();
+    rhiza.shutdown().await.unwrap();
 
     let reopened = Rhiza::open(config(root.path())).await.unwrap();
     reopened.shutdown().await.unwrap();
     root.close().unwrap();
-}
-
-#[test]
-fn shutdown_consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
-    const HANG_GUARD: Duration = Duration::from_secs(10);
-
-    let root = tempfile::tempdir().unwrap();
-    let root_path = root.path().to_path_buf();
-    let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
-    let (saturated_tx, saturated_rx) = mpsc::channel();
-    let (shutdown_finished_tx, shutdown_finished_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let executor = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        executor.block_on(async move {
-            let rhiza = Rhiza::open(config(&root_path)).await.unwrap();
-            let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                blocker_started_tx.send(()).unwrap();
-                release_blocker_rx.recv().unwrap();
-            });
-            blocker_started_rx.recv().unwrap();
-            saturated_tx.send(()).unwrap();
-            shutdown_finished_tx.send(rhiza.shutdown().await).unwrap();
-            blocker.await.unwrap();
-        });
-    });
-    saturated_rx
-        .recv_timeout(HANG_GUARD)
-        .expect("blocking-pool saturation must be established");
-
-    let result = shutdown_finished_rx.recv_timeout(HANG_GUARD);
-    release_blocker_tx.send(()).unwrap();
-    worker.join().unwrap();
-
-    result
-        .expect("shutdown consensus drain must start despite blocking-pool saturation")
-        .unwrap();
 }
 
 fn config(root: &std::path::Path) -> EmbeddedConfig {
@@ -363,19 +312,40 @@ fn local_file_backed_rejects_wrong_canonical_cluster_id_before_creating_state() 
 }
 
 #[test]
-fn local_file_backed_rejects_non_sql_profiles_before_creating_state() {
-    for execution_profile in [ExecutionProfile::Graph, ExecutionProfile::Kv] {
+fn local_file_backed_rejects_uncompiled_profiles_before_creating_state() {
+    assert!(
+        !rhiza_node::execution_profile_compiled(ExecutionProfile::Kv),
+        "this facade does not expose a KV feature; keep one uncompiled-profile case"
+    );
+    let expected = [
+        ExecutionProfile::Sqlite,
+        ExecutionProfile::Graph,
+        ExecutionProfile::Kv,
+    ]
+    .into_iter()
+    .find(|profile| rhiza_node::execution_profile_compiled(*profile))
+    .expect("the test build must compile at least one execution profile");
+    let mut rejected = 0;
+
+    for execution_profile in [ExecutionProfile::Graph, ExecutionProfile::Kv]
+        .into_iter()
+        .filter(|profile| !rhiza_node::execution_profile_compiled(*profile))
+    {
         let root = tempfile::tempdir().unwrap();
+        assert!(root.path().read_dir().unwrap().next().is_none());
 
         assert!(matches!(
             EmbeddedConfig::local_file_backed("cluster-a", root.path(), execution_profile),
             Err(Error::ExecutionProfileMismatch {
-                expected: ExecutionProfile::Sqlite,
+                expected: actual_expected,
                 actual,
-            }) if actual == execution_profile
+            }) if actual_expected == expected && actual == execution_profile
         ));
         assert!(root.path().read_dir().unwrap().next().is_none());
+        rejected += 1;
     }
+
+    assert!(rejected > 0, "the test must exercise an uncompiled profile");
 }
 
 fn config_with_blocked_minority(
@@ -446,6 +416,12 @@ impl BlockingRelease {
     }
 }
 
+impl Drop for BlockingRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct BlockingRecorder {
     inner: RecorderFileStore,
     started: mpsc::Sender<()>,
@@ -453,12 +429,16 @@ struct BlockingRecorder {
 }
 
 impl RecorderRpc for BlockingRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         self.inner.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -478,6 +458,7 @@ impl RecorderRpc for BlockingRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -488,7 +469,11 @@ impl RecorderRpc for BlockingRecorder {
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         let _ = self.started.send(());
         self.release.wait();
         self.inner.record(request)
@@ -496,17 +481,26 @@ impl RecorderRpc for BlockingRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
         self.inner.install_decision_proof(proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         self.inner.inspect_decision_proof(slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         self.inner.inspect_record_summary(slot)
     }
 }

@@ -66,6 +66,7 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
 
     let entry = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(
@@ -76,7 +77,11 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
         .unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     let CertifiedDecisionInspection::Committed(certified) = consensus
-        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+        )
         .unwrap()
     else {
         panic!("typed ISR quorum did not reconstruct the ordinary decision");
@@ -97,8 +102,11 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
             _ => {}
         }
     }
-    assert_eq!(calls.iter().filter(|call| **call == "piggyback").count(), 3);
-    assert_eq!(calls.iter().filter(|call| **call == "record").count(), 3);
+    // Quorum freezes the public decision. A pending hedge may be pruned
+    // before it starts, so every executed recorder must piggyback before its
+    // record, but all three recorders need not execute.
+    assert!((2..=3).contains(&piggybacks));
+    assert_eq!(piggybacks, records);
     assert_eq!(calls.iter().filter(|call| **call == "store").count(), 0);
 }
 
@@ -370,6 +378,7 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
 
     let winner = shared_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             2,
             schema.hash,
             Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -428,6 +437,7 @@ fn sql_batch_reprepares_all_members_after_a_foreign_slot_winner() {
         .unwrap();
     let winner = shared_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             2,
             schema.hash,
             Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -609,6 +619,7 @@ fn startup_recovers_quorum_decision_without_qlog_exactly_once() {
     );
     let decided = decided_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, prepared.payload),
@@ -631,6 +642,7 @@ fn startup_rejects_non_qwal_sql_decision_before_mutating_qlog() {
     let decided_consensus = consensus(dir.path());
     decided_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(
@@ -661,6 +673,7 @@ fn startup_rejects_non_qwal_peer_winner_before_mutating_qlog() {
     let decided_consensus = consensus(dir.path());
     let decided = decided_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(
@@ -749,6 +762,7 @@ fn startup_accepts_peer_candidate_only_when_consensus_committed_exact_entry() {
     );
     let decided = decided_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, prepared.payload),
@@ -775,6 +789,7 @@ fn startup_rejects_peer_candidate_that_differs_from_committed_decision() {
     let decided_consensus = consensus(dir.path());
     decided_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(
@@ -836,6 +851,7 @@ async fn authenticated_three_http_recorders_commit() {
         ThreeNodeConsensus::from_recorders("rhiza:sql:cluster-a", "node-1", 1, 1, recorders)
             .unwrap()
             .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                 1,
                 LogHash::ZERO,
                 Command::new(
@@ -886,16 +902,20 @@ async fn configured_generation_http_clients_reach_recorder_and_log_routes() {
         HttpRecorderClient::new_with_recovery_generation(&base_url, "node-1", "peer-token-1", 7)
             .unwrap();
     let (reply, summary, fence) = tokio::task::spawn_blocking(move || {
+        let context = rhiza_quepaxa::RecorderRpcContext::default_timeout();
         (
-            recorder.recorder_id(),
-            recorder.inspect_record_summary(1),
-            recorder.observe_read_fence(ReadFenceRequest {
-                cluster_id: "rhiza:sql:cluster-a".into(),
-                epoch: 1,
-                config_id: 1,
-                config_digest: LogHash::ZERO,
-                slot: 1,
-            }),
+            recorder.recorder_id(&context),
+            recorder.inspect_record_summary(&context, 1),
+            recorder.observe_read_fence(
+                &context,
+                ReadFenceRequest {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    slot: 1,
+                },
+            ),
         )
     })
     .await
@@ -935,13 +955,16 @@ async fn http_read_fence_fails_before_the_general_recorder_deadline() {
 
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        client.observe_read_fence(ReadFenceRequest {
-            cluster_id: "rhiza:sql:cluster-a".into(),
-            epoch: 1,
-            config_id: 1,
-            config_digest: LogHash::ZERO,
-            slot: 1,
-        })
+        client.observe_read_fence(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            ReadFenceRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+            },
+        )
     })
     .await
     .unwrap();
@@ -967,21 +990,24 @@ async fn http_record_transport_failure_releases_the_quorum_attempt_promptly() {
 
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        client.record(RecordRequest {
-            cluster_id: "rhiza:sql:cluster-a".into(),
-            epoch: 1,
-            config_id: 1,
-            config_digest: test_config_digest(),
-            slot: 1,
-            step: 1,
-            proposal: rhiza_quepaxa::Proposal::nil(),
-            command: None,
-        })
+        client.record(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            RecordRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: test_config_digest(),
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            },
+        )
     })
     .await
     .unwrap();
 
-    assert!(matches!(result, Err(rhiza_quepaxa::Error::ProposeFailed)));
+    assert!(matches!(result, Err(rhiza_quepaxa::Error::UnknownOutcome)));
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "record inherited the 10 second recorder deadline"
@@ -993,12 +1019,16 @@ async fn http_record_transport_failure_releases_the_quorum_attempt_promptly() {
 struct TypedOnlyRecorder(RecorderFileStore);
 
 impl RecorderRpc for TypedOnlyRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         self.0.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _cluster_id: String,
         _epoch: u64,
         _config_id: u64,
@@ -1011,6 +1041,7 @@ impl RecorderRpc for TypedOnlyRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _cluster_id: String,
         _epoch: u64,
         _config_id: u64,
@@ -1020,24 +1051,37 @@ impl RecorderRpc for TypedOnlyRecorder {
         self.0.fetch_command(command_hash)
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         self.0.record_proposal(request)
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
         self.0.install_decision_proof_record(proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
-        RecorderRpc::inspect_decision_proof(&self.0, slot)
+    fn inspect_decision_proof(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        RecorderRpc::inspect_decision_proof(&self.0, context, slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-        RecorderRpc::inspect_record_summary(&self.0, slot)
+    fn inspect_record_summary(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        RecorderRpc::inspect_record_summary(&self.0, context, slot)
     }
 
     fn supports_context_read_fence(&self) -> bool {
@@ -1046,9 +1090,10 @@ impl RecorderRpc for TypedOnlyRecorder {
 
     fn observe_read_fence(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<rhiza_quepaxa::ReadFenceObservation> {
-        RecorderRpc::observe_read_fence(&self.0, request)
+        RecorderRpc::observe_read_fence(&self.0, context, request)
     }
 }
 
@@ -1159,7 +1204,7 @@ async fn unauthorized_request_is_rejected() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("wrong-token")
-        .json(&serde_json::json!({"version": 3, "body": null}))
+        .json(&serde_json::json!({"version": 5, "remaining_deadline_ms": 1_000, "body": null}))
         .send()
         .await
         .unwrap()
@@ -1609,7 +1654,7 @@ async fn disconnected_client_holds_its_slot_without_starving_peer_rpc() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("peer-token-1")
-        .json(&serde_json::json!({"version": 3, "body": null}))
+        .json(&serde_json::json!({"version": 5, "remaining_deadline_ms": 1_000, "body": null}))
         .send()
         .await
         .unwrap();
@@ -1677,6 +1722,7 @@ fn read_barrier_inspects_after_an_identical_historical_noop() {
     let written = runtime.write("request-1", "alpha", "one").unwrap();
     let historical = shared_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             written.applied_index + 1,
             written.hash,
             Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -1716,12 +1762,16 @@ struct FenceFaultRecorder {
 }
 
 impl RecorderRpc for FenceFaultRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         self.inner.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -1731,6 +1781,7 @@ impl RecorderRpc for FenceFaultRecorder {
     ) -> rhiza_quepaxa::Result<()> {
         RecorderRpc::store_command_for(
             &self.inner,
+            context,
             cluster_id,
             epoch,
             config_id,
@@ -1742,6 +1793,7 @@ impl RecorderRpc for FenceFaultRecorder {
 
     fn fetch_command_for(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -1750,6 +1802,7 @@ impl RecorderRpc for FenceFaultRecorder {
     ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
         RecorderRpc::fetch_command_for(
             &self.inner,
+            context,
             cluster_id,
             epoch,
             config_id,
@@ -1758,27 +1811,40 @@ impl RecorderRpc for FenceFaultRecorder {
         )
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         if self.record_failure {
             return Err(rhiza_quepaxa::Error::ProposeFailed);
         }
-        RecorderRpc::record(&self.inner, request)
+        RecorderRpc::record(&self.inner, context, request)
     }
 
     fn install_decision_proof(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
-        RecorderRpc::install_decision_proof(&self.inner, proof, membership)
+        RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
-        RecorderRpc::inspect_decision_proof(&self.inner, slot)
+    fn inspect_decision_proof(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-        RecorderRpc::inspect_record_summary(&self.inner, slot)
+    fn inspect_record_summary(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        RecorderRpc::inspect_record_summary(&self.inner, context, slot)
     }
 
     fn supports_context_read_fence(&self) -> bool {
@@ -1787,12 +1853,13 @@ impl RecorderRpc for FenceFaultRecorder {
 
     fn observe_read_fence(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<rhiza_quepaxa::ReadFenceObservation> {
         if let Some(error) = self.read_fence_failure.clone() {
             return Err(error);
         }
-        RecorderRpc::observe_read_fence(&self.inner, request)
+        RecorderRpc::observe_read_fence(&self.inner, context, request)
     }
 }
 
@@ -2010,12 +2077,16 @@ fn stopped_configuration_rejects_read_barrier_without_advancing_qlog() {
 struct ProofDroppingRecorder(RecorderFileStore);
 
 impl RecorderRpc for ProofDroppingRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         self.0.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _cluster_id: String,
         _epoch: u64,
         _config_id: u64,
@@ -2028,6 +2099,7 @@ impl RecorderRpc for ProofDroppingRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _cluster_id: String,
         _epoch: u64,
         _config_id: u64,
@@ -2037,12 +2109,17 @@ impl RecorderRpc for ProofDroppingRecorder {
         self.0.fetch_command(command_hash)
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         self.0.record_proposal(request)
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
@@ -2052,12 +2129,20 @@ impl RecorderRpc for ProofDroppingRecorder {
         Ok(())
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
-        RecorderRpc::inspect_decision_proof(&self.0, slot)
+    fn inspect_decision_proof(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        RecorderRpc::inspect_decision_proof(&self.0, context, slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
-        RecorderRpc::inspect_record_summary(&self.0, slot)
+    fn inspect_record_summary(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        RecorderRpc::inspect_record_summary(&self.0, context, slot)
     }
 
     fn supports_context_read_fence(&self) -> bool {
@@ -2066,9 +2151,10 @@ impl RecorderRpc for ProofDroppingRecorder {
 
     fn observe_read_fence(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<rhiza_quepaxa::ReadFenceObservation> {
-        RecorderRpc::observe_read_fence(&self.0, request)
+        RecorderRpc::observe_read_fence(&self.0, context, request)
     }
 }
 
@@ -2124,6 +2210,7 @@ fn read_barrier_catches_up_past_a_historical_phase2_noop_without_an_installed_pr
 
     let historical = writer_consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::ReadBarrier, Vec::new()),
@@ -2137,9 +2224,15 @@ fn read_barrier_catches_up_past_a_historical_phase2_noop_without_an_installed_pr
             ..
         } if payload.is_empty()
     ));
-    assert!(recorders
-        .iter()
-        .all(|recorder| recorder.inspect_decision_proof(1).unwrap().is_none()));
+    assert!(recorders.iter().all(|recorder| {
+        RecorderRpc::inspect_decision_proof(
+            recorder,
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+        )
+        .unwrap()
+        .is_none()
+    }));
 
     let written = writer.write("request-1", "alpha", "one").unwrap();
     assert!(written.applied_index > historical.index);
@@ -2808,7 +2901,7 @@ async fn log_fetch_saturation_does_not_consume_recorder_capacity() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("peer-token-1")
-        .json(&serde_json::json!({"version": 3, "body": null}))
+        .json(&serde_json::json!({"version": 5, "remaining_deadline_ms": 1_000, "body": null}))
         .send()
         .await
         .unwrap();
@@ -2835,7 +2928,12 @@ fn cancelled_peer_recovery_is_joined_before_open_returns_without_persisting() {
     });
 
     gate.wait_until_started();
-    startup.cancel(Instant::now() + Duration::from_millis(10));
+    let cancellation_token = StartupIoContext::issue_cancellation_token();
+    let close_receipt = startup.cancel_for_shutdown(
+        cancellation_token.clone(),
+        Instant::now() + Duration::from_millis(10),
+        rhiza_node::StartupCancellationAuthority::Internal,
+    );
     std::thread::sleep(Duration::from_millis(20));
     assert!(
         !attempt.is_finished(),
@@ -2844,12 +2942,14 @@ fn cancelled_peer_recovery_is_joined_before_open_returns_without_persisting() {
     gate.release();
 
     let error = attempt.join().unwrap().unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("startup cancelled during peer log fetch"),
-        "{error}"
-    );
+    match error {
+        NodeError::StartupCancelled { token, stage } => {
+            assert_eq!(token, cancellation_token);
+            assert_eq!(stage, "peer log fetch");
+        }
+        error => panic!("expected typed peer-fetch cancellation, got {error}"),
+    }
+    assert!(startup.recognizes_close_receipt(&close_receipt));
     let log = FileLogStore::open_with_configuration(
         root.path().join("node/consensus/log"),
         "rhiza:sql:cluster-a",
@@ -2892,7 +2992,7 @@ async fn recorder_backend_errors_return_non_success_statuses() {
             .header(NODE_ID_HEADER, "node-1")
             .header(RECOVERY_GENERATION_HEADER, "1")
             .bearer_auth("peer-token-1")
-            .json(&serde_json::json!({"version": 3, "body": null}))
+            .json(&serde_json::json!({"version": 5, "remaining_deadline_ms": 1_000, "body": null}))
             .send()
             .await
             .unwrap();
@@ -3066,7 +3166,7 @@ async fn unauthenticated_invalid_bodies_are_rejected_before_body_or_capacity() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("peer-token-1")
-        .json(&serde_json::json!({"version": 3, "body": null}))
+        .json(&serde_json::json!({"version": 5, "remaining_deadline_ms": 1_000, "body": null}))
         .send()
         .await
         .unwrap();
@@ -3232,12 +3332,16 @@ impl OrderingRecorder {
 }
 
 impl RecorderRpc for OrderingRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         Ok(self.id.clone())
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -3254,6 +3358,7 @@ impl RecorderRpc for OrderingRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -3264,7 +3369,11 @@ impl RecorderRpc for OrderingRecorder {
         Ok(self.commands.lock().unwrap().get(&command_hash).cloned())
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         assert_test_recorder_context(
             &request.cluster_id,
             request.epoch,
@@ -3280,11 +3389,12 @@ impl RecorderRpc for OrderingRecorder {
                 .insert(command.hash(), command.clone());
             self.calls.lock().unwrap().push("piggyback");
         }
-        assert!(request.proposal.value.as_ref().is_none_or(|value| self
-            .commands
-            .lock()
-            .unwrap()
-            .contains_key(&value.command_hash)));
+        assert!(request.proposal.value.as_ref().is_none_or(|value| {
+            self.commands
+                .lock()
+                .unwrap()
+                .contains_key(&value.command_hash)
+        }));
         self.calls.lock().unwrap().push("record");
         let mut states = self.isr.lock().unwrap();
         let current = states.entry(request.slot).or_default().clone();
@@ -3304,6 +3414,7 @@ impl RecorderRpc for OrderingRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         _membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
@@ -3314,11 +3425,19 @@ impl RecorderRpc for OrderingRecorder {
         Ok(())
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         Ok(self.proofs.lock().unwrap().get(&slot).cloned())
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         let states = self.isr.lock().unwrap();
         let Some(state) = states.get(&slot) else {
             return Ok(None);
@@ -3357,7 +3476,10 @@ struct FailingRecorder {
 }
 
 impl RecorderRpc for FailingRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         Err(self.error.clone())
     }
 }
@@ -3442,12 +3564,16 @@ impl GatedRecorder {
 }
 
 impl RecorderRpc for GatedRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         Ok(self.id.clone())
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -3463,6 +3589,7 @@ impl RecorderRpc for GatedRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -3473,7 +3600,11 @@ impl RecorderRpc for GatedRecorder {
         Ok(self.commands.lock().unwrap().get(&command_hash).cloned())
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         assert_test_recorder_context(
             &request.cluster_id,
             request.epoch,
@@ -3507,6 +3638,7 @@ impl RecorderRpc for GatedRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         _membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
@@ -3517,11 +3649,19 @@ impl RecorderRpc for GatedRecorder {
         Ok(())
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         Ok(self.proofs.lock().unwrap().get(&slot).cloned())
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         let states = self.isr.lock().unwrap();
         let Some(state) = states.get(&slot) else {
             return Ok(None);

@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -41,6 +41,660 @@ pub type Phase = u8;
 pub type Step = u64;
 pub type Priority = u128;
 
+/// Per-operation deadline and cancellation signal carried by every Recorder
+/// RPC. A deadline is deliberately absolute so queueing time counts against
+/// the operation's budget.
+#[derive(Clone, Debug)]
+pub struct RecorderRpcContext {
+    deadline: Instant,
+    cancellations: Vec<Arc<AtomicBool>>,
+}
+
+impl RecorderRpcContext {
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::with_deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        )
+    }
+
+    /// Uses a caller-owned cancellation token. This is the only supported
+    /// bridge from a host runtime's shutdown signal into a consensus call.
+    pub fn with_timeout_and_cancellation(timeout: Duration, cancellation: Arc<AtomicBool>) -> Self {
+        let mut context = Self::with_timeout(timeout);
+        context.cancellations.push(cancellation);
+        context
+    }
+
+    pub fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            cancellations: vec![Arc::new(AtomicBool::new(false))],
+        }
+    }
+
+    pub fn default_timeout() -> Self {
+        Self::with_timeout(DEFAULT_RECORDER_RPC_TIMEOUT)
+    }
+
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn cancel(&self) {
+        for cancellation in &self.cancellations {
+            cancellation.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellations
+            .iter()
+            .any(|cancellation| cancellation.load(Ordering::Acquire))
+    }
+
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline.checked_duration_since(Instant::now())
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(Error::RpcCancelled);
+        }
+        if self.remaining().is_none() {
+            return Err(Error::RpcDeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    fn with_cancellation(&self, cancellation: Arc<AtomicBool>) -> Self {
+        let mut cancellations = self.cancellations.clone();
+        cancellations.push(cancellation);
+        Self {
+            deadline: self.deadline,
+            cancellations,
+        }
+    }
+
+    fn with_deadline_and_cancellation(
+        &self,
+        deadline: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        let mut cancellations = self.cancellations.clone();
+        cancellations.push(cancellation);
+        Self {
+            deadline,
+            cancellations,
+        }
+    }
+}
+
+/// An RPC invocation captures the caller deadline once.  `work_deadline`
+/// is never recomputed by nested work: the final reserve is exclusively for
+/// cancelling and draining already admitted jobs.
+#[derive(Clone)]
+struct RpcCallBudget {
+    caller: RecorderRpcContext,
+    deadline: Instant,
+    work_deadline: Instant,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ControlWorkDeadlineCheckpoint {
+    Constructor,
+    Admission,
+}
+
+impl RpcCallBudget {
+    fn new(caller: &RecorderRpcContext) -> Result<Self> {
+        #[cfg(test)]
+        record_control_budget_constructor(caller);
+        let deadline = caller.deadline();
+        let Some(work_deadline) = deadline.checked_sub(CONTROL_DRAIN_RESERVE) else {
+            caller.check()?;
+            return Err(Error::RpcDeadlineExceeded);
+        };
+        check_control_work_deadline(
+            caller,
+            work_deadline,
+            ControlWorkDeadlineCheckpoint::Constructor,
+        )?;
+        Ok(Self {
+            caller: caller.clone(),
+            deadline,
+            work_deadline,
+        })
+    }
+
+    fn check_admission(&self) -> Result<()> {
+        check_control_work_deadline(
+            &self.caller,
+            self.work_deadline,
+            ControlWorkDeadlineCheckpoint::Admission,
+        )
+    }
+
+    fn child_context(&self, group: &RpcCallGroup) -> RecorderRpcContext {
+        self.caller
+            .with_deadline_and_cancellation(self.work_deadline, group.token())
+    }
+}
+
+// Control collectors were the first users.  Keep the private alias while
+// record collectors migrate to the same caller-owned D/W budget.
+type ControlCallBudget = RpcCallBudget;
+
+#[cfg(test)]
+struct ControlBudgetConstructorHook {
+    cancellation: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+static CONTROL_BUDGET_CONSTRUCTOR_HOOK: std::sync::OnceLock<
+    Mutex<Option<ControlBudgetConstructorHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct ControlBudgetConstructorHookGuard;
+
+#[cfg(test)]
+impl Drop for ControlBudgetConstructorHookGuard {
+    fn drop(&mut self) {
+        let hook = CONTROL_BUDGET_CONSTRUCTOR_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn count_control_budget_constructors_for(
+    cancellation: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
+) -> ControlBudgetConstructorHookGuard {
+    let hook = CONTROL_BUDGET_CONSTRUCTOR_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(
+        hook.is_none(),
+        "only one control-budget constructor hook may be armed"
+    );
+    *hook = Some(ControlBudgetConstructorHook {
+        cancellation,
+        calls,
+    });
+    ControlBudgetConstructorHookGuard
+}
+
+#[cfg(test)]
+fn record_control_budget_constructor(context: &RecorderRpcContext) {
+    let hook = CONTROL_BUDGET_CONSTRUCTOR_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = lock_unpoison(hook);
+    if hook.as_ref().is_some_and(|candidate| {
+        context
+            .cancellations
+            .iter()
+            .any(|token| Arc::ptr_eq(token, &candidate.cancellation))
+    }) {
+        hook.as_ref().unwrap().calls.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn check_control_work_deadline(
+    caller: &RecorderRpcContext,
+    work_deadline: Instant,
+    _checkpoint: ControlWorkDeadlineCheckpoint,
+) -> Result<()> {
+    caller.check()?;
+    #[cfg(test)]
+    pause_before_control_work_deadline_check(caller, _checkpoint);
+    if Instant::now() >= work_deadline {
+        caller.check()?;
+        return Err(Error::RpcDeadlineExceeded);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct ControlWorkDeadlineHook {
+    cancellation: Arc<AtomicBool>,
+    checkpoint: ControlWorkDeadlineCheckpoint,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+static CONTROL_WORK_DEADLINE_HOOK: std::sync::OnceLock<Mutex<Option<ControlWorkDeadlineHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct ControlWorkDeadlineHookGuard;
+
+#[cfg(test)]
+impl Drop for ControlWorkDeadlineHookGuard {
+    fn drop(&mut self) {
+        let hook = CONTROL_WORK_DEADLINE_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn pause_next_control_work_deadline_check(
+    cancellation: Arc<AtomicBool>,
+    checkpoint: ControlWorkDeadlineCheckpoint,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+) -> ControlWorkDeadlineHookGuard {
+    let hook = CONTROL_WORK_DEADLINE_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(
+        hook.is_none(),
+        "only one control deadline hook may be armed"
+    );
+    *hook = Some(ControlWorkDeadlineHook {
+        cancellation,
+        checkpoint,
+        entered,
+        release,
+    });
+    ControlWorkDeadlineHookGuard
+}
+
+#[cfg(test)]
+fn pause_before_control_work_deadline_check(
+    context: &RecorderRpcContext,
+    checkpoint: ControlWorkDeadlineCheckpoint,
+) {
+    let hook = CONTROL_WORK_DEADLINE_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = {
+        let mut hook = lock_unpoison(hook);
+        match hook.as_ref() {
+            Some(candidate)
+                if candidate.checkpoint == checkpoint
+                    && context
+                        .cancellations
+                        .iter()
+                        .any(|token| Arc::ptr_eq(token, &candidate.cancellation)) =>
+            {
+                hook.take()
+            }
+            _ => None,
+        }
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.entered.send(()).unwrap();
+    let (released, condition) = &*hook.release;
+    let mut released = lock_unpoison(released);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+#[cfg(test)]
+struct SummaryDispatchHook {
+    cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+static SUMMARY_DISPATCH_HOOK: std::sync::OnceLock<Mutex<Option<SummaryDispatchHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct SummaryDispatchHookGuard;
+
+#[cfg(test)]
+impl Drop for SummaryDispatchHookGuard {
+    fn drop(&mut self) {
+        let hook = SUMMARY_DISPATCH_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn pause_after_next_summary_dispatch(
+    cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+) -> SummaryDispatchHookGuard {
+    let hook = SUMMARY_DISPATCH_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(
+        hook.is_none(),
+        "only one summary dispatch hook may be armed"
+    );
+    *hook = Some(SummaryDispatchHook {
+        cancellation,
+        entered,
+        release,
+    });
+    SummaryDispatchHookGuard
+}
+
+#[cfg(test)]
+fn pause_after_summary_dispatch(context: &RecorderRpcContext) {
+    let hook = SUMMARY_DISPATCH_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = {
+        let mut hook = lock_unpoison(hook);
+        match hook.as_ref() {
+            Some(candidate)
+                if context
+                    .cancellations
+                    .iter()
+                    .any(|token| Arc::ptr_eq(token, &candidate.cancellation)) =>
+            {
+                hook.take()
+            }
+            _ => None,
+        }
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.entered.send(()).unwrap();
+    let (released, condition) = &*hook.release;
+    let mut released = lock_unpoison(released);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+#[cfg(test)]
+struct SummaryProvisionalNoneHook {
+    cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+static SUMMARY_PROVISIONAL_NONE_HOOK: std::sync::OnceLock<
+    Mutex<Option<SummaryProvisionalNoneHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct SummaryProvisionalNoneHookGuard;
+
+#[cfg(test)]
+impl Drop for SummaryProvisionalNoneHookGuard {
+    fn drop(&mut self) {
+        let hook = SUMMARY_PROVISIONAL_NONE_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn pause_after_next_summary_provisional_none(
+    cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+) -> SummaryProvisionalNoneHookGuard {
+    let hook = SUMMARY_PROVISIONAL_NONE_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(
+        hook.is_none(),
+        "only one summary provisional-none hook may be armed"
+    );
+    *hook = Some(SummaryProvisionalNoneHook {
+        cancellation,
+        entered,
+        release,
+    });
+    SummaryProvisionalNoneHookGuard
+}
+
+#[cfg(test)]
+fn pause_after_summary_provisional_none(context: &RecorderRpcContext) {
+    let hook = SUMMARY_PROVISIONAL_NONE_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = {
+        let mut hook = lock_unpoison(hook);
+        match hook.as_ref() {
+            Some(candidate)
+                if context
+                    .cancellations
+                    .iter()
+                    .any(|token| Arc::ptr_eq(token, &candidate.cancellation)) =>
+            {
+                hook.take()
+            }
+            _ => None,
+        }
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.entered.send(()).unwrap();
+    let (released, condition) = &*hook.release;
+    let mut released = lock_unpoison(released);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+#[cfg(test)]
+struct FetchDispatchHook {
+    cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+static FETCH_DISPATCH_HOOK: std::sync::OnceLock<Mutex<Option<FetchDispatchHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct FetchDispatchHookGuard;
+
+#[cfg(test)]
+impl Drop for FetchDispatchHookGuard {
+    fn drop(&mut self) {
+        let hook = FETCH_DISPATCH_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn pause_after_next_fetch_dispatch(
+    cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+) -> FetchDispatchHookGuard {
+    let hook = FETCH_DISPATCH_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(hook.is_none(), "only one fetch dispatch hook may be armed");
+    *hook = Some(FetchDispatchHook {
+        cancellation,
+        entered,
+        release,
+    });
+    FetchDispatchHookGuard
+}
+
+#[cfg(test)]
+fn pause_after_fetch_dispatch(context: &RecorderRpcContext) {
+    let hook = FETCH_DISPATCH_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = {
+        let mut hook = lock_unpoison(hook);
+        match hook.as_ref() {
+            Some(candidate)
+                if context
+                    .cancellations
+                    .iter()
+                    .any(|token| Arc::ptr_eq(token, &candidate.cancellation)) =>
+            {
+                hook.take()
+            }
+            _ => None,
+        }
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.entered.send(()).unwrap();
+    let (released, condition) = &*hook.release;
+    let mut released = lock_unpoison(released);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum BudgetIdentityEvent {
+    ReadFenceHandoff {
+        deadline: Instant,
+        work_deadline: Instant,
+        outstanding: usize,
+    },
+    SummaryHandoff {
+        deadline: Instant,
+        work_deadline: Instant,
+        outstanding: usize,
+    },
+    FetchDispatch {
+        deadline: Instant,
+        work_deadline: Instant,
+    },
+    FetchHandoff {
+        deadline: Instant,
+        work_deadline: Instant,
+        outstanding: usize,
+        mutation_started: usize,
+    },
+    FinishFetchHandoff {
+        deadline: Instant,
+        work_deadline: Instant,
+        outstanding: usize,
+        mutation_started: usize,
+    },
+    InstallDispatch {
+        deadline: Instant,
+        work_deadline: Instant,
+        mutation_started: usize,
+        mutation_started_set: bool,
+    },
+}
+
+#[cfg(test)]
+struct BudgetIdentityHook {
+    cancellation: Arc<AtomicBool>,
+    events: std::sync::mpsc::SyncSender<BudgetIdentityEvent>,
+}
+
+#[cfg(test)]
+static BUDGET_IDENTITY_HOOK: std::sync::OnceLock<Mutex<Option<BudgetIdentityHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct BudgetIdentityHookGuard;
+
+#[cfg(test)]
+impl Drop for BudgetIdentityHookGuard {
+    fn drop(&mut self) {
+        let hook = BUDGET_IDENTITY_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn record_budget_identity_for(
+    cancellation: Arc<AtomicBool>,
+    events: std::sync::mpsc::SyncSender<BudgetIdentityEvent>,
+) -> BudgetIdentityHookGuard {
+    let hook = BUDGET_IDENTITY_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(hook.is_none(), "only one budget identity hook may be armed");
+    *hook = Some(BudgetIdentityHook {
+        cancellation,
+        events,
+    });
+    BudgetIdentityHookGuard
+}
+
+#[cfg(test)]
+fn record_budget_identity(context: &RecorderRpcContext, event: BudgetIdentityEvent) {
+    let hook = BUDGET_IDENTITY_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = lock_unpoison(hook);
+    if hook.as_ref().is_some_and(|candidate| {
+        context
+            .cancellations
+            .iter()
+            .any(|token| Arc::ptr_eq(token, &candidate.cancellation))
+    }) {
+        hook.as_ref().unwrap().events.send(event).unwrap();
+    }
+}
+
+#[cfg(test)]
+struct FetchGroupTokenHook {
+    cancellation: Arc<AtomicBool>,
+    token: std::sync::mpsc::SyncSender<Arc<AtomicBool>>,
+}
+
+#[cfg(test)]
+static FETCH_GROUP_TOKEN_HOOK: std::sync::OnceLock<Mutex<Option<FetchGroupTokenHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct FetchGroupTokenHookGuard;
+
+#[cfg(test)]
+impl Drop for FetchGroupTokenHookGuard {
+    fn drop(&mut self) {
+        let hook = FETCH_GROUP_TOKEN_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn capture_next_fetch_group_token(
+    cancellation: Arc<AtomicBool>,
+    token: std::sync::mpsc::SyncSender<Arc<AtomicBool>>,
+) -> FetchGroupTokenHookGuard {
+    let hook = FETCH_GROUP_TOKEN_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(
+        hook.is_none(),
+        "only one fetch group-token hook may be armed"
+    );
+    *hook = Some(FetchGroupTokenHook {
+        cancellation,
+        token,
+    });
+    FetchGroupTokenHookGuard
+}
+
+#[cfg(test)]
+fn capture_fetch_group_token(context: &RecorderRpcContext, group: &ControlCallGroup) {
+    let hook = FETCH_GROUP_TOKEN_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = {
+        let mut hook = lock_unpoison(hook);
+        if hook.as_ref().is_some_and(|candidate| {
+            context
+                .cancellations
+                .iter()
+                .any(|token| Arc::ptr_eq(token, &candidate.cancellation))
+        }) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.token.send(group.token()).unwrap();
+    }
+}
+
 /// Read-only classification of a recorder root before startup recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecorderPreflight {
@@ -53,6 +707,14 @@ const RECORDER_STATE_VERSION: u16 = 4;
 const CONFIGURATION_STATE_VERSION: u16 = 3;
 const RECORD_WORKER_QUEUE_CAPACITY: usize = 1;
 const CONTROL_WORKER_QUEUE_CAPACITY: usize = 1;
+/// A blocked worker result channel must periodically re-check the caller's
+/// cancellation token instead of sleeping until its absolute deadline.
+const CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// The final ten control polls are reserved for cancellation and drain.
+const CONTROL_DRAIN_RESERVE: Duration = Duration::from_millis(100);
+/// The maximum time the consensus runtime will wait for a Recorder RPC unless
+/// its caller supplies a shorter explicit deadline.
+pub const DEFAULT_RECORDER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The largest replicated command supported by the bounded WAL rotation policy below. The
 // remaining limits follow directly from the on-disk envelopes: seven membership entries,
@@ -67,6 +729,17 @@ const MAX_TRANSITION_INTENT_BYTES: usize =
 const MAX_CONFIGURATION_HEAD_INTENT_BYTES: usize =
     MAX_CONFIGURATION_BYTES + MAX_RECORDED_HEAD_BYTES + 4 + 2 + 8 + 8;
 const MAX_RECORDER_WAL_BYTES: usize = 64 * 1024 * 1024 + 2 * 1024 * 1024;
+
+fn validate_replicated_command_size(command: &StoredCommand) -> Result<()> {
+    let actual = command.payload.len();
+    if actual > MAX_REPLICATED_COMMAND_BYTES {
+        return Err(Error::CommandTooLarge {
+            actual,
+            limit: MAX_REPLICATED_COMMAND_BYTES,
+        });
+    }
+    Ok(())
+}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const O_NOFOLLOW_FLAG: i32 = 0o400000;
@@ -88,8 +761,17 @@ pub enum Error {
         actual_prev_hash: LogHash,
     },
     CommandHashMismatch,
+    CommandTooLarge {
+        actual: usize,
+        limit: usize,
+    },
     CommandUnavailable,
     Cancelled,
+    /// The caller cancelled an RPC before a recorder acknowledged it.
+    RpcCancelled,
+    /// The RPC deadline elapsed before a recorder acknowledged it. The
+    /// recorder may still have durably performed the operation.
+    RpcDeadlineExceeded,
     ConflictingCertificates,
     Decode(String),
     DuplicateRecorderIdentity,
@@ -106,6 +788,9 @@ pub enum Error {
     ReadFenceUnsupported,
     TypedProofInstallRequired,
     TypedRecordRequired,
+    /// The result of a mutating Recorder RPC is unknown. Callers must recover
+    /// from Recorder state rather than retrying it as a new operation.
+    UnknownOutcome,
 }
 
 impl fmt::Display for Error {
@@ -115,8 +800,16 @@ impl fmt::Display for Error {
                 write!(f, "QuePaxa predecessor conflicts at slot {slot}")
             }
             Self::CommandHashMismatch => write!(f, "QuePaxa command hash mismatch"),
+            Self::CommandTooLarge { actual, limit } => {
+                write!(
+                    f,
+                    "QuePaxa command payload of {actual} bytes exceeds the {limit}-byte limit"
+                )
+            }
             Self::CommandUnavailable => write!(f, "QuePaxa command bytes unavailable"),
             Self::Cancelled => write!(f, "QuePaxa proposal cancelled"),
+            Self::RpcCancelled => write!(f, "QuePaxa recorder RPC cancelled"),
+            Self::RpcDeadlineExceeded => write!(f, "QuePaxa recorder RPC deadline elapsed"),
             Self::ConflictingCertificates => {
                 write!(f, "QuePaxa recovered conflicting decision certificates")
             }
@@ -152,11 +845,50 @@ impl fmt::Display for Error {
             Self::TypedRecordRequired => {
                 write!(f, "recorder does not implement the typed Record operation")
             }
+            Self::UnknownOutcome => {
+                write!(
+                    f,
+                    "QuePaxa recorder RPC outcome is unknown; recover recorder state"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+fn check_operation_context(
+    context: &RecorderRpcContext,
+    mutation_started: &AtomicBool,
+) -> Result<()> {
+    match context.check() {
+        Err(Error::RpcCancelled | Error::RpcDeadlineExceeded)
+            if mutation_started.load(Ordering::Acquire) =>
+        {
+            Err(Error::UnknownOutcome)
+        }
+        result => result,
+    }
+}
+
+fn check_proposal_operation_context<F>(
+    context: &RecorderRpcContext,
+    mutation_started: &AtomicBool,
+    cancelled: &F,
+) -> Result<()>
+where
+    F: Fn() -> Result<()>,
+{
+    check_operation_context(context, mutation_started)?;
+    match cancelled() {
+        Err(Error::RpcCancelled | Error::RpcDeadlineExceeded)
+            if mutation_started.load(Ordering::Acquire) =>
+        {
+            Err(Error::UnknownOutcome)
+        }
+        result => result,
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Membership {
@@ -221,7 +953,7 @@ impl Membership {
 pub type FixedMembership = Membership;
 
 pub trait Consensus {
-    fn propose(&self, command: Command) -> Result<LogEntry>;
+    fn propose(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry>;
 }
 
 pub fn quorum_size(n: usize) -> usize {
@@ -1269,12 +2001,13 @@ enum RecordedHeadProvenance {
 pub trait RecorderRpc: Send + Sync {
     /// Performs one genuine QuePaxa Record operation.
     ///
-    /// Network implementations must enforce a finite deadline and return an
-    /// error when it expires. The same bounded-call requirement applies to all
-    /// process-bound methods on this trait. Lifecycle owners retain and join
-    /// admitted calls after their shutdown deadline, so a non-returning custom
-    /// implementation intentionally prevents a false quiescent shutdown.
-    fn record(&self, _request: RecordRequest) -> Result<RecordSummary> {
+    /// Implementations must enforce `context.deadline()` and stop I/O when
+    /// `context.is_cancelled()` becomes true.
+    fn record(
+        &self,
+        _context: &RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary> {
         Err(Error::TypedRecordRequired)
     }
 
@@ -1284,17 +2017,26 @@ pub trait RecorderRpc: Send + Sync {
     /// Phase2 acknowledgements rely on a quorum of these durable successes.
     fn install_decision_proof(
         &self,
+        _context: &RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<()> {
         Err(Error::TypedProofInstallRequired)
     }
 
-    fn inspect_decision_proof(&self, _slot: Slot) -> Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &RecorderRpcContext,
+        _slot: Slot,
+    ) -> Result<Option<DecisionProof>> {
         Ok(None)
     }
 
-    fn inspect_record_summary(&self, _slot: Slot) -> Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &RecorderRpcContext,
+        _slot: Slot,
+    ) -> Result<Option<RecordSummary>> {
         Err(Error::TypedRecordRequired)
     }
 
@@ -1304,20 +2046,22 @@ pub trait RecorderRpc: Send + Sync {
         false
     }
 
-    fn observe_read_fence(&self, _request: ReadFenceRequest) -> Result<ReadFenceObservation> {
+    fn observe_read_fence(
+        &self,
+        _context: &RecorderRpcContext,
+        _request: ReadFenceRequest,
+    ) -> Result<ReadFenceObservation> {
         Err(Error::ReadFenceUnsupported)
     }
 
-    fn recorder_id(&self) -> Result<NodeId> {
+    fn recorder_id(&self, _context: &RecorderRpcContext) -> Result<NodeId> {
         Err(Error::TypedRecordRequired)
     }
 
-    fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
-        self.store_command_for(String::new(), 0, 0, LogHash::ZERO, command_hash, command)
-    }
-
+    #[allow(clippy::too_many_arguments)] // mirrors the durable recorder identity tuple
     fn store_command_for(
         &self,
+        context: &RecorderRpcContext,
         cluster_id: ClusterId,
         epoch: Epoch,
         config_id: ConfigId,
@@ -1326,6 +2070,7 @@ pub trait RecorderRpc: Send + Sync {
         command: StoredCommand,
     ) -> Result<()> {
         let _ = (
+            context,
             cluster_id,
             epoch,
             config_id,
@@ -1336,11 +2081,95 @@ pub trait RecorderRpc: Send + Sync {
         Err(Error::TypedRecordRequired)
     }
 
-    fn fetch_command(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
-        self.fetch_command_for(String::new(), 0, 0, LogHash::ZERO, command_hash)
+    fn fetch_command_for(
+        &self,
+        context: &RecorderRpcContext,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> Result<Option<StoredCommand>> {
+        let _ = (
+            context,
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+        );
+        Err(Error::TypedRecordRequired)
+    }
+}
+
+impl RecorderFileStore {
+    /// Direct local-store access for embedding and diagnostic code. Distributed
+    /// callers must use the context-bearing [`RecorderRpc`] interface.
+    pub fn recorder_id(&self) -> Result<NodeId> {
+        Ok(self.recorder_id.clone())
     }
 
-    fn fetch_command_for(
+    pub fn record(&self, request: RecordRequest) -> Result<RecordSummary> {
+        self.record_proposal(request)
+    }
+
+    pub fn install_decision_proof(
+        &self,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> Result<()> {
+        self.install_decision_proof_record(proof, membership)
+    }
+
+    pub fn inspect_decision_proof(&self, slot: Slot) -> Result<Option<DecisionProof>> {
+        Ok(self.load(slot)?.decision_proof().cloned())
+    }
+
+    pub fn inspect_record_summary(&self, slot: Slot) -> Result<Option<RecordSummary>> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        let configuration = self.configuration_state()?;
+        let exists_in_wal = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
+            .slots
+            .contains_key(&slot);
+        if !exists_in_wal && !self.path(slot).exists() {
+            return Ok(None);
+        }
+        let state = self.load_unlocked(slot, configuration.config_digest)?;
+        Ok(Some(record_summary(
+            &self.recorder_id,
+            &state,
+            state.decision_proof().cloned(),
+        )))
+    }
+
+    pub fn store_command_for(
+        &self,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> Result<()> {
+        self.apply(RecorderRequest::StoreCommand {
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        })?;
+        Ok(())
+    }
+
+    pub fn fetch_command_for(
         &self,
         cluster_id: ClusterId,
         epoch: Epoch,
@@ -1348,12 +2177,17 @@ pub trait RecorderRpc: Send + Sync {
         config_digest: LogHash,
         command_hash: LogHash,
     ) -> Result<Option<StoredCommand>> {
-        let _ = (cluster_id, epoch, config_id, config_digest, command_hash);
-        Err(Error::TypedRecordRequired)
+        Ok(self
+            .apply(RecorderRequest::FetchCommand {
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            })?
+            .command)
     }
-}
 
-impl RecorderFileStore {
     /// Classifies an existing recorder root without creating, recovering, truncating, or
     /// rewriting local state. `Recoverable` is limited to durable normal-crash artifacts that a
     /// subsequent locked open knows how to finish.
@@ -1369,7 +2203,7 @@ impl RecorderFileStore {
         let metadata = match fs::symlink_metadata(root) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(RecorderPreflight::Missing)
+                return Ok(RecorderPreflight::Missing);
             }
             Err(error) => return Err(Error::Io(error.to_string())),
         };
@@ -1400,7 +2234,7 @@ impl RecorderFileStore {
             (Some(_), Some(_)) => {
                 return Err(Error::Decode(
                     "recorder has conflicting recovery intents".into(),
-                ))
+                ));
             }
             (Some(bytes), None) => {
                 validate_recoverable_transition_intent(
@@ -1561,7 +2395,7 @@ impl RecorderFileStore {
         let root_metadata = match fs::symlink_metadata(&root) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(Error::Decode("recorder root does not exist".into()))
+                return Err(Error::Decode("recorder root does not exist".into()));
             }
             Err(error) => return Err(Error::Io(error.to_string())),
         };
@@ -2193,6 +3027,7 @@ impl RecorderFileStore {
     }
 
     fn store_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
+        validate_replicated_command_size(command)?;
         if command.hash() != command_hash {
             return Err(Error::CommandHashMismatch);
         }
@@ -2259,7 +3094,7 @@ impl RecorderFileStore {
                     self.epoch,
                     self.current_config_id(),
                     config_digest,
-                ))
+                ));
             }
             Err(error) => return Err(error),
         };
@@ -2585,6 +3420,7 @@ impl RecorderFileStore {
         value: &AcceptedValue,
         command: &StoredCommand,
     ) -> Result<()> {
+        validate_replicated_command_size(command)?;
         let expected = AcceptedValue::from_command(
             &self.cluster_id,
             slot,
@@ -3282,20 +4118,106 @@ pub struct ThreeNodeConsensus {
     // HTTP timeout instead of a prompt Unavailable result.
     read_fence_workers: Vec<ControlWorker>,
     priority_source: Arc<dyn PrioritySource>,
+    #[cfg(feature = "test-hooks")]
+    test_instance_id: u64,
     proposal_sequence: AtomicU64,
     sequential_tip: Mutex<SingleNodeState>,
 }
 
 struct RecordJob {
     index: usize,
+    context: RecorderRpcContext,
     request: RecordRequest,
     result: std::sync::mpsc::SyncSender<(usize, Result<RecordSummary>)>,
 }
 
 struct RecordWorker {
-    sender: Option<std::sync::mpsc::SyncSender<RecordJob>>,
+    state: Arc<RecordWorkerState>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+struct RecordWorkerState {
+    queue: Arc<RecordQueue>,
     pending: Arc<AtomicUsize>,
+    cancellation: Arc<AtomicBool>,
+    quarantined: AtomicBool,
+    #[cfg(feature = "test-hooks")]
+    live_groups: Mutex<BTreeMap<usize, (RpcCallGroup, usize)>>,
+}
+
+struct RecordQueue {
+    state: Mutex<RecordQueueState>,
+    available: Condvar,
+}
+
+struct RecordQueueState {
+    jobs: VecDeque<QueuedRecordJob>,
+    closed: bool,
+}
+
+struct QueuedRecordJob {
+    job: RecordJob,
+    completion: ControlCompletionGuard,
+}
+
+#[cfg(test)]
+struct RecordWorkerPanicAfterPopHook {
+    worker_identity: usize,
+    popped: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+static RECORD_WORKER_PANIC_AFTER_POP: std::sync::OnceLock<
+    Mutex<Vec<RecordWorkerPanicAfterPopHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct RecordWorkerPanicAfterPopGuard {
+    worker_identity: usize,
+}
+
+#[cfg(test)]
+impl Drop for RecordWorkerPanicAfterPopGuard {
+    fn drop(&mut self) {
+        let hooks = RECORD_WORKER_PANIC_AFTER_POP.get_or_init(|| Mutex::new(Vec::new()));
+        lock_unpoison(hooks).retain(|hook| hook.worker_identity != self.worker_identity);
+    }
+}
+
+#[cfg(test)]
+fn arm_record_worker_panic_after_pop(
+    worker: &Arc<RecordWorkerState>,
+    popped: std::sync::mpsc::SyncSender<()>,
+) -> RecordWorkerPanicAfterPopGuard {
+    let worker_identity = Arc::as_ptr(worker) as usize;
+    let hooks = RECORD_WORKER_PANIC_AFTER_POP.get_or_init(|| Mutex::new(Vec::new()));
+    let mut hooks = lock_unpoison(hooks);
+    assert!(
+        !hooks
+            .iter()
+            .any(|hook| hook.worker_identity == worker_identity),
+        "only one record worker panic hook may be armed per worker"
+    );
+    hooks.push(RecordWorkerPanicAfterPopHook {
+        worker_identity,
+        popped,
+    });
+    RecordWorkerPanicAfterPopGuard { worker_identity }
+}
+
+#[cfg(test)]
+fn take_record_worker_panic_after_pop(worker_identity: usize) -> bool {
+    let hooks = RECORD_WORKER_PANIC_AFTER_POP.get_or_init(|| Mutex::new(Vec::new()));
+    let mut hooks = lock_unpoison(hooks);
+    let Some(index) = hooks
+        .iter()
+        .position(|hook| hook.worker_identity == worker_identity)
+    else {
+        return false;
+    };
+    let hook = hooks.swap_remove(index);
+    let _ = hook.popped.send(());
+    true
 }
 
 impl RecordWorker {
@@ -3306,76 +4228,373 @@ impl RecordWorker {
         config_digest: LogHash,
     ) -> Result<Self> {
         let expected_id = recorder_id;
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<RecordJob>(RECORD_WORKER_QUEUE_CAPACITY);
-        let pending = Arc::new(AtomicUsize::new(0));
-        let worker_pending = Arc::clone(&pending);
+        let queue = Arc::new(RecordQueue {
+            state: Mutex::new(RecordQueueState {
+                jobs: VecDeque::with_capacity(RECORD_WORKER_QUEUE_CAPACITY),
+                closed: false,
+            }),
+            available: Condvar::new(),
+        });
+        let state = Arc::new(RecordWorkerState {
+            queue,
+            pending: Arc::new(AtomicUsize::new(0)),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            quarantined: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            live_groups: Mutex::new(BTreeMap::new()),
+        });
+        let worker_state = Arc::clone(&state);
         let handle = thread::Builder::new()
             .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let expected_slot = job.request.slot;
-                    let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        recorder.record(job.request)
-                    }))
-                    .unwrap_or(Err(Error::ProposeFailed))
-                    .and_then(|reply| {
-                        if reply.recorder_id == expected_id
-                            && reply.slot == expected_slot
-                            && reply.config_id == config_id
-                            && reply.config_digest == config_digest
-                        {
-                            Ok(reply)
-                        } else {
-                            Err(Error::Rejected(RejectReason::InvalidRequest))
-                        }
-                    });
-                    let _ = job.result.send((job.index, reply));
-                    worker_pending.fetch_sub(1, Ordering::Release);
+                let abnormal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    record_worker_loop(
+                        &worker_state,
+                        recorder.as_ref(),
+                        &expected_id,
+                        config_id,
+                        config_digest,
+                    );
+                }))
+                .is_err();
+                if abnormal {
+                    worker_state.quarantine();
                 }
             })
             .map_err(|error| Error::Io(error.to_string()))?;
         Ok(Self {
-            sender: Some(sender),
+            state,
             handle: Some(handle),
-            pending,
         })
     }
 
-    fn dispatch(&self, job: RecordJob) -> bool {
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        let (failed, saturated) = match &self.sender {
-            Some(sender) => match sender.try_send(job) {
-                Ok(()) => (None, false),
-                Err(std::sync::mpsc::TrySendError::Full(job)) => (
-                    Some((
-                        job,
-                        Error::Io("recorder worker queue is temporarily full".into()),
-                    )),
-                    true,
-                ),
-                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
-                    (Some((job, Error::ProposeFailed)), false)
+    #[cfg(test)]
+    fn dispatch(&self, job: RecordJob) -> RecordDispatch {
+        self.dispatch_inner(job, None, None)
+    }
+
+    fn dispatch_mutating_group(
+        &self,
+        job: RecordJob,
+        group: &RpcCallGroup,
+        mutation_started: &AtomicBool,
+    ) -> RecordDispatch {
+        self.dispatch_inner(job, Some(group), Some(mutation_started))
+    }
+
+    fn dispatch_inner(
+        &self,
+        job: RecordJob,
+        group: Option<&RpcCallGroup>,
+        mutation_started: Option<&AtomicBool>,
+    ) -> RecordDispatch {
+        let grouped = group.is_some();
+        let mut queued_job = Some(QueuedRecordJob {
+            job,
+            completion: ControlCompletionGuard::new(Arc::clone(&self.state.pending)),
+        });
+        let (pruned, error, outcome) = {
+            let mut queue = lock_unpoison(&self.state.queue.state);
+            let mut pruned = Vec::new();
+            let mut retained = VecDeque::with_capacity(queue.jobs.len());
+            while let Some(job) = queue.jobs.pop_front() {
+                if job.is_cancelled() {
+                    pruned.push(job);
+                } else {
+                    retained.push_back(job);
                 }
-            },
-            None => (Some((job, Error::ProposeFailed)), false),
+            }
+            queue.jobs = retained;
+            if queue.closed || self.state.quarantined.load(Ordering::Acquire) {
+                (pruned, Some(Error::ProposeFailed), RecordDispatch::Failed)
+            } else if queue.jobs.len() >= RECORD_WORKER_QUEUE_CAPACITY {
+                (
+                    pruned,
+                    Some(Error::Io(
+                        "recorder worker queue is temporarily full".into(),
+                    )),
+                    RecordDispatch::Saturated,
+                )
+            } else {
+                let queued = queued_job.as_mut().expect("record job must be present");
+                // Mark the mutating admission and register its lease while the
+                // queue is locked, before the worker can observe the job.
+                queued.completion.arm(group, &self.state);
+                #[cfg(feature = "test-hooks")]
+                queued.completion.attach_record_worker(&self.state, group);
+                if let Some(mutation_started) = mutation_started {
+                    mutation_started.store(true, Ordering::Release);
+                }
+                queue
+                    .jobs
+                    .push_back(queued_job.take().expect("record job must be present"));
+                self.state.queue.available.notify_one();
+                (pruned, None, RecordDispatch::Accepted)
+            }
         };
-        if let Some((job, error)) = failed {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-            let _ = job.result.send((job.index, Err(error)));
+        for job in pruned {
+            if job.completion.group().is_some() {
+                job.fail(Error::RpcCancelled);
+            }
         }
-        saturated
+        // Group collectors classify a pre-admission failure from
+        // `RecordDispatch`; injecting a synthetic reply would make it look
+        // like an un-attributable admitted result.  The direct test-only
+        // dispatch path keeps the reply contract used by worker unit tests.
+        if let Some(error) = error.filter(|_| !grouped) {
+            queued_job.unwrap().fail(error);
+        }
+        outcome
     }
 
     fn is_idle(&self) -> bool {
-        self.pending.load(Ordering::Acquire) == 0
+        self.state.pending.load(Ordering::Acquire) == 0
     }
 
     fn shutdown(&mut self) {
-        self.sender.take();
-        if let Some(handle) = self.handle.take() {
+        // Closing/draining is also the admission fence. Only the post-close
+        // snapshot can prove that no recorder call is running: a pre-close
+        // idle observation could race a newly admitted noncooperative RPC.
+        let join_idle_worker = self.state.close_and_drain();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if join_idle_worker || handle.is_finished() {
             let _ = handle.join();
+            return;
+        }
+        // A running custom RecorderRpc may be stuck in a syscall or ignore
+        // cancellation. Keep shutdown bounded in that case: detaching retains
+        // only the worker-owned recorder/state Arcs, never a runtime borrow.
+        drop(handle);
+    }
+}
+
+impl QueuedRecordJob {
+    #[cfg(feature = "test-hooks")]
+    fn test_event(&self, worker: usize, event: TestWorkerEvent) {
+        if let Some(group) = self.completion.group() {
+            group.record_test_worker_event(worker, event);
         }
     }
+
+    fn run(
+        self,
+        recorder: &dyn RecorderRpc,
+        worker_cancellation: &Arc<AtomicBool>,
+        _worker_identity: usize,
+        expected_id: &NodeId,
+        config_id: ConfigId,
+        config_digest: LogHash,
+    ) {
+        #[cfg(feature = "test-hooks")]
+        self.test_event(_worker_identity, TestWorkerEvent::RunningEntered);
+        if self.is_cancelled() {
+            #[cfg(feature = "test-hooks")]
+            self.test_event(_worker_identity, TestWorkerEvent::RunningExited);
+            self.fail(Error::RpcCancelled);
+            return;
+        }
+        #[cfg(test)]
+        if take_record_worker_panic_after_pop(_worker_identity) {
+            panic!("injected record worker panic after queue pop");
+        }
+        let expected_slot = self.job.request.slot;
+        let mut context = self
+            .job
+            .context
+            .with_cancellation(Arc::clone(worker_cancellation));
+        if let Some(group) = self.completion.group() {
+            context = context.with_cancellation(group.token());
+        }
+        let reply = recorder_rpc(RecorderRpcOperation::Mutating, || {
+            recorder.record(&context, self.job.request.clone())
+        })
+        .and_then(|reply| {
+            if reply.recorder_id == *expected_id
+                && reply.slot == expected_slot
+                && reply.config_id == config_id
+                && reply.config_digest == config_digest
+            {
+                Ok(reply)
+            } else {
+                Err(Error::Rejected(RejectReason::InvalidRequest))
+            }
+        });
+        let _ = self.job.result.send((self.job.index, reply));
+        #[cfg(feature = "test-hooks")]
+        self.test_event(_worker_identity, TestWorkerEvent::ReplySent);
+        #[cfg(feature = "test-hooks")]
+        self.test_event(_worker_identity, TestWorkerEvent::RunningExited);
+    }
+
+    fn fail(self, error: Error) {
+        let _ = self.job.result.send((self.job.index, Err(error)));
+    }
+
+    fn fail_for_worker(self) {
+        self.fail(Error::UnknownOutcome);
+    }
+
+    fn belongs_to(&self, group: &RpcCallGroup) -> bool {
+        self.completion
+            .group()
+            .is_some_and(|candidate| candidate.is_same(group))
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.completion
+            .group()
+            .is_some_and(RpcCallGroup::is_cancelled)
+    }
+}
+
+fn record_worker_loop(
+    state: &RecordWorkerState,
+    recorder: &dyn RecorderRpc,
+    expected_id: &NodeId,
+    config_id: ConfigId,
+    config_digest: LogHash,
+) {
+    loop {
+        let job = {
+            let mut queue = lock_unpoison(&state.queue.state);
+            while queue.jobs.is_empty() && !queue.closed {
+                queue = state
+                    .queue
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            queue.jobs.pop_front()
+        };
+        let Some(job) = job else {
+            break;
+        };
+        #[cfg(feature = "test-hooks")]
+        job.test_event(
+            state as *const RecordWorkerState as usize,
+            TestWorkerEvent::Popped,
+        );
+        job.run(
+            recorder,
+            &state.cancellation,
+            state as *const RecordWorkerState as usize,
+            expected_id,
+            config_id,
+            config_digest,
+        );
+    }
+}
+
+impl RecordWorkerState {
+    #[cfg(feature = "test-hooks")]
+    fn test_register_group(&self, group: &RpcCallGroup) {
+        let key = Arc::as_ptr(&group.state) as usize;
+        let mut groups = lock_unpoison(&self.live_groups);
+        let entry = groups.entry(key).or_insert_with(|| (group.clone(), 0));
+        entry.1 += 1;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn test_complete_group(&self, group: &RpcCallGroup) {
+        let key = Arc::as_ptr(&group.state) as usize;
+        let mut groups = lock_unpoison(&self.live_groups);
+        let (_, count) = groups
+            .get_mut(&key)
+            .expect("record worker completion must match an admitted group lease");
+        assert!(
+            *count > 0,
+            "record worker group lease accounting must not underflow"
+        );
+        *count -= 1;
+        if *count == 0 {
+            groups.remove(&key);
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn test_record_worker_quarantined(&self) {
+        for (group, _) in lock_unpoison(&self.live_groups).values() {
+            group.record_test_worker_event(
+                self as *const Self as usize,
+                TestWorkerEvent::Quarantined,
+            );
+        }
+    }
+
+    fn prune_pending(&self, group: &RpcCallGroup) {
+        let pruned = {
+            let mut queue = lock_unpoison(&self.queue.state);
+            let mut pruned = Vec::new();
+            let mut retained = VecDeque::with_capacity(queue.jobs.len());
+            while let Some(job) = queue.jobs.pop_front() {
+                if job.belongs_to(group) {
+                    pruned.push(job);
+                } else {
+                    retained.push_back(job);
+                }
+            }
+            queue.jobs = retained;
+            pruned
+        };
+        for job in pruned {
+            #[cfg(feature = "test-hooks")]
+            job.test_event(self as *const Self as usize, TestWorkerEvent::Pruned);
+            job.fail(Error::RpcCancelled);
+        }
+    }
+
+    fn quarantine(&self) {
+        if self.quarantined.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        #[cfg(feature = "test-hooks")]
+        self.test_record_worker_quarantined();
+        self.close_and_drain();
+    }
+
+    /// Fences admission and returns whether no job remained running after
+    /// queued jobs were drained. A true result permits a bounded worker join.
+    fn close_and_drain(&self) -> bool {
+        self.cancellation.store(true, Ordering::Release);
+        let drained = {
+            let mut queue = lock_unpoison(&self.queue.state);
+            queue.closed = true;
+            queue.jobs.drain(..).collect::<Vec<_>>()
+        };
+        self.queue.available.notify_all();
+        for job in drained {
+            #[cfg(feature = "test-hooks")]
+            {
+                let worker = self as *const Self as usize;
+                job.test_event(worker, TestWorkerEvent::CloseDrained);
+            }
+            job.fail_for_worker();
+        }
+        self.pending.load(Ordering::Acquire) == 0
+    }
+}
+
+impl RpcCallWorker for RecordWorkerState {
+    fn prune_pending(&self, group: &RpcCallGroup) {
+        RecordWorkerState::prune_pending(self, group);
+    }
+
+    fn quarantine(&self) {
+        RecordWorkerState::quarantine(self);
+    }
+
+    fn worker_identity(&self) -> usize {
+        self as *const Self as usize
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RecordDispatch {
+    NotAttempted,
+    Accepted,
+    Saturated,
+    Failed,
 }
 
 impl Drop for RecordWorker {
@@ -3387,27 +4606,32 @@ impl Drop for RecordWorker {
 enum ControlJob {
     InstallProof {
         index: usize,
+        context: RecorderRpcContext,
         proof: DecisionProof,
         membership: Membership,
         result: std::sync::mpsc::SyncSender<(usize, Result<()>)>,
     },
     InspectProof {
         index: usize,
+        context: RecorderRpcContext,
         slot: Slot,
         result: std::sync::mpsc::SyncSender<(usize, Result<Option<DecisionProof>>)>,
     },
     InspectSummary {
         index: usize,
+        context: RecorderRpcContext,
         slot: Slot,
         result: std::sync::mpsc::SyncSender<(usize, Result<Option<RecordSummary>>)>,
     },
     ObserveReadFence {
         index: usize,
+        context: RecorderRpcContext,
         request: ReadFenceRequest,
         result: std::sync::mpsc::SyncSender<(usize, Result<ReadFenceObservation>)>,
     },
     StoreCommand {
         index: usize,
+        context: RecorderRpcContext,
         cluster_id: ClusterId,
         epoch: Epoch,
         config_id: ConfigId,
@@ -3418,6 +4642,7 @@ enum ControlJob {
     },
     FetchCommand {
         index: usize,
+        context: RecorderRpcContext,
         cluster_id: ClusterId,
         epoch: Epoch,
         config_id: ConfigId,
@@ -3427,44 +4652,91 @@ enum ControlJob {
     },
 }
 
+/// Whether an admitted recorder RPC can have durably changed recorder state.
+///
+/// A panic only tells us that no response was observed.  For mutations, that
+/// leaves the outcome indeterminate; for reads it remains a definite local
+/// failure.  Keep this explicit at every catch boundary so new control RPCs
+/// cannot silently inherit the wrong retry semantics.
+#[derive(Clone, Copy)]
+enum RecorderRpcOperation {
+    Mutating,
+    ReadOnly,
+}
+
 impl ControlJob {
+    fn operation(&self) -> RecorderRpcOperation {
+        match self {
+            Self::InstallProof { .. } | Self::StoreCommand { .. } => RecorderRpcOperation::Mutating,
+            Self::InspectProof { .. }
+            | Self::InspectSummary { .. }
+            | Self::ObserveReadFence { .. }
+            | Self::FetchCommand { .. } => RecorderRpcOperation::ReadOnly,
+        }
+    }
+
+    fn with_cancellation(&mut self, cancellation: Arc<AtomicBool>) {
+        let context = match self {
+            Self::InstallProof { context, .. }
+            | Self::InspectProof { context, .. }
+            | Self::InspectSummary { context, .. }
+            | Self::ObserveReadFence { context, .. }
+            | Self::StoreCommand { context, .. }
+            | Self::FetchCommand { context, .. } => context,
+        };
+        *context = context.with_cancellation(cancellation);
+    }
+
     fn run(self, recorder: &dyn RecorderRpc) {
         match self {
             Self::InstallProof {
                 index,
+                context,
                 proof,
                 membership,
                 result,
             } => {
-                let reply = control_rpc(|| recorder.install_decision_proof(proof, &membership));
+                let reply = recorder_rpc(RecorderRpcOperation::Mutating, || {
+                    recorder.install_decision_proof(&context, proof, &membership)
+                });
                 let _ = result.send((index, reply));
             }
             Self::InspectProof {
                 index,
+                context,
                 slot,
                 result,
             } => {
-                let reply = control_rpc(|| recorder.inspect_decision_proof(slot));
+                let reply = recorder_rpc(RecorderRpcOperation::ReadOnly, || {
+                    recorder.inspect_decision_proof(&context, slot)
+                });
                 let _ = result.send((index, reply));
             }
             Self::InspectSummary {
                 index,
+                context,
                 slot,
                 result,
             } => {
-                let reply = control_rpc(|| recorder.inspect_record_summary(slot));
+                let reply = recorder_rpc(RecorderRpcOperation::ReadOnly, || {
+                    recorder.inspect_record_summary(&context, slot)
+                });
                 let _ = result.send((index, reply));
             }
             Self::ObserveReadFence {
                 index,
+                context,
                 request,
                 result,
             } => {
-                let reply = control_rpc(|| recorder.observe_read_fence(request));
+                let reply = recorder_rpc(RecorderRpcOperation::ReadOnly, || {
+                    recorder.observe_read_fence(&context, request)
+                });
                 let _ = result.send((index, reply));
             }
             Self::StoreCommand {
                 index,
+                context,
                 cluster_id,
                 epoch,
                 config_id,
@@ -3473,8 +4745,9 @@ impl ControlJob {
                 command,
                 result,
             } => {
-                let reply = control_rpc(|| {
+                let reply = recorder_rpc(RecorderRpcOperation::Mutating, || {
                     recorder.store_command_for(
+                        &context,
                         cluster_id,
                         epoch,
                         config_id,
@@ -3487,6 +4760,7 @@ impl ControlJob {
             }
             Self::FetchCommand {
                 index,
+                context,
                 cluster_id,
                 epoch,
                 config_id,
@@ -3494,8 +4768,9 @@ impl ControlJob {
                 command_hash,
                 result,
             } => {
-                let reply = control_rpc(|| {
+                let reply = recorder_rpc(RecorderRpcOperation::ReadOnly, || {
                     recorder.fetch_command_for(
+                        &context,
                         cluster_id,
                         epoch,
                         config_id,
@@ -3529,36 +4804,1002 @@ impl ControlJob {
     }
 }
 
-fn control_rpc<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
-        .unwrap_or(Err(Error::ProposeFailed))
+fn recorder_rpc<T>(operation: RecorderRpcOperation, call: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).unwrap_or_else(|_| {
+        Err(match operation {
+            RecorderRpcOperation::Mutating => Error::UnknownOutcome,
+            RecorderRpcOperation::ReadOnly => Error::ProposeFailed,
+        })
+    })
+}
+
+#[derive(Clone)]
+struct RpcCallGroup {
+    state: Arc<RpcCallGroupState>,
+}
+
+struct RpcCallGroupState {
+    cancelled: Arc<AtomicBool>,
+    outstanding: Mutex<Vec<Weak<RpcGroupLease>>>,
+    drained: Condvar,
+    #[cfg(feature = "test-hooks")]
+    test_probes: Mutex<Vec<TestProbeAttachment>>,
+}
+
+// Existing control paths keep their internal name while record mutations use
+// the same call-local accounting implementation.
+type ControlCallGroup = RpcCallGroup;
+
+trait RpcCallWorker: Send + Sync {
+    /// Removes only jobs which are still queued for `group`. A running
+    /// mutation is deliberately not interrupted here: its operation-local W
+    /// remains authoritative until the caller-owned D.
+    fn prune_pending(&self, group: &RpcCallGroup);
+    fn quarantine(&self);
+    fn worker_identity(&self) -> usize;
+}
+
+/// Operation-local RPC-group accounting exposed only to downstream test
+/// harnesses. Registrations are keyed by either a caller-owned cancellation
+/// token or a proposal slot scoped to one consensus instance. One probe Arc
+/// may have only one live registration and can be reused only after every
+/// admitted lease has drained and every captured logical RPC-group attachment
+/// from its previous registration has dropped. Dropping a registration guard
+/// alone does not revoke an attachment already captured by a group.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct TestControlOperationProbe {
+    lifecycle: Mutex<TestProbeLifecycle>,
+    lifecycle_changed: Condvar,
+    worker_transitions: Mutex<BTreeMap<usize, TestWorkerTransition>>,
+}
+
+/// One mutex-protected lifecycle snapshot backs every probe counter.  Tests
+/// must never infer a lease state by comparing separately published atomics:
+/// admission and completion are concurrent by design.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+struct TestProbeLifecycle {
+    generation: u64,
+    attachments: Vec<Weak<TestProbeAttachmentLease>>,
+    leases: usize,
+    dispatch_count: usize,
+    observed_max_outstanding: usize,
+    cancel_count: usize,
+    quarantine_count: usize,
+    drained_count: usize,
+}
+
+#[cfg(feature = "test-hooks")]
+impl TestProbeLifecycle {
+    fn has_admitted_outstanding_lease(&self) -> bool {
+        self.dispatch_count != 0 && self.observed_max_outstanding != 0 && self.leases != 0
+    }
+
+    fn has_drained_every_admitted_lease(&self) -> bool {
+        self.dispatch_count != 0 && self.leases == 0 && self.drained_count == self.dispatch_count
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Eq, PartialEq)]
+enum TestProbeLifecycleWait {
+    Ready,
+    TimedOut,
+    GenerationChanged,
+}
+
+/// A typed rejection from the test-only probe registration API.  Rejections
+/// are normal test-harness outcomes and must not poison shared hook state.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestProbeRegistrationError {
+    DuplicateLiveRegistration,
+    ActiveAttachments { attachments: usize },
+    LiveLeases { leases: usize },
+    GenerationExhausted,
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone)]
+struct TestProbeAttachment {
+    probe: Arc<TestControlOperationProbe>,
+    generation: u64,
+    // One Arc is captured per logical RpcCallGroup. Event-path clones share
+    // this lease, so only the final group-state attachment drop releases the
+    // generation for reuse.
+    _lease: Arc<TestProbeAttachmentLease>,
+}
+
+/// Keeps a captured probe generation live for the lifetime of its owning
+/// RpcCallGroupState attachment. The lifecycle keeps only a `Weak` reference,
+/// so the final attachment drop is authoritative and cannot form a cycle.
+/// Event-path clones share this Arc and therefore do not create more logical
+/// group attachments.
+#[cfg(feature = "test-hooks")]
+struct TestProbeAttachmentLease;
+
+/// Test-hook-only lifecycle counters for one record worker. They are kept off
+/// production paths and make a leaked operation lease attributable to a
+/// concrete worker rather than a global outstanding count.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug, Default)]
+pub struct TestWorkerTransition {
+    pub worker_identity: usize,
+    /// Leases still owned by this worker for the probed group. This follows
+    /// the guard's admission/drop lifetime, so diagnostics can distinguish a
+    /// real worker lease from a stale observation.
+    pub live_leases: usize,
+    pub enqueued: usize,
+    pub popped: usize,
+    pub running_entered: usize,
+    pub running_exited: usize,
+    pub reply_sent: usize,
+    pub pruned: usize,
+    pub close_drained: usize,
+    pub quarantined: usize,
+    pub completion_dropped: usize,
+}
+
+#[cfg(feature = "test-hooks")]
+impl TestControlOperationProbe {
+    pub fn pending(&self) -> usize {
+        lock_unpoison(&self.lifecycle).leases
+    }
+
+    pub fn outstanding(&self) -> usize {
+        lock_unpoison(&self.lifecycle).leases
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        lock_unpoison(&self.lifecycle).dispatch_count
+    }
+
+    pub fn observed_max_outstanding(&self) -> usize {
+        lock_unpoison(&self.lifecycle).observed_max_outstanding
+    }
+
+    pub fn cancel_count(&self) -> usize {
+        lock_unpoison(&self.lifecycle).cancel_count
+    }
+
+    pub fn quarantine_count(&self) -> usize {
+        lock_unpoison(&self.lifecycle).quarantine_count
+    }
+
+    pub fn drained_count(&self) -> usize {
+        lock_unpoison(&self.lifecycle).drained_count
+    }
+
+    /// Waits for this exact probe's group to admit at least one lease that is
+    /// still outstanding. The condition is checked while holding the same
+    /// mutex used by lease admission, so an admission that happened before
+    /// the waiter subscribes is observed rather than missed. Returns `false`
+    /// if the timeout expires or this probe's generation changes while waiting;
+    /// a waiter never consumes readiness from a later registration generation.
+    pub fn wait_for_admitted_outstanding(&self, timeout: Duration) -> bool {
+        matches!(
+            self.wait_for_admitted_outstanding_after_generation_capture(timeout, || {}),
+            TestProbeLifecycleWait::Ready
+        )
+    }
+
+    /// Waits until every lease admitted by this exact probe generation has
+    /// completed. The lifecycle condition and completion notification share
+    /// one mutex/Condvar, so a completion published before the waiter starts
+    /// remains observable. Returns `false` on timeout or generation reset.
+    pub fn wait_for_quiescence(&self, timeout: Duration) -> bool {
+        matches!(
+            self.wait_for_quiescence_after_generation_capture(timeout, || {}),
+            TestProbeLifecycleWait::Ready
+        )
+    }
+
+    fn wait_for_admitted_outstanding_after_generation_capture<F>(
+        &self,
+        timeout: Duration,
+        generation_captured: F,
+    ) -> TestProbeLifecycleWait
+    where
+        F: FnOnce(),
+    {
+        self.wait_for_lifecycle_condition_after_generation_capture(
+            timeout,
+            generation_captured,
+            TestProbeLifecycle::has_admitted_outstanding_lease,
+        )
+    }
+
+    fn wait_for_quiescence_after_generation_capture<F>(
+        &self,
+        timeout: Duration,
+        generation_captured: F,
+    ) -> TestProbeLifecycleWait
+    where
+        F: FnOnce(),
+    {
+        self.wait_for_lifecycle_condition_after_generation_capture(
+            timeout,
+            generation_captured,
+            TestProbeLifecycle::has_drained_every_admitted_lease,
+        )
+    }
+
+    fn wait_for_lifecycle_condition_after_generation_capture<F, P>(
+        &self,
+        timeout: Duration,
+        generation_captured: F,
+        ready: P,
+    ) -> TestProbeLifecycleWait
+    where
+        F: FnOnce(),
+        P: Fn(&TestProbeLifecycle) -> bool,
+    {
+        let started = Instant::now();
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        let generation = lifecycle.generation;
+        generation_captured();
+        loop {
+            if lifecycle.generation != generation {
+                return TestProbeLifecycleWait::GenerationChanged;
+            }
+            if ready(&lifecycle) {
+                return TestProbeLifecycleWait::Ready;
+            }
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return TestProbeLifecycleWait::TimedOut;
+            };
+            let (next_lifecycle, timeout_result) = self
+                .lifecycle_changed
+                .wait_timeout(lifecycle, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle = next_lifecycle;
+            if timeout_result.timed_out() {
+                if lifecycle.generation != generation {
+                    return TestProbeLifecycleWait::GenerationChanged;
+                }
+                if !ready(&lifecycle) {
+                    return TestProbeLifecycleWait::TimedOut;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_admitted_outstanding_after_test_generation_capture(
+        &self,
+        timeout: Duration,
+        captured: Arc<std::sync::Barrier>,
+    ) -> TestProbeLifecycleWait {
+        self.wait_for_admitted_outstanding_after_generation_capture(timeout, move || {
+            captured.wait();
+        })
+    }
+
+    #[cfg(test)]
+    fn wait_for_quiescence_after_test_generation_capture(
+        &self,
+        timeout: Duration,
+        captured: Arc<std::sync::Barrier>,
+    ) -> TestProbeLifecycleWait {
+        self.wait_for_quiescence_after_generation_capture(timeout, move || {
+            captured.wait();
+        })
+    }
+
+    pub fn worker_transitions(&self) -> Vec<TestWorkerTransition> {
+        lock_unpoison(&self.worker_transitions)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn current_attachment(self: &Arc<Self>) -> TestProbeAttachment {
+        let generation = lock_unpoison(&self.lifecycle).generation;
+        self.capture_attachment(generation)
+    }
+
+    fn begin_generation(&self) -> std::result::Result<u64, TestProbeRegistrationError> {
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        if lifecycle.leases != 0 {
+            return Err(TestProbeRegistrationError::LiveLeases {
+                leases: lifecycle.leases,
+            });
+        }
+        lifecycle
+            .attachments
+            .retain(|attachment| attachment.strong_count() != 0);
+        if !lifecycle.attachments.is_empty() {
+            return Err(TestProbeRegistrationError::ActiveAttachments {
+                attachments: lifecycle.attachments.len(),
+            });
+        }
+        let generation = lifecycle
+            .generation
+            .checked_add(1)
+            .ok_or(TestProbeRegistrationError::GenerationExhausted)?;
+        *lifecycle = TestProbeLifecycle::default();
+        // Keep generation monotonic while resetting all observable counters
+        // for the next attachment generation.
+        lifecycle.generation = generation;
+        // Hold lifecycle through the transition clear. A stale attachment
+        // that checked the old generation must not append an event after this
+        // new generation starts.
+        lock_unpoison(&self.worker_transitions).clear();
+        self.lifecycle_changed.notify_all();
+        drop(lifecycle);
+        Ok(generation)
+    }
+
+    /// Captures one generation lease for a logical RPC group. Group capture
+    /// and generation registration take the global hook lock before this
+    /// lifecycle lock, so a live hook cannot cross a generation reset.
+    fn capture_attachment(self: &Arc<Self>, generation: u64) -> TestProbeAttachment {
+        let lease = Arc::new(TestProbeAttachmentLease);
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        lifecycle
+            .attachments
+            .retain(|attachment| attachment.strong_count() != 0);
+        lifecycle.attachments.push(Arc::downgrade(&lease));
+        drop(lifecycle);
+        TestProbeAttachment {
+            probe: Arc::clone(self),
+            generation,
+            _lease: lease,
+        }
+    }
+
+    fn record_lease_registered(&self, generation: u64) {
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        if lifecycle.generation != generation {
+            return;
+        }
+        lifecycle.leases = lifecycle
+            .leases
+            .checked_add(1)
+            .expect("test probe lease counter overflow");
+        lifecycle.dispatch_count = lifecycle
+            .dispatch_count
+            .checked_add(1)
+            .expect("test probe dispatch counter overflow");
+        lifecycle.observed_max_outstanding =
+            lifecycle.observed_max_outstanding.max(lifecycle.leases);
+        self.lifecycle_changed.notify_all();
+    }
+
+    fn record_lease_completed(&self, generation: u64) {
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        if lifecycle.generation != generation {
+            return;
+        }
+        lifecycle.leases = lifecycle
+            .leases
+            .checked_sub(1)
+            .expect("test probe completion without a live lease");
+        lifecycle.drained_count = lifecycle
+            .drained_count
+            .checked_add(1)
+            .expect("test probe drain counter overflow");
+        self.lifecycle_changed.notify_all();
+    }
+
+    fn record_cancel(&self, generation: u64) {
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        if lifecycle.generation != generation {
+            return;
+        }
+        lifecycle.cancel_count = lifecycle
+            .cancel_count
+            .checked_add(1)
+            .expect("test probe cancellation counter overflow");
+        self.lifecycle_changed.notify_all();
+    }
+
+    fn record_quarantine(&self, generation: u64) {
+        let mut lifecycle = lock_unpoison(&self.lifecycle);
+        if lifecycle.generation != generation {
+            return;
+        }
+        lifecycle.quarantine_count = lifecycle
+            .quarantine_count
+            .checked_add(1)
+            .expect("test probe quarantine counter overflow");
+        self.lifecycle_changed.notify_all();
+    }
+
+    fn record_worker_event(&self, generation: u64, worker: usize, event: TestWorkerEvent) {
+        let lifecycle = lock_unpoison(&self.lifecycle);
+        if lifecycle.generation != generation {
+            return;
+        }
+        let mut transitions = lock_unpoison(&self.worker_transitions);
+        let entry = transitions
+            .entry(worker)
+            .or_insert_with(|| TestWorkerTransition {
+                worker_identity: worker,
+                ..Default::default()
+            });
+        match event {
+            TestWorkerEvent::Enqueued => {
+                entry.enqueued += 1;
+                entry.live_leases += 1;
+            }
+            TestWorkerEvent::Popped => entry.popped += 1,
+            TestWorkerEvent::RunningEntered => entry.running_entered += 1,
+            TestWorkerEvent::RunningExited => entry.running_exited += 1,
+            TestWorkerEvent::ReplySent => entry.reply_sent += 1,
+            TestWorkerEvent::Pruned => entry.pruned += 1,
+            TestWorkerEvent::CloseDrained => entry.close_drained += 1,
+            TestWorkerEvent::Quarantined => entry.quarantined += 1,
+            TestWorkerEvent::CompletionDropped => {
+                entry.completion_dropped += 1;
+                entry.live_leases = entry
+                    .live_leases
+                    .checked_sub(1)
+                    .expect("test worker lease accounting underflow");
+            }
+        }
+        drop(lifecycle);
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+struct TestControlOperationHook {
+    id: u64,
+    generation: u64,
+    root_cancellation: Option<Arc<AtomicBool>>,
+    consensus_instance_id: Option<u64>,
+    slot: Option<Slot>,
+    probe: Arc<TestControlOperationProbe>,
+}
+
+#[cfg(feature = "test-hooks")]
+static TEST_CONTROL_OPERATION_HOOKS: std::sync::OnceLock<Mutex<Vec<TestControlOperationHook>>> =
+    std::sync::OnceLock::new();
+
+/// Removes the test probe registration when its test scope ends.
+#[cfg(feature = "test-hooks")]
+pub struct TestControlOperationProbeGuard {
+    id: u64,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for TestControlOperationProbeGuard {
+    fn drop(&mut self) {
+        let hooks = TEST_CONTROL_OPERATION_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+        lock_unpoison(hooks).retain(|hook| hook.id != self.id);
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+fn register_test_operation_probe(
+    mut hook: TestControlOperationHook,
+) -> std::result::Result<(), TestProbeRegistrationError> {
+    let hooks = TEST_CONTROL_OPERATION_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut hooks = lock_unpoison(hooks);
+    if hooks
+        .iter()
+        .any(|candidate| Arc::ptr_eq(&candidate.probe, &hook.probe))
+    {
+        return Err(TestProbeRegistrationError::DuplicateLiveRegistration);
+    }
+    // A dropped registration guard does not revoke a group attachment. Refuse
+    // reuse until every captured group has gone away, including groups that
+    // have not admitted a lease yet.
+    hook.generation = hook.probe.begin_generation()?;
+    hooks.push(hook);
+    Ok(())
+}
+
+/// Registers an operation-local test probe for the externally owned
+/// cancellation token carried by `context`. `with_timeout_and_cancellation`
+/// appends that token last, which keeps independently running tests isolated.
+#[cfg(feature = "test-hooks")]
+pub fn install_test_control_operation_probe(
+    context: &RecorderRpcContext,
+    probe: Arc<TestControlOperationProbe>,
+) -> std::result::Result<TestControlOperationProbeGuard, TestProbeRegistrationError> {
+    let root_cancellation = context
+        .cancellations
+        .last()
+        .cloned()
+        .expect("recorder contexts always carry a cancellation token");
+    let id = NEXT_TEST_CONTROL_OPERATION_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+    register_test_operation_probe(TestControlOperationHook {
+        id,
+        generation: 0,
+        root_cancellation: Some(root_cancellation),
+        consensus_instance_id: None,
+        slot: None,
+        probe,
+    })?;
+    Ok(TestControlOperationProbeGuard { id })
+}
+
+#[cfg(feature = "test-hooks")]
+static NEXT_TEST_CONTROL_OPERATION_HOOK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "test-hooks")]
+static NEXT_TEST_CONSENSUS_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Returns all live instance-scoped record-probe registrations. This is mainly
+/// useful to diagnose a harness-wide leak; parallel tests should instead use
+/// [`ThreeNodeConsensus::test_record_operation_probe_registration_count`].
+#[cfg(feature = "test-hooks")]
+pub fn test_record_operation_probe_registration_count() -> usize {
+    TEST_CONTROL_OPERATION_HOOKS
+        .get()
+        .map(|hooks| {
+            lock_unpoison(hooks)
+                .iter()
+                .filter(|hook| hook.consensus_instance_id.is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+struct RpcGroupLease {
+    state: AtomicUsize,
+    group: RpcCallGroup,
+    // The group is allowed to outlive a worker during shutdown.  Keeping this
+    // weak prevents a timed-out call from extending worker/queue lifetime.
+    worker: Weak<dyn RpcCallWorker>,
+    #[cfg(feature = "test-hooks")]
+    worker_identity: usize,
+}
+
+#[cfg(test)]
+struct ControlDrainTimeoutHook {
+    group_cancellation: Arc<AtomicBool>,
+    worker: Arc<ControlWorkerState>,
+    fired: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+static CONTROL_DRAIN_TIMEOUT_HOOK: std::sync::OnceLock<Mutex<Option<ControlDrainTimeoutHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct ControlDrainTimeoutHookGuard;
+
+#[cfg(test)]
+impl Drop for ControlDrainTimeoutHookGuard {
+    fn drop(&mut self) {
+        let hook = CONTROL_DRAIN_TIMEOUT_HOOK.get_or_init(|| Mutex::new(None));
+        *lock_unpoison(hook) = None;
+    }
+}
+
+#[cfg(test)]
+fn force_next_control_group_drain_timeout(
+    group_cancellation: Arc<AtomicBool>,
+    worker: Arc<ControlWorkerState>,
+    fired: std::sync::mpsc::SyncSender<()>,
+) -> ControlDrainTimeoutHookGuard {
+    let hook = CONTROL_DRAIN_TIMEOUT_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    assert!(hook.is_none(), "only one control drain hook may be armed");
+    *hook = Some(ControlDrainTimeoutHook {
+        group_cancellation,
+        worker,
+        fired,
+    });
+    ControlDrainTimeoutHookGuard
+}
+
+#[cfg(test)]
+fn force_control_group_drain_timeout(
+    group_cancellation: &Arc<AtomicBool>,
+) -> Option<Arc<ControlWorkerState>> {
+    let hook = CONTROL_DRAIN_TIMEOUT_HOOK.get_or_init(|| Mutex::new(None));
+    let mut hook = lock_unpoison(hook);
+    if hook
+        .as_ref()
+        .is_some_and(|candidate| Arc::ptr_eq(&candidate.group_cancellation, group_cancellation))
+    {
+        let hook = hook.take().unwrap();
+        hook.fired.send(()).unwrap();
+        Some(hook.worker)
+    } else {
+        None
+    }
+}
+
+const CONTROL_LEASE_PENDING: usize = 0;
+const CONTROL_LEASE_COMPLETED: usize = 1;
+const CONTROL_LEASE_QUARANTINE_REQUESTED: usize = 2;
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy)]
+enum TestWorkerEvent {
+    Enqueued,
+    Popped,
+    RunningEntered,
+    RunningExited,
+    ReplySent,
+    Pruned,
+    CloseDrained,
+    Quarantined,
+    CompletionDropped,
+}
+
+impl RpcCallGroup {
+    #[cfg(feature = "test-hooks")]
+    fn record_test_worker_event(&self, worker: usize, event: TestWorkerEvent) {
+        for attachment in self.test_probes() {
+            attachment
+                .probe
+                .record_worker_event(attachment.generation, worker, event);
+        }
+    }
+    fn new() -> Self {
+        Self {
+            state: Arc::new(RpcCallGroupState {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                outstanding: Mutex::new(Vec::new()),
+                drained: Condvar::new(),
+                #[cfg(feature = "test-hooks")]
+                test_probes: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn attach_test_record_probe(&self, consensus_instance_id: u64, slot: Slot) {
+        let hooks = TEST_CONTROL_OPERATION_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+        let probes = lock_unpoison(hooks)
+            .iter()
+            .filter(|hook| {
+                hook.consensus_instance_id == Some(consensus_instance_id) && hook.slot == Some(slot)
+            })
+            .map(|hook| hook.probe.capture_attachment(hook.generation))
+            .collect();
+        *lock_unpoison(&self.state.test_probes) = probes;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn attach_test_root_probe(&self, context: &RecorderRpcContext) {
+        let hooks = TEST_CONTROL_OPERATION_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+        let probes = lock_unpoison(hooks)
+            .iter()
+            .filter(|hook| {
+                hook.root_cancellation.as_ref().is_some_and(|root| {
+                    context
+                        .cancellations
+                        .iter()
+                        .any(|token| Arc::ptr_eq(token, root))
+                })
+            })
+            .map(|hook| hook.probe.capture_attachment(hook.generation))
+            .collect();
+        *lock_unpoison(&self.state.test_probes) = probes;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn test_probes(&self) -> Vec<TestProbeAttachment> {
+        lock_unpoison(&self.state.test_probes).clone()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    /// Mirrors one lease registration into every attached probe. The probe
+    /// owns one synchronized lifecycle state rather than publishing a group
+    /// vector snapshot, so a completion cannot be overwritten by stale
+    /// admission data.
+    fn record_test_lease_registered(&self) {
+        for probe in self.test_probes() {
+            probe.probe.record_lease_registered(probe.generation);
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn record_test_lease_completed(&self) {
+        for probe in self.test_probes() {
+            probe.probe.record_lease_completed(probe.generation);
+        }
+    }
+
+    fn token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.state.cancelled)
+    }
+
+    fn register<W>(&self, worker: &Arc<W>) -> Arc<RpcGroupLease>
+    where
+        W: RpcCallWorker + 'static,
+    {
+        #[cfg(feature = "test-hooks")]
+        let worker_identity = worker.worker_identity();
+        let worker: Arc<dyn RpcCallWorker> = Arc::clone(worker) as Arc<dyn RpcCallWorker>;
+        let lease = Arc::new(RpcGroupLease {
+            state: AtomicUsize::new(CONTROL_LEASE_PENDING),
+            group: self.clone(),
+            worker: Arc::downgrade(&worker),
+            #[cfg(feature = "test-hooks")]
+            worker_identity,
+        });
+        lock_unpoison(&self.state.outstanding).push(Arc::downgrade(&lease));
+        #[cfg(feature = "test-hooks")]
+        self.record_test_lease_registered();
+        lease
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    #[cfg(test)]
+    fn outstanding_len(&self) -> usize {
+        let mut outstanding = lock_unpoison(&self.state.outstanding);
+        outstanding.retain(|lease| lease.strong_count() != 0);
+        outstanding.len()
+    }
+
+    fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        #[cfg(feature = "test-hooks")]
+        for probe in self.test_probes() {
+            probe.probe.record_cancel(probe.generation);
+        }
+    }
+
+    fn prune_pending(&self) {
+        let workers = self.outstanding_workers(false);
+        for worker in workers {
+            worker.prune_pending(self);
+        }
+    }
+
+    fn cancel_and_prune(&self) {
+        self.cancel();
+        self.prune_pending();
+    }
+
+    fn complete(&self, lease: &Arc<RpcGroupLease>) {
+        lease
+            .state
+            .store(CONTROL_LEASE_COMPLETED, Ordering::Release);
+        let mut outstanding = lock_unpoison(&self.state.outstanding);
+        outstanding.retain(|candidate| {
+            candidate
+                .upgrade()
+                .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
+        });
+        drop(outstanding);
+        #[cfg(feature = "test-hooks")]
+        self.record_test_lease_completed();
+        self.state.drained.notify_all();
+    }
+
+    fn outstanding_workers(&self, quarantine_only: bool) -> Vec<Arc<dyn RpcCallWorker>> {
+        let outstanding = lock_unpoison(&self.state.outstanding);
+        let mut workers: Vec<Arc<dyn RpcCallWorker>> = Vec::new();
+        for lease in outstanding.iter().filter_map(Weak::upgrade) {
+            if quarantine_only
+                && lease
+                    .state
+                    .compare_exchange(
+                        CONTROL_LEASE_PENDING,
+                        CONTROL_LEASE_QUARANTINE_REQUESTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+            #[cfg(feature = "test-hooks")]
+            if quarantine_only {
+                for probe in self.test_probes() {
+                    probe.probe.record_quarantine(probe.generation);
+                }
+            }
+            let Some(worker) = lease.worker.upgrade() else {
+                continue;
+            };
+            if !workers
+                .iter()
+                .any(|candidate| candidate.worker_identity() == worker.worker_identity())
+            {
+                workers.push(worker);
+            }
+        }
+        workers
+    }
+
+    /// Returns the workers which still owned a pending lease at D.
+    fn drain_to_deadline(&self, deadline: Instant) -> Vec<Arc<dyn RpcCallWorker>> {
+        #[cfg(test)]
+        if let Some(worker) = force_control_group_drain_timeout(&self.state.cancelled) {
+            return self.outstanding_worker_forced_timeout(&worker);
+        }
+        let mut outstanding = lock_unpoison(&self.state.outstanding);
+        loop {
+            outstanding.retain(|lease| lease.strong_count() != 0);
+            if outstanding.is_empty() {
+                return Vec::new();
+            }
+            let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                drop(outstanding);
+                return self.outstanding_workers(true);
+            };
+            let (next, _) = self
+                .state
+                .drained
+                .wait_timeout(outstanding, wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            outstanding = next;
+        }
+    }
+
+    #[cfg(test)]
+    fn outstanding_worker_forced_timeout(
+        &self,
+        target: &Arc<ControlWorkerState>,
+    ) -> Vec<Arc<dyn RpcCallWorker>> {
+        let target_identity = target.worker_identity();
+        let outstanding = lock_unpoison(&self.state.outstanding);
+        for lease in outstanding.iter().filter_map(Weak::upgrade) {
+            if lease
+                .worker
+                .upgrade()
+                .is_some_and(|worker| worker.worker_identity() == target_identity)
+                && lease
+                    .state
+                    .compare_exchange(
+                        CONTROL_LEASE_PENDING,
+                        CONTROL_LEASE_QUARANTINE_REQUESTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                let target: Arc<dyn RpcCallWorker> = Arc::clone(target) as Arc<dyn RpcCallWorker>;
+                return vec![target];
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// Owns every admission-side accounting resource.  It is deliberately not
+/// cloneable: whichever path consumes a queued job also consumes its guard.
+struct ControlCompletionGuard {
+    pending: Arc<AtomicUsize>,
+    lease: Option<Arc<RpcGroupLease>>,
+    armed: bool,
+    #[cfg(feature = "test-hooks")]
+    record_worker: Option<Weak<RecordWorkerState>>,
+}
+
+impl ControlCompletionGuard {
+    fn new(pending: Arc<AtomicUsize>) -> Self {
+        Self {
+            pending,
+            lease: None,
+            armed: false,
+            #[cfg(feature = "test-hooks")]
+            record_worker: None,
+        }
+    }
+
+    fn arm<W>(&mut self, group: Option<&RpcCallGroup>, worker: &Arc<W>)
+    where
+        W: RpcCallWorker + 'static,
+    {
+        debug_assert!(!self.armed);
+        self.lease = group.map(|group| group.register(worker));
+        #[cfg(feature = "test-hooks")]
+        if let Some(group) = group {
+            group.record_test_worker_event(worker.worker_identity(), TestWorkerEvent::Enqueued);
+        }
+        self.pending.fetch_add(1, Ordering::Release);
+        self.armed = true;
+    }
+
+    fn group(&self) -> Option<&RpcCallGroup> {
+        self.lease.as_ref().map(|lease| &lease.group)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn attach_record_worker(
+        &mut self,
+        worker: &Arc<RecordWorkerState>,
+        group: Option<&RpcCallGroup>,
+    ) {
+        self.record_worker = Some(Arc::downgrade(worker));
+        if let Some(group) = group {
+            worker.test_register_group(group);
+        }
+    }
+}
+
+impl Drop for ControlCompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let previous = self.pending.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous > 0);
+        if let Some(lease) = self.lease.take() {
+            #[cfg(feature = "test-hooks")]
+            if let Some(worker) = self.record_worker.as_ref().and_then(Weak::upgrade) {
+                worker.test_complete_group(&lease.group);
+            }
+            #[cfg(feature = "test-hooks")]
+            lease.group.record_test_worker_event(
+                lease.worker_identity,
+                TestWorkerEvent::CompletionDropped,
+            );
+            lease.group.complete(&lease);
+        }
+    }
 }
 
 struct QueuedControlJob {
     job: ControlJob,
     cancelled: Option<Arc<AtomicBool>>,
+    completion: ControlCompletionGuard,
 }
 
 impl QueuedControlJob {
-    fn run(self, recorder: &dyn RecorderRpc) {
-        if !self
+    fn run(mut self, recorder: &dyn RecorderRpc, worker_cancellation: &Arc<AtomicBool>) {
+        let cancelled = self
             .cancelled
             .as_ref()
             .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
-        {
-            self.job.run(recorder);
+            || self
+                .completion
+                .group()
+                .is_some_and(ControlCallGroup::is_cancelled);
+        if cancelled {
+            if self.completion.group().is_some() {
+                self.job.fail(Error::RpcCancelled);
+            }
+            return;
         }
+        self.job.with_cancellation(Arc::clone(worker_cancellation));
+        self.job.run(recorder);
     }
 
     fn fail(self, error: Error) {
         self.job.fail(error);
     }
+
+    fn fail_for_worker(self) {
+        let error = match self.job.operation() {
+            RecorderRpcOperation::Mutating => Error::UnknownOutcome,
+            RecorderRpcOperation::ReadOnly => Error::ProposeFailed,
+        };
+        self.fail(error);
+    }
+
+    fn belongs_to(&self, group: &ControlCallGroup) -> bool {
+        self.completion
+            .group()
+            .is_some_and(|candidate| candidate.is_same(group))
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            || self
+                .completion
+                .group()
+                .is_some_and(ControlCallGroup::is_cancelled)
+    }
 }
 
+#[cfg(test)]
 struct ControlJobCancellation {
     cancelled: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl ControlJobCancellation {
     fn new() -> Self {
         Self {
@@ -3571,6 +5812,7 @@ impl ControlJobCancellation {
     }
 }
 
+#[cfg(test)]
 impl Drop for ControlJobCancellation {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -3578,9 +5820,25 @@ impl Drop for ControlJobCancellation {
 }
 
 struct ControlWorker {
-    queue: Option<Arc<ControlQueue>>,
+    state: Arc<ControlWorkerState>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+struct ControlWorkerState {
+    queue: Arc<ControlQueue>,
     pending: Arc<AtomicUsize>,
+    cancellation: Arc<AtomicBool>,
+    quarantined: AtomicBool,
+    #[cfg(test)]
+    panic_after_pop: AtomicBool,
+    #[cfg(test)]
+    post_pop_hook: Mutex<Option<ControlWorkerPostPopHook>>,
+}
+
+#[cfg(test)]
+struct ControlWorkerPostPopHook {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 struct ControlQueue {
@@ -3593,7 +5851,7 @@ struct ControlQueueState {
     closed: bool,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlDispatch {
     Accepted,
     Saturated,
@@ -3609,83 +5867,120 @@ impl ControlWorker {
             }),
             available: Condvar::new(),
         });
-        let worker_queue = Arc::clone(&queue);
-        let pending = Arc::new(AtomicUsize::new(0));
-        let worker_pending = Arc::clone(&pending);
+        let state = Arc::new(ControlWorkerState {
+            queue,
+            pending: Arc::new(AtomicUsize::new(0)),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            quarantined: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_after_pop: AtomicBool::new(false),
+            #[cfg(test)]
+            post_pop_hook: Mutex::new(None),
+        });
+        let worker_state = Arc::clone(&state);
         let handle = thread::Builder::new()
-            .spawn(move || loop {
-                let job = {
-                    let mut state = worker_queue.state.lock().unwrap();
-                    while state.jobs.is_empty() && !state.closed {
-                        state = worker_queue.available.wait(state).unwrap();
-                    }
-                    state.jobs.pop_front()
-                };
-                let Some(job) = job else {
-                    break;
-                };
-                job.run(recorder.as_ref());
-                worker_pending.fetch_sub(1, Ordering::Release);
+            .spawn(move || {
+                let abnormal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    control_worker_loop(&worker_state, recorder.as_ref());
+                }))
+                .is_err();
+                if abnormal {
+                    worker_state.close_and_drain();
+                }
             })
             .map_err(|error| Error::Io(error.to_string()))?;
         Ok(Self {
-            queue: Some(queue),
+            state,
             handle: Some(handle),
-            pending,
         })
     }
 
+    #[cfg(test)]
     fn dispatch(&self, job: ControlJob) -> ControlDispatch {
-        self.dispatch_with_cancellation(job, None)
+        Self::dispatch_inner(&self.state, job, None, None, None)
     }
 
+    #[cfg(test)]
     fn dispatch_cancellable(
         &self,
         job: ControlJob,
         cancellation: Arc<AtomicBool>,
     ) -> ControlDispatch {
-        self.dispatch_with_cancellation(job, Some(cancellation))
+        Self::dispatch_inner(&self.state, job, Some(cancellation), None, None)
     }
 
-    fn dispatch_with_cancellation(
+    fn dispatch_group(&self, job: ControlJob, group: &ControlCallGroup) -> ControlDispatch {
+        Self::dispatch_inner(&self.state, job, None, Some(group), None)
+    }
+
+    /// Marks the caller's mutation certainty while the queue is still locked,
+    /// before the worker can observe the admitted job.
+    fn dispatch_mutating_group(
         &self,
         job: ControlJob,
-        cancelled: Option<Arc<AtomicBool>>,
+        group: &ControlCallGroup,
+        mutation_started: &AtomicBool,
     ) -> ControlDispatch {
-        let mut queued_job = Some(QueuedControlJob { job, cancelled });
-        let (error, outcome) = match &self.queue {
-            Some(queue) => {
-                let mut state = queue.state.lock().unwrap();
-                let queued_before = state.jobs.len();
-                // A completed hedge must release queued capacity without waiting for a blocked peer.
-                state.jobs.retain(|job| {
-                    !job.cancelled
-                        .as_ref()
-                        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
-                });
-                let removed = queued_before - state.jobs.len();
-                if removed != 0 {
-                    self.pending.fetch_sub(removed, Ordering::Release);
-                }
+        Self::dispatch_inner(&self.state, job, None, Some(group), Some(mutation_started))
+    }
 
-                if state.closed {
-                    (Some(Error::ProposeFailed), ControlDispatch::Failed)
-                } else if state.jobs.len() >= CONTROL_WORKER_QUEUE_CAPACITY {
-                    (
-                        Some(Error::Io(
-                            "recorder control worker queue is temporarily full".into(),
-                        )),
-                        ControlDispatch::Saturated,
-                    )
+    fn dispatch_inner(
+        state: &Arc<ControlWorkerState>,
+        job: ControlJob,
+        cancelled: Option<Arc<AtomicBool>>,
+        group: Option<&ControlCallGroup>,
+        mutation_started: Option<&AtomicBool>,
+    ) -> ControlDispatch {
+        let mut queued_job = Some(QueuedControlJob {
+            job,
+            cancelled,
+            completion: ControlCompletionGuard::new(Arc::clone(&state.pending)),
+        });
+        let (pruned, error, outcome) = {
+            let mut queue = lock_unpoison(&state.queue.state);
+            let mut pruned = Vec::new();
+            let mut retained = VecDeque::with_capacity(queue.jobs.len());
+            while let Some(job) = queue.jobs.pop_front() {
+                if job.is_cancelled() {
+                    pruned.push(job);
                 } else {
-                    self.pending.fetch_add(1, Ordering::Relaxed);
-                    state.jobs.push_back(queued_job.take().unwrap());
-                    queue.available.notify_one();
-                    (None, ControlDispatch::Accepted)
+                    retained.push_back(job);
                 }
             }
-            None => (Some(Error::ProposeFailed), ControlDispatch::Failed),
+            queue.jobs = retained;
+            if queue.closed || state.quarantined.load(Ordering::Acquire) {
+                (pruned, Some(Error::ProposeFailed), ControlDispatch::Failed)
+            } else if queue.jobs.len() >= CONTROL_WORKER_QUEUE_CAPACITY {
+                (
+                    pruned,
+                    Some(Error::Io(
+                        "recorder control worker queue is temporarily full".into(),
+                    )),
+                    ControlDispatch::Saturated,
+                )
+            } else {
+                let queued = queued_job.as_mut().expect("control job must be present");
+                // The lease and pending increment happen while the queue is
+                // still locked, before a worker can pop the job.
+                queued.completion.arm(group, state);
+                if let Some(mutation_started) = mutation_started {
+                    mutation_started.store(true, Ordering::Release);
+                }
+                queue
+                    .jobs
+                    .push_back(queued_job.take().expect("control job must be present"));
+                state.queue.available.notify_one();
+                (pruned, None, ControlDispatch::Accepted)
+            }
         };
+        for job in pruned {
+            // Legacy cancellable dispatch deliberately had no reply for a
+            // skipped hedge.  Its guard still completes; group-owned jobs
+            // receive the explicit cancellation reply required for draining.
+            if job.completion.group().is_some() {
+                job.fail(Error::RpcCancelled);
+            }
+        }
         if let Some(error) = error {
             queued_job.unwrap().fail(error);
         }
@@ -3693,17 +5988,156 @@ impl ControlWorker {
     }
 
     fn is_idle(&self) -> bool {
-        self.pending.load(Ordering::Acquire) == 0
+        self.state.pending.load(Ordering::Acquire) == 0
     }
 
     fn shutdown(&mut self) {
-        if let Some(queue) = self.queue.take() {
-            queue.state.lock().unwrap().closed = true;
-            queue.available.notify_one();
-        }
-        if let Some(handle) = self.handle.take() {
+        self.shutdown_after_before_close();
+    }
+
+    #[cfg(test)]
+    fn shutdown_after_stale_idle_observation(
+        &mut self,
+        before_close: impl FnOnce(),
+    ) -> (bool, bool) {
+        // The seam is immediately before the admission fence. If an idle
+        // snapshot were taken before this callback, a real dispatch below
+        // could make that snapshot stale before close runs.
+        let stale_idle = self.is_idle();
+        before_close();
+        let current_idle = self.is_idle();
+        self.shutdown_after_before_close();
+        (stale_idle, current_idle)
+    }
+
+    fn shutdown_after_before_close(&mut self) {
+        // See RecordWorker::shutdown: closing first serializes the running
+        // snapshot with admission, so a successful join never waits on an
+        // RPC that raced a stale pre-close idle observation.
+        let join_idle_worker = self.state.close_and_drain();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if join_idle_worker || handle.is_finished() {
             let _ = handle.join();
+            return;
         }
+        // Preserve bounded shutdown for a noncooperative RecorderRpc. The
+        // detached closure owns only the explicit recorder/state Arcs.
+        drop(handle);
+    }
+
+    #[cfg(test)]
+    fn panic_after_next_pop(&self) {
+        self.state.panic_after_pop.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn pause_after_next_pop(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        *lock_unpoison(&self.state.post_pop_hook) =
+            Some(ControlWorkerPostPopHook { entered, release });
+    }
+}
+
+fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn control_worker_loop(state: &ControlWorkerState, recorder: &dyn RecorderRpc) {
+    loop {
+        let job = {
+            let mut queue = lock_unpoison(&state.queue.state);
+            while queue.jobs.is_empty() && !queue.closed {
+                queue = state
+                    .queue
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            queue.jobs.pop_front()
+        };
+        let Some(job) = job else {
+            break;
+        };
+        #[cfg(test)]
+        if let Some(hook) = lock_unpoison(&state.post_pop_hook).take() {
+            hook.entered.send(()).unwrap();
+            let (released, condition) = &*hook.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+        }
+        #[cfg(test)]
+        if state.panic_after_pop.swap(false, Ordering::AcqRel) {
+            panic!("control worker test hook");
+        }
+        job.run(recorder, &state.cancellation);
+    }
+}
+
+impl ControlWorkerState {
+    fn prune_pending(&self, group: &ControlCallGroup) {
+        let pruned = {
+            let mut queue = lock_unpoison(&self.queue.state);
+            let mut pruned = Vec::new();
+            let mut retained = VecDeque::with_capacity(queue.jobs.len());
+            while let Some(job) = queue.jobs.pop_front() {
+                if job.belongs_to(group) {
+                    pruned.push(job);
+                } else {
+                    retained.push_back(job);
+                }
+            }
+            queue.jobs = retained;
+            pruned
+        };
+        for job in pruned {
+            job.fail(Error::RpcCancelled);
+        }
+    }
+
+    fn quarantine(&self) {
+        if self.quarantined.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.close_and_drain();
+    }
+
+    /// Fences admission and returns whether no job remained running after
+    /// queued jobs were drained. A true result permits a bounded worker join.
+    fn close_and_drain(&self) -> bool {
+        self.cancellation.store(true, Ordering::Release);
+        let drained = {
+            let mut queue = lock_unpoison(&self.queue.state);
+            queue.closed = true;
+            queue.jobs.drain(..).collect::<Vec<_>>()
+        };
+        self.queue.available.notify_all();
+        for job in drained {
+            job.fail_for_worker();
+        }
+        self.pending.load(Ordering::Acquire) == 0
+    }
+}
+
+impl RpcCallWorker for ControlWorkerState {
+    fn prune_pending(&self, group: &RpcCallGroup) {
+        ControlWorkerState::prune_pending(self, group);
+    }
+
+    fn quarantine(&self) {
+        ControlWorkerState::quarantine(self);
+    }
+
+    fn worker_identity(&self) -> usize {
+        self as *const Self as usize
     }
 }
 
@@ -3814,9 +6248,49 @@ impl Drop for ThreeNodeConsensus {
 }
 
 impl ThreeNodeConsensus {
-    /// Waits up to `timeout` for accepted recorder and control RPC jobs.
-    /// Callers must first quiesce proposal admission and ensure no proposal
-    /// can still dispatch jobs; this only drains already accepted jobs.
+    /// Returns this consensus instance's live record-probe registrations.
+    #[cfg(feature = "test-hooks")]
+    pub fn test_record_operation_probe_registration_count(&self) -> usize {
+        TEST_CONTROL_OPERATION_HOOKS
+            .get()
+            .map(|hooks| {
+                lock_unpoison(hooks)
+                    .iter()
+                    .filter(|hook| hook.consensus_instance_id == Some(self.test_instance_id))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Registers an exact, instance-scoped record RPC-group probe for tests.
+    ///
+    /// The registration key is this consensus object's monotonically assigned
+    /// identity plus `slot`; equal slots in separate consensus instances never
+    /// share accounting.
+    #[cfg(feature = "test-hooks")]
+    pub fn install_test_record_operation_probe(
+        &self,
+        slot: Slot,
+        probe: Arc<TestControlOperationProbe>,
+    ) -> std::result::Result<TestControlOperationProbeGuard, TestProbeRegistrationError> {
+        let id = NEXT_TEST_CONTROL_OPERATION_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+        register_test_operation_probe(TestControlOperationHook {
+            id,
+            generation: 0,
+            root_cancellation: None,
+            consensus_instance_id: Some(self.test_instance_id),
+            slot: Some(slot),
+            probe,
+        })?;
+        Ok(TestControlOperationProbeGuard { id })
+    }
+
+    /// Diagnostic wait for currently accepted recorder, control, and read RPC jobs.
+    ///
+    /// This is not shutdown or quiescence evidence: it observes every group
+    /// sharing this consensus instance, including work owned by other callers.
+    /// Shutdown owners must instead drain their own admitted operation/task
+    /// scopes before reporting completion.
     pub fn finish_pending_rpcs(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
@@ -3955,9 +6429,10 @@ impl ThreeNodeConsensus {
         next_index: LogIndex,
         last_hash: LogHash,
     ) -> Result<Self> {
+        let context = RecorderRpcContext::default_timeout();
         let recorder_ids = recorders
             .iter()
-            .map(|recorder| recorder.recorder_id())
+            .map(|recorder| recorder.recorder_id(&context))
             .collect::<Result<Vec<_>>>()?;
         Self::from_recorders_with_ids_and_recovered_tip(
             cluster_id,
@@ -4019,6 +6494,8 @@ impl ThreeNodeConsensus {
             control_workers,
             read_fence_workers,
             priority_source: Arc::new(OsPrioritySource),
+            #[cfg(feature = "test-hooks")]
+            test_instance_id: NEXT_TEST_CONSENSUS_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             proposal_sequence: AtomicU64::new(1),
             sequential_tip: Mutex::new(SingleNodeState {
                 next_index,
@@ -4036,43 +6513,74 @@ impl ThreeNodeConsensus {
     ///
     /// [`Error::NoQuorum`] is retryable, including when bounded control-worker
     /// queues are temporarily saturated.
-    pub fn register_command(&self, command_hash: LogHash, command_bytes: Vec<u8>) -> Result<()> {
+    pub fn register_command(
+        &self,
+        context: &RecorderRpcContext,
+        command_hash: LogHash,
+        command_bytes: Vec<u8>,
+    ) -> Result<()> {
         let command = StoredCommand::new(EntryType::Command, command_bytes);
         if command.hash() != command_hash {
             return Err(Error::CommandHashMismatch);
         }
-        self.store_command_on_quorum(command_hash, &command)
+        let mutation_started = AtomicBool::new(false);
+        let budget = ControlCallBudget::new(context)
+            .map_err(|error| Self::store_context_error(error, &mutation_started))?;
+        self.store_command_on_quorum_with_budget(&budget, &mutation_started, command_hash, &command)
     }
 
-    fn propose_next(&self, command: Command) -> Result<LogEntry> {
+    fn propose_next(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry> {
         let mut tip = self
             .sequential_tip
             .lock()
             .map_err(|_| Error::ProposeFailed)?;
-        let entry = self.propose_at(tip.next_index, tip.last_hash, command)?;
+        let entry = self.propose_at(context, tip.next_index, tip.last_hash, command)?;
         tip.next_index = entry.index + 1;
         tip.last_hash = entry.hash;
         Ok(entry)
     }
 
-    pub fn propose_at(&self, slot: Slot, prev_hash: LogHash, command: Command) -> Result<LogEntry> {
-        self.propose_stored_at(slot, prev_hash, stored_command(command)?)
+    /// Proposes with a caller-owned RPC deadline and cancellation signal.
+    /// A deadline after any recorder may have accepted the value returns
+    /// [`Error::UnknownOutcome`]; recover the slot before issuing new work.
+    pub fn propose(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry> {
+        context.check()?;
+        let mut tip = self
+            .sequential_tip
+            .lock()
+            .map_err(|_| Error::ProposeFailed)?;
+        let entry = self.propose_stored_at_until(
+            tip.next_index,
+            tip.last_hash,
+            stored_command(command)?,
+            &context,
+            || context.check(),
+        )?;
+        tip.next_index = entry.index + 1;
+        tip.last_hash = entry.hash;
+        Ok(entry)
     }
 
-    pub fn propose_at_cancellable(
+    pub fn propose_at(
         &self,
+        context: RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
         command: Command,
-        cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<LogEntry> {
-        self.propose_stored_at_until(slot, prev_hash, stored_command(command)?, || {
-            cancelled.load(Ordering::Acquire)
+        self.propose_stored_at_until(slot, prev_hash, stored_command(command)?, &context, || {
+            context.check()
         })
     }
 
-    pub fn propose_stop_at(&self, slot: Slot, prev_hash: LogHash) -> Result<LogEntry> {
+    pub fn propose_stop_at(
+        &self,
+        context: RecorderRpcContext,
+        slot: Slot,
+        prev_hash: LogHash,
+    ) -> Result<LogEntry> {
         self.propose_stored_at(
+            context,
             slot,
             prev_hash,
             ConfigChange::stop(self.config_id, self.config_digest).to_stored_command(),
@@ -4081,6 +6589,7 @@ impl ThreeNodeConsensus {
 
     pub fn propose_stop_for_successor_at(
         &self,
+        context: RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
         successor: &Membership,
@@ -4097,15 +6606,17 @@ impl ThreeNodeConsensus {
             successor.members().to_vec(),
         )
         .map_err(|_| Error::Rejected(RejectReason::InvalidTransition))?;
-        self.propose_stored_at(slot, prev_hash, stop.to_stored_command())
+        self.propose_stored_at(context, slot, prev_hash, stop.to_stored_command())
     }
 
     pub fn propose_activation_barrier_at(
         &self,
+        context: RecorderRpcContext,
         stop_slot: Slot,
         prefix_hash: LogHash,
     ) -> Result<LogEntry> {
         self.propose_stored_at(
+            context,
             stop_slot.checked_add(1).ok_or(Error::InvalidRecoveredTip)?,
             prefix_hash,
             ConfigChange::activation_barrier(
@@ -4118,7 +6629,11 @@ impl ThreeNodeConsensus {
         )
     }
 
-    pub fn propose_activation_for_stop_entry(&self, stop: &LogEntry) -> Result<LogEntry> {
+    pub fn propose_activation_for_stop_entry(
+        &self,
+        context: RecorderRpcContext,
+        stop: &LogEntry,
+    ) -> Result<LogEntry> {
         let command = StoredCommand::new(stop.entry_type, stop.payload.clone());
         let change = ConfigChange::recognize(&command)
             .map_err(|_| Error::Rejected(RejectReason::InvalidTransition))?;
@@ -4133,6 +6648,7 @@ impl ThreeNodeConsensus {
             .ok_or(Error::Rejected(RejectReason::InvalidTransition))?
             .clone();
         self.propose_stored_at(
+            context,
             stop.index
                 .checked_add(1)
                 .ok_or(Error::InvalidRecoveredTip)?,
@@ -4147,7 +6663,11 @@ impl ThreeNodeConsensus {
         )
     }
 
-    pub fn propose_activation_for_stop_at(&self, stop_proof: &DecisionProof) -> Result<LogEntry> {
+    pub fn propose_activation_for_stop_at(
+        &self,
+        context: RecorderRpcContext,
+        stop_proof: &DecisionProof,
+    ) -> Result<LogEntry> {
         if proof_cluster_id(stop_proof) != self.cluster_id {
             return Err(Error::Rejected(RejectReason::WrongCluster));
         }
@@ -4185,6 +6705,7 @@ impl ThreeNodeConsensus {
             .expect("bound stop has successor")
             .clone();
         self.propose_stored_at(
+            context,
             stop_slot.checked_add(1).ok_or(Error::InvalidRecoveredTip)?,
             value.entry_hash,
             ConfigChange::bound_activation_barrier(
@@ -4199,11 +6720,12 @@ impl ThreeNodeConsensus {
 
     pub fn propose_stored_at(
         &self,
+        context: RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
         command: StoredCommand,
     ) -> Result<LogEntry> {
-        self.propose_stored_at_until(slot, prev_hash, command, || false)
+        self.propose_stored_at_until(slot, prev_hash, command, &context, || Ok(()))
     }
 
     fn propose_stored_at_until<F>(
@@ -4211,14 +6733,14 @@ impl ThreeNodeConsensus {
         slot: Slot,
         prev_hash: LogHash,
         offered_command: StoredCommand,
+        context: &RecorderRpcContext,
         cancelled: F,
     ) -> Result<LogEntry>
     where
-        F: Fn() -> bool,
+        F: Fn() -> Result<()>,
     {
-        if cancelled() {
-            return Err(Error::Cancelled);
-        }
+        let mutation_started = AtomicBool::new(false);
+        check_proposal_operation_context(context, &mutation_started, &cancelled)?;
         let offered_value = AcceptedValue::from_command(
             &self.cluster_id,
             slot,
@@ -4239,10 +6761,8 @@ impl ThreeNodeConsensus {
         )
         .with_command(offered_command.clone());
         loop {
-            if cancelled() {
-                return Err(Error::Cancelled);
-            }
-            match self.drive(progress)? {
+            check_proposal_operation_context(context, &mutation_started, &cancelled)?;
+            match self.drive_inner(progress, context, &mutation_started)? {
                 DriveOutcome::Progress(next) => progress = next,
                 DriveOutcome::Pending(next) => {
                     progress = next;
@@ -4258,7 +6778,7 @@ impl ThreeNodeConsensus {
                     let command = if self.command_matches_value(slot, value, &offered_command) {
                         offered_command.clone()
                     } else {
-                        self.fetch_verified_value(slot, value)?
+                        self.fetch_verified_value(slot, value, context, &mutation_started)?
                             .ok_or(Error::CommandUnavailable)?
                     };
                     return self.log_entry_from_value(slot, command, value);
@@ -4267,8 +6787,23 @@ impl ThreeNodeConsensus {
         }
     }
 
-    pub fn drive(&self, mut progress: ProposerProgress) -> Result<DriveOutcome> {
-        self.ensure_progress_command(&mut progress)?;
+    pub fn drive(
+        &self,
+        context: &RecorderRpcContext,
+        progress: ProposerProgress,
+    ) -> Result<DriveOutcome> {
+        let mutation_started = AtomicBool::new(false);
+        self.drive_inner(progress, context, &mutation_started)
+    }
+
+    fn drive_inner(
+        &self,
+        mut progress: ProposerProgress,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<DriveOutcome> {
+        check_operation_context(context, mutation_started)?;
+        self.ensure_progress_command(&mut progress, context, mutation_started)?;
         let round = progress.step / 4;
         let phase = progress.step % 4;
         if phase == 0 {
@@ -4327,7 +6862,8 @@ impl ThreeNodeConsensus {
                 })
             })
             .collect::<Result<_>>()?;
-        let mut replies = self.record_broadcast(requests)?;
+        let mut replies =
+            self.record_broadcast_with_context(requests, context.clone(), mutation_started)?;
         progress.command_holders.extend(
             replies
                 .iter()
@@ -4348,10 +6884,12 @@ impl ThreeNodeConsensus {
                         &self.membership,
                     )
                     .map_err(Error::Rejected)?;
-                return self.finish_decision(
+                return self.finish_decision_with_context(
                     proof.clone(),
                     progress.command.as_ref(),
                     progress.transition_involved,
+                    context,
+                    mutation_started,
                 );
             }
         }
@@ -4366,7 +6904,7 @@ impl ThreeNodeConsensus {
                 if let Some(proposal) = &caught_up.first_current {
                     progress.proposal = proposal.clone();
                 }
-                self.ensure_progress_command(&mut progress)?;
+                self.ensure_progress_command(&mut progress, context, mutation_started)?;
                 progress.phase_zero_priorities.clear();
                 return Ok(DriveOutcome::Progress(progress));
             }
@@ -4414,10 +6952,12 @@ impl ThreeNodeConsensus {
                         proposal,
                         summaries,
                     };
-                    return self.finish_decision(
+                    return self.finish_decision_with_context(
                         proof,
                         progress.command.as_ref(),
                         progress.transition_involved,
+                        context,
+                        mutation_started,
                     );
                 }
                 progress.proposal = replies
@@ -4443,10 +6983,12 @@ impl ThreeNodeConsensus {
                         proposal: progress.proposal.clone(),
                         summaries,
                     };
-                    return self.finish_decision(
+                    return self.finish_decision_with_context(
                         proof,
                         progress.command.as_ref(),
                         progress.transition_involved,
+                        context,
+                        mutation_started,
                     );
                 }
             }
@@ -4459,17 +7001,19 @@ impl ThreeNodeConsensus {
             }
             _ => unreachable!("phase is step modulo four"),
         }
-        self.ensure_progress_command(&mut progress)?;
+        self.ensure_progress_command(&mut progress, context, mutation_started)?;
         progress.step = progress.step.checked_add(1).ok_or(Error::ProposeFailed)?;
         progress.phase_zero_priorities.clear();
         Ok(DriveOutcome::Progress(progress))
     }
 
-    fn finish_decision(
+    fn finish_decision_with_context(
         &self,
         proof: DecisionProof,
         known_command: Option<&StoredCommand>,
         transition_involved: bool,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
     ) -> Result<DriveOutcome> {
         proof
             .validate_for_cluster(
@@ -4485,15 +7029,24 @@ impl ThreeNodeConsensus {
             .value
             .as_ref()
             .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
+        let mut control_budget = None;
+        let mut fetched_command = false;
         let command = match known_command {
             Some(command)
                 if self.command_matches_value(proof_context(&proof).0, value, command) =>
             {
                 command.clone()
             }
-            _ => self
-                .fetch_verified_value(proof_context(&proof).0, value)?
-                .ok_or(Error::CommandUnavailable)?,
+            _ => {
+                fetched_command = true;
+                self.fetch_verified_value_with_budget(
+                    Self::finish_control_budget(&mut control_budget, context, mutation_started)?,
+                    proof_context(&proof).0,
+                    value,
+                    mutation_started,
+                )?
+                .ok_or(Error::CommandUnavailable)?
+            }
         };
         if !matches!(&proof, DecisionProof::Phase2 { .. })
             && command.entry_type != EntryType::ConfigChange
@@ -4501,78 +7054,338 @@ impl ThreeNodeConsensus {
         {
             return Ok(DriveOutcome::Decision(proof));
         }
-        self.install_decision_proof_quorum(proof.clone())?;
+        let budget = Self::finish_control_budget(&mut control_budget, context, mutation_started)?;
+        if fetched_command {
+            #[cfg(test)]
+            record_budget_identity(
+                &budget.caller,
+                BudgetIdentityEvent::FinishFetchHandoff {
+                    deadline: budget.deadline,
+                    work_deadline: budget.work_deadline,
+                    // Fetch returns only after its group has been drained.
+                    outstanding: 0,
+                    mutation_started: mutation_started as *const AtomicBool as usize,
+                },
+            );
+        }
+        self.install_decision_proof_quorum_with_budget(budget, proof.clone(), mutation_started)?;
         Ok(DriveOutcome::Decision(proof))
     }
 
-    fn install_decision_proof_quorum(&self, proof: DecisionProof) -> Result<()> {
+    fn finish_control_budget<'a>(
+        control_budget: &'a mut Option<ControlCallBudget>,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<&'a ControlCallBudget> {
+        if control_budget.is_none() {
+            *control_budget = Some(
+                ControlCallBudget::new(context)
+                    .map_err(|error| Self::store_context_error(error, mutation_started))?,
+            );
+        }
+        Ok(control_budget
+            .as_ref()
+            .expect("the finish-decision control budget is initialized above"))
+    }
+
+    #[cfg(test)]
+    fn install_decision_proof_quorum(
+        &self,
+        proof: DecisionProof,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<()> {
+        let budget = ControlCallBudget::new(context)
+            .map_err(|error| Self::store_context_error(error, mutation_started))?;
+        self.install_decision_proof_quorum_with_budget(&budget, proof, mutation_started)
+    }
+
+    /// Installs a proof under an already captured control budget.  Nested
+    /// fetch/install paths must use this entrypoint to share D/W and the root
+    /// mutation certainty.
+    fn install_decision_proof_quorum_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        proof: DecisionProof,
+        mutation_started: &AtomicBool,
+    ) -> Result<()> {
+        check_operation_context(&budget.caller, mutation_started)?;
         let membership = self.membership.clone();
         let quorum = membership.quorum_size();
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
-        let mut saturated = 0;
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
+        let mut dispatches = vec![None; total];
+        let mut dispatch_error = None;
+        let mut install_dispatch_paused = false;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::InstallProof {
-                index,
-                proof: proof.clone(),
-                membership: membership.clone(),
-                result: sender.clone(),
-            }) == ControlDispatch::Saturated
-            {
-                saturated += 1;
+            if let Err(error) = budget.check_admission() {
+                dispatch_error = Some(Self::store_context_error(error, mutation_started));
+                break;
+            }
+            let dispatch = worker.dispatch_mutating_group(
+                ControlJob::InstallProof {
+                    index,
+                    context: budget.child_context(&group),
+                    proof: proof.clone(),
+                    membership: membership.clone(),
+                    result: sender.clone(),
+                },
+                &group,
+                mutation_started,
+            );
+            dispatches[index] = Some(dispatch);
+            if dispatch == ControlDispatch::Accepted && !install_dispatch_paused {
+                install_dispatch_paused = true;
+                #[cfg(test)]
+                pause_after_fetch_dispatch(&budget.caller);
+                #[cfg(test)]
+                capture_fetch_group_token(&budget.caller, &group);
+                #[cfg(test)]
+                record_budget_identity(
+                    &budget.caller,
+                    BudgetIdentityEvent::InstallDispatch {
+                        deadline: budget.deadline,
+                        work_deadline: budget.work_deadline,
+                        mutation_started: mutation_started as *const AtomicBool as usize,
+                        mutation_started_set: mutation_started.load(Ordering::Acquire),
+                    },
+                );
             }
         }
         drop(sender);
+        let admitted: Vec<_> = dispatches
+            .iter()
+            .map(|dispatch| *dispatch == Some(ControlDispatch::Accepted))
+            .collect();
+        let accepted_count = admitted.iter().filter(|admitted| **admitted).count();
+        let saturated = dispatches
+            .iter()
+            .filter(|dispatch| **dispatch == Some(ControlDispatch::Saturated))
+            .count();
         let mut installed = 0;
-        let mut worker_failed = false;
-        for (_, result) in receiver {
-            match result {
-                Ok(()) => installed += 1,
-                Err(Error::ProposeFailed) => worker_failed = true,
-                Err(_) => {}
+        let mut received = 0;
+        let mut replied = vec![false; total];
+        let mut worker_failed = dispatches.contains(&Some(ControlDispatch::Failed));
+        let mut observed_unknown = false;
+        let mut safety_error = None;
+        let mut frozen = dispatch_error.map(Err);
+        let mut disconnected = false;
+        while frozen.is_none() {
+            if let Err(error) = budget.check_admission() {
+                frozen = Some(Err(Self::store_context_error(error, mutation_started)));
+                break;
             }
-            if installed >= quorum {
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .expect("admission check established the work deadline");
+            let result = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL)) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    if mutation_started.load(Ordering::Acquire) {
+                        frozen = Some(Err(Error::UnknownOutcome));
+                    }
+                    None
+                }
+            };
+            let Some((index, result)) = result else {
+                if frozen.is_some() || disconnected {
+                    break;
+                }
+                continue;
+            };
+            let admitted_reply = if index >= total {
+                observed_unknown = true;
+                false
+            } else if admitted[index] {
+                if replied[index] {
+                    observed_unknown = true;
+                    false
+                } else {
+                    replied[index] = true;
+                    received += 1;
+                    true
+                }
+            } else {
+                false
+            };
+            if admitted_reply {
+                match result {
+                    Ok(()) => installed += 1,
+                    Err(Error::UnknownOutcome) => observed_unknown = true,
+                    Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {
+                        observed_unknown = true;
+                    }
+                    Err(Error::ProposeFailed) => worker_failed = true,
+                    Err(error) if Self::is_control_safety_error(&error) => {
+                        safety_error.get_or_insert(error);
+                    }
+                    Err(_) => {}
+                }
+            }
+            if let Some(error) = safety_error.clone() {
+                frozen = Some(Err(error));
+            } else if observed_unknown {
+                frozen = Some(Err(Error::UnknownOutcome));
+            } else if installed >= quorum {
+                frozen = Some(Ok(()));
+            } else if received == accepted_count {
                 break;
             }
         }
-        if installed < quorum {
-            return Err(
-                if worker_failed && !control_quorum_reachable(installed, saturated, quorum) {
-                    Error::ProposeFailed
-                } else {
-                    Error::NoQuorum
-                },
-            );
+        group.cancel_and_prune();
+        let timed_out = group.drain_to_deadline(budget.deadline);
+        for worker in &timed_out {
+            worker.quarantine();
         }
-        Ok(())
+        while let Ok((index, result)) = receiver.try_recv() {
+            let admitted_reply = if index >= total {
+                observed_unknown = true;
+                false
+            } else if admitted[index] {
+                if replied[index] {
+                    observed_unknown = true;
+                    false
+                } else {
+                    replied[index] = true;
+                    received += 1;
+                    true
+                }
+            } else {
+                false
+            };
+            if admitted_reply {
+                match result {
+                    Ok(()) => installed += 1,
+                    Err(Error::UnknownOutcome) => observed_unknown = true,
+                    Err(Error::ProposeFailed) => worker_failed = true,
+                    Err(error) if Self::is_control_safety_error(&error) => {
+                        safety_error.get_or_insert(error);
+                    }
+                    // Cleanup cancellation is delivery, not an independently
+                    // ambiguous proof installation.
+                    Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) | Err(_) => {}
+                }
+            }
+        }
+        if let Some(error) = safety_error {
+            return Err(error);
+        }
+        if received < accepted_count || observed_unknown || !timed_out.is_empty() {
+            return Err(Error::UnknownOutcome);
+        }
+        if let Err(error) = budget.check_admission() {
+            return Err(Self::store_context_error(error, mutation_started));
+        }
+        match frozen {
+            Some(result) => result,
+            None if installed >= quorum => Ok(()),
+            None if worker_failed && !control_quorum_reachable(installed, saturated, quorum) => {
+                Err(Error::ProposeFailed)
+            }
+            None => Err(Error::NoQuorum),
+        }
     }
 
+    #[cfg(test)]
     fn record_broadcast(&self, requests: Vec<RecordRequest>) -> Result<Vec<RecordSummary>> {
+        let context = RecorderRpcContext::default_timeout();
+        let mutation_started = AtomicBool::new(false);
+        self.record_broadcast_with_context(requests, context, &mutation_started)
+    }
+
+    fn record_broadcast_with_context(
+        &self,
+        requests: Vec<RecordRequest>,
+        context: RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<Vec<RecordSummary>> {
+        check_operation_context(&context, mutation_started)?;
+        let budget = RpcCallBudget::new(&context)
+            .map_err(|error| Self::store_context_error(error, mutation_started))?;
         let quorum = self.membership.quorum_size();
         let total = self.record_workers.len().min(requests.len());
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
-        let mut saturated_workers = vec![false; total];
+        let group = RpcCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        if let Some(slot) = requests.first().map(|request| request.slot) {
+            group.attach_test_record_probe(self.test_instance_id, slot);
+        }
+        let mut dispatches = vec![RecordDispatch::NotAttempted; total];
+        let mut dispatch_error = None;
         for (index, (worker, request)) in self.record_workers.iter().zip(requests).enumerate() {
-            saturated_workers[index] = worker.dispatch(RecordJob {
-                index,
-                request,
-                result: sender.clone(),
-            });
+            let dispatch = match budget.check_admission() {
+                Ok(()) => worker.dispatch_mutating_group(
+                    RecordJob {
+                        index,
+                        context: budget.child_context(&group),
+                        request,
+                        result: sender.clone(),
+                    },
+                    &group,
+                    mutation_started,
+                ),
+                Err(error) => {
+                    dispatch_error = Some(Self::store_context_error(error, mutation_started));
+                    break;
+                }
+            };
+            dispatches[index] = dispatch;
         }
         drop(sender);
-        let saturated = saturated_workers
+        let saturated = dispatches
             .iter()
-            .filter(|saturated| **saturated)
+            .filter(|dispatch| **dispatch == RecordDispatch::Saturated)
             .count();
-        let accepted = total.saturating_sub(saturated);
+        let accepted = dispatches
+            .iter()
+            .filter(|dispatch| **dispatch == RecordDispatch::Accepted)
+            .count();
         let mut accepted_completed = 0;
+        let mut replied = vec![false; total];
         let mut typed_errors = vec![None; total];
-        let mut worker_failed = false;
+        // A preclosed or quarantined worker was actually contacted and
+        // definitely failed admission.  It must affect the final quorum
+        // classification, unlike workers the caller never attempted after a
+        // context stop.
+        let mut worker_failed = dispatches.contains(&RecordDispatch::Failed);
+        let mut observed_unknown = false;
+        let mut safety_error = None;
         let mut replies = Vec::with_capacity(quorum);
-        for (index, result) in receiver {
-            if !saturated_workers[index] {
-                accepted_completed += 1;
+        let mut frozen: Option<Result<Vec<RecordSummary>>> = dispatch_error.map(Err);
+        while frozen.is_none() && accepted_completed < accepted {
+            if let Err(error) = budget.check_admission() {
+                frozen = Some(Err(Self::store_context_error(error, mutation_started)));
+                break;
             }
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .expect("record admission check established the work deadline");
+            let (index, result) = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL))
+            {
+                Ok(reply) => reply,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    frozen = Some(Err(Error::UnknownOutcome));
+                    break;
+                }
+            };
+            if index >= total || dispatches[index] != RecordDispatch::Accepted {
+                observed_unknown = true;
+                continue;
+            }
+            if replied[index] {
+                observed_unknown = true;
+                continue;
+            }
+            replied[index] = true;
+            accepted_completed += 1;
             match result {
                 Ok(reply) => {
                     if !replies
@@ -4582,91 +7395,338 @@ impl ThreeNodeConsensus {
                         replies.push(reply);
                     }
                     if replies.len() >= quorum {
-                        return Ok(replies);
+                        frozen = Some(Ok(replies.clone()));
                     }
                 }
-                Err(error @ Error::Rejected(_)) | Err(error @ Error::TypedRecordRequired) => {
+                Err(Error::UnknownOutcome) => {
+                    observed_unknown = true;
+                    frozen = Some(Err(Error::UnknownOutcome));
+                }
+                Err(error) if Self::is_record_safety_error(&error) => {
+                    safety_error.get_or_insert(error);
+                }
+                Err(error @ (Error::TypedRecordRequired | Error::Rejected(_))) => {
                     typed_errors[index] = Some(error);
+                }
+                Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {
+                    observed_unknown = mutation_started.load(Ordering::Acquire);
+                    frozen = Some(Err(Self::store_context_error(
+                        Error::RpcCancelled,
+                        mutation_started,
+                    )));
                 }
                 Err(Error::ProposeFailed) => worker_failed = true,
                 Err(_) => {}
             }
             let accepted_remaining = accepted.saturating_sub(accepted_completed);
             if replies.len() + saturated + accepted_remaining < quorum {
-                return match typed_errors.into_iter().flatten().next() {
+                frozen = Some(match typed_errors.iter().flatten().next() {
+                    Some(error) => Err(error.clone()),
+                    None if worker_failed => Err(Error::ProposeFailed),
+                    None => Ok(replies.clone()),
+                });
+            }
+        }
+        if frozen.is_none() {
+            frozen = Some(if accepted_completed < accepted {
+                Err(Error::UnknownOutcome)
+            } else if replies.len() + saturated >= quorum {
+                Ok(replies)
+            } else {
+                match typed_errors.into_iter().flatten().next() {
                     Some(error) => Err(error),
                     None if worker_failed => Err(Error::ProposeFailed),
                     None => Ok(replies),
-                };
+                }
+            });
+        }
+
+        // Quorum freezes the public result, not the lifecycle of its admitted
+        // workers. Reclaim jobs that have not begun, but leave a running
+        // mutation under its child W until the original caller D.
+        group.prune_pending();
+        let timed_out = group.drain_to_deadline(budget.deadline);
+        if !timed_out.is_empty() {
+            group.cancel();
+            group.prune_pending();
+            for worker in &timed_out {
+                worker.quarantine();
             }
         }
-        if replies.len() + saturated >= quorum {
-            return Ok(replies);
+        while let Ok((index, result)) = receiver.try_recv() {
+            if index >= total || dispatches[index] != RecordDispatch::Accepted {
+                observed_unknown = true;
+                continue;
+            }
+            if replied[index] {
+                observed_unknown = true;
+                continue;
+            }
+            replied[index] = true;
+            accepted_completed += 1;
+            match result {
+                Err(error) if Self::is_record_safety_error(&error) => {
+                    safety_error.get_or_insert(error);
+                }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
+                _ => {}
+            }
         }
-        match typed_errors.into_iter().flatten().next() {
-            Some(error) => Err(error),
-            None if worker_failed => Err(Error::ProposeFailed),
-            None => Ok(replies),
+        if let Some(error) = safety_error {
+            return Err(error);
         }
+        if observed_unknown || !timed_out.is_empty() || accepted_completed < accepted {
+            return Err(Error::UnknownOutcome);
+        }
+        if let Err(error) = context.check() {
+            return Err(Self::store_context_error(error, mutation_started));
+        }
+        frozen.unwrap()
     }
 
     pub fn inspect_decision_at(
         &self,
+        context: &RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
     ) -> Result<DecisionInspection> {
-        Ok(match self.inspect_certified_decision_at(slot, prev_hash)? {
-            CertifiedDecisionInspection::Committed(certified) => {
-                DecisionInspection::Committed(certified.entry)
-            }
-            CertifiedDecisionInspection::Empty => DecisionInspection::Empty,
-            CertifiedDecisionInspection::Pending => DecisionInspection::Pending,
-            CertifiedDecisionInspection::Unavailable => DecisionInspection::Unavailable,
-        })
+        Ok(
+            match self.inspect_certified_decision_at(context, slot, prev_hash)? {
+                CertifiedDecisionInspection::Committed(certified) => {
+                    DecisionInspection::Committed(certified.entry)
+                }
+                CertifiedDecisionInspection::Empty => DecisionInspection::Empty,
+                CertifiedDecisionInspection::Pending => DecisionInspection::Pending,
+                CertifiedDecisionInspection::Unavailable => DecisionInspection::Unavailable,
+            },
+        )
     }
 
-    pub fn inspect_decision_proof_at(&self, slot: Slot) -> Result<Option<DecisionProof>> {
+    pub fn inspect_decision_proof_at(
+        &self,
+        context: &RecorderRpcContext,
+        slot: Slot,
+    ) -> Result<Option<DecisionProof>> {
+        let budget = ControlCallBudget::new(context)?;
+        self.inspect_decision_proof_with_budget(&budget, slot)
+    }
+
+    /// Reuses a top-level read budget so sequential inspection stages share
+    /// the original D/W rather than subtracting the drain reserve again.
+    fn inspect_decision_proof_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        slot: Slot,
+    ) -> Result<Option<DecisionProof>> {
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
         let quorum = self.membership.quorum_size();
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
         let mut saturated = 0;
+        let mut candidate = None;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::InspectProof {
-                index,
-                slot,
-                result: sender.clone(),
-            }) == ControlDispatch::Saturated
-            {
-                saturated += 1;
+            if let Err(error) = budget.check_admission() {
+                candidate = Some(Err(error));
+                break;
+            }
+            match worker.dispatch_group(
+                ControlJob::InspectProof {
+                    index,
+                    context: budget.child_context(&group),
+                    slot,
+                    result: sender.clone(),
+                },
+                &group,
+            ) {
+                ControlDispatch::Accepted => {}
+                ControlDispatch::Saturated => saturated += 1,
+                ControlDispatch::Failed => {}
             }
         }
         drop(sender);
         let mut successful = BTreeSet::new();
         let mut proofs = Vec::new();
         let mut worker_failed = false;
-        for (index, result) in receiver {
+        let mut observed_unknown = false;
+        while candidate.is_none() {
+            if let Err(error) = budget.check_admission() {
+                candidate = Some(Err(error));
+                break;
+            }
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .expect("admission check guaranteed a future work deadline");
+            let result = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL)) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    candidate = Some(Err(
+                        if worker_failed
+                            && !control_quorum_reachable(successful.len(), saturated, quorum)
+                        {
+                            Error::ProposeFailed
+                        } else {
+                            Error::NoQuorum
+                        },
+                    ));
+                    None
+                }
+            };
+            let Some((index, result)) = result else {
+                continue;
+            };
             match result {
                 Ok(proof) => {
                     successful.insert(self.membership.members()[index].clone());
                     proofs.extend(proof);
                 }
+                Err(Error::UnknownOutcome) => {
+                    observed_unknown = true;
+                    candidate = Some(Err(Error::UnknownOutcome));
+                }
                 Err(Error::ProposeFailed) => worker_failed = true,
                 Err(_) => {}
             }
             if successful.len() >= quorum {
-                break;
+                candidate = Some(self.select_decision_proof(slot, proofs.clone()));
             }
         }
-        if successful.len() < quorum {
-            return Err(
+
+        let candidate = candidate.unwrap_or_else(|| {
+            Err(
                 if worker_failed && !control_quorum_reachable(successful.len(), saturated, quorum) {
                     Error::ProposeFailed
                 } else {
                     Error::NoQuorum
                 },
+            )
+        });
+        group.cancel_and_prune();
+        let timed_out_workers = group.drain_to_deadline(budget.deadline);
+
+        // Quarantine is cleanup, not result selection.  Do it first even if
+        // later evidence proves a safety error or an unknown outcome.
+        for worker in &timed_out_workers {
+            worker.quarantine();
+        }
+
+        let mut safety_error = match &candidate {
+            Err(error) if Self::is_control_safety_error(error) => Some(error.clone()),
+            _ => None,
+        };
+        let mut validated_proofs = Vec::new();
+        for proof in proofs {
+            self.fold_inspected_proof(slot, proof, &mut validated_proofs, &mut safety_error);
+        }
+        // `drain_to_deadline` proves every non-timed-out accepted job has
+        // either sent its reply before completing or dropped its sender while
+        // unwinding.  With a timed-out worker its sender may remain live, so
+        // an Empty channel is likewise complete for every job that did drain.
+        while let Ok((_, result)) = receiver.try_recv() {
+            self.fold_late_inspect_proof_result(
+                slot,
+                result,
+                &mut validated_proofs,
+                &mut safety_error,
+                &mut observed_unknown,
             );
         }
-        self.select_decision_proof(slot, proofs)
+        if let Some(error) = safety_error {
+            return Err(error);
+        }
+        if observed_unknown {
+            return Err(Error::UnknownOutcome);
+        }
+        if !timed_out_workers.is_empty() {
+            return Err(Error::RpcDeadlineExceeded);
+        }
+        budget.check_admission()?;
+        candidate
+    }
+
+    fn fold_late_inspect_proof_result(
+        &self,
+        slot: Slot,
+        result: Result<Option<DecisionProof>>,
+        validated_proofs: &mut Vec<DecisionProof>,
+        safety_error: &mut Option<Error>,
+        observed_unknown: &mut bool,
+    ) {
+        match result {
+            Ok(Some(proof)) => {
+                self.fold_inspected_proof(slot, proof, validated_proofs, safety_error);
+            }
+            Err(Error::UnknownOutcome) => *observed_unknown = true,
+            Ok(None) | Err(_) => {}
+        }
+    }
+
+    /// Validates every proof in arrival-independent order.  This is used for
+    /// both the replies observed before the frozen candidate and replies
+    /// drained afterwards, so a valid but conflicting certificate can never
+    /// be hidden by a quorum result or an intervening `UnknownOutcome`.
+    fn fold_inspected_proof(
+        &self,
+        slot: Slot,
+        proof: DecisionProof,
+        validated_proofs: &mut Vec<DecisionProof>,
+        safety_error: &mut Option<Error>,
+    ) {
+        let validation = self.validate_inspected_proof(slot, &proof).and_then(|()| {
+            if validated_proofs
+                .iter()
+                .any(|existing| existing.proposal().value != proof.proposal().value)
+            {
+                Err(Error::ConflictingCertificates)
+            } else {
+                Ok(())
+            }
+        });
+        match validation {
+            Ok(()) => validated_proofs.push(proof),
+            Err(error) if safety_error.is_none() => *safety_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    fn validate_inspected_proof(&self, slot: Slot, proof: &DecisionProof) -> Result<()> {
+        if proof_cluster_id(proof) != self.cluster_id {
+            return Err(Error::Rejected(RejectReason::WrongCluster));
+        }
+        proof
+            .validate_for_cluster(
+                &self.cluster_id,
+                slot,
+                self.epoch,
+                self.config_id,
+                &self.membership,
+            )
+            .map_err(Error::Rejected)
+    }
+
+    fn is_control_safety_error(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::ChainConflict { .. }
+                | Error::CommandHashMismatch
+                | Error::ConflictingCertificates
+                // In this collector every retained Rejected candidate comes
+                // from local proof validation; remote rejections are ignored
+                // while collecting replies and cannot reach this precedence.
+                | Error::Rejected(_)
+        )
+    }
+
+    fn is_record_safety_error(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::ChainConflict { .. }
+                | Error::CommandHashMismatch
+                | Error::ConflictingCertificates
+        )
     }
 
     fn select_decision_proof(
@@ -4707,17 +7767,36 @@ impl ThreeNodeConsensus {
 
     fn certified_inspection_from_proof(
         &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
         slot: Slot,
         prev_hash: LogHash,
         proof: DecisionProof,
     ) -> Result<CertifiedDecisionInspection> {
         let decision = certificate_from_proof(&proof)?;
         self.ensure_predecessor(slot, prev_hash, decision.value.prev_hash)?;
-        let Some(command) = self.fetch_verified_value(slot, &decision.value)? else {
+        let Some(command) =
+            self.fetch_verified_value_with_budget(budget, slot, &decision.value, mutation_started)?
+        else {
             return Ok(CertifiedDecisionInspection::Unavailable);
         };
         if command.entry_type == EntryType::ConfigChange {
-            self.install_decision_proof_quorum(proof.clone())?;
+            #[cfg(test)]
+            record_budget_identity(
+                &budget.caller,
+                BudgetIdentityEvent::FetchHandoff {
+                    deadline: budget.deadline,
+                    work_deadline: budget.work_deadline,
+                    // Fetch returns only after its group has been drained.
+                    outstanding: 0,
+                    mutation_started: mutation_started as *const AtomicBool as usize,
+                },
+            );
+            self.install_decision_proof_quorum_with_budget(
+                budget,
+                proof.clone(),
+                mutation_started,
+            )?;
         }
         let entry = self.log_entry_from_value(slot, command, &decision.value)?;
         Ok(CertifiedDecisionInspection::Committed(Box::new(
@@ -4731,10 +7810,13 @@ impl ThreeNodeConsensus {
 
     pub fn inspect_certified_decision_at(
         &self,
+        context: &RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
     ) -> Result<CertifiedDecisionInspection> {
-        self.inspect_typed_record_summaries(slot, prev_hash)
+        let budget = ControlCallBudget::new(context)?;
+        let mutation_started = AtomicBool::new(false);
+        self.inspect_typed_record_summaries_with_budget(&budget, &mutation_started, slot, prev_hash)
     }
 
     pub fn supports_context_read_fence(&self) -> bool {
@@ -4748,13 +7830,27 @@ impl ThreeNodeConsensus {
     /// the existing certified inspection path and can never become Empty.
     pub fn inspect_context_read_fence_at(
         &self,
+        context: &RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
     ) -> Result<CertifiedDecisionInspection> {
         if !self.supports_context_read_fence() {
             return Err(Error::ReadFenceUnsupported);
         }
+        let budget = ControlCallBudget::new(context)?;
+        let mutation_started = AtomicBool::new(false);
+        self.inspect_context_read_fence_with_budget(&budget, &mutation_started, slot, prev_hash)
+    }
+
+    fn inspect_context_read_fence_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
+        slot: Slot,
+        prev_hash: LogHash,
+    ) -> Result<CertifiedDecisionInspection> {
         let quorum = self.membership.quorum_size();
+        check_operation_context(&budget.caller, mutation_started)?;
         let total = self.read_fence_workers.len();
         let request = ReadFenceRequest {
             cluster_id: self.cluster_id.clone(),
@@ -4764,14 +7860,34 @@ impl ThreeNodeConsensus {
             slot,
         };
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
         let mut saturated = 0;
+        let mut dispatch_error = None;
+        let mut read_fence_dispatch_paused = false;
         for (index, worker) in self.read_fence_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::ObserveReadFence {
-                index,
-                request: request.clone(),
-                result: sender.clone(),
-            }) == ControlDispatch::Saturated
-            {
+            if let Err(error) = budget.check_admission() {
+                dispatch_error = Some(Self::fetch_context_error(error, mutation_started));
+                break;
+            }
+            let dispatch = worker.dispatch_group(
+                ControlJob::ObserveReadFence {
+                    index,
+                    context: budget.child_context(&group),
+                    request: request.clone(),
+                    result: sender.clone(),
+                },
+                &group,
+            );
+            if dispatch == ControlDispatch::Accepted && !read_fence_dispatch_paused {
+                read_fence_dispatch_paused = true;
+                #[cfg(test)]
+                pause_after_fetch_dispatch(&budget.caller);
+                #[cfg(test)]
+                capture_fetch_group_token(&budget.caller, &group);
+            }
+            if dispatch == ControlDispatch::Saturated {
                 saturated += 1;
             }
         }
@@ -4779,8 +7895,31 @@ impl ThreeNodeConsensus {
         let mut successful = 0_usize;
         let mut empty = 0_usize;
         let mut worker_failed = false;
+        let mut observed_unknown = false;
+        let mut safety_error = None;
+        let mut disconnected = false;
         let mut received = 0_usize;
-        for (index, result) in receiver {
+        let mut frozen: Option<Result<bool>> = None;
+        while frozen.is_none() && !observed_unknown {
+            if let Err(error) = budget.check_admission() {
+                frozen = Some(Err(Self::fetch_context_error(error, mutation_started)));
+                break;
+            }
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap();
+            let result = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL)) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
+            let Some((index, result)) = result else {
+                continue;
+            };
             received += 1;
             match result {
                 Ok(observation)
@@ -4793,55 +7932,168 @@ impl ThreeNodeConsensus {
                     successful += 1;
                     if observation.slot_state == ReadFenceSlotState::Empty {
                         empty += 1;
-                        if empty >= quorum {
-                            return Ok(CertifiedDecisionInspection::Empty);
-                        }
                     }
                 }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
                 Err(Error::ProposeFailed) => worker_failed = true,
-                Ok(_) | Err(_) => {}
+                // A malformed identity/context observation is evidence of a
+                // broken fence protocol, not an ordinary unavailable voter.
+                Ok(_) => {
+                    safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
+                }
+                // Group cleanup can synthesize these replies for pruned
+                // hedges. The root context is checked after drain.
+                Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {}
+                Err(_) => {}
             }
-            let remaining = total.saturating_sub(received);
-            if successful.saturating_add(remaining) < quorum {
-                return Ok(CertifiedDecisionInspection::Unavailable);
+            if empty >= quorum {
+                // A quorum of Empty observations is a valid linearization
+                // point. A late occupied/higher fence reply is later
+                // ordinary evidence and cannot overturn that quorum; quorum
+                // intersection makes the Empty result safe at that point.
+                frozen = Some(Ok(true));
+            } else if successful >= quorum
+                && empty.saturating_add(total.saturating_sub(received)) < quorum
+            {
+                frozen = Some(Ok(false));
             }
         }
-        if successful < quorum {
-            if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
-                return Err(Error::ProposeFailed);
+        let frozen = dispatch_error.map(Err).unwrap_or_else(|| {
+            frozen.unwrap_or_else(|| {
+                if disconnected && mutation_started.load(Ordering::Acquire) {
+                    Err(Error::UnknownOutcome)
+                } else if worker_failed && !control_quorum_reachable(successful, saturated, quorum)
+                {
+                    Err(Error::ProposeFailed)
+                } else {
+                    Ok(false)
+                }
+            })
+        });
+        if let Err(error) = &frozen {
+            if Self::is_control_safety_error(error) {
+                safety_error = Some(error.clone());
             }
-            return Ok(CertifiedDecisionInspection::Unavailable);
         }
-        Ok(match self.inspect_certified_decision_at(slot, prev_hash)? {
-            // An occupied fence quorum cannot be weakened by the typed
-            // summary path's context-free absence classification.
-            CertifiedDecisionInspection::Empty => CertifiedDecisionInspection::Pending,
-            inspection => inspection,
-        })
+        group.cancel_and_prune();
+        let timed_out = group.drain_to_deadline(budget.deadline);
+        for worker in &timed_out {
+            worker.quarantine();
+        }
+        while let Ok((index, result)) = receiver.try_recv() {
+            match result {
+                Ok(observation)
+                    if valid_read_fence_observation(
+                        &observation,
+                        &self.membership.members()[index],
+                        &request,
+                    ) => {}
+                Ok(_) => {
+                    safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
+                }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
+                _ => {}
+            }
+        }
+        if let Some(error) = safety_error {
+            return Err(error);
+        }
+        if observed_unknown {
+            return Err(Error::UnknownOutcome);
+        }
+        if !timed_out.is_empty() {
+            return Err(if mutation_started.load(Ordering::Acquire) {
+                Error::UnknownOutcome
+            } else {
+                Error::RpcDeadlineExceeded
+            });
+        }
+        if let Err(error) = budget.check_admission() {
+            return Err(Self::fetch_context_error(error, mutation_started));
+        }
+        match frozen? {
+            true => Ok(CertifiedDecisionInspection::Empty),
+            false if successful < quorum => {
+                if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
+                    Err(Error::ProposeFailed)
+                } else {
+                    Ok(CertifiedDecisionInspection::Unavailable)
+                }
+            }
+            false => {
+                let inspection = {
+                    #[cfg(test)]
+                    record_budget_identity(
+                        &budget.caller,
+                        BudgetIdentityEvent::ReadFenceHandoff {
+                            deadline: budget.deadline,
+                            work_deadline: budget.work_deadline,
+                            outstanding: group.outstanding_len(),
+                        },
+                    );
+                    self.inspect_typed_record_summaries_with_budget(
+                        budget,
+                        mutation_started,
+                        slot,
+                        prev_hash,
+                    )?
+                };
+                Ok(match inspection {
+                    // An occupied fence quorum cannot be weakened by the
+                    // typed summary path's context-free absence result.
+                    CertifiedDecisionInspection::Empty => CertifiedDecisionInspection::Pending,
+                    inspection => inspection,
+                })
+            }
+        }
     }
 
-    fn inspect_typed_record_summaries(
+    fn inspect_typed_record_summaries_with_budget(
         &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
         slot: Slot,
         prev_hash: LogHash,
     ) -> Result<CertifiedDecisionInspection> {
         let quorum = self.membership.quorum_size();
+        check_operation_context(&budget.caller, mutation_started)?;
         let config_id = self.config_id;
         let config_digest = self.config_digest;
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
-        let cancellation = ControlJobCancellation::new();
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
         let mut saturated = 0;
+        let mut dispatch_error = None;
+        let mut summary_dispatch_paused = false;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch_cancellable(
+            if let Err(error) = budget.check_admission() {
+                dispatch_error = Some(match error {
+                    Error::RpcCancelled | Error::RpcDeadlineExceeded
+                        if mutation_started.load(Ordering::Acquire) =>
+                    {
+                        Error::UnknownOutcome
+                    }
+                    error => error,
+                });
+                break;
+            }
+            let dispatch = worker.dispatch_group(
                 ControlJob::InspectSummary {
                     index,
+                    context: budget.child_context(&group),
                     slot,
                     result: sender.clone(),
                 },
-                cancellation.token(),
-            ) == ControlDispatch::Saturated
-            {
+                &group,
+            );
+            if dispatch == ControlDispatch::Accepted && !summary_dispatch_paused {
+                summary_dispatch_paused = true;
+                #[cfg(test)]
+                pause_after_summary_dispatch(&budget.caller);
+            }
+            if dispatch == ControlDispatch::Saturated {
                 saturated += 1;
             }
         }
@@ -4849,7 +8101,34 @@ impl ThreeNodeConsensus {
         let mut successful = 0;
         let mut summaries = Vec::new();
         let mut worker_failed = false;
-        for (index, result) in receiver {
+        let mut observed_unknown = false;
+        let mut safety_error = None;
+        let mut frozen: Option<Result<Option<DecisionProof>>> = None;
+        let mut provisional_none_hook_fired = false;
+        // An admitted summary RPC remains safety-relevant even after a
+        // quorum has produced a candidate.  In particular, a quorum of
+        // `None` responses cannot establish absence while another admitted
+        // recorder can still report an occupied slot or a conflicting proof.
+        // Keep the bounded original W/D until every admitted reply is
+        // observed (or the caller deadline/cancellation makes that
+        // impossible); only then may cleanup prune anything left queued.
+        while !observed_unknown {
+            if let Err(error) = budget.check_admission() {
+                frozen = Some(Err(error));
+                break;
+            }
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap();
+            let result = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL)) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let Some((index, result)) = result else {
+                continue;
+            };
             match result {
                 Ok(summary)
                     if summary.as_ref().is_none_or(|summary| {
@@ -4862,16 +8141,128 @@ impl ThreeNodeConsensus {
                     successful += 1;
                     summaries.extend(summary);
                 }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
                 Err(Error::ProposeFailed) => worker_failed = true,
-                Ok(_) | Err(_) => {}
+                Ok(_) => {
+                    safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
+                }
+                Err(_) => {}
             }
             if successful >= quorum {
-                if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
-                    // The nested command fetch reuses these bounded workers, so cancel queued summaries first.
-                    drop(cancellation);
-                    return self.certified_inspection_from_proof(slot, prev_hash, proof);
+                let proof = self.proof_from_record_summaries(slot, &summaries);
+                if matches!(&proof, Ok(None))
+                    && !summaries.is_empty()
+                    && !provisional_none_hook_fired
+                {
+                    provisional_none_hook_fired = true;
+                    #[cfg(test)]
+                    pause_after_summary_provisional_none(&budget.caller);
                 }
+                frozen = Some(proof);
             }
+        }
+        let mut frozen = dispatch_error.map(Err).unwrap_or_else(|| {
+            frozen.unwrap_or_else(|| {
+                if successful < quorum {
+                    Err(
+                        if worker_failed && !control_quorum_reachable(successful, saturated, quorum)
+                        {
+                            Error::ProposeFailed
+                        } else {
+                            Error::NoQuorum
+                        },
+                    )
+                } else {
+                    self.proof_from_record_summaries(slot, &summaries)
+                }
+            })
+        });
+        if let Err(error) = &frozen {
+            if Self::is_control_safety_error(error) {
+                safety_error = Some(error.clone());
+            }
+        }
+        group.cancel_and_prune();
+        let timed_out = group.drain_to_deadline(budget.deadline);
+        for worker in &timed_out {
+            worker.quarantine();
+        }
+        while let Ok((index, result)) = receiver.try_recv() {
+            match result {
+                Ok(summary)
+                    if summary.as_ref().is_none_or(|summary| {
+                        summary.recorder_id == self.membership.members()[index]
+                            && summary.slot == slot
+                            && summary.config_id == config_id
+                            && summary.config_digest == config_digest
+                    }) =>
+                {
+                    summaries.extend(summary)
+                }
+                Ok(_) => {
+                    safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
+                }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
+                _ => {}
+            }
+        }
+        if safety_error.is_none() {
+            match self.proof_from_record_summaries(slot, &summaries) {
+                Err(error) => safety_error = Some(error),
+                Ok(Some(late_proof)) => match &frozen {
+                    // A quorum can first establish only that no proof has
+                    // been observed. The compulsory drain may then deliver
+                    // the missing valid evidence; preserve it for the
+                    // certified inspection rather than returning Pending.
+                    Ok(None) => frozen = Ok(Some(late_proof)),
+                    Ok(Some(frozen_proof))
+                        if frozen_proof.proposal().value != late_proof.proposal().value =>
+                    {
+                        safety_error = Some(Error::ConflictingCertificates);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if let Some(error) = safety_error {
+            return Err(error);
+        }
+        if observed_unknown {
+            return Err(Error::UnknownOutcome);
+        }
+        if !timed_out.is_empty() {
+            return Err(if mutation_started.load(Ordering::Acquire) {
+                Error::UnknownOutcome
+            } else {
+                Error::RpcDeadlineExceeded
+            });
+        }
+        if let Err(error) = budget.check_admission() {
+            return Err(if mutation_started.load(Ordering::Acquire) {
+                Error::UnknownOutcome
+            } else {
+                error
+            });
+        }
+        let proof = frozen?;
+        if let Some(proof) = proof {
+            #[cfg(test)]
+            record_budget_identity(
+                &budget.caller,
+                BudgetIdentityEvent::SummaryHandoff {
+                    deadline: budget.deadline,
+                    work_deadline: budget.work_deadline,
+                    outstanding: group.outstanding_len(),
+                },
+            );
+            return self.certified_inspection_from_proof(
+                budget,
+                mutation_started,
+                slot,
+                prev_hash,
+                proof,
+            );
         }
         if successful < quorum {
             if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
@@ -4884,9 +8275,6 @@ impl ThreeNodeConsensus {
         }
         if summaries.len() < quorum {
             return Ok(CertifiedDecisionInspection::Unavailable);
-        }
-        if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
-            return self.certified_inspection_from_proof(slot, prev_hash, proof);
         }
         Ok(CertifiedDecisionInspection::Pending)
     }
@@ -4971,12 +8359,14 @@ impl ThreeNodeConsensus {
 
     pub fn recover_decision_at(
         &self,
+        context: RecorderRpcContext,
         slot: Slot,
         prev_hash: LogHash,
     ) -> Result<DecisionInspection> {
-        match self.inspect_decision_at(slot, prev_hash)? {
+        match self.inspect_decision_at(&context, slot, prev_hash)? {
             DecisionInspection::Pending => self
                 .propose_stored_at(
+                    context,
                     slot,
                     prev_hash,
                     StoredCommand::new(EntryType::Noop, Vec::new()),
@@ -4986,20 +8376,25 @@ impl ThreeNodeConsensus {
         }
     }
 
-    pub fn recover_decided_at(&self, slot: Slot, prev_hash: LogHash) -> Result<Option<LogEntry>> {
-        match self.inspect_decision_at(slot, prev_hash)? {
+    pub fn recover_decided_at(
+        &self,
+        context: &RecorderRpcContext,
+        slot: Slot,
+        prev_hash: LogHash,
+    ) -> Result<Option<LogEntry>> {
+        match self.inspect_decision_at(context, slot, prev_hash)? {
             DecisionInspection::Committed(entry) => Ok(Some(entry)),
             DecisionInspection::Empty | DecisionInspection::Pending => Ok(None),
             DecisionInspection::Unavailable => Err(Error::CommandUnavailable),
         }
     }
 
-    pub fn recover_decided_next(&self) -> Result<Option<LogEntry>> {
+    pub fn recover_decided_next(&self, context: &RecorderRpcContext) -> Result<Option<LogEntry>> {
         let mut tip = self
             .sequential_tip
             .lock()
             .map_err(|_| Error::ProposeFailed)?;
-        let Some(entry) = self.recover_decided_at(tip.next_index, tip.last_hash)? else {
+        let Some(entry) = self.recover_decided_at(context, tip.next_index, tip.last_hash)? else {
             return Ok(None);
         };
         tip.next_index = entry
@@ -5026,69 +8421,272 @@ impl ThreeNodeConsensus {
         Ok(())
     }
 
-    fn store_command_on_quorum(
+    fn store_context_error(error: Error, mutation_started: &AtomicBool) -> Error {
+        match error {
+            Error::RpcCancelled | Error::RpcDeadlineExceeded
+                if mutation_started.load(Ordering::Acquire) =>
+            {
+                Error::UnknownOutcome
+            }
+            error => error,
+        }
+    }
+
+    /// Stores command bytes under one caller-captured deadline.  Every
+    /// admitted mutation is group-owned so a terminal result is not returned
+    /// until it has either finished by D or its worker was quarantined.
+    fn store_command_on_quorum_with_budget(
         &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
         command_hash: LogHash,
         command: &StoredCommand,
     ) -> Result<()> {
+        check_operation_context(&budget.caller, mutation_started)?;
         let quorum = quorum_size(self.control_workers.len());
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
-        let mut saturated = 0;
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
+        let mut dispatches = vec![None; total];
+        let mut dispatch_error = None;
+        let mut store_dispatch_paused = false;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::StoreCommand {
-                index,
-                cluster_id: self.cluster_id.clone(),
-                epoch: self.epoch,
-                config_id: self.config_id,
-                config_digest: self.config_digest,
-                command_hash,
-                command: command.clone(),
-                result: sender.clone(),
-            }) == ControlDispatch::Saturated
-            {
-                saturated += 1;
+            if let Err(error) = budget.check_admission() {
+                dispatch_error = Some(Self::store_context_error(error, mutation_started));
+                break;
+            }
+            let dispatch = worker.dispatch_mutating_group(
+                ControlJob::StoreCommand {
+                    index,
+                    context: budget.child_context(&group),
+                    cluster_id: self.cluster_id.clone(),
+                    epoch: self.epoch,
+                    config_id: self.config_id,
+                    config_digest: self.config_digest,
+                    command_hash,
+                    command: command.clone(),
+                    result: sender.clone(),
+                },
+                &group,
+                mutation_started,
+            );
+            dispatches[index] = Some(dispatch);
+            if dispatch == ControlDispatch::Accepted && !store_dispatch_paused {
+                store_dispatch_paused = true;
+                #[cfg(test)]
+                pause_after_fetch_dispatch(&budget.caller);
+                #[cfg(test)]
+                capture_fetch_group_token(&budget.caller, &group);
             }
         }
         drop(sender);
+        let admitted: Vec<_> = dispatches
+            .iter()
+            .map(|dispatch| *dispatch == Some(ControlDispatch::Accepted))
+            .collect();
+        let accepted_count = admitted.iter().filter(|admitted| **admitted).count();
+        let saturated = dispatches
+            .iter()
+            .filter(|dispatch| **dispatch == Some(ControlDispatch::Saturated))
+            .count();
         let mut stored = 0;
-        let mut worker_failed = false;
-        for (_, result) in receiver {
-            match result {
-                Ok(()) => stored += 1,
-                Err(Error::ProposeFailed) => worker_failed = true,
-                Err(_) => {}
+        let mut received = 0;
+        let mut replied = vec![false; total];
+        // Direct dispatch failure is part of the final quorum classification,
+        // but its synthetic channel reply is not an admitted worker reply.
+        let mut worker_failed = dispatches.contains(&Some(ControlDispatch::Failed));
+        let mut observed_unknown = false;
+        let mut safety_error = None;
+        let mut disconnected = false;
+        let mut frozen = dispatch_error.map(Err);
+        while frozen.is_none() {
+            if let Err(error) = budget.check_admission() {
+                frozen = Some(Err(Self::store_context_error(error, mutation_started)));
+                break;
             }
-            if stored >= quorum {
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .expect("admission check established the work deadline");
+            let result = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL)) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    None
+                }
+            };
+            if disconnected {
+                if mutation_started.load(Ordering::Acquire) {
+                    frozen = Some(Err(Error::UnknownOutcome));
+                }
+                break;
+            }
+            let Some((index, result)) = result else {
+                continue;
+            };
+            let admitted_reply = if index >= total {
+                // A worker is bound to its collector index.  A reply which
+                // cannot be attributed to that admission is indeterminate.
+                observed_unknown = true;
+                false
+            } else if admitted[index] {
+                if replied[index] {
+                    // Duplicate replies could otherwise manufacture progress
+                    // or conceal a missing admitted worker reply.
+                    observed_unknown = true;
+                    false
+                } else {
+                    replied[index] = true;
+                    received += 1;
+                    true
+                }
+            } else {
+                // Saturated and pre-closed workers can still send a legacy
+                // synthetic reply.  Dispatch state, never this arrival,
+                // determines their contribution to quorum classification.
+                false
+            };
+            if admitted_reply {
+                match result {
+                    Ok(()) => stored += 1,
+                    Err(Error::UnknownOutcome) => observed_unknown = true,
+                    Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {
+                        observed_unknown = true;
+                    }
+                    Err(Error::ProposeFailed) => worker_failed = true,
+                    Err(error) if Self::is_control_safety_error(&error) => {
+                        safety_error.get_or_insert(error);
+                    }
+                    Err(_) => {}
+                }
+            }
+            if let Some(error) = safety_error.clone() {
+                frozen = Some(Err(error));
+            } else if observed_unknown {
+                frozen = Some(Err(Error::UnknownOutcome));
+            } else if stored >= quorum {
+                frozen = Some(Ok(()));
+            } else if received == accepted_count {
                 break;
             }
         }
-        if stored < quorum {
-            return Err(
-                if worker_failed && !control_quorum_reachable(stored, saturated, quorum) {
-                    Error::ProposeFailed
-                } else {
-                    Error::NoQuorum
-                },
-            );
+        group.cancel_and_prune();
+        let timed_out = group.drain_to_deadline(budget.deadline);
+        for worker in &timed_out {
+            worker.quarantine();
         }
-        Ok(())
+        while let Ok((index, result)) = receiver.try_recv() {
+            let admitted_reply = if index >= total {
+                observed_unknown = true;
+                false
+            } else if admitted[index] {
+                if replied[index] {
+                    observed_unknown = true;
+                    false
+                } else {
+                    replied[index] = true;
+                    received += 1;
+                    true
+                }
+            } else {
+                false
+            };
+            if admitted_reply {
+                match result {
+                    Ok(()) => stored += 1,
+                    Err(Error::UnknownOutcome) => observed_unknown = true,
+                    Err(Error::ProposeFailed) => worker_failed = true,
+                    Err(error) if Self::is_control_safety_error(&error) => {
+                        safety_error.get_or_insert(error);
+                    }
+                    // Group cleanup deliberately cancels hedges after the
+                    // result is frozen.  It still counts as delivery, but is
+                    // not an independently ambiguous mutation.
+                    Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) | Err(_) => {}
+                }
+            }
+        }
+        if let Some(error) = safety_error {
+            return Err(error);
+        }
+        if received < accepted_count {
+            return Err(Error::UnknownOutcome);
+        }
+        if observed_unknown {
+            return Err(Error::UnknownOutcome);
+        }
+        if !timed_out.is_empty() {
+            return Err(Error::UnknownOutcome);
+        }
+        if let Err(error) = budget.check_admission() {
+            return Err(Self::store_context_error(error, mutation_started));
+        }
+        match frozen {
+            Some(result) => result,
+            None if stored >= quorum => Ok(()),
+            None if worker_failed && !control_quorum_reachable(stored, saturated, quorum) => {
+                Err(Error::ProposeFailed)
+            }
+            None => Err(Error::NoQuorum),
+        }
     }
 
     fn fetch_verified_value(
         &self,
         slot: Slot,
         value: &AcceptedValue,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
     ) -> Result<Option<StoredCommand>> {
+        check_operation_context(context, mutation_started)?;
+        let budget = ControlCallBudget::new(context)
+            .map_err(|error| Self::fetch_context_error(error, mutation_started))?;
+        self.fetch_verified_value_with_budget(&budget, slot, value, mutation_started)
+    }
+
+    fn fetch_context_error(error: Error, mutation_started: &AtomicBool) -> Error {
+        match error {
+            Error::RpcCancelled | Error::RpcDeadlineExceeded
+                if mutation_started.load(Ordering::Acquire) =>
+            {
+                Error::UnknownOutcome
+            }
+            error => error,
+        }
+    }
+
+    /// Collects command bytes under one already-captured control budget.  A
+    /// certified-summary caller must use this entrypoint so its fetch cannot
+    /// recapture a later deadline or spend a second drain reserve.
+    fn fetch_verified_value_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        slot: Slot,
+        value: &AcceptedValue,
+        mutation_started: &AtomicBool,
+    ) -> Result<Option<StoredCommand>> {
+        check_operation_context(&budget.caller, mutation_started)?;
         let quorum = quorum_size(self.control_workers.len());
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
-        let cancellation = ControlJobCancellation::new();
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
         let mut saturated = 0;
+        let mut dispatch_error = None;
+        let mut fetch_dispatch_paused = false;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch_cancellable(
+            if let Err(error) = budget.check_admission() {
+                dispatch_error = Some(Self::fetch_context_error(error, mutation_started));
+                break;
+            }
+            let dispatch = worker.dispatch_group(
                 ControlJob::FetchCommand {
                     index,
+                    context: budget.child_context(&group),
                     cluster_id: self.cluster_id.clone(),
                     epoch: self.epoch,
                     config_id: self.config_id,
@@ -5096,54 +8694,168 @@ impl ThreeNodeConsensus {
                     command_hash: value.command_hash,
                     result: sender.clone(),
                 },
-                cancellation.token(),
-            ) == ControlDispatch::Saturated
-            {
+                &group,
+            );
+            if dispatch == ControlDispatch::Accepted && !fetch_dispatch_paused {
+                fetch_dispatch_paused = true;
+                #[cfg(test)]
+                pause_after_fetch_dispatch(&budget.caller);
+                #[cfg(test)]
+                capture_fetch_group_token(&budget.caller, &group);
+                #[cfg(test)]
+                record_budget_identity(
+                    &budget.caller,
+                    BudgetIdentityEvent::FetchDispatch {
+                        deadline: budget.deadline,
+                        work_deadline: budget.work_deadline,
+                    },
+                );
+            }
+            if dispatch == ControlDispatch::Saturated {
                 saturated += 1;
             }
         }
         drop(sender);
-        let mut mismatch = false;
         let mut successful = 0;
         let mut worker_failed = false;
-        for (_, result) in receiver {
+        let mut observed_unknown = false;
+        let mut safety_error = None;
+        let mut candidate = None;
+        let mut disconnected = false;
+        let mut frozen: Option<Result<Option<StoredCommand>>> = None;
+        while frozen.is_none() && !observed_unknown {
+            if let Err(error) = budget.check_admission() {
+                frozen = Some(Err(Self::fetch_context_error(error, mutation_started)));
+                break;
+            }
+            let remaining = budget
+                .work_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap();
+            let result = match receiver.recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL)) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
+            let Some((_, result)) = result else {
+                continue;
+            };
             match result {
                 Ok(command) => {
                     successful += 1;
                     if let Some(command) = command {
                         if command.hash() != value.command_hash {
-                            continue;
+                            safety_error.get_or_insert(Error::CommandHashMismatch);
                         }
-                        let expected = AcceptedValue::from_command(
-                            &self.cluster_id,
-                            slot,
-                            self.epoch,
-                            self.config_id,
-                            value.prev_hash,
-                            &command,
-                        );
-                        if expected == *value {
-                            return Ok(Some(command));
+                        if safety_error.is_none() {
+                            let expected = AcceptedValue::from_command(
+                                &self.cluster_id,
+                                slot,
+                                self.epoch,
+                                self.config_id,
+                                value.prev_hash,
+                                &command,
+                            );
+                            if expected == *value {
+                                candidate.get_or_insert(command);
+                            } else {
+                                safety_error
+                                    .get_or_insert(Error::Rejected(RejectReason::InvalidValue));
+                            }
                         }
-                        mismatch = true;
                     }
                 }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
+                // A group-owned hedge can report cancellation after the
+                // collector begins its own cleanup.  The root context is
+                // checked after drain, so a genuine caller cancellation or
+                // deadline still upgrades a post-mutation call without
+                // treating cleanup as an external UnknownOutcome.
+                Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {}
                 Err(Error::ProposeFailed) => worker_failed = true,
                 Err(_) => {}
             }
+            // A locally verified command is already bound to the certified
+            // value, so it is a complete fetch candidate.  Absence needs a
+            // quorum before it can freeze as `None`.
+            if candidate.is_some() || successful >= quorum {
+                frozen = Some(Ok(candidate.take()));
+            }
         }
-        if mismatch {
-            Err(Error::Rejected(RejectReason::InvalidValue))
-        } else if successful < quorum && saturated > 0 {
-            Err(Error::NoQuorum)
-        } else if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
-            Err(Error::ProposeFailed)
-        } else {
-            Ok(None)
+        let frozen = dispatch_error.map(Err).unwrap_or_else(|| {
+            frozen.unwrap_or_else(|| {
+                if disconnected && mutation_started.load(Ordering::Acquire) {
+                    Err(Error::UnknownOutcome)
+                } else if successful < quorum && saturated > 0 {
+                    Err(Error::NoQuorum)
+                } else if worker_failed && !control_quorum_reachable(successful, saturated, quorum)
+                {
+                    Err(Error::ProposeFailed)
+                } else {
+                    Ok(candidate)
+                }
+            })
+        });
+        if let Err(error) = &frozen {
+            if Self::is_control_safety_error(error) || matches!(error, Error::CommandHashMismatch) {
+                safety_error = Some(error.clone());
+            }
         }
+        group.cancel_and_prune();
+        let timed_out = group.drain_to_deadline(budget.deadline);
+        for worker in &timed_out {
+            worker.quarantine();
+        }
+        while let Ok((_, result)) = receiver.try_recv() {
+            match result {
+                Ok(Some(command)) if command.hash() != value.command_hash => {
+                    safety_error.get_or_insert(Error::CommandHashMismatch);
+                }
+                Ok(Some(command)) => {
+                    let expected = AcceptedValue::from_command(
+                        &self.cluster_id,
+                        slot,
+                        self.epoch,
+                        self.config_id,
+                        value.prev_hash,
+                        &command,
+                    );
+                    if expected != *value {
+                        safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidValue));
+                    }
+                }
+                Err(Error::UnknownOutcome) => observed_unknown = true,
+                _ => {}
+            }
+        }
+        if let Some(error) = safety_error {
+            return Err(error);
+        }
+        if observed_unknown {
+            return Err(Error::UnknownOutcome);
+        }
+        if !timed_out.is_empty() {
+            return Err(if mutation_started.load(Ordering::Acquire) {
+                Error::UnknownOutcome
+            } else {
+                Error::RpcDeadlineExceeded
+            });
+        }
+        if let Err(error) = budget.check_admission() {
+            return Err(Self::fetch_context_error(error, mutation_started));
+        }
+        frozen
     }
 
-    fn ensure_progress_command(&self, progress: &mut ProposerProgress) -> Result<()> {
+    fn ensure_progress_command(
+        &self,
+        progress: &mut ProposerProgress,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<()> {
         let value = progress
             .proposal
             .value
@@ -5157,7 +8869,8 @@ impl ThreeNodeConsensus {
             return Ok(());
         }
         progress.command_holders.clear();
-        progress.command = self.fetch_verified_value(progress.slot, value)?;
+        progress.command =
+            self.fetch_verified_value(progress.slot, value, context, mutation_started)?;
         if let Some(command) = &progress.command {
             progress.transition_involved |= command.entry_type == EntryType::ConfigChange;
             Ok(())
@@ -5229,23 +8942,45 @@ pub enum CertifiedDecisionInspection {
 }
 
 impl RecorderRpc for RecorderFileStore {
-    fn recorder_id(&self) -> Result<NodeId> {
+    fn recorder_id(&self, context: &RecorderRpcContext) -> Result<NodeId> {
+        context.check()?;
         Ok(self.recorder_id.clone())
     }
 
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary> {
+    fn record(
+        &self,
+        context: &RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary> {
+        context.check()?;
         self.record_proposal(request)
     }
 
-    fn install_decision_proof(&self, proof: DecisionProof, membership: &Membership) -> Result<()> {
+    fn install_decision_proof(
+        &self,
+        context: &RecorderRpcContext,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> Result<()> {
+        context.check()?;
         self.install_decision_proof_record(proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: Slot) -> Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        context: &RecorderRpcContext,
+        slot: Slot,
+    ) -> Result<Option<DecisionProof>> {
+        context.check()?;
         Ok(self.load(slot)?.decision_proof().cloned())
     }
 
-    fn inspect_record_summary(&self, slot: Slot) -> Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        context: &RecorderRpcContext,
+        slot: Slot,
+    ) -> Result<Option<RecordSummary>> {
+        context.check()?;
         let _guard = self
             .sync
             .lock()
@@ -5273,7 +9008,12 @@ impl RecorderRpc for RecorderFileStore {
         true
     }
 
-    fn observe_read_fence(&self, request: ReadFenceRequest) -> Result<ReadFenceObservation> {
+    fn observe_read_fence(
+        &self,
+        context: &RecorderRpcContext,
+        request: ReadFenceRequest,
+    ) -> Result<ReadFenceObservation> {
+        context.check()?;
         let _guard = self
             .sync
             .lock()
@@ -5331,12 +9071,9 @@ impl RecorderRpc for RecorderFileStore {
         })
     }
 
-    fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
-        RecorderFileStore::store_command(self, command_hash, command)
-    }
-
     fn store_command_for(
         &self,
+        context: &RecorderRpcContext,
         cluster_id: ClusterId,
         epoch: Epoch,
         config_id: ConfigId,
@@ -5344,6 +9081,7 @@ impl RecorderRpc for RecorderFileStore {
         command_hash: LogHash,
         command: StoredCommand,
     ) -> Result<()> {
+        context.check()?;
         self.apply(RecorderRequest::StoreCommand {
             cluster_id,
             epoch,
@@ -5355,18 +9093,16 @@ impl RecorderRpc for RecorderFileStore {
         Ok(())
     }
 
-    fn fetch_command(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
-        RecorderFileStore::fetch_command(self, command_hash)
-    }
-
     fn fetch_command_for(
         &self,
+        context: &RecorderRpcContext,
         cluster_id: ClusterId,
         epoch: Epoch,
         config_id: ConfigId,
         config_digest: LogHash,
         command_hash: LogHash,
     ) -> Result<Option<StoredCommand>> {
+        context.check()?;
         Ok(self
             .apply(RecorderRequest::FetchCommand {
                 cluster_id,
@@ -5479,8 +9215,8 @@ fn decode_certificate_proposer(encoded: &str) -> Option<(&str, &str)> {
 }
 
 impl Consensus for ThreeNodeConsensus {
-    fn propose(&self, command: Command) -> Result<LogEntry> {
-        self.propose_next(command)
+    fn propose(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry> {
+        self.propose_next(context, command)
     }
 }
 
@@ -5525,7 +9261,9 @@ fn stored_command(command: Command) -> Result<StoredCommand> {
         CommandKind::Deterministic => EntryType::Command,
         CommandKind::ReadBarrier => EntryType::Noop,
     };
-    Ok(StoredCommand::new(entry_type, command.payload().to_vec()))
+    let command = StoredCommand::new(entry_type, command.payload().to_vec());
+    validate_replicated_command_size(&command)?;
+    Ok(command)
 }
 
 fn encode_configuration_state(state: &ConfigurationState) -> Result<Vec<u8>> {
@@ -6094,6 +9832,7 @@ fn decode_stored_command(bytes: &[u8]) -> Result<StoredCommand> {
         .get(cursor..end)
         .ok_or_else(|| Error::Decode("short command payload".into()))?
         .to_vec();
+    validate_replicated_command_size(&StoredCommand::new(entry_type, payload.clone()))?;
     cursor = end;
     if cursor != body.len() {
         return Err(Error::Decode("trailing command bytes".into()));
@@ -6365,7 +10104,7 @@ fn read_regular_file_bounded(path: &Path, maximum: usize, name: &str) -> Result<
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(Error::Decode(format!("recorder is missing {name}")))
+            return Err(Error::Decode(format!("recorder is missing {name}")));
         }
         Err(error) => return Err(Error::Io(error.to_string())),
     };
@@ -6506,7 +10245,7 @@ fn open_existing_root_lock(path: &Path) -> Result<fs::File> {
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(Error::Decode("recorder root lock does not exist".into()))
+            return Err(Error::Decode("recorder root lock does not exist".into()));
         }
         Err(error) => return Err(Error::Io(error.to_string())),
     };
@@ -6856,7 +10595,7 @@ fn read_existing_command_cache(root: &Path, command_hash: LogHash) -> Result<Sto
     let bytes =
         match read_regular_file_bounded(&path, MAX_COMMAND_CACHE_BYTES, "command cache entry") {
             Err(Error::Decode(message)) if message == "recorder is missing command cache entry" => {
-                return Err(Error::CommandUnavailable)
+                return Err(Error::CommandUnavailable);
             }
             result => result?,
         };
@@ -7260,7 +10999,8 @@ impl SingleNodeConsensus {
 }
 
 impl Consensus for SingleNodeConsensus {
-    fn propose(&self, command: Command) -> Result<LogEntry> {
+    fn propose(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry> {
+        context.check()?;
         let mut state = self.state.lock().map_err(|_| Error::ProposeFailed)?;
         let command = stored_command(command)?;
         let prev_hash = state.last_hash;
@@ -7292,25 +11032,38 @@ impl Consensus for SingleNodeConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_file_reads, decode_configuration_state, decode_recorder_state, decode_wal_frame,
-        encode_stored_command, encode_wal_frame, last_file_sync_kind, reset_command_file_reads,
-        reset_sync_counts, sync_counts, sync_wal_append, sync_wal_metadata, upsert_wal_command,
-        AcceptedValue, CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus,
-        ControlDispatch, ControlJob, ControlJobCancellation, ControlWorker, DecisionInspection,
-        DecisionProof, DriveOutcome, Error, FileSyncKind, Membership, PrioritySource, Proposal,
-        ProposalPriority, ProposerProgress, ReadFenceObservation, ReadFenceRequest,
-        ReadFenceSlotState, RecordRequest, RecordSummary, RecordedHeadProvenance,
-        RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc, RecorderSlotState,
-        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
+        capture_next_fetch_group_token, command_file_reads, count_control_budget_constructors_for,
+        decode_configuration_state, decode_recorder_state, decode_wal_frame, encode_stored_command,
+        encode_wal_frame, force_next_control_group_drain_timeout, last_file_sync_kind,
+        pause_after_next_fetch_dispatch, pause_after_next_summary_dispatch,
+        pause_after_next_summary_provisional_none, record_budget_identity_for,
+        reset_command_file_reads, reset_sync_counts, sync_counts, sync_wal_append,
+        sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
+        CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus,
+        ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob, ControlJobCancellation,
+        ControlWorker, DecisionInspection, DecisionProof, DriveOutcome, Error, FileSyncKind,
+        Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
+        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
+        RecordedHeadProvenance, RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc,
+        RecorderRpcContext, RecorderSlotState, RecorderSummary, RejectReason, SealFaultPoint,
+        SingleNodeConsensus, Slot, ThreeNodeConsensus,
+    };
+    #[cfg(feature = "test-hooks")]
+    use super::{
+        ControlCompletionGuard, RecordDispatch, RecordJob, RecordWorker, RpcCallGroup,
+        RpcCallWorker, TestControlOperationProbe, TestProbeLifecycleWait,
+        TestProbeRegistrationError,
     };
     use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
+    #[cfg(feature = "test-hooks")]
+    use std::sync::Barrier;
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc, Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc, Arc, Condvar, Mutex, OnceLock,
         },
         thread,
         time::{Duration, Instant},
@@ -7336,6 +11089,41 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    fn blocking_control_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_blocking_control_tests() -> std::sync::MutexGuard<'static, ()> {
+        // A failed test must not turn every later serial test into an unrelated
+        // `PoisonError`; the original assertion remains the only failure.
+        blocking_control_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ensures a test failure cannot strand a recorder worker behind a
+    /// rendezvous-channel gate and contaminate later parallel tests.
+    struct ChannelRelease(Option<mpsc::SyncSender<()>>);
+
+    impl ChannelRelease {
+        fn new(sender: mpsc::SyncSender<()>) -> Self {
+            Self(Some(sender))
+        }
+
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ChannelRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
 
     fn cache_backed_recorder_for_preflight(
@@ -7393,6 +11181,1491 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "test-hooks")]
+    struct TestProbeWorker;
+
+    #[cfg(feature = "test-hooks")]
+    impl RpcCallWorker for TestProbeWorker {
+        fn prune_pending(&self, _group: &RpcCallGroup) {}
+
+        fn quarantine(&self) {}
+
+        fn worker_identity(&self) -> usize {
+            self as *const Self as usize
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn test_probe_consensus() -> ThreeNodeConsensus {
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(SlotRecorder {
+                        recorder_id,
+                        reject_slot: None,
+                        observed: None,
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_rejects_duplicate_registration() {
+        let consensus = test_probe_consensus();
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let guard = consensus
+            .install_test_record_operation_probe(7, Arc::clone(&probe))
+            .unwrap();
+
+        assert!(matches!(
+            consensus.install_test_record_operation_probe(7, Arc::clone(&probe)),
+            Err(TestProbeRegistrationError::DuplicateLiveRegistration)
+        ));
+        assert_eq!(
+            consensus.test_record_operation_probe_registration_count(),
+            1
+        );
+        drop(guard);
+        assert_eq!(
+            consensus.test_record_operation_probe_registration_count(),
+            0
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_capture_attaches_every_matching_live_probe() {
+        let consensus = test_probe_consensus();
+        let first_probe = Arc::new(TestControlOperationProbe::default());
+        let second_probe = Arc::new(TestControlOperationProbe::default());
+        let first_registration = consensus
+            .install_test_record_operation_probe(11, Arc::clone(&first_probe))
+            .unwrap();
+        let second_registration = consensus
+            .install_test_record_operation_probe(11, Arc::clone(&second_probe))
+            .unwrap();
+        let group = RpcCallGroup::new();
+        group.attach_test_record_probe(consensus.test_instance_id, 11);
+        let worker = Arc::new(TestProbeWorker);
+        let mut completion = ControlCompletionGuard::new(Arc::new(AtomicUsize::new(0)));
+        completion.arm(Some(&group), &worker);
+        drop(completion);
+
+        for probe in [&first_probe, &second_probe] {
+            assert_eq!(probe.dispatch_count(), 1);
+            assert_eq!(probe.drained_count(), 1);
+            assert_eq!(probe.outstanding(), 0);
+            assert!(probe.worker_transitions().iter().all(|transition| {
+                transition.enqueued == 1
+                    && transition.completion_dropped == 1
+                    && transition.live_leases == 0
+            }));
+        }
+        drop(group);
+        drop(first_registration);
+        drop(second_registration);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_rejects_reinstall_while_a_dropped_guard_has_live_leases() {
+        let consensus = test_probe_consensus();
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let registration = consensus
+            .install_test_record_operation_probe(8, Arc::clone(&probe))
+            .unwrap();
+        let group = RpcCallGroup::new();
+        group.attach_test_record_probe(consensus.test_instance_id, 8);
+        let worker = Arc::new(TestProbeWorker);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let mut completion = ControlCompletionGuard::new(pending);
+        completion.arm(Some(&group), &worker);
+        drop(registration);
+        assert_eq!(probe.outstanding(), 1);
+
+        assert!(matches!(
+            consensus.install_test_record_operation_probe(8, Arc::clone(&probe)),
+            Err(TestProbeRegistrationError::LiveLeases { leases: 1 })
+        ));
+        assert_eq!(probe.outstanding(), 1);
+        drop(completion);
+        assert_eq!(probe.outstanding(), 0);
+        assert_eq!(probe.drained_count(), 1);
+        assert!(matches!(
+            consensus.install_test_record_operation_probe(8, Arc::clone(&probe)),
+            Err(TestProbeRegistrationError::ActiveAttachments { attachments: 1 })
+        ));
+        drop(group);
+        let registration = consensus
+            .install_test_record_operation_probe(8, Arc::clone(&probe))
+            .unwrap();
+        drop(registration);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_reuses_only_after_the_last_group_attachment_drops() {
+        let consensus = test_probe_consensus();
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let registration = consensus
+            .install_test_record_operation_probe(9, Arc::clone(&probe))
+            .unwrap();
+        let group = RpcCallGroup::new();
+        group.attach_test_record_probe(consensus.test_instance_id, 9);
+        let worker = Arc::new(TestProbeWorker);
+        let mut completion = ControlCompletionGuard::new(Arc::new(AtomicUsize::new(0)));
+        completion.arm(Some(&group), &worker);
+        drop(registration);
+        drop(completion);
+        assert_eq!(probe.outstanding(), 0);
+        assert!(matches!(
+            consensus.install_test_record_operation_probe(9, Arc::clone(&probe)),
+            Err(TestProbeRegistrationError::ActiveAttachments { attachments: 1 })
+        ));
+        drop(group);
+
+        let registration = consensus
+            .install_test_record_operation_probe(9, Arc::clone(&probe))
+            .unwrap();
+        assert_eq!(probe.dispatch_count(), 0);
+        assert_eq!(probe.outstanding(), 0);
+        drop(registration);
+        assert_eq!(
+            consensus.test_record_operation_probe_registration_count(),
+            0
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_attachment_prevents_generation_reuse_until_group_drop() {
+        let consensus = test_probe_consensus();
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let old_registration = consensus
+            .install_test_record_operation_probe(10, Arc::clone(&probe))
+            .unwrap();
+        let old_group = RpcCallGroup::new();
+        old_group.attach_test_record_probe(consensus.test_instance_id, 10);
+        let worker = Arc::new(TestProbeWorker);
+        drop(old_registration);
+
+        // A generation stays live from attachment, not only from an admitted
+        // lease. This closes the attach-before-admit reuse window.
+        assert!(matches!(
+            consensus.install_test_record_operation_probe(10, Arc::clone(&probe)),
+            Err(TestProbeRegistrationError::ActiveAttachments { attachments: 1 })
+        ));
+
+        let mut old_completion = ControlCompletionGuard::new(Arc::new(AtomicUsize::new(0)));
+        old_completion.arm(Some(&old_group), &worker);
+        drop(old_completion);
+        assert_eq!(probe.dispatch_count(), 1);
+        assert_eq!(probe.drained_count(), 1);
+        assert_eq!(probe.outstanding(), 0);
+        assert!(probe.worker_transitions().iter().all(|transition| {
+            transition.enqueued == 1
+                && transition.completion_dropped == 1
+                && transition.live_leases == 0
+        }));
+        drop(old_group);
+
+        let current_registration = consensus
+            .install_test_record_operation_probe(10, Arc::clone(&probe))
+            .unwrap();
+
+        let current_group = RpcCallGroup::new();
+        current_group.attach_test_record_probe(consensus.test_instance_id, 10);
+        let mut current_completion = ControlCompletionGuard::new(Arc::new(AtomicUsize::new(0)));
+        current_completion.arm(Some(&current_group), &worker);
+        drop(current_completion);
+        current_group.cancel_and_prune();
+        assert_eq!(probe.dispatch_count(), 1);
+        assert_eq!(probe.drained_count(), 1);
+        assert_eq!(probe.outstanding(), 0);
+        assert_eq!(probe.cancel_count(), 1);
+        assert!(probe.worker_transitions().iter().all(|transition| {
+            transition.enqueued == 1
+                && transition.completion_dropped == 1
+                && transition.pruned == 0
+                && transition.live_leases == 0
+        }));
+        drop(current_registration);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_readiness_observes_an_admission_before_waiting() {
+        let probe = Arc::new(TestControlOperationProbe::default());
+        probe.record_lease_registered(0);
+
+        assert!(probe.wait_for_admitted_outstanding(Duration::ZERO));
+
+        probe.record_lease_completed(0);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_quiescence_observes_completion_before_waiting() {
+        let probe = Arc::new(TestControlOperationProbe::default());
+        probe.record_lease_registered(0);
+        probe.record_lease_completed(0);
+
+        assert!(probe.wait_for_quiescence(Duration::ZERO));
+        assert_eq!(probe.dispatch_count(), 1);
+        assert_eq!(probe.outstanding(), 0);
+        assert_eq!(probe.drained_count(), 1);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_readiness_rejects_a_later_generation() {
+        let consensus = test_probe_consensus();
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let old_registration = consensus
+            .install_test_record_operation_probe(12, Arc::clone(&probe))
+            .unwrap();
+        let old_group = RpcCallGroup::new();
+        old_group.attach_test_record_probe(consensus.test_instance_id, 12);
+
+        let captured_generation = Arc::new(Barrier::new(2));
+        let (waiter_result_tx, waiter_result_rx) = mpsc::sync_channel(1);
+        let waiter = {
+            let probe = Arc::clone(&probe);
+            let captured_generation = Arc::clone(&captured_generation);
+            thread::spawn(move || {
+                waiter_result_tx
+                    .send(
+                        probe.wait_for_admitted_outstanding_after_test_generation_capture(
+                            Duration::from_secs(2),
+                            captured_generation,
+                        ),
+                    )
+                    .unwrap();
+            })
+        };
+        captured_generation.wait();
+
+        drop(old_registration);
+        drop(old_group);
+        let current_registration = consensus
+            .install_test_record_operation_probe(12, Arc::clone(&probe))
+            .unwrap();
+        assert_eq!(
+            waiter_result_rx
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap(),
+            TestProbeLifecycleWait::GenerationChanged,
+            "the stale waiter must wake on generation reset before new admission"
+        );
+        waiter.join().unwrap();
+
+        let current_group = RpcCallGroup::new();
+        current_group.attach_test_record_probe(consensus.test_instance_id, 12);
+        let worker = Arc::new(TestProbeWorker);
+        let mut completion = ControlCompletionGuard::new(Arc::new(AtomicUsize::new(0)));
+        completion.arm(Some(&current_group), &worker);
+        assert!(probe.wait_for_admitted_outstanding(Duration::ZERO));
+        drop(completion);
+        drop(current_group);
+        drop(current_registration);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_probe_quiescence_rejects_a_later_generation_and_resets_false() {
+        let consensus = test_probe_consensus();
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let captured_generation = Arc::new(Barrier::new(2));
+        let (waiter_result_tx, waiter_result_rx) = mpsc::sync_channel(1);
+        let waiter = {
+            let probe = Arc::clone(&probe);
+            let captured_generation = Arc::clone(&captured_generation);
+            thread::spawn(move || {
+                waiter_result_tx
+                    .send(probe.wait_for_quiescence_after_test_generation_capture(
+                        Duration::from_secs(2),
+                        captured_generation,
+                    ))
+                    .unwrap();
+            })
+        };
+        captured_generation.wait();
+
+        let registration = consensus
+            .install_test_record_operation_probe(13, Arc::clone(&probe))
+            .unwrap();
+        assert_eq!(
+            waiter_result_rx
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap(),
+            TestProbeLifecycleWait::GenerationChanged,
+            "a stale quiescence waiter must not consume a later generation"
+        );
+        waiter.join().unwrap();
+        assert!(!probe.wait_for_quiescence(Duration::ZERO));
+        drop(registration);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn record_probe_counts_each_guard_lifetime_across_fast_groups() {
+        // Force the original race with two threads: registration reads the
+        // group's length, completion publishes zero, then delayed admission
+        // overwrites that result with its stale nonzero snapshot.
+        let legacy_published = Arc::new(AtomicUsize::new(1));
+        let legacy_snapshot_taken = Arc::new(Barrier::new(2));
+        let legacy_completion_published = Arc::new(Barrier::new(2));
+        let legacy_registration = {
+            let published = Arc::clone(&legacy_published);
+            let snapshot_taken = Arc::clone(&legacy_snapshot_taken);
+            let completion_published = Arc::clone(&legacy_completion_published);
+            thread::spawn(move || {
+                let stale_snapshot = published.load(Ordering::Acquire);
+                snapshot_taken.wait();
+                completion_published.wait();
+                published.store(stale_snapshot, Ordering::Release);
+            })
+        };
+        legacy_snapshot_taken.wait();
+        legacy_published.store(0, Ordering::Release);
+        legacy_completion_published.wait();
+        legacy_registration.join().unwrap();
+        assert_eq!(legacy_published.load(Ordering::Acquire), 1);
+
+        // The authoritative lifecycle records admission in one mutex-held
+        // transition. Its delayed registration suffix has no second counter
+        // publication, so the analogous completion remains visible as zero.
+        let authoritative = Arc::new(TestControlOperationProbe::default());
+        let authoritative_registered = Arc::new(Barrier::new(2));
+        let authoritative_completed = Arc::new(Barrier::new(2));
+        let authoritative_registration = {
+            let probe = Arc::clone(&authoritative);
+            let registered = Arc::clone(&authoritative_registered);
+            let completed = Arc::clone(&authoritative_completed);
+            thread::spawn(move || {
+                probe.record_lease_registered(0);
+                registered.wait();
+                completed.wait();
+            })
+        };
+        authoritative_registered.wait();
+        authoritative.record_lease_completed(0);
+        authoritative_completed.wait();
+        authoritative_registration.join().unwrap();
+        assert_eq!(authoritative.outstanding(), 0);
+
+        // The real probe has one mutex-protected lifecycle state. Two groups
+        // share it and complete in reverse order; no delayed publication can
+        // overwrite 1 or 0 after a completion.
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let first = RpcCallGroup::new();
+        let second = RpcCallGroup::new();
+        *super::lock_unpoison(&first.state.test_probes) = vec![probe.current_attachment()];
+        *super::lock_unpoison(&second.state.test_probes) = vec![probe.current_attachment()];
+        let worker = Arc::new(TestProbeWorker);
+        let pending = Arc::new(AtomicUsize::new(0));
+
+        let mut first_guard = ControlCompletionGuard::new(Arc::clone(&pending));
+        first_guard.arm(Some(&first), &worker);
+        let mut second_guard = ControlCompletionGuard::new(Arc::clone(&pending));
+        second_guard.arm(Some(&second), &worker);
+
+        assert_eq!(first.outstanding_len(), 1);
+        assert_eq!(second.outstanding_len(), 1);
+        assert_eq!(pending.load(Ordering::Acquire), 2);
+        assert_eq!(probe.dispatch_count(), 2);
+        assert_eq!(probe.pending(), 2);
+        assert_eq!(probe.outstanding(), 2);
+        assert_eq!(probe.observed_max_outstanding(), 2);
+        let transitions = probe.worker_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].enqueued, 2);
+        assert_eq!(transitions[0].live_leases, 2);
+        assert_eq!(transitions[0].completion_dropped, 0);
+
+        // Completion can be immediate and out of admission order.
+        drop(second_guard);
+        assert_eq!(first.outstanding_len(), 1);
+        assert_eq!(second.outstanding_len(), 0);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(probe.pending(), 1);
+        assert_eq!(probe.outstanding(), 1);
+        assert_eq!(probe.drained_count(), 1);
+        let transitions = probe.worker_transitions();
+        assert_eq!(transitions[0].live_leases, 1);
+        assert_eq!(transitions[0].completion_dropped, 1);
+
+        drop(first_guard);
+        assert_eq!(first.outstanding_len(), 0);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(probe.pending(), 0);
+        assert_eq!(probe.outstanding(), 0);
+        assert_eq!(probe.drained_count(), 2);
+        let transitions = probe.worker_transitions();
+        assert_eq!(transitions[0].live_leases, 0);
+        assert_eq!(transitions[0].completion_dropped, 2);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn record_probe_releases_queued_leases_on_prune_and_close() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let request = |slot| RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                slot,
+                AcceptedValue {
+                    command_hash: LogHash::ZERO,
+                    prev_hash: LogHash::ZERO,
+                    entry_hash: LogHash::ZERO,
+                },
+            ),
+            command: None,
+        };
+        let start_worker = |started, release| {
+            RecordWorker::spawn(
+                "n1".into(),
+                Arc::new(BlockingRecorder {
+                    recorder_id: "n1",
+                    started,
+                    release_first: Mutex::new(release),
+                }),
+                1,
+                membership.digest(),
+            )
+            .unwrap()
+        };
+
+        // The running first job holds the worker while a second group queues
+        // its hedge. `prune_pending` is the post-quorum path: it must consume
+        // the queued guard rather than merely hide the job from the queue.
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut worker = start_worker(started_tx, release_rx);
+        let background = RpcCallGroup::new();
+        let pruned_group = RpcCallGroup::new();
+        let pruned_probe = Arc::new(TestControlOperationProbe::default());
+        *super::lock_unpoison(&pruned_group.state.test_probes) =
+            vec![pruned_probe.current_attachment()];
+        let started = AtomicBool::new(false);
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch_mutating_group(
+                RecordJob {
+                    index: 0,
+                    context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    request: request(1),
+                    result: first_tx,
+                },
+                &background,
+                &started,
+            ),
+            RecordDispatch::Accepted
+        ));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let (queued_tx, queued_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch_mutating_group(
+                RecordJob {
+                    index: 0,
+                    context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    request: request(2),
+                    result: queued_tx,
+                },
+                &pruned_group,
+                &started,
+            ),
+            RecordDispatch::Accepted
+        ));
+        assert_eq!(pruned_probe.outstanding(), 1);
+        pruned_group.prune_pending();
+        assert_eq!(
+            queued_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((0, Err(Error::RpcCancelled)))
+        );
+        assert_eq!(pruned_group.outstanding_len(), 0);
+        assert_eq!(pruned_probe.pending(), 0);
+        assert_eq!(pruned_probe.outstanding(), 0);
+        assert_eq!(pruned_probe.drained_count(), 1);
+        assert!(pruned_probe.worker_transitions().iter().all(|transition| {
+            transition.pruned == 1
+                && transition.live_leases == 0
+                && transition.enqueued == transition.completion_dropped
+        }));
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            first_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((0, Ok(_)))
+        ));
+        worker.shutdown();
+
+        // Shutdown's close-and-drain path has the same obligation for a
+        // queued job, but returns mutation-unknown instead of cancellation.
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (_release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut worker = start_worker(started_tx, release_rx);
+        let background = RpcCallGroup::new();
+        let closed_group = RpcCallGroup::new();
+        let closed_probe = Arc::new(TestControlOperationProbe::default());
+        *super::lock_unpoison(&closed_group.state.test_probes) =
+            vec![closed_probe.current_attachment()];
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch_mutating_group(
+                RecordJob {
+                    index: 0,
+                    context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    request: request(1),
+                    result: first_tx,
+                },
+                &background,
+                &started,
+            ),
+            RecordDispatch::Accepted
+        ));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let (queued_tx, queued_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch_mutating_group(
+                RecordJob {
+                    index: 0,
+                    context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    request: request(2),
+                    result: queued_tx,
+                },
+                &closed_group,
+                &started,
+            ),
+            RecordDispatch::Accepted
+        ));
+        worker.state.close_and_drain();
+        assert_eq!(
+            queued_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((0, Err(Error::UnknownOutcome)))
+        );
+        assert!(matches!(
+            first_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((0, Err(Error::RpcCancelled)))
+        ));
+        assert_eq!(closed_group.outstanding_len(), 0);
+        assert_eq!(closed_probe.pending(), 0);
+        assert_eq!(closed_probe.outstanding(), 0);
+        assert_eq!(closed_probe.drained_count(), 1);
+        assert!(closed_probe.worker_transitions().iter().all(|transition| {
+            transition.close_drained == 1
+                && transition.live_leases == 0
+                && transition.enqueued == transition.completion_dropped
+        }));
+        worker.handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn caller_context_reaches_record_and_control_workers_unchanged() {
+        let event_timeout = Duration::from_secs(10);
+        let record_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _record_gate = GateRelease::new(Arc::clone(&record_gate));
+        let (record_tx, record_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(GatedContextRecorder {
+                        recorder_id,
+                        contexts: record_tx.clone(),
+                        release: Arc::clone(&record_gate),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let context = RecorderRpcContext::with_timeout(event_timeout);
+        let (record_done_tx, record_done_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let context = context.clone();
+            thread::spawn(move || {
+                let mutation_started = AtomicBool::new(false);
+                record_done_tx
+                    .send(consensus.record_broadcast_with_context(
+                        record_requests(&consensus, 1),
+                        context,
+                        &mutation_started,
+                    ))
+                    .unwrap();
+            })
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                record_rx.recv_timeout(event_timeout).unwrap(),
+                context.deadline() - super::CONTROL_DRAIN_RESERVE
+            );
+        }
+        release_gate(&record_gate);
+        assert!(record_done_rx.recv_timeout(event_timeout).unwrap().is_ok());
+        caller.join().unwrap();
+
+        let (_unused_record_tx, _unused_record_rx) = mpsc::sync_channel(1);
+        let (control_tx, control_rx) = mpsc::sync_channel(1);
+        let worker = ControlWorker::spawn(Arc::new(ContextRecordingRecorder {
+            recorder_id: "n1",
+            record_contexts: _unused_record_tx,
+            control_contexts: control_tx,
+            record_error: None,
+        }))
+        .unwrap();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::InspectProof {
+                index: 0,
+                context: context.clone(),
+                slot: 1,
+                result: result_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(result_rx.recv_timeout(event_timeout).unwrap().1, Ok(None));
+        assert_eq!(
+            control_rx.recv_timeout(event_timeout).unwrap(),
+            context.deadline()
+        );
+    }
+
+    #[test]
+    fn cancellation_before_record_dispatch_is_typed_and_side_effect_free() {
+        let (record_tx, record_rx) = mpsc::sync_channel(3);
+        let (control_tx, _control_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ContextRecordingRecorder {
+                        recorder_id,
+                        record_contexts: record_tx.clone(),
+                        control_contexts: control_tx.clone(),
+                        record_error: None,
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let context = RecorderRpcContext::with_timeout(Duration::from_secs(30));
+        context.cancel();
+        let mutation_started = AtomicBool::new(false);
+        assert_eq!(
+            consensus.record_broadcast_with_context(
+                record_requests(&consensus, 1),
+                context,
+                &mutation_started,
+            ),
+            Err(Error::RpcCancelled)
+        );
+        assert!(!mutation_started.load(Ordering::Acquire));
+        assert_eq!(record_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn zero_deadline_record_broadcast_admits_no_record_worker() {
+        let (record_tx, record_rx) = mpsc::sync_channel(3);
+        let (control_tx, _control_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ContextRecordingRecorder {
+                        recorder_id,
+                        record_contexts: record_tx.clone(),
+                        control_contexts: control_tx.clone(),
+                        record_error: None,
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let mutation_started = AtomicBool::new(false);
+
+        assert_eq!(
+            consensus.record_broadcast_with_context(
+                record_requests(&consensus, 1),
+                RecorderRpcContext::with_timeout(Duration::ZERO),
+                &mutation_started,
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert!(!mutation_started.load(Ordering::Acquire));
+        assert_eq!(record_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn record_partial_admission_is_independent_of_the_preclosed_worker_position() {
+        for preclosed in [0, 2] {
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.into(),
+                        Box::new(SlotRecorder {
+                            recorder_id,
+                            reject_slot: None,
+                            observed: None,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            consensus.record_workers[preclosed].state.close_and_drain();
+            let mutation_started = AtomicBool::new(false);
+
+            let replies = consensus
+                .record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &mutation_started,
+                )
+                .unwrap();
+            assert_eq!(replies.len(), 2);
+            assert!(replies.iter().all(|reply| reply.slot == 1));
+            assert!(mutation_started.load(Ordering::Acquire));
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn record_preclosed_worker_contributes_to_impossible_quorum_classification() {
+        for preclosed in 0..3 {
+            let success = (preclosed + 1) % 3;
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, recorder_id)| {
+                    let recorder: Box<dyn RecorderRpc> = if index == success {
+                        Box::new(SlotRecorder {
+                            recorder_id,
+                            reject_slot: None,
+                            observed: None,
+                        })
+                    } else {
+                        Box::new(AlwaysIoRecorder)
+                    };
+                    (recorder_id.into(), recorder)
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            consensus.record_workers[preclosed].state.close_and_drain();
+            assert_eq!(
+                consensus.record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &AtomicBool::new(false),
+                ),
+                Err(Error::ProposeFailed)
+            );
+
+            let typed = (preclosed + 2) % 3;
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, recorder_id)| {
+                    let recorder: Box<dyn RecorderRpc> = if index == success {
+                        Box::new(SlotRecorder {
+                            recorder_id,
+                            reject_slot: None,
+                            observed: None,
+                        })
+                    } else if index == typed {
+                        Box::new(SlotRecorder {
+                            recorder_id,
+                            reject_slot: Some(1),
+                            observed: None,
+                        })
+                    } else {
+                        Box::new(AlwaysIoRecorder)
+                    };
+                    (recorder_id.into(), recorder)
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            consensus.record_workers[preclosed].state.close_and_drain();
+            assert_eq!(
+                consensus.record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &AtomicBool::new(false),
+                ),
+                Err(Error::Rejected(RejectReason::InvalidRequest))
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_or_expiry_after_record_dispatch_is_unknown_outcome() {
+        for record_error in [Error::RpcCancelled, Error::RpcDeadlineExceeded] {
+            let (record_tx, record_rx) = mpsc::sync_channel(3);
+            let (control_tx, _control_rx) = mpsc::sync_channel(3);
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ContextRecordingRecorder {
+                            recorder_id,
+                            record_contexts: record_tx.clone(),
+                            control_contexts: control_tx.clone(),
+                            record_error: Some(record_error.clone()),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            let context = RecorderRpcContext::with_timeout(Duration::from_secs(30));
+            let mutation_started = AtomicBool::new(false);
+            assert_eq!(
+                consensus.record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    context,
+                    &mutation_started,
+                ),
+                Err(Error::UnknownOutcome)
+            );
+            assert!(mutation_started.load(Ordering::Acquire));
+            assert!(record_rx.recv().is_ok());
+        }
+    }
+
+    #[test]
+    fn record_quorum_waits_through_root_deadline_then_quarantines_a_noncooperative_hedge() {
+        let (n1_started_tx, n1_started_rx) = mpsc::sync_channel(1);
+        let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
+        let (n3_started_tx, n3_started_rx) = mpsc::sync_channel(1);
+        let (n1_release_tx, n1_release_rx) = mpsc::sync_channel(1);
+        let (n2_release_tx, n2_release_rx) = mpsc::sync_channel(1);
+        let (n3_release_tx, n3_release_rx) = mpsc::sync_channel(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n1",
+                    started: n1_started_tx,
+                    release_first: Mutex::new(n1_release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n2",
+                    started: n2_started_tx,
+                    release_first: Mutex::new(n2_release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(NonCooperativeRecordRecorder {
+                    recorder_id: "n3",
+                    started: n3_started_tx,
+                    release: Mutex::new(n3_release_rx),
+                    calls: Arc::clone(&calls),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                let mutation_started = AtomicBool::new(false);
+                let result = consensus.record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    RecorderRpcContext::with_timeout(Duration::from_millis(300)),
+                    &mutation_started,
+                );
+                done_tx
+                    .send((result, mutation_started.load(Ordering::Acquire)))
+                    .unwrap();
+            })
+        };
+        let caller_guard = ChannelReleaseAndJoin::new(
+            vec![
+                n1_release_tx.clone(),
+                n2_release_tx.clone(),
+                n3_release_tx.clone(),
+            ],
+            caller,
+        );
+
+        assert_eq!(n1_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(n2_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(n3_started_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        n1_release_tx.send(()).unwrap();
+        n2_release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a two-reply quorum must not escape while an admitted mutating hedge is running"
+        );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((Err(Error::UnknownOutcome), true))
+        );
+
+        let blocked = &consensus.record_workers[2].state;
+        assert!(blocked.quarantined.load(Ordering::Acquire));
+        assert!(!consensus.record_workers[0]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        assert!(!consensus.record_workers[1]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        assert_eq!(blocked.pending.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // A quarantined worker accepts no new mutation, while the healthy
+        // quorum recovers immediately without waiting for the stuck call.
+        let follow_up = consensus.record_broadcast_with_context(
+            record_requests(&consensus, 2),
+            RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(follow_up, Ok(ref replies) if replies.len() == 2),
+            "healthy quorum must recover after isolating the stuck worker: {follow_up:?}"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(blocked.pending.load(Ordering::Acquire), 1);
+
+        caller_guard.finish();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(blocked.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn frozen_record_quorum_prunes_only_its_queued_hedge() {
+        let event_timeout = Duration::from_secs(10);
+        let (n1_started_tx, n1_started_rx) = mpsc::sync_channel(4);
+        let (n1_release_tx, n1_release_rx) = mpsc::sync_channel(1);
+        let (n2_seen_tx, n2_seen_rx) = mpsc::sync_channel(4);
+        let (n3_seen_tx, n3_seen_rx) = mpsc::sync_channel(4);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n1",
+                    started: n1_started_tx,
+                    release_first: Mutex::new(n1_release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n2",
+                    reject_slot: None,
+                    observed: Some(n2_seen_tx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n3",
+                    reject_slot: None,
+                    observed: Some(n3_seen_tx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        #[cfg(feature = "test-hooks")]
+        let queued_hedge_probe = Arc::new(TestControlOperationProbe::default());
+        #[cfg(feature = "test-hooks")]
+        let _queued_hedge_probe = consensus
+            .install_test_record_operation_probe(2, Arc::clone(&queued_hedge_probe))
+            .unwrap();
+
+        let (a_done_tx, a_done_rx) = mpsc::sync_channel(1);
+        let a_consensus = Arc::clone(&consensus);
+        let caller_a = thread::spawn(move || {
+            a_done_tx
+                .send(a_consensus.record_broadcast_with_context(
+                    record_requests(&a_consensus, 1),
+                    RecorderRpcContext::with_timeout(event_timeout),
+                    &AtomicBool::new(false),
+                ))
+                .unwrap();
+        });
+        let caller_a_guard = ChannelReleaseAndJoin::new(vec![n1_release_tx], caller_a);
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            n1_started_rx.recv_timeout(event_timeout),
+            Ok(1),
+            "A n1 start missing: a_done={:?}, probe_registrations={}, probe_pending={}, probe_outstanding={}, probe_dispatches={}, n1_pending={}, n1_quarantined={}",
+            a_done_rx.try_recv(),
+            consensus.test_record_operation_probe_registration_count(),
+            queued_hedge_probe.pending(),
+            queued_hedge_probe.outstanding(),
+            queued_hedge_probe.dispatch_count(),
+            consensus.record_workers[0]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            consensus.record_workers[0]
+                .state
+                .quarantined
+                .load(Ordering::Acquire),
+        );
+        #[cfg(not(feature = "test-hooks"))]
+        assert_eq!(n1_started_rx.recv_timeout(event_timeout), Ok(1));
+        assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(1));
+        assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(1));
+
+        let (b_done_tx, b_done_rx) = mpsc::sync_channel(1);
+        let b_consensus = Arc::clone(&consensus);
+        let caller_b = thread::spawn(move || {
+            b_done_tx
+                .send(b_consensus.record_broadcast_with_context(
+                    record_requests(&b_consensus, 2),
+                    RecorderRpcContext::with_timeout(event_timeout),
+                    &AtomicBool::new(false),
+                ))
+                .unwrap();
+        });
+        assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(2));
+        assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(2));
+        assert!(
+            matches!(
+                b_done_rx.recv_timeout(event_timeout),
+                Ok(Ok(replies)) if replies.len() == 2
+            ),
+            "the frozen quorum must reclaim B's queued n1 job without waiting for B's W"
+        );
+        caller_b.join().unwrap();
+        #[cfg(feature = "test-hooks")]
+        {
+            assert_eq!(queued_hedge_probe.pending(), 0);
+            assert_eq!(queued_hedge_probe.outstanding(), 0);
+            assert_eq!(queued_hedge_probe.dispatch_count(), 3);
+            assert_eq!(queued_hedge_probe.drained_count(), 3);
+            let transitions = queued_hedge_probe.worker_transitions();
+            assert!(
+                transitions.iter().any(|transition| {
+                    transition.pruned == 1
+                        && transition.live_leases == 0
+                        && transition.enqueued == transition.completion_dropped
+                }),
+                "the queued post-quorum hedge must be pruned and drop its exact lease: {transitions:?}"
+            );
+            assert!(transitions.iter().all(|transition| {
+                transition.live_leases == 0 && transition.enqueued == transition.completion_dropped
+            }));
+        }
+        assert_eq!(n1_started_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(
+            consensus.record_workers[0]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            1,
+            "only A's running n1 job remains leased"
+        );
+        assert!(!consensus.record_workers[0]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+
+        assert!(caller_a_guard.finish());
+        assert!(matches!(
+            a_done_rx.recv_timeout(event_timeout),
+            Ok(Ok(replies)) if replies.len() == 2
+        ));
+        assert!(matches!(
+            consensus.record_broadcast_with_context(
+                record_requests(&consensus, 3),
+                RecorderRpcContext::with_timeout(event_timeout),
+                &AtomicBool::new(false),
+            ),
+            Ok(replies) if replies.len() == 2
+        ));
+        assert_eq!(
+            n1_started_rx.recv_timeout(event_timeout),
+            Ok(3),
+            "final recovery n1 worker state: pending={}, quarantined={}",
+            consensus.record_workers[0]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            consensus.record_workers[0]
+                .state
+                .quarantined
+                .load(Ordering::Acquire),
+        );
+        assert!(consensus.finish_pending_rpcs(event_timeout));
+    }
+
+    #[test]
+    fn record_work_deadline_cancels_all_admitted_workers_and_reuses_them_before_root_deadline() {
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(WorkDeadlineCancellationRecorder {
+                        recorder_id,
+                        started: started_tx.clone(),
+                        cancelled: cancelled_tx.clone(),
+                        calls: AtomicUsize::new(0),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                let mutation_started = AtomicBool::new(false);
+                done_tx
+                    .send(consensus.record_broadcast_with_context(
+                        record_requests(&consensus, 1),
+                        RecorderRpcContext::with_timeout(Duration::from_millis(300)),
+                        &mutation_started,
+                    ))
+                    .unwrap();
+            })
+        };
+        let mut started = HashSet::new();
+        for _ in 0..3 {
+            started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert_eq!(started.len(), 3);
+        let mut cancelled = HashSet::new();
+        for _ in 0..3 {
+            cancelled.insert(cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert_eq!(cancelled, started);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert!(consensus.record_workers.iter().all(|worker| {
+            worker.state.pending.load(Ordering::Acquire) == 0
+                && !worker.state.quarantined.load(Ordering::Acquire)
+        }));
+        let replies = consensus
+            .record_broadcast_with_context(
+                record_requests(&consensus, 2),
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(replies.len(), 2);
+    }
+
+    #[test]
+    fn record_worker_exit_after_pop_without_reply_is_unknown_and_quarantined() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n1",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(GatedRecordRecorder {
+                    recorder_id: "n2",
+                    release: Arc::clone(&release),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(GatedRecordRecorder {
+                    recorder_id: "n3",
+                    release: Arc::clone(&release),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        #[cfg(feature = "test-hooks")]
+        let worker_exit_probe = Arc::new(TestControlOperationProbe::default());
+        #[cfg(feature = "test-hooks")]
+        let _worker_exit_probe = consensus
+            .install_test_record_operation_probe(1, Arc::clone(&worker_exit_probe))
+            .unwrap();
+        let (popped_tx, popped_rx) = mpsc::sync_channel(1);
+        let _panic =
+            super::arm_record_worker_panic_after_pop(&consensus.record_workers[0].state, popped_tx);
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        let caller = {
+            let consensus = Arc::new(consensus);
+            let caller = Arc::clone(&consensus);
+            let mutation_started = Arc::clone(&mutation_started);
+            (
+                consensus,
+                thread::spawn(move || {
+                    caller.record_broadcast_with_context(
+                        record_requests(&caller, 1),
+                        RecorderRpcContext::with_timeout(Duration::from_secs(10)),
+                        &mutation_started,
+                    )
+                }),
+            )
+        };
+        assert_eq!(popped_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        release_gate(&release);
+        assert_eq!(caller.1.join().unwrap(), Err(Error::UnknownOutcome));
+        assert!(mutation_started.load(Ordering::Acquire));
+        let quarantine_deadline = Instant::now() + Duration::from_secs(1);
+        while !caller
+            .0
+            .record_workers
+            .iter()
+            .any(|worker| worker.state.quarantined.load(Ordering::Acquire))
+            && Instant::now() < quarantine_deadline
+        {
+            thread::yield_now();
+        }
+        let quarantined: Vec<_> = caller
+            .0
+            .record_workers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, worker)| {
+                worker
+                    .state
+                    .quarantined
+                    .load(Ordering::Acquire)
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(caller.0.finish_pending_rpcs(Duration::from_secs(1)));
+        #[cfg(feature = "test-hooks")]
+        {
+            assert_eq!(worker_exit_probe.pending(), 0);
+            assert_eq!(worker_exit_probe.outstanding(), 0);
+            assert_eq!(worker_exit_probe.dispatch_count(), 3);
+            assert_eq!(worker_exit_probe.drained_count(), 3);
+            assert!(
+                worker_exit_probe
+                    .worker_transitions()
+                    .iter()
+                    .all(|transition| {
+                        transition.live_leases == 0
+                            && transition.enqueued == transition.completion_dropped
+                            // The panic unwinds and drops its lease before
+                            // the worker wrapper observes quarantine, so no
+                            // group-scoped quarantine attribution exists.
+                            && transition.quarantined == 0
+                    }),
+                "a popped worker panic must drop every group lease before quarantine is observable: {:?}",
+                worker_exit_probe.worker_transitions(),
+            );
+        }
+
+        let replies = caller
+            .0
+            .record_broadcast_with_context(
+                record_requests(&caller.0, 2),
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(replies
+            .iter()
+            .all(|reply| reply.recorder_id != caller.0.membership().members()[quarantined[0]]));
+    }
+
+    #[test]
+    fn record_quorum_result_is_independent_of_the_first_two_reply_arrivals() {
+        for first_two in [[0, 1], [1, 0]] {
+            let (n1_started_tx, n1_started_rx) = mpsc::sync_channel(1);
+            let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
+            let (n3_started_tx, n3_started_rx) = mpsc::sync_channel(1);
+            let (n1_release_tx, n1_release_rx) = mpsc::sync_channel(1);
+            let (n2_release_tx, n2_release_rx) = mpsc::sync_channel(1);
+            let (_n3_release_tx, n3_release_rx) = mpsc::sync_channel(1);
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(BlockingRecorder {
+                        recorder_id: "n1",
+                        started: n1_started_tx,
+                        release_first: Mutex::new(n1_release_rx),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(BlockingRecorder {
+                        recorder_id: "n2",
+                        started: n2_started_tx,
+                        release_first: Mutex::new(n2_release_rx),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(BlockingRecorder {
+                        recorder_id: "n3",
+                        started: n3_started_tx,
+                        release_first: Mutex::new(n3_release_rx),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    done_tx
+                        .send(consensus.record_broadcast_with_context(
+                            record_requests(&consensus, 1),
+                            RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                            &AtomicBool::new(false),
+                        ))
+                        .unwrap();
+                })
+            };
+            assert_eq!(n1_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+            assert_eq!(n2_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+            assert_eq!(n3_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+            for worker in first_two {
+                match worker {
+                    0 => n1_release_tx.send(()).unwrap(),
+                    1 => n2_release_tx.send(()).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            let replies = done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            let mut ids: Vec<_> = replies
+                .iter()
+                .map(|reply| reply.recorder_id.as_str())
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, ["n1", "n2"]);
+            caller.join().unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn caller_cancellation_while_proposal_is_pending_after_admission_is_unknown() {
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let mut releases = Vec::new();
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                releases.push(release_tx);
+                (
+                    recorder_id.into(),
+                    Box::new(BlockingRecorder {
+                        recorder_id,
+                        started: started_tx.clone(),
+                        release_first: Mutex::new(release_rx),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let context = RecorderRpcContext::with_timeout(Duration::from_secs(5));
+        let proposer = {
+            let consensus = Arc::clone(&consensus);
+            let context = context.clone();
+            thread::spawn(move || {
+                consensus.propose_at(
+                    context,
+                    1,
+                    LogHash::ZERO,
+                    Command::new(CommandKind::Deterministic, b"pending".to_vec()),
+                )
+            })
+        };
+        for _ in 0..3 {
+            assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        }
+        context.cancel();
+        assert_eq!(proposer.join().unwrap(), Err(Error::UnknownOutcome));
+        for release in releases {
+            let _ = release.send(());
+        }
+    }
+
+    #[test]
+    fn read_timeouts_never_become_unknown_outcomes() {
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ReadTimeoutRecorder) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 1),
+            Err(Error::NoQuorum)
+        );
+        assert_eq!(
+            consensus.inspect_context_read_fence_at(
+                &RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            ),
+            Ok(CertifiedDecisionInspection::Unavailable)
+        );
+    }
+
     #[test]
     fn record_request_requires_the_current_command_field() {
         let request = RecordRequest {
@@ -7439,7 +12712,11 @@ mod tests {
     }
 
     impl RecorderRpc for ThreadRecordingRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             self.threads.lock().unwrap().insert(thread::current().id());
             Ok(record_summary(self.recorder_id, request))
         }
@@ -7452,6 +12729,7 @@ mod tests {
     impl RecorderRpc for ThreadRecordingControlRecorder {
         fn inspect_decision_proof(
             &self,
+            _context: &RecorderRpcContext,
             _slot: u64,
         ) -> super::Result<Option<super::DecisionProof>> {
             self.threads.lock().unwrap().insert(thread::current().id());
@@ -7459,10 +12737,590 @@ mod tests {
         }
     }
 
+    struct ContextRecordingRecorder {
+        recorder_id: &'static str,
+        record_contexts: mpsc::SyncSender<Instant>,
+        control_contexts: mpsc::SyncSender<Instant>,
+        record_error: Option<Error>,
+    }
+
+    struct GatedContextRecorder {
+        recorder_id: &'static str,
+        contexts: mpsc::SyncSender<Instant>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecorderRpc for GatedContextRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            self.contexts.send(context.deadline()).unwrap();
+            let (released, condition) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    impl RecorderRpc for ContextRecordingRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            self.record_contexts.send(context.deadline()).unwrap();
+            match &self.record_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(record_summary(self.recorder_id, request)),
+            }
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            self.control_contexts.send(context.deadline()).unwrap();
+            Ok(None)
+        }
+    }
+
+    struct ReadTimeoutRecorder;
+
+    impl RecorderRpc for ReadTimeoutRecorder {
+        fn inspect_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            Err(Error::RpcDeadlineExceeded)
+        }
+
+        fn supports_context_read_fence(&self) -> bool {
+            true
+        }
+
+        fn observe_read_fence(
+            &self,
+            _context: &RecorderRpcContext,
+            _request: ReadFenceRequest,
+        ) -> super::Result<ReadFenceObservation> {
+            Err(Error::RpcDeadlineExceeded)
+        }
+    }
+
     struct BlockingControlRecorder {
         recorder_id: &'static str,
         started: mpsc::SyncSender<u64>,
         release_first: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct GateProofRecorder {
+        recorder_id: &'static str,
+        started: mpsc::SyncSender<&'static str>,
+        exited: Option<mpsc::SyncSender<&'static str>>,
+        release: Option<Arc<(Mutex<bool>, Condvar)>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for GateProofRecorder {
+        fn inspect_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.started.send(self.recorder_id).unwrap();
+            if let Some(release) = &self.release {
+                let (released, condition) = &**release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            if let Some(exited) = &self.exited {
+                exited.send(self.recorder_id).unwrap();
+            }
+            Ok(None)
+        }
+    }
+
+    struct GateRelease {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl GateRelease {
+        fn new(gate: Arc<(Mutex<bool>, Condvar)>) -> Self {
+            Self { gate }
+        }
+    }
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            release_gate(&self.gate);
+        }
+    }
+
+    /// Ensures channel-gated worker tests never leave a blocked caller or
+    /// detached worker behind when an assertion fails midway through a test.
+    struct ChannelReleaseAndJoin {
+        releases: Vec<mpsc::SyncSender<()>>,
+        caller: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ChannelReleaseAndJoin {
+        fn new(releases: Vec<mpsc::SyncSender<()>>, caller: thread::JoinHandle<()>) -> Self {
+            Self {
+                releases,
+                caller: Some(caller),
+            }
+        }
+
+        fn finish(mut self) -> bool {
+            self.release_and_join()
+        }
+
+        fn release_and_join(&mut self) -> bool {
+            for release in self.releases.drain(..) {
+                let _ = release.send(());
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self
+                .caller
+                .as_ref()
+                .is_some_and(|caller| !caller.is_finished())
+                && Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            let Some(caller) = self.caller.take() else {
+                return true;
+            };
+            if caller.is_finished() {
+                caller.join().unwrap();
+                true
+            } else {
+                // Drop detaches only after every test gate was released and
+                // the bounded grace period elapsed; Drop itself never blocks.
+                drop(caller);
+                false
+            }
+        }
+    }
+
+    impl Drop for ChannelReleaseAndJoin {
+        fn drop(&mut self) {
+            let _ = self.release_and_join();
+        }
+    }
+
+    #[test]
+    fn channel_release_and_join_unwinds_without_leaking_a_gated_caller() {
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+        let active = Arc::new(AtomicUsize::new(1));
+        let caller_active = Arc::clone(&active);
+        let caller = thread::spawn(move || {
+            let _ = release_rx.recv();
+            caller_active.store(0, Ordering::Release);
+            exited_tx.send(()).unwrap();
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ChannelReleaseAndJoin::new(vec![release_tx], caller);
+            panic!("injected assertion-path unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(exited_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    struct ScriptedProofRecorder {
+        recorder_id: &'static str,
+        started: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        reply: super::Result<Option<DecisionProof>>,
+    }
+
+    impl RecorderRpc for ScriptedProofRecorder {
+        fn inspect_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            self.started.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.reply.clone()
+        }
+    }
+
+    struct ScriptedSummaryRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        reply: super::Result<Option<RecordSummary>>,
+    }
+
+    impl RecorderRpc for ScriptedSummaryRecorder {
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            self.entered.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.reply.clone()
+        }
+    }
+
+    struct ScriptedSummaryFetchRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        cancellation_observed: Option<mpsc::SyncSender<bool>>,
+        summary: RecordSummary,
+        command: StoredCommand,
+    }
+
+    impl RecorderRpc for ScriptedSummaryFetchRecorder {
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            self.entered.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            if let Some(cancellation_observed) = &self.cancellation_observed {
+                cancellation_observed.send(_context.is_cancelled()).unwrap();
+            }
+            Ok(Some(self.summary.clone()))
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            Ok(Some(self.command.clone()))
+        }
+    }
+
+    struct BlockingQueuedSummaryFetchRecorder {
+        blocker_slot: Slot,
+        blocker_started: mpsc::SyncSender<()>,
+        blocker_gate: Arc<(Mutex<bool>, Condvar)>,
+        summary_started: mpsc::SyncSender<()>,
+        summary: RecordSummary,
+        command: StoredCommand,
+    }
+
+    impl RecorderRpc for BlockingQueuedSummaryFetchRecorder {
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            if slot == self.blocker_slot {
+                self.blocker_started.send(()).unwrap();
+                let (released, condition) = &*self.blocker_gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+                return Ok(None);
+            }
+            self.summary_started.send(()).unwrap();
+            Ok(Some(self.summary.clone()))
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            Ok(Some(self.command.clone()))
+        }
+    }
+
+    struct ScriptedFetchRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        reply: super::Result<Option<StoredCommand>>,
+    }
+
+    impl RecorderRpc for ScriptedFetchRecorder {
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            self.entered.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.reply.clone()
+        }
+    }
+
+    struct ScriptedCommandStoreRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        reply: super::Result<()>,
+    }
+
+    impl RecorderRpc for ScriptedCommandStoreRecorder {
+        fn store_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> super::Result<()> {
+            self.entered.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.reply.clone()
+        }
+    }
+
+    struct ScriptedInstallProofRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        reply: super::Result<()>,
+    }
+
+    impl RecorderRpc for ScriptedInstallProofRecorder {
+        fn install_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> super::Result<()> {
+            self.entered.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.reply.clone()
+        }
+    }
+
+    struct ScriptedFenceRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        reply: super::Result<ReadFenceSlotState>,
+    }
+
+    impl RecorderRpc for ScriptedFenceRecorder {
+        fn supports_context_read_fence(&self) -> bool {
+            true
+        }
+
+        fn observe_read_fence(
+            &self,
+            _context: &RecorderRpcContext,
+            request: ReadFenceRequest,
+        ) -> super::Result<ReadFenceObservation> {
+            self.entered.send(self.recorder_id).unwrap();
+            if let Some(gate) = &self.gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.reply.clone().map(|slot_state| ReadFenceObservation {
+                recorder_id: self.recorder_id.into(),
+                cluster_id: request.cluster_id,
+                epoch: request.epoch,
+                config_id: request.config_id,
+                config_digest: request.config_digest,
+                slot: request.slot,
+                max_head: match slot_state {
+                    ReadFenceSlotState::Empty => None,
+                    ReadFenceSlotState::Occupied { .. } => Some(request.slot),
+                },
+                slot_state,
+            })
+        }
+    }
+
+    struct SummaryFetchBudgetRecorder {
+        summary: RecordSummary,
+        command: StoredCommand,
+    }
+
+    impl RecorderRpc for SummaryFetchBudgetRecorder {
+        fn supports_context_read_fence(&self) -> bool {
+            true
+        }
+
+        fn observe_read_fence(
+            &self,
+            _context: &RecorderRpcContext,
+            request: ReadFenceRequest,
+        ) -> super::Result<ReadFenceObservation> {
+            Ok(ReadFenceObservation {
+                recorder_id: self.summary.recorder_id.clone(),
+                cluster_id: request.cluster_id,
+                epoch: request.epoch,
+                config_id: request.config_id,
+                config_digest: request.config_digest,
+                slot: request.slot,
+                max_head: Some(request.slot),
+                slot_state: ReadFenceSlotState::Occupied { summary: None },
+            })
+        }
+
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            Ok(Some(self.summary.clone()))
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            Ok(Some(self.command.clone()))
+        }
+
+        fn install_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> super::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ProofSummaryFetchRecorder {
+        recorder_id: &'static str,
+        entered: mpsc::SyncSender<&'static str>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        summary: RecordSummary,
+        fetch_entries: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for ProofSummaryFetchRecorder {
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            self.entered.send(self.recorder_id).unwrap();
+            let (released, condition) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            Ok(Some(self.summary.clone()))
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            self.fetch_entries.fetch_add(1, Ordering::AcqRel);
+            Ok(None)
+        }
+    }
+
+    struct TokenGateProofRecorder {
+        recorder_id: &'static str,
+        started: mpsc::SyncSender<&'static str>,
+        group_token: mpsc::SyncSender<Arc<AtomicBool>>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        exited: Option<mpsc::SyncSender<&'static str>>,
+    }
+
+    impl RecorderRpc for TokenGateProofRecorder {
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            self.group_token
+                .send(Arc::clone(
+                    &context.cancellations[context.cancellations.len() - 2],
+                ))
+                .unwrap();
+            self.started.send(self.recorder_id).unwrap();
+            let (released, condition) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            if let Some(exited) = &self.exited {
+                exited.send(self.recorder_id).unwrap();
+            }
+            Ok(None)
+        }
     }
 
     struct BlockingInspectionReadFenceRecorder {
@@ -7479,9 +13337,27 @@ mod tests {
 
     struct SuccessfulCommandStoreRecorder;
 
+    struct UnknownCommandStoreRecorder;
+
+    impl RecorderRpc for UnknownCommandStoreRecorder {
+        fn store_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> super::Result<()> {
+            Err(Error::UnknownOutcome)
+        }
+    }
+
     impl RecorderRpc for SuccessfulCommandStoreRecorder {
         fn store_command_for(
             &self,
+            _context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7498,6 +13374,7 @@ mod tests {
     impl RecorderRpc for FailingCommandStoreRecorder {
         fn store_command_for(
             &self,
+            _context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7512,6 +13389,7 @@ mod tests {
     impl RecorderRpc for BlockingCommandStoreRecorder {
         fn store_command_for(
             &self,
+            _context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7530,11 +13408,19 @@ mod tests {
     }
 
     impl RecorderRpc for BlockingControlRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             Ok(record_summary(self.recorder_id, request))
         }
 
-        fn inspect_decision_proof(&self, slot: u64) -> super::Result<Option<super::DecisionProof>> {
+        fn inspect_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            slot: u64,
+        ) -> super::Result<Option<super::DecisionProof>> {
             self.started.send(slot).unwrap();
             if slot == 1 {
                 self.release_first.lock().unwrap().recv().unwrap();
@@ -7558,6 +13444,7 @@ mod tests {
         assert!(matches!(
             worker.dispatch(ControlJob::InspectProof {
                 index: 1,
+                context: RecorderRpcContext::default_timeout(),
                 slot: 1,
                 result: result_tx.clone(),
             }),
@@ -7570,6 +13457,7 @@ mod tests {
             worker.dispatch_cancellable(
                 ControlJob::InspectProof {
                     index: 2,
+                    context: RecorderRpcContext::default_timeout(),
                     slot: 2,
                     result: result_tx.clone(),
                 },
@@ -7582,6 +13470,7 @@ mod tests {
         assert!(matches!(
             worker.dispatch(ControlJob::InspectProof {
                 index: 3,
+                context: RecorderRpcContext::default_timeout(),
                 slot: 3,
                 result: result_tx,
             }),
@@ -7595,8 +13484,2065 @@ mod tests {
         assert_eq!(result_rx.recv().unwrap().0, 3);
     }
 
+    fn release_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, condition) = &**gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+    }
+
+    fn wait_for_control_worker_idle(worker: &ControlWorker, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_idle() {
+            assert!(
+                Instant::now() < deadline,
+                "{label} must send its reply and complete before the second gate opens"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn valid_inspected_proof(membership: &Membership, command_hash: LogHash) -> DecisionProof {
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue {
+                command_hash,
+                prev_hash: LogHash::ZERO,
+                entry_hash: LogHash::ZERO,
+            },
+        );
+        let summaries = membership.members()[..membership.quorum_size()]
+            .iter()
+            .map(|recorder_id| RecorderSummary {
+                recorder_id: recorder_id.clone(),
+                slot: 1,
+                step: 4,
+                first_current: Some(proposal.clone()),
+                aggregate_prior: None,
+            })
+            .collect();
+        DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal,
+            summaries,
+        }
+    }
+
+    #[test]
+    fn proof_quorum_waits_for_every_admitted_group_job() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(GateProofRecorder {
+                    recorder_id: "n1",
+                    started: started_tx.clone(),
+                    exited: None,
+                    release: Some(Arc::clone(&release)),
+                    calls: Arc::clone(&calls),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(GateProofRecorder {
+                    recorder_id: "n2",
+                    started: started_tx.clone(),
+                    exited: None,
+                    release: Some(Arc::clone(&release)),
+                    calls: Arc::clone(&calls),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(GateProofRecorder {
+                    recorder_id: "n3",
+                    started: started_tx,
+                    exited: Some(exited_tx),
+                    release: Some(Arc::clone(&release)),
+                    calls,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_decision_proof_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                    ))
+                    .unwrap();
+            })
+        };
+        let mut admitted = BTreeSet::new();
+        for _ in 0..3 {
+            admitted.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert_eq!(admitted, BTreeSet::from(["n1", "n2", "n3"]));
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        release_gate(&release);
+        assert_eq!(
+            exited_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "n3"
+        );
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(None)
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn proof_short_deadline_never_admits_and_cancellation_wins() {
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(GateProofRecorder {
+                        recorder_id,
+                        started: started_tx.clone(),
+                        exited: None,
+                        release: None,
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(
+            consensus.inspect_decision_proof_at(
+                &RecorderRpcContext::with_timeout(Duration::from_millis(1)),
+                1,
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        let cancelled = RecorderRpcContext::with_timeout(Duration::from_millis(1));
+        cancelled.cancel();
+        assert_eq!(
+            consensus.inspect_decision_proof_at(&cancelled, 1),
+            Err(Error::RpcCancelled)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(started_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn proof_work_deadline_admission_rechecks_cancellation_before_deadline_error() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(GateProofRecorder {
+                        recorder_id,
+                        started: started_tx.clone(),
+                        exited: None,
+                        release: None,
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_millis(130),
+            Arc::clone(&cancellation),
+        );
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
+        let _hook = super::pause_next_control_work_deadline_check(
+            Arc::clone(&cancellation),
+            super::ControlWorkDeadlineCheckpoint::Admission,
+            entered_tx,
+            Arc::clone(&release),
+        );
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let context = context.clone();
+            thread::spawn(move || consensus.inspect_decision_proof_at(&context, 1))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        cancellation.store(true, Ordering::Release);
+        release_gate(&release);
+        assert_eq!(caller.join().unwrap(), Err(Error::RpcCancelled));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(started_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn proof_work_deadline_constructor_rechecks_cancellation_before_deadline_error() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(GateProofRecorder {
+                        recorder_id,
+                        started: started_tx.clone(),
+                        exited: None,
+                        release: None,
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_millis(130),
+            Arc::clone(&cancellation),
+        );
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
+        let _hook = super::pause_next_control_work_deadline_check(
+            Arc::clone(&cancellation),
+            super::ControlWorkDeadlineCheckpoint::Constructor,
+            entered_tx,
+            Arc::clone(&release),
+        );
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let context = context.clone();
+            thread::spawn(move || consensus.inspect_decision_proof_at(&context, 1))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        cancellation.store(true, Ordering::Release);
+        release_gate(&release);
+        assert_eq!(caller.join().unwrap(), Err(Error::RpcCancelled));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(started_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn proof_late_unknown_overrides_a_frozen_quorum_candidate() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n1",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n2",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n3",
+                    started: started_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Err(Error::UnknownOutcome),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_decision_proof_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                    ))
+                    .unwrap();
+            })
+        };
+        for _ in 0..3 {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::UnknownOutcome)
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn summary_quorum_drains_all_admitted_jobs_before_returning_empty() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(CertifiedDecisionInspection::Empty)
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn summary_quorum_drain_preserves_cancellation_before_any_next_stage() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcCancelled)
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn summary_late_unknown_overrides_a_frozen_empty_candidate() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Err(Error::UnknownOutcome),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::UnknownOutcome)
+        );
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn summary_drain_promotes_late_quorum_proof_after_pending_freeze() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"late-proof".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let summary = |recorder_id: &str, first_current: Option<Proposal>| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current,
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let root_cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root_cancellation),
+        );
+        let (provisional_tx, provisional_rx) = mpsc::sync_channel(1);
+        let provisional_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_provisional = GateRelease::new(Arc::clone(&provisional_gate));
+        let _provisional_hook = pause_after_next_summary_provisional_none(
+            Arc::clone(&root_cancellation),
+            provisional_tx,
+            Arc::clone(&provisional_gate),
+        );
+        let (late_cancellation_tx, late_cancellation_rx) = mpsc::sync_channel(1);
+        let recorder = |recorder_id, gate, summary, cancellation_observed| {
+            Box::new(ScriptedSummaryFetchRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                cancellation_observed,
+                summary,
+                command: command.clone(),
+            }) as Box<dyn RecorderRpc>
+        };
+        let recorders = vec![
+            (
+                "n1".into(),
+                recorder(
+                    "n1",
+                    Some(Arc::clone(&early)),
+                    summary("n1", Some(proposal.clone())),
+                    None,
+                ),
+            ),
+            (
+                "n2".into(),
+                recorder(
+                    "n2",
+                    Some(Arc::clone(&late)),
+                    summary("n2", Some(proposal.clone())),
+                    Some(late_cancellation_tx),
+                ),
+            ),
+            (
+                "n3".into(),
+                recorder("n3", Some(Arc::clone(&early)), summary("n3", None), None),
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        provisional_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_gate(&late);
+        assert_eq!(
+            late_cancellation_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(false),
+            "late summary must remain live while the initial None is provisional"
+        );
+        release_gate(&provisional_gate);
+        let inspection = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let Ok(CertifiedDecisionInspection::Committed(certified)) = inspection else {
+            panic!("a valid late quorum proof must be promoted: {inspection:?}");
+        };
+        assert_eq!(certified.proof.proposal().value, proposal.value);
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_provisional_none_keeps_queued_recorder_until_it_supplies_the_proof() {
+        const BLOCKER_SLOT: Slot = 2;
+
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"queued-late-proof".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (blocker_started_tx, blocker_started_rx) = mpsc::sync_channel(1);
+        let blocker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_blocker = GateRelease::new(Arc::clone(&blocker_gate));
+        let (queued_summary_started_tx, queued_summary_started_rx) = mpsc::sync_channel(1);
+        let (n1_entered_tx, _n1_entered_rx) = mpsc::sync_channel(3);
+        let (n3_entered_tx, _n3_entered_rx) = mpsc::sync_channel(3);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryFetchRecorder {
+                    recorder_id: "n1",
+                    entered: n1_entered_tx,
+                    gate: None,
+                    cancellation_observed: None,
+                    summary: summary("n1"),
+                    command: command.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(BlockingQueuedSummaryFetchRecorder {
+                    blocker_slot: BLOCKER_SLOT,
+                    blocker_started: blocker_started_tx,
+                    blocker_gate: Arc::clone(&blocker_gate),
+                    summary_started: queued_summary_started_tx,
+                    summary: summary("n2"),
+                    command: command.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: n3_entered_tx,
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+
+        let (blocker_result_tx, blocker_result_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[1].dispatch(ControlJob::InspectSummary {
+                index: 1,
+                context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                slot: BLOCKER_SLOT,
+                result: blocker_result_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        blocker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let root_cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root_cancellation),
+        );
+        let (provisional_tx, provisional_rx) = mpsc::sync_channel(1);
+        let provisional_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_provisional = GateRelease::new(Arc::clone(&provisional_gate));
+        let _provisional_hook = pause_after_next_summary_provisional_none(
+            Arc::clone(&root_cancellation),
+            provisional_tx,
+            Arc::clone(&provisional_gate),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+
+        provisional_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_gate(&blocker_gate);
+        assert_eq!(
+            queued_summary_started_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "the queued n2 summary must run instead of being pruned"
+        );
+        release_gate(&provisional_gate);
+        assert_eq!(
+            blocker_result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            (1, Ok(None))
+        );
+        let inspection = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            inspection,
+            Ok(CertifiedDecisionInspection::Committed(_))
+        ));
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_empty_quorum_keeps_a_queued_occupied_recorder_until_inspected() {
+        const BLOCKER_SLOT: Slot = 2;
+
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let summary = RecordSummary {
+            recorder_id: "n1".into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 1,
+            first_current: None,
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (blocker_started_tx, blocker_started_rx) = mpsc::sync_channel(1);
+        let blocker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_blocker = GateRelease::new(Arc::clone(&blocker_gate));
+        let (queued_summary_started_tx, queued_summary_started_rx) = mpsc::sync_channel(1);
+        let (empty_entered_tx, empty_entered_rx) = mpsc::sync_channel(2);
+        let command = StoredCommand::new(EntryType::Command, Vec::new());
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingQueuedSummaryFetchRecorder {
+                    blocker_slot: BLOCKER_SLOT,
+                    blocker_started: blocker_started_tx,
+                    blocker_gate: Arc::clone(&blocker_gate),
+                    summary_started: queued_summary_started_tx,
+                    summary,
+                    command,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: empty_entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: empty_entered_tx,
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+
+        let (blocker_result_tx, blocker_result_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[0].dispatch(ControlJob::InspectSummary {
+                index: 0,
+                context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                slot: BLOCKER_SLOT,
+                result: blocker_result_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        blocker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+
+        for _ in 0..2 {
+            empty_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+        }
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&blocker_gate);
+        assert_eq!(
+            queued_summary_started_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "an admitted occupied recorder must not be pruned after an empty quorum"
+        );
+        assert_eq!(
+            blocker_result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            (0, Ok(None))
+        );
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(CertifiedDecisionInspection::Unavailable)
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_drain_rejects_conflicting_valid_late_proofs_after_pending_freeze() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3", "n4", "n5"]).unwrap();
+        let first_late = valid_inspected_proof(&membership, LogHash::digest(&[b"first-late"]));
+        let conflicting_late =
+            valid_inspected_proof(&membership, LogHash::digest(&[b"conflicting-late"]));
+        let command = StoredCommand::new(EntryType::Command, Vec::new());
+        let summary = |recorder_id: &str, decided: Option<DecisionProof>| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: None,
+            aggregate_prior: None,
+            decided,
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(5);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let root_cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root_cancellation),
+        );
+        let (provisional_tx, provisional_rx) = mpsc::sync_channel(1);
+        let provisional_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_provisional = GateRelease::new(Arc::clone(&provisional_gate));
+        let _provisional_hook = pause_after_next_summary_provisional_none(
+            Arc::clone(&root_cancellation),
+            provisional_tx,
+            Arc::clone(&provisional_gate),
+        );
+        let (late_cancellation_tx, late_cancellation_rx) = mpsc::sync_channel(2);
+        let recorder = |recorder_id, gate, summary, cancellation_observed| {
+            Box::new(ScriptedSummaryFetchRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate: Some(gate),
+                cancellation_observed,
+                summary,
+                command: command.clone(),
+            }) as Box<dyn RecorderRpc>
+        };
+        let recorders = vec![
+            (
+                "n1".into(),
+                recorder("n1", Arc::clone(&early), summary("n1", None), None),
+            ),
+            (
+                "n2".into(),
+                recorder(
+                    "n2",
+                    Arc::clone(&late),
+                    summary("n2", Some(first_late)),
+                    Some(late_cancellation_tx.clone()),
+                ),
+            ),
+            (
+                "n3".into(),
+                recorder(
+                    "n3",
+                    Arc::clone(&late),
+                    summary("n3", Some(conflicting_late)),
+                    Some(late_cancellation_tx),
+                ),
+            ),
+            (
+                "n4".into(),
+                recorder("n4", Arc::clone(&early), summary("n4", None), None),
+            ),
+            (
+                "n5".into(),
+                recorder("n5", Arc::clone(&early), summary("n5", None), None),
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+        for _ in 0..5 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        provisional_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_gate(&late);
+        assert_eq!(
+            late_cancellation_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(false),
+            "first late summary must remain live while the initial None is provisional"
+        );
+        assert_eq!(
+            late_cancellation_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(false),
+            "second late summary must remain live while the initial None is provisional"
+        );
+        release_gate(&provisional_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::ConflictingCertificates)
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_proof_candidate_cancellation_blocks_legacy_fetch_stage() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let proposal = valid_inspected_proof(&membership, LogHash::ZERO)
+            .proposal()
+            .clone();
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let fetch_entries = Arc::new(AtomicUsize::new(0));
+        let recorder = |recorder_id, gate, summary: RecordSummary| {
+            Box::new(ProofSummaryFetchRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                summary,
+                fetch_entries: Arc::clone(&fetch_entries),
+            }) as Box<dyn RecorderRpc>
+        };
+        let recorders = vec![
+            (
+                "n1".into(),
+                recorder("n1", Arc::clone(&early), summary("n1")),
+            ),
+            (
+                "n2".into(),
+                recorder("n2", Arc::clone(&early), summary("n2")),
+            ),
+            (
+                "n3".into(),
+                recorder("n3", Arc::clone(&late), summary("n3")),
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcCancelled)
+        );
+        caller.join().unwrap();
+        assert_eq!(fetch_entries.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn summary_late_invalid_identity_evidence_beats_a_frozen_proof() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let proposal = valid_inspected_proof(&membership, LogHash::ZERO)
+            .proposal()
+            .clone();
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let fetch_entries = Arc::new(AtomicUsize::new(0));
+        let proof_recorder = |recorder_id, summary: RecordSummary| {
+            Box::new(ProofSummaryFetchRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate: Arc::clone(&early),
+                summary,
+                fetch_entries: Arc::clone(&fetch_entries),
+            }) as Box<dyn RecorderRpc>
+        };
+        let invalid = RecordSummary {
+            recorder_id: "wrong-member".into(),
+            ..summary("n3")
+        };
+        let recorders = vec![
+            ("n1".into(), proof_recorder("n1", summary("n1"))),
+            ("n2".into(), proof_recorder("n2", summary("n2"))),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Ok(Some(invalid)),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::Rejected(RejectReason::InvalidCertificate))
+        );
+        caller.join().unwrap();
+        assert_eq!(fetch_entries.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn summary_short_deadline_admits_no_backend_work() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedSummaryRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.inspect_certified_decision_at(
+                &RecorderRpcContext::with_timeout(Duration::from_millis(1)),
+                1,
+                LogHash::ZERO
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn summary_partial_admission_cancellation_drains_the_admitted_job() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedSummaryRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook = pause_after_next_summary_dispatch(
+            Arc::clone(&cancellation),
+            hook_tx,
+            Arc::clone(&dispatch_gate),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "n1"
+        );
+        cancellation.store(true, Ordering::Release);
+        release_gate(&dispatch_gate);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcCancelled)
+        );
+        caller.join().unwrap();
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_frozen_safety_error_beats_late_unknown_outcome() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 5,
+            first_current: None,
+            aggregate_prior: None,
+            // A two-recorder installed-proof quorum is selected before the
+            // drain.  Its empty signer set is invalid, so this is a genuine
+            // collector safety failure rather than a mocked finalizer.
+            decided: Some(test_decision_proof(&membership)),
+        };
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(summary("n1"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(summary("n2"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Err(Error::UnknownOutcome),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::Rejected(RejectReason::InvalidCertificate))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn proof_late_conflict_or_invalid_evidence_overrides_a_frozen_candidate() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |early_reply: super::Result<Option<DecisionProof>>,
+                   late_replies: [super::Result<Option<DecisionProof>>; 2],
+                   expected: Error| {
+            let (started_tx, started_rx) = mpsc::sync_channel(3);
+            let early = Arc::new((Mutex::new(false), Condvar::new()));
+            let late = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_early = GateRelease::new(Arc::clone(&early));
+            let _release_late = GateRelease::new(Arc::clone(&late));
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(ScriptedProofRecorder {
+                        recorder_id: "n1",
+                        started: started_tx.clone(),
+                        gate: Some(Arc::clone(&early)),
+                        reply: early_reply,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(ScriptedProofRecorder {
+                        recorder_id: "n2",
+                        started: started_tx.clone(),
+                        gate: Some(Arc::clone(&late)),
+                        reply: late_replies[0].clone(),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(ScriptedProofRecorder {
+                        recorder_id: "n3",
+                        started: started_tx,
+                        gate: Some(Arc::clone(&late)),
+                        reply: late_replies[1].clone(),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.inspect_decision_proof_at(
+                            &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                            1,
+                        ))
+                        .unwrap();
+                })
+            };
+            for _ in 0..3 {
+                started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            release_gate(&early);
+            assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+            release_gate(&late);
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Err(expected)
+            );
+            caller.join().unwrap();
+            assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+        };
+
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        run(
+            Err(Error::UnknownOutcome),
+            [
+                Ok(Some(valid_inspected_proof(&membership, LogHash::ZERO))),
+                Ok(Some(valid_inspected_proof(
+                    &membership,
+                    LogHash::digest(&[b"late-conflict"]),
+                ))),
+            ],
+            Error::ConflictingCertificates,
+        );
+    }
+
+    #[test]
+    fn proof_folds_pre_freeze_conflicts_even_when_unknown_freezes_the_response() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(5);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let unknown = Arc::new((Mutex::new(false), Condvar::new()));
+        let drain = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_unknown = GateRelease::new(Arc::clone(&unknown));
+        let _release_drain = GateRelease::new(Arc::clone(&drain));
+        let membership = Membership::new(["n1", "n2", "n3", "n4", "n5"]).unwrap();
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n1",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(valid_inspected_proof(&membership, LogHash::ZERO))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n2",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(valid_inspected_proof(
+                        &membership,
+                        LogHash::digest(&[b"pre-freeze-conflict"]),
+                    ))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n3",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&unknown)),
+                    reply: Err(Error::UnknownOutcome),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n4".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n4",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&drain)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n5".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n5",
+                    started: started_tx,
+                    gate: Some(Arc::clone(&drain)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_decision_proof_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                    ))
+                    .unwrap();
+            })
+        };
+        for _ in 0..5 {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        let early_deadline = Instant::now() + Duration::from_secs(1);
+        while !consensus.control_workers[..2]
+            .iter()
+            .all(ControlWorker::is_idle)
+        {
+            assert!(
+                Instant::now() < early_deadline,
+                "both conflicting proofs must reach the production collector before Unknown"
+            );
+            thread::yield_now();
+        }
+        release_gate(&unknown);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&drain);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::ConflictingCertificates)
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn proof_late_invalid_evidence_overrides_a_frozen_success() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n1",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n2",
+                    started: started_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedProofRecorder {
+                    recorder_id: "n3",
+                    started: started_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Ok(Some(test_decision_proof(&membership))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_decision_proof_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                    ))
+                    .unwrap();
+            })
+        };
+        for _ in 0..3 {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::Rejected(RejectReason::InvalidCertificate))
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn proof_drain_timeout_quarantines_only_the_noncooperative_worker() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+        let (group_token_tx, group_token_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_slow = GateRelease::new(Arc::clone(&slow));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(TokenGateProofRecorder {
+                    recorder_id: "n1",
+                    started: started_tx.clone(),
+                    group_token: group_token_tx.clone(),
+                    gate: Arc::clone(&early),
+                    exited: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(TokenGateProofRecorder {
+                    recorder_id: "n2",
+                    started: started_tx.clone(),
+                    group_token: group_token_tx.clone(),
+                    gate: Arc::clone(&early),
+                    exited: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(TokenGateProofRecorder {
+                    recorder_id: "n3",
+                    started: started_tx,
+                    group_token: group_token_tx,
+                    gate: Arc::clone(&slow),
+                    exited: Some(exited_tx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_decision_proof_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                        1,
+                    ))
+                    .unwrap();
+            })
+        };
+        let mut entered = BTreeSet::new();
+        for _ in 0..3 {
+            entered.insert(started_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert_eq!(entered, BTreeSet::from(["n1", "n2", "n3"]));
+        let group_tokens = (0..3)
+            .map(|_| group_token_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            group_tokens
+                .iter()
+                .all(|token| Arc::ptr_eq(token, &group_tokens[0])),
+            "every control job must carry the exact same group cancellation token"
+        );
+        let (fired_tx, fired_rx) = mpsc::sync_channel(1);
+        let _force_drain = super::force_next_control_group_drain_timeout(
+            Arc::clone(&group_tokens[0]),
+            Arc::clone(&consensus.control_workers[2].state),
+            fired_tx,
+        );
+        release_gate(&early);
+        assert_eq!(fired_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers[2]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        assert!(consensus.control_workers[..2]
+            .iter()
+            .all(|worker| !worker.state.quarantined.load(Ordering::Acquire)));
+
+        // The closed third worker is isolated; the other quorum still serves
+        // an unrelated call while the original backend remains blocked.
+        assert_eq!(
+            consensus.inspect_decision_proof_at(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                2,
+            ),
+            Ok(None)
+        );
+        release_gate(&slow);
+        assert_eq!(
+            exited_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "n3"
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(5)));
+        assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+    }
+
+    #[test]
+    fn proof_timeout_quarantines_before_unknown_or_safety_precedence() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |first: super::Result<Option<DecisionProof>>, expected: Error| {
+            let (started_tx, started_rx) = mpsc::sync_channel(3);
+            let early = Arc::new((Mutex::new(false), Condvar::new()));
+            let blocked = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_early = GateRelease::new(Arc::clone(&early));
+            let _release_blocked = GateRelease::new(Arc::clone(&blocked));
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(ScriptedProofRecorder {
+                        recorder_id: "n1",
+                        started: started_tx.clone(),
+                        gate: Some(Arc::clone(&early)),
+                        reply: first,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(ScriptedProofRecorder {
+                        recorder_id: "n2",
+                        started: started_tx.clone(),
+                        gate: Some(Arc::clone(&early)),
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(ScriptedProofRecorder {
+                        recorder_id: "n3",
+                        started: started_tx,
+                        gate: Some(Arc::clone(&blocked)),
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.inspect_decision_proof_at(
+                            &RecorderRpcContext::with_timeout(Duration::from_millis(300)),
+                            1,
+                        ))
+                        .unwrap();
+                })
+            };
+            for _ in 0..3 {
+                started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            release_gate(&early);
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Err(expected)
+            );
+            caller.join().unwrap();
+            assert!(consensus.control_workers[2]
+                .state
+                .quarantined
+                .load(Ordering::Acquire));
+            release_gate(&blocked);
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
+        };
+
+        run(Err(Error::UnknownOutcome), Error::UnknownOutcome);
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        run(
+            Ok(Some(test_decision_proof(&membership))),
+            Error::Rejected(RejectReason::InvalidCertificate),
+        );
+    }
+
+    #[test]
+    fn group_prune_does_not_cancel_an_unrelated_group() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = ControlWorker::spawn(Arc::new(BlockingControlRecorder {
+            recorder_id: "n1",
+            started: started_tx,
+            release_first: Mutex::new(release_rx),
+        }))
+        .unwrap();
+        let group_a = ControlCallGroup::new();
+        let group_b = ControlCallGroup::new();
+        let (a_tx, a_rx) = mpsc::sync_channel(1);
+        let (b_tx, b_rx) = mpsc::sync_channel(1);
+        let context = RecorderRpcContext::default_timeout();
+
+        assert_eq!(
+            worker.dispatch_group(
+                ControlJob::InspectProof {
+                    index: 1,
+                    context: context.clone(),
+                    slot: 1,
+                    result: a_tx.clone(),
+                },
+                &group_a,
+            ),
+            ControlDispatch::Accepted
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        assert_eq!(
+            worker.dispatch_group(
+                ControlJob::InspectProof {
+                    index: 2,
+                    context: context.clone(),
+                    slot: 2,
+                    result: b_tx,
+                },
+                &group_b,
+            ),
+            ControlDispatch::Accepted
+        );
+        group_b.cancel_and_prune();
+        assert!(group_b
+            .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(b_rx.recv_timeout(Duration::from_secs(1)).unwrap().0, 2);
+        assert_eq!(a_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_tx.send(()).unwrap();
+        assert_eq!(a_rx.recv_timeout(Duration::from_secs(1)).unwrap().0, 1);
+        assert!(group_a
+            .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+            .is_empty());
+    }
+
+    #[test]
+    fn completion_guard_survives_receiver_drop_and_worker_exit_or_queue_poison() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, _started_rx) = mpsc::sync_channel(2);
+        let worker = ControlWorker::spawn(Arc::new(GateProofRecorder {
+            recorder_id: "n1",
+            started: started_tx.clone(),
+            exited: None,
+            release: None,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .unwrap();
+        let group = ControlCallGroup::new();
+        let (drop_tx, drop_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            worker.dispatch_group(
+                ControlJob::InspectProof {
+                    index: 1,
+                    context: RecorderRpcContext::default_timeout(),
+                    slot: 1,
+                    result: drop_tx,
+                },
+                &group,
+            ),
+            ControlDispatch::Accepted
+        );
+        drop(drop_rx);
+        assert!(group
+            .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+            .is_empty());
+        assert!(worker.is_idle());
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _queue = worker.state.queue.state.lock().unwrap();
+            panic!("poison queue mutex");
+        }));
+        assert!(poison.is_err());
+        let poisoned_group = ControlCallGroup::new();
+        let (poisoned_tx, poisoned_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            worker.dispatch_group(
+                ControlJob::InspectProof {
+                    index: 2,
+                    context: RecorderRpcContext::default_timeout(),
+                    slot: 2,
+                    result: poisoned_tx,
+                },
+                &poisoned_group,
+            ),
+            ControlDispatch::Accepted
+        );
+        assert_eq!(
+            poisoned_rx.recv_timeout(Duration::from_secs(1)).unwrap().0,
+            2
+        );
+        assert!(poisoned_group
+            .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+            .is_empty());
+
+        let exit_group = ControlCallGroup::new();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        worker.panic_after_next_pop();
+        assert_eq!(
+            worker.dispatch_group(
+                ControlJob::InspectProof {
+                    index: 3,
+                    context: RecorderRpcContext::default_timeout(),
+                    slot: 3,
+                    result: exit_tx,
+                },
+                &exit_group,
+            ),
+            ControlDispatch::Accepted
+        );
+        assert!(exit_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(exit_group
+            .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+            .is_empty());
+        assert!(worker.is_idle());
+        let mut queue = worker
+            .state
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !queue.closed {
+            queue = worker
+                .state
+                .queue
+                .available
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(queue);
+        assert_eq!(
+            worker.dispatch(ControlJob::InspectProof {
+                index: 4,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 4,
+                result: mpsc::sync_channel(1).0,
+            }),
+            ControlDispatch::Failed
+        );
+    }
+
+    #[test]
+    fn abnormal_worker_exit_fails_queued_jobs_by_operation_certainty() {
+        let _blocking = lock_blocking_control_tests();
+        let run_read = || {
+            let (started_tx, _started_rx) = mpsc::sync_channel(1);
+            let worker = ControlWorker::spawn(Arc::new(GateProofRecorder {
+                recorder_id: "n1",
+                started: started_tx,
+                exited: None,
+                release: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .unwrap();
+            let pause = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_pause = GateRelease::new(Arc::clone(&pause));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            worker.pause_after_next_pop(entered_tx, Arc::clone(&pause));
+            let first = ControlCallGroup::new();
+            let second = ControlCallGroup::new();
+            let (first_tx, _first_rx) = mpsc::sync_channel(1);
+            let (second_tx, second_rx) = mpsc::sync_channel(1);
+            assert_eq!(
+                worker.dispatch_group(
+                    ControlJob::InspectProof {
+                        index: 1,
+                        context: RecorderRpcContext::default_timeout(),
+                        slot: 1,
+                        result: first_tx,
+                    },
+                    &first,
+                ),
+                ControlDispatch::Accepted
+            );
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                worker.dispatch_group(
+                    ControlJob::InspectProof {
+                        index: 2,
+                        context: RecorderRpcContext::default_timeout(),
+                        slot: 2,
+                        result: second_tx,
+                    },
+                    &second,
+                ),
+                ControlDispatch::Accepted
+            );
+            worker.panic_after_next_pop();
+            release_gate(&pause);
+            assert_eq!(
+                second_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+                Err(Error::ProposeFailed)
+            );
+            assert!(first
+                .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+                .is_empty());
+            assert!(second
+                .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+                .is_empty());
+            assert!(worker.is_idle());
+        };
+        let run_mutation = || {
+            let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+            let (started_tx, _started_rx) = mpsc::sync_channel(1);
+            let worker = ControlWorker::spawn(Arc::new(GateProofRecorder {
+                recorder_id: "n1",
+                started: started_tx,
+                exited: None,
+                release: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .unwrap();
+            let pause = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_pause = GateRelease::new(Arc::clone(&pause));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            worker.pause_after_next_pop(entered_tx, Arc::clone(&pause));
+            let first = ControlCallGroup::new();
+            let second = ControlCallGroup::new();
+            let (first_tx, _first_rx) = mpsc::sync_channel(1);
+            let (second_tx, second_rx) = mpsc::sync_channel(1);
+            assert_eq!(
+                worker.dispatch_group(
+                    ControlJob::InstallProof {
+                        index: 1,
+                        context: RecorderRpcContext::default_timeout(),
+                        proof: test_decision_proof(&membership),
+                        membership: membership.clone(),
+                        result: first_tx,
+                    },
+                    &first,
+                ),
+                ControlDispatch::Accepted
+            );
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                worker.dispatch_group(
+                    ControlJob::InstallProof {
+                        index: 2,
+                        context: RecorderRpcContext::default_timeout(),
+                        proof: test_decision_proof(&membership),
+                        membership,
+                        result: second_tx,
+                    },
+                    &second,
+                ),
+                ControlDispatch::Accepted
+            );
+            worker.panic_after_next_pop();
+            release_gate(&pause);
+            assert_eq!(
+                second_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+                Err(Error::UnknownOutcome)
+            );
+            assert!(first
+                .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+                .is_empty());
+            assert!(second
+                .drain_to_deadline(Instant::now() + Duration::from_secs(1))
+                .is_empty());
+            assert!(worker.is_idle());
+        };
+        run_read();
+        run_mutation();
+    }
+
     impl RecorderRpc for BlockingInspectionReadFenceRecorder {
-        fn inspect_record_summary(&self, _slot: u64) -> super::Result<Option<RecordSummary>> {
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: u64,
+        ) -> super::Result<Option<RecordSummary>> {
             if self.block_inspection {
                 self.started.send(self.recorder_id).unwrap();
                 let (released, condition) = &*self.release;
@@ -7614,6 +15560,7 @@ mod tests {
 
         fn observe_read_fence(
             &self,
+            _context: &RecorderRpcContext,
             request: ReadFenceRequest,
         ) -> super::Result<ReadFenceObservation> {
             Ok(ReadFenceObservation {
@@ -7636,12 +15583,103 @@ mod tests {
     }
 
     impl RecorderRpc for BlockingRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             self.started.send(request.slot).unwrap();
             if request.slot == 1 {
-                self.release_first.lock().unwrap().recv().unwrap();
+                loop {
+                    context.check()?;
+                    match self
+                        .release_first
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_millis(5))
+                    {
+                        Ok(()) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            panic!("blocking test recorder release channel disconnected")
+                        }
+                    }
+                }
             }
             Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    struct GatedRecordRecorder {
+        recorder_id: &'static str,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecorderRpc for GatedRecordRecorder {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            let (released, condition) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    /// Deliberately ignores the call context.  It models a recorder stuck
+    /// below the cooperative RPC layer, so the caller must wait through D and
+    /// quarantine its worker rather than returning an early quorum success.
+    struct NonCooperativeRecordRecorder {
+        recorder_id: &'static str,
+        started: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for NonCooperativeRecordRecorder {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    struct WorkDeadlineCancellationRecorder {
+        recorder_id: &'static str,
+        started: mpsc::SyncSender<&'static str>,
+        cancelled: mpsc::SyncSender<&'static str>,
+        calls: AtomicUsize,
+    }
+
+    impl RecorderRpc for WorkDeadlineCancellationRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) != 0 {
+                return Ok(record_summary(self.recorder_id, request));
+            }
+            self.started.send(self.recorder_id).unwrap();
+            loop {
+                match context.check() {
+                    Ok(()) => thread::sleep(Duration::from_millis(1)),
+                    Err(error @ (Error::RpcCancelled | Error::RpcDeadlineExceeded)) => {
+                        self.cancelled.send(self.recorder_id).unwrap();
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
 
@@ -7652,7 +15690,11 @@ mod tests {
     }
 
     impl RecorderRpc for SlotRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             if let Some(observed) = &self.observed {
                 observed.send(request.slot).unwrap();
             }
@@ -7664,26 +15706,126 @@ mod tests {
         }
     }
 
-    struct RejectFromSlotRecorder {
-        recorder_id: &'static str,
-        reject_from: u64,
+    struct PanickingRecorder {
+        mutated: Arc<AtomicBool>,
     }
 
-    impl RecorderRpc for RejectFromSlotRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
-            if request.slot >= self.reject_from {
-                Err(Error::Rejected(RejectReason::InvalidRequest))
-            } else {
-                Ok(record_summary(self.recorder_id, request))
-            }
+    impl RecorderRpc for PanickingRecorder {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            _request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            self.mutated.store(true, Ordering::Release);
+            panic!("injected recorder panic")
         }
     }
 
-    struct PanickingRecorder;
+    struct PanicThenSuccessfulRecordRecorder {
+        recorder_id: &'static str,
+        calls: AtomicUsize,
+        mutated: Arc<AtomicBool>,
+    }
 
-    impl RecorderRpc for PanickingRecorder {
-        fn record(&self, _request: RecordRequest) -> super::Result<RecordSummary> {
-            panic!("injected recorder panic")
+    impl RecorderRpc for PanicThenSuccessfulRecordRecorder {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.mutated.store(true, Ordering::Release);
+                panic!("injected record panic after mutation")
+            }
+            Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    struct PanicAfterMutationControlRecorder {
+        mutations: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for PanicAfterMutationControlRecorder {
+        fn install_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> super::Result<()> {
+            self.mutations.fetch_add(1, Ordering::Release);
+            panic!("injected proof-install panic after mutation")
+        }
+
+        fn store_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> super::Result<()> {
+            self.mutations.fetch_add(1, Ordering::Release);
+            panic!("injected command-store panic after mutation")
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            panic!("injected read-only fetch panic")
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            panic!("injected read-only inspection panic")
+        }
+
+        fn inspect_record_summary(
+            &self,
+            _context: &RecorderRpcContext,
+            _slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            panic!("injected read-only summary inspection panic")
+        }
+
+        fn observe_read_fence(
+            &self,
+            _context: &RecorderRpcContext,
+            _request: ReadFenceRequest,
+        ) -> super::Result<ReadFenceObservation> {
+            panic!("injected read-only fence observation panic")
+        }
+    }
+
+    fn test_decision_proof(membership: &Membership) -> DecisionProof {
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue {
+                command_hash: LogHash::ZERO,
+                prev_hash: LogHash::ZERO,
+                entry_hash: LogHash::ZERO,
+            },
+        );
+        DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal,
+            summaries: Vec::new(),
         }
     }
 
@@ -7693,7 +15835,11 @@ mod tests {
     }
 
     impl RecorderRpc for FailingFromSlotRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             if request.slot >= self.fail_from {
                 Err(Error::ProposeFailed)
             } else {
@@ -7705,7 +15851,11 @@ mod tests {
     struct AlwaysIoRecorder;
 
     impl RecorderRpc for AlwaysIoRecorder {
-        fn record(&self, _request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            _request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             Err(Error::Io("injected recorder unavailable".into()))
         }
     }
@@ -7717,6 +15867,7 @@ mod tests {
     impl RecorderRpc for MissingCommandRecorder {
         fn fetch_command_for(
             &self,
+            _context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7724,6 +15875,31 @@ mod tests {
             _command_hash: LogHash,
         ) -> super::Result<Option<StoredCommand>> {
             self.observed.send(()).unwrap();
+            Ok(None)
+        }
+    }
+
+    struct GatedMissingCommandRecorder {
+        observed: mpsc::SyncSender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecorderRpc for GatedMissingCommandRecorder {
+        fn fetch_command_for(
+            &self,
+            _context: &RecorderRpcContext,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            self.observed.send(()).unwrap();
+            let (released, condition) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
             Ok(None)
         }
     }
@@ -7741,6 +15917,7 @@ mod tests {
     impl RecorderRpc for AvailableCommandRecorder {
         fn fetch_command_for(
             &self,
+            _context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7756,6 +15933,7 @@ mod tests {
     impl RecorderRpc for FailingCommandFetchRecorder {
         fn fetch_command_for(
             &self,
+            _context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7769,6 +15947,7 @@ mod tests {
     impl RecorderRpc for BlockingCommandRecorder {
         fn fetch_command_for(
             &self,
+            context: &RecorderRpcContext,
             _cluster_id: String,
             _epoch: u64,
             _config_id: u64,
@@ -7776,7 +15955,19 @@ mod tests {
             _command_hash: LogHash,
         ) -> super::Result<Option<StoredCommand>> {
             self.started.send(()).unwrap();
-            let _ = self.release.lock().unwrap().recv();
+            loop {
+                context.check()?;
+                match self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(5))
+                {
+                    Ok(()) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Error::RpcCancelled),
+                }
+            }
             Ok(Some(self.command.clone()))
         }
     }
@@ -7819,7 +16010,11 @@ mod tests {
     }
 
     impl RecorderRpc for CatchUpRecorder {
-        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+        fn record(
+            &self,
+            _context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
             let mut summary = record_summary(self.recorder_id, request);
             summary.step = self.step;
             Ok(summary)
@@ -7830,10 +16025,16 @@ mod tests {
     fn single_node_consensus_commits_contiguous_hash_chain() {
         let consensus = SingleNodeConsensus::new("cluster-a", 1, 1);
         let first = consensus
-            .propose(Command::new(CommandKind::Deterministic, b"first".to_vec()))
+            .propose(
+                RecorderRpcContext::default_timeout(),
+                Command::new(CommandKind::Deterministic, b"first".to_vec()),
+            )
             .unwrap();
         let second = consensus
-            .propose(Command::new(CommandKind::Deterministic, b"second".to_vec()))
+            .propose(
+                RecorderRpcContext::default_timeout(),
+                Command::new(CommandKind::Deterministic, b"second".to_vec()),
+            )
             .unwrap();
 
         assert_eq!(first.index, 1);
@@ -7879,7 +16080,10 @@ mod tests {
                 .insert((0, recorder_id.into()), ProposalPriority::from_u64(1));
         }
 
-        let DriveOutcome::Progress(progress) = consensus.drive(progress).unwrap() else {
+        let DriveOutcome::Progress(progress) = consensus
+            .drive(&RecorderRpcContext::default_timeout(), progress)
+            .unwrap()
+        else {
             panic!("phase zero quorum should advance progress");
         };
         assert!(progress.phase_zero_priorities.is_empty());
@@ -7915,13 +16119,19 @@ mod tests {
                 .with_command(command);
         progress.step = 0;
 
-        let DriveOutcome::Pending(mut progress) = consensus.drive(progress).unwrap() else {
+        let DriveOutcome::Pending(mut progress) = consensus
+            .drive(&RecorderRpcContext::default_timeout(), progress)
+            .unwrap()
+        else {
             panic!("one recorder reply should leave progress pending");
         };
         assert_eq!(progress.phase_zero_priorities.len(), 3);
         assert_eq!(source.samples.load(Ordering::Relaxed), 3);
 
-        let DriveOutcome::Pending(retry) = consensus.drive(progress.clone()).unwrap() else {
+        let DriveOutcome::Pending(retry) = consensus
+            .drive(&RecorderRpcContext::default_timeout(), progress.clone())
+            .unwrap()
+        else {
             panic!("same-round retry should remain pending");
         };
         assert_eq!(retry.phase_zero_priorities, progress.phase_zero_priorities);
@@ -7929,7 +16139,10 @@ mod tests {
 
         for round in 1..=64 {
             progress.step = round * 4;
-            let DriveOutcome::Pending(next) = consensus.drive(progress).unwrap() else {
+            let DriveOutcome::Pending(next) = consensus
+                .drive(&RecorderRpcContext::default_timeout(), progress)
+                .unwrap()
+            else {
                 panic!("one recorder reply should leave progress pending");
             };
             assert_eq!(next.phase_zero_priorities.len(), 3);
@@ -7976,7 +16189,10 @@ mod tests {
                 .insert((0, recorder_id.into()), ProposalPriority::from_u64(1));
         }
 
-        let DriveOutcome::Progress(progress) = consensus.drive(progress).unwrap() else {
+        let DriveOutcome::Progress(progress) = consensus
+            .drive(&RecorderRpcContext::default_timeout(), progress)
+            .unwrap()
+        else {
             panic!("higher recorder steps should catch progress up");
         };
         assert_eq!(progress.step, 8);
@@ -8105,6 +16321,7 @@ mod tests {
         reset_sync_counts();
         RecorderRpc::store_command_for(
             &store,
+            &RecorderRpcContext::default_timeout(),
             "cluster".into(),
             1,
             1,
@@ -8195,6 +16412,42 @@ mod tests {
             Err(Error::CommandHashMismatch)
         );
         assert!(!store.command_path(claimed_hash).exists());
+    }
+
+    #[test]
+    fn recorder_rejects_commands_over_the_documented_payload_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path().join("n1"),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let command = StoredCommand::new(
+            EntryType::Command,
+            vec![0_u8; super::MAX_REPLICATED_COMMAND_BYTES + 1],
+        );
+        assert_eq!(
+            store.store_command(command.hash(), command),
+            Err(Error::CommandTooLarge {
+                actual: super::MAX_REPLICATED_COMMAND_BYTES + 1,
+                limit: super::MAX_REPLICATED_COMMAND_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn recorder_rpc_context_distinguishes_cancellation_from_deadline_expiry() {
+        let cancelled = RecorderRpcContext::with_timeout(Duration::from_secs(1));
+        cancelled.cancel();
+        assert_eq!(cancelled.check(), Err(Error::RpcCancelled));
+
+        let expired = RecorderRpcContext::with_timeout(Duration::ZERO);
+        assert_eq!(expired.check(), Err(Error::RpcDeadlineExceeded));
     }
 
     #[test]
@@ -9647,9 +17900,15 @@ mod tests {
         let mut progress = ProposerProgress::new(1, proposal(&offered)).with_command(offered);
 
         progress.proposal = proposal(&transition);
-        consensus.ensure_progress_command(&mut progress).unwrap();
+        let context = RecorderRpcContext::default_timeout();
+        let mutation_started = AtomicBool::new(false);
+        consensus
+            .ensure_progress_command(&mut progress, &context, &mutation_started)
+            .unwrap();
         progress.proposal = proposal(&adopted);
-        consensus.ensure_progress_command(&mut progress).unwrap();
+        consensus
+            .ensure_progress_command(&mut progress, &context, &mutation_started)
+            .unwrap();
 
         assert_eq!(progress.command, Some(adopted));
         assert!(progress.transition_involved);
@@ -9717,7 +17976,12 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        assert_eq!(
+            consensus
+                .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 1)
+                .unwrap(),
+            None
+        );
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
@@ -9742,7 +18006,12 @@ mod tests {
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
         for slot in 1..=16 {
-            assert_eq!(consensus.inspect_decision_proof_at(slot).unwrap(), None);
+            assert_eq!(
+                consensus
+                    .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), slot)
+                    .unwrap(),
+                None
+            );
         }
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
@@ -9753,8 +18022,10 @@ mod tests {
 
     #[test]
     fn blocked_control_minority_does_not_delay_record_quorum() {
+        let _blocking = lock_blocking_control_tests();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let mut release = ChannelRelease::new(release_tx);
         let recorders = vec![
             (
                 "n1".into(),
@@ -9784,14 +18055,27 @@ mod tests {
         let consensus =
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let (inspection_tx, inspection_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[1].dispatch(ControlJob::InspectProof {
+                index: 1,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 1,
+                result: inspection_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(10)), Ok(1));
         let replies = consensus
             .record_broadcast(record_requests(&consensus, 1))
             .unwrap();
         assert_eq!(replies.len(), 2);
 
-        release_tx.send(()).unwrap();
+        release.release();
+        assert_eq!(
+            inspection_rx.recv_timeout(Duration::from_secs(5)),
+            Ok((1, Ok(None)))
+        );
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
@@ -9799,6 +18083,7 @@ mod tests {
     fn blocked_control_majority_does_not_head_of_line_block_read_fence() {
         let (started_tx, started_rx) = mpsc::sync_channel(2);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
         let recorders = ["n1", "n2", "n3"]
             .into_iter()
             .map(|recorder_id| {
@@ -9817,7 +18102,9 @@ mod tests {
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
         );
         let inspecting = Arc::clone(&consensus);
-        let inspection = thread::spawn(move || inspecting.inspect_decision_at(1, LogHash::ZERO));
+        let inspection = thread::spawn(move || {
+            inspecting.inspect_decision_at(&RecorderRpcContext::default_timeout(), 1, LogHash::ZERO)
+        });
         let mut started = BTreeSet::new();
         started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -9826,7 +18113,11 @@ mod tests {
         let before = Instant::now();
         assert_eq!(
             consensus
-                .inspect_context_read_fence_at(1, LogHash::ZERO)
+                .inspect_context_read_fence_at(
+                    &RecorderRpcContext::default_timeout(),
+                    1,
+                    LogHash::ZERO
+                )
                 .unwrap(),
             CertifiedDecisionInspection::Empty
         );
@@ -9844,15 +18135,20 @@ mod tests {
 
     #[test]
     fn saturated_control_queue_does_not_contaminate_later_requests() {
-        let (started_tx, started_rx) = mpsc::sync_channel(4);
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (fast_started_tx, _fast_started_rx) = mpsc::sync_channel(8);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let fast_replies = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast_replies = GateRelease::new(Arc::clone(&fast_replies));
         let recorders = vec![
             (
                 "n1".into(),
-                Box::new(SlotRecorder {
+                Box::new(ScriptedProofRecorder {
                     recorder_id: "n1",
-                    reject_slot: None,
-                    observed: None,
+                    started: fast_started_tx.clone(),
+                    gate: Some(Arc::clone(&fast_replies)),
+                    reply: Ok(None),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
@@ -9865,37 +18161,1597 @@ mod tests {
             ),
             (
                 "n3".into(),
-                Box::new(SlotRecorder {
+                Box::new(ScriptedProofRecorder {
                     recorder_id: "n3",
-                    reject_slot: None,
-                    observed: None,
+                    started: fast_started_tx,
+                    gate: Some(Arc::clone(&fast_replies)),
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let first = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                consensus.inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 1)
+            })
+        };
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)), Ok(1));
+        release_gate(&fast_replies);
+        let fast_deadline = Instant::now() + Duration::from_secs(1);
+        while ![0, 2]
+            .into_iter()
+            .all(|index| consensus.control_workers[index].is_idle())
+        {
+            assert!(
+                Instant::now() < fast_deadline,
+                "n1/n3 must finish slot 1 before their queue availability is tested at slot 3"
+            );
+            thread::yield_now();
+        }
+        let (queued_tx, queued_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[1].dispatch(ControlJob::InspectProof {
+                index: 1,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 2,
+                result: queued_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        assert_eq!(
+            consensus.control_workers[1]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            2,
+            "n2 has one running and one queued job, so slot 3 must saturate its dispatch"
+        );
+        assert_eq!(
+            consensus
+                .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 3)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            consensus.control_workers[1]
+                .state
+                .pending
+                .load(Ordering::Acquire),
+            2,
+            "the saturated slot-3 dispatch must not join n2's queue"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(None));
+        assert_eq!(
+            queued_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((1, Ok(None)))
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(
+            consensus.inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 4),
+            Ok(None)
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn command_registration_preserves_unknown_outcome_from_an_admitted_worker() {
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(UnknownCommandStoreRecorder) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"ambiguous".to_vec());
+        assert_eq!(
+            consensus.register_command(
+                &RecorderRpcContext::default_timeout(),
+                command.hash(),
+                command.payload,
+            ),
+            Err(Error::UnknownOutcome)
+        );
+    }
+
+    #[test]
+    fn install_proof_quorum_drains_a_slow_admitted_hedge() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let _release_slow = GateRelease::new(Arc::clone(&slow));
+        let recorder = |recorder_id, gate| {
+            Box::new(ScriptedInstallProofRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1", Some(Arc::clone(&fast)))),
+                    ("n2".into(), recorder("n2", Some(Arc::clone(&fast)))),
+                    ("n3".into(), recorder("n3", Some(Arc::clone(&slow)))),
+                ],
+            )
+            .unwrap(),
+        );
+        let proof = test_decision_proof(consensus.membership());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.install_decision_proof_quorum(
+                        proof,
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&fast);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&slow);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_missing_admitted_reply_after_worker_exit_is_unknown() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let _release_pause = GateRelease::new(Arc::clone(&pause));
+        let recorder = |recorder_id| {
+            Box::new(ScriptedInstallProofRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate: Some(Arc::clone(&fast)),
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1")),
+                    ("n2".into(), recorder("n2")),
+                    (
+                        "n3".into(),
+                        Box::new(SuccessfulCommandStoreRecorder) as Box<dyn RecorderRpc>,
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+        consensus.control_workers[2].pause_after_next_pop(paused_tx, Arc::clone(&pause));
+        consensus.control_workers[2].panic_after_next_pop();
+        let proof = test_decision_proof(consensus.membership());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.install_decision_proof_quorum(
+                        proof,
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap()
+            })
+        };
+        paused_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_gate(&fast);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&pause);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers[2].is_idle());
+        let queue = &consensus.control_workers[2].state.queue;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = queue
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.closed {
+            let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                panic!("n3 must publish queue closure after its Install worker panic");
+            };
+            let (next, _) = queue
+                .available
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+        drop(state);
+        let (failed_tx, _failed_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[2].dispatch(ControlJob::InstallProof {
+                index: 2,
+                context: RecorderRpcContext::default_timeout(),
+                proof: test_decision_proof(consensus.membership()),
+                membership: consensus.membership().clone(),
+                result: failed_tx,
+            }),
+            ControlDispatch::Failed
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(
+            consensus.install_decision_proof_quorum(
+                test_decision_proof(consensus.membership()),
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            ),
+            Ok(())
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_drain_miss_quarantines_before_unknown_and_survivors_recover() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let slow = Arc::new((Mutex::new(false), Condvar::new()));
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_slow = GateRelease::new(Arc::clone(&slow));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let recorder = |recorder_id, gate| {
+            Box::new(ScriptedInstallProofRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1", Some(Arc::clone(&slow)))),
+                    ("n2".into(), recorder("n2", Some(Arc::clone(&fast)))),
+                    ("n3".into(), recorder("n3", Some(Arc::clone(&fast)))),
+                ],
+            )
+            .unwrap(),
+        );
+        let root = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root),
+        );
+        let (token_tx, token_rx) = mpsc::sync_channel(1);
+        let _token = capture_next_fetch_group_token(Arc::clone(&root), token_tx);
+        let proof = test_decision_proof(consensus.membership());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.install_decision_proof_quorum(
+                        proof,
+                        &context,
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        let token = token_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        let _timeout = force_next_control_group_drain_timeout(
+            token,
+            Arc::clone(&consensus.control_workers[0].state),
+            ack_tx,
+        );
+        release_gate(&fast);
+        ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        assert!(consensus.control_workers[0]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        release_gate(&slow);
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(
+            consensus.install_decision_proof_quorum(
+                test_decision_proof(consensus.membership()),
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            ),
+            Ok(())
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_group_cleanup_cancellation_counts_as_delivery() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (entered_tx, _entered_rx) = mpsc::sync_channel(2);
+        let successful = |recorder_id| {
+            Box::new(ScriptedInstallProofRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate: None,
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            vec![
+                ("n1".into(), successful("n1")),
+                ("n2".into(), successful("n2")),
+                (
+                    "n3".into(),
+                    Box::new(BlockingControlRecorder {
+                        recorder_id: "n3",
+                        started: started_tx,
+                        release_first: Mutex::new(release_rx),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+            ],
+        )
+        .unwrap();
+        let (inspection_tx, _inspection_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[2].dispatch(ControlJob::InspectProof {
+                index: 2,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 1,
+                result: inspection_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(
+            consensus.install_decision_proof_quorum(
+                test_decision_proof(consensus.membership()),
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            ),
+            Ok(()),
+            "the pruned admitted n3 RpcCancelled must be counted as delivery, not missing-reply Unknown"
+        );
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_admission_shares_mutation_certainty_with_nested_fetch() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedInstallProofRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(()),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let budget = ControlCallBudget::new(&context).unwrap();
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook = pause_after_next_fetch_dispatch(
+            Arc::clone(&cancellation),
+            hook_tx,
+            Arc::clone(&dispatch_gate),
+        );
+        let proof = test_decision_proof(consensus.membership());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let mutation_started = Arc::clone(&mutation_started);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.install_decision_proof_quorum_with_budget(
+                        &budget,
+                        proof,
+                        &mutation_started,
+                    ))
+                    .unwrap()
+            })
+        };
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(mutation_started.load(Ordering::Acquire));
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)), Ok("n1"));
+        cancellation.store(true, Ordering::Release);
+        let value = AcceptedValue::from_command(
+            "cluster",
+            7,
+            1,
+            1,
+            LogHash::ZERO,
+            &StoredCommand::new(EntryType::Command, b"install-nested-fetch-value".to_vec()),
+        );
+        assert_eq!(
+            consensus.fetch_verified_value(7, &value, &context, &mutation_started),
+            Err(Error::UnknownOutcome)
+        );
+        release_gate(&dispatch_gate);
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_partial_admission_cancellation_drains_before_unknown() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedInstallProofRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(()),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook = pause_after_next_fetch_dispatch(
+            Arc::clone(&cancellation),
+            hook_tx,
+            Arc::clone(&dispatch_gate),
+        );
+        let proof = test_decision_proof(consensus.membership());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.install_decision_proof_quorum(
+                        proof,
+                        &context,
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap()
+            })
+        };
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)), Ok("n1"));
+        cancellation.store(true, Ordering::Release);
+        release_gate(&dispatch_gate);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_late_unknown_overrides_frozen_quorum_success() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorder = |recorder_id, gate, reply| {
+            Box::new(ScriptedInstallProofRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                reply,
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1", Some(Arc::clone(&fast)), Ok(()))),
+                    ("n2".into(), recorder("n2", Some(Arc::clone(&fast)), Ok(()))),
+                    (
+                        "n3".into(),
+                        recorder("n3", Some(Arc::clone(&late)), Err(Error::UnknownOutcome)),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        let proof = test_decision_proof(consensus.membership());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.install_decision_proof_quorum(
+                        proof,
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&fast);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn install_proof_short_deadline_admits_no_backend_work() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedInstallProofRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(()),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.install_decision_proof_quorum(
+                test_decision_proof(consensus.membership()),
+                &RecorderRpcContext::with_timeout(Duration::ZERO),
+                &AtomicBool::new(false),
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn install_proof_saturated_and_admitted_failures_are_arrival_order_independent() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |n2_reply: super::Result<()>, expected: Error| {
+            for n2_first in [true, false] {
+                let n1_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let n2_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let n3_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let _release_n1 = GateRelease::new(Arc::clone(&n1_gate));
+                let _release_n2 = GateRelease::new(Arc::clone(&n2_gate));
+                let _release_n3 = GateRelease::new(Arc::clone(&n3_gate));
+                let (n1_entered_tx, n1_entered_rx) = mpsc::sync_channel(2);
+                let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+                let recorder = |recorder_id, gate, reply| {
+                    Box::new(ScriptedInstallProofRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: Some(gate),
+                        reply,
+                    }) as Box<dyn RecorderRpc>
+                };
+                let consensus = Arc::new(
+                    ThreeNodeConsensus::from_recorders_with_ids(
+                        "cluster",
+                        "n1",
+                        1,
+                        1,
+                        vec![
+                            (
+                                "n1".into(),
+                                Box::new(ScriptedInstallProofRecorder {
+                                    recorder_id: "n1",
+                                    entered: n1_entered_tx,
+                                    gate: Some(Arc::clone(&n1_gate)),
+                                    reply: Ok(()),
+                                }) as Box<dyn RecorderRpc>,
+                            ),
+                            (
+                                "n2".into(),
+                                recorder("n2", Arc::clone(&n2_gate), n2_reply.clone()),
+                            ),
+                            (
+                                "n3".into(),
+                                recorder("n3", Arc::clone(&n3_gate), Err(Error::ProposeFailed)),
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                let occupied = test_decision_proof(consensus.membership());
+                let (occupied_tx, _occupied_rx) = mpsc::sync_channel(2);
+                assert_eq!(
+                    consensus.control_workers[0].dispatch(ControlJob::InstallProof {
+                        index: 0,
+                        context: RecorderRpcContext::default_timeout(),
+                        proof: occupied.clone(),
+                        membership: consensus.membership().clone(),
+                        result: occupied_tx.clone(),
+                    }),
+                    ControlDispatch::Accepted
+                );
+                assert_eq!(n1_entered_rx.recv_timeout(Duration::from_secs(1)), Ok("n1"));
+                assert_eq!(
+                    consensus.control_workers[0].dispatch(ControlJob::InstallProof {
+                        index: 0,
+                        context: RecorderRpcContext::default_timeout(),
+                        proof: occupied,
+                        membership: consensus.membership().clone(),
+                        result: occupied_tx,
+                    }),
+                    ControlDispatch::Accepted,
+                    "the second occupied n1 job must fill the sole queue slot"
+                );
+
+                let (result_tx, result_rx) = mpsc::sync_channel(1);
+                let caller = {
+                    let consensus = Arc::clone(&consensus);
+                    thread::spawn(move || {
+                        result_tx
+                            .send(consensus.install_decision_proof_quorum(
+                                test_decision_proof(consensus.membership()),
+                                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                                &AtomicBool::new(false),
+                            ))
+                            .unwrap()
+                    })
+                };
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(
+                    !consensus.control_workers[0].is_idle(),
+                    "n1 must remain saturated while n2/n3 reply in either order"
+                );
+                if n2_first {
+                    release_gate(&n2_gate);
+                    wait_for_control_worker_idle(&consensus.control_workers[1], "n2");
+                    assert!(!consensus.control_workers[2].is_idle());
+                    release_gate(&n3_gate);
+                } else {
+                    release_gate(&n3_gate);
+                    wait_for_control_worker_idle(&consensus.control_workers[2], "n3");
+                    assert!(!consensus.control_workers[1].is_idle());
+                    release_gate(&n2_gate);
+                }
+                assert_eq!(
+                    result_rx.recv_timeout(Duration::from_secs(1)),
+                    Ok(Err(expected.clone()))
+                );
+                caller.join().unwrap();
+                release_gate(&n1_gate);
+                assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            }
+        };
+        run(Ok(()), Error::NoQuorum);
+        run(
+            Err(Error::Io("ordinary install failure".into())),
+            Error::ProposeFailed,
+        );
+    }
+
+    #[test]
+    fn install_proof_preclosed_worker_is_arrival_order_independent() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |n2_reply: super::Result<()>| {
+            for n2_first in [true, false] {
+                let n2_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let n3_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let _release_n2 = GateRelease::new(Arc::clone(&n2_gate));
+                let _release_n3 = GateRelease::new(Arc::clone(&n3_gate));
+                let (n1_entered_tx, _n1_entered_rx) = mpsc::sync_channel(1);
+                let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+                let recorder = |recorder_id, gate, reply| {
+                    Box::new(ScriptedInstallProofRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: Some(gate),
+                        reply,
+                    }) as Box<dyn RecorderRpc>
+                };
+                let consensus = Arc::new(
+                    ThreeNodeConsensus::from_recorders_with_ids(
+                        "cluster",
+                        "n1",
+                        1,
+                        1,
+                        vec![
+                            (
+                                "n1".into(),
+                                Box::new(ScriptedInstallProofRecorder {
+                                    recorder_id: "n1",
+                                    entered: n1_entered_tx,
+                                    gate: None,
+                                    reply: Ok(()),
+                                }) as Box<dyn RecorderRpc>,
+                            ),
+                            (
+                                "n2".into(),
+                                recorder("n2", Arc::clone(&n2_gate), n2_reply.clone()),
+                            ),
+                            (
+                                "n3".into(),
+                                recorder("n3", Arc::clone(&n3_gate), Err(Error::ProposeFailed)),
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                consensus.control_workers[0].state.close_and_drain();
+
+                let (result_tx, result_rx) = mpsc::sync_channel(1);
+                let caller = {
+                    let consensus = Arc::clone(&consensus);
+                    thread::spawn(move || {
+                        result_tx
+                            .send(consensus.install_decision_proof_quorum(
+                                test_decision_proof(consensus.membership()),
+                                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                                &AtomicBool::new(false),
+                            ))
+                            .unwrap()
+                    })
+                };
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                if n2_first {
+                    release_gate(&n2_gate);
+                    wait_for_control_worker_idle(&consensus.control_workers[1], "n2");
+                    assert!(!consensus.control_workers[2].is_idle());
+                    release_gate(&n3_gate);
+                } else {
+                    release_gate(&n3_gate);
+                    wait_for_control_worker_idle(&consensus.control_workers[2], "n3");
+                    assert!(!consensus.control_workers[1].is_idle());
+                    release_gate(&n2_gate);
+                }
+                assert_eq!(
+                    result_rx.recv_timeout(Duration::from_secs(1)),
+                    Ok(Err(Error::ProposeFailed))
+                );
+                caller.join().unwrap();
+                assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            }
+        };
+        run(Ok(()));
+        run(Err(Error::Io("ordinary install failure".into())));
+    }
+
+    #[test]
+    fn store_command_saturated_and_admitted_failures_are_arrival_order_independent() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |n2_reply: super::Result<()>, expected: Error| {
+            for n2_first in [true, false] {
+                let (n1_started_tx, n1_started_rx) = mpsc::sync_channel(2);
+                let n1_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let n2_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let n3_gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let _release_n1 = GateRelease::new(Arc::clone(&n1_gate));
+                let _release_n2 = GateRelease::new(Arc::clone(&n2_gate));
+                let _release_n3 = GateRelease::new(Arc::clone(&n3_gate));
+                let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+                let recorder = |recorder_id, gate, reply| {
+                    Box::new(ScriptedCommandStoreRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: Some(gate),
+                        reply,
+                    }) as Box<dyn RecorderRpc>
+                };
+                let consensus = Arc::new(
+                    ThreeNodeConsensus::from_recorders_with_ids(
+                        "cluster",
+                        "n1",
+                        1,
+                        1,
+                        vec![
+                            (
+                                "n1".into(),
+                                Box::new(BlockingCommandStoreRecorder {
+                                    started: n1_started_tx,
+                                    release: Arc::clone(&n1_gate),
+                                }) as Box<dyn RecorderRpc>,
+                            ),
+                            (
+                                "n2".into(),
+                                recorder("n2", Arc::clone(&n2_gate), n2_reply.clone()),
+                            ),
+                            (
+                                "n3".into(),
+                                recorder("n3", Arc::clone(&n3_gate), Err(Error::ProposeFailed)),
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                let occupied = StoredCommand::new(EntryType::Command, b"occupy-store".to_vec());
+                let (occupied_tx, _occupied_rx) = mpsc::sync_channel(2);
+                assert_eq!(
+                    consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
+                        index: 0,
+                        context: RecorderRpcContext::default_timeout(),
+                        cluster_id: "cluster".into(),
+                        epoch: 1,
+                        config_id: 1,
+                        config_digest: consensus.membership().digest(),
+                        command_hash: occupied.hash(),
+                        command: occupied.clone(),
+                        result: occupied_tx.clone(),
+                    }),
+                    ControlDispatch::Accepted
+                );
+                n1_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(
+                    consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
+                        index: 0,
+                        context: RecorderRpcContext::default_timeout(),
+                        cluster_id: "cluster".into(),
+                        epoch: 1,
+                        config_id: 1,
+                        config_digest: consensus.membership().digest(),
+                        command_hash: occupied.hash(),
+                        command: occupied.clone(),
+                        result: occupied_tx.clone(),
+                    }),
+                    ControlDispatch::Accepted
+                );
+
+                let command = StoredCommand::new(EntryType::Command, b"order-store".to_vec());
+                let (result_tx, result_rx) = mpsc::sync_channel(1);
+                let caller = {
+                    let consensus = Arc::clone(&consensus);
+                    thread::spawn(move || {
+                        result_tx
+                            .send(consensus.register_command(
+                                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                                command.hash(),
+                                command.payload,
+                            ))
+                            .unwrap()
+                    })
+                };
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(!consensus.control_workers[1].is_idle());
+                assert!(!consensus.control_workers[2].is_idle());
+                if n2_first {
+                    release_gate(&n2_gate);
+                    wait_for_control_worker_idle(&consensus.control_workers[1], "n2");
+                    assert!(
+                        !consensus.control_workers[2].is_idle(),
+                        "n3 must remain blocked until its designated second release"
+                    );
+                    release_gate(&n3_gate);
+                } else {
+                    release_gate(&n3_gate);
+                    wait_for_control_worker_idle(&consensus.control_workers[2], "n3");
+                    assert!(
+                        !consensus.control_workers[1].is_idle(),
+                        "n2 must remain blocked until its designated second release"
+                    );
+                    release_gate(&n2_gate);
+                }
+                assert_eq!(
+                    result_rx.recv_timeout(Duration::from_secs(1)),
+                    Ok(Err(expected.clone()))
+                );
+                caller.join().unwrap();
+                release_gate(&n1_gate);
+                assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            }
+        };
+        run(Ok(()), Error::NoQuorum);
+        run(
+            Err(Error::Io("ordinary store failure".into())),
+            Error::ProposeFailed,
+        );
+    }
+
+    #[test]
+    fn store_command_preclosed_worker_is_arrival_order_independent() {
+        let _blocking = lock_blocking_control_tests();
+        for n2_first in [true, false] {
+            let n2_gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let n3_gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_n2 = GateRelease::new(Arc::clone(&n2_gate));
+            let _release_n3 = GateRelease::new(Arc::clone(&n3_gate));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+            let recorder = |recorder_id, gate, reply| {
+                Box::new(ScriptedCommandStoreRecorder {
+                    recorder_id,
+                    entered: entered_tx.clone(),
+                    gate: Some(gate),
+                    reply,
+                }) as Box<dyn RecorderRpc>
+            };
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids(
+                    "cluster",
+                    "n1",
+                    1,
+                    1,
+                    vec![
+                        (
+                            "n1".into(),
+                            Box::new(SuccessfulCommandStoreRecorder) as Box<dyn RecorderRpc>,
+                        ),
+                        ("n2".into(), recorder("n2", Arc::clone(&n2_gate), Ok(()))),
+                        (
+                            "n3".into(),
+                            recorder("n3", Arc::clone(&n3_gate), Err(Error::ProposeFailed)),
+                        ),
+                    ],
+                )
+                .unwrap(),
+            );
+            consensus.control_workers[0].state.close_and_drain();
+
+            let command = StoredCommand::new(EntryType::Command, b"closed-order-store".to_vec());
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.register_command(
+                            &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                            command.hash(),
+                            command.payload,
+                        ))
+                        .unwrap()
+                })
+            };
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(!consensus.control_workers[1].is_idle());
+            assert!(!consensus.control_workers[2].is_idle());
+            if n2_first {
+                release_gate(&n2_gate);
+                wait_for_control_worker_idle(&consensus.control_workers[1], "n2");
+                assert!(
+                    !consensus.control_workers[2].is_idle(),
+                    "n3 must remain blocked until its designated second release"
+                );
+                release_gate(&n3_gate);
+            } else {
+                release_gate(&n3_gate);
+                wait_for_control_worker_idle(&consensus.control_workers[2], "n3");
+                assert!(
+                    !consensus.control_workers[1].is_idle(),
+                    "n2 must remain blocked until its designated second release"
+                );
+                release_gate(&n2_gate);
+            }
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(Err(Error::ProposeFailed))
+            );
+            caller.join().unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn store_command_quorum_drains_a_slow_admitted_hedge() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let _release_slow = GateRelease::new(Arc::clone(&slow));
+        let recorder = |recorder_id, gate| {
+            Box::new(ScriptedCommandStoreRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1", Some(Arc::clone(&fast)))),
+                    ("n2".into(), recorder("n2", Some(Arc::clone(&fast)))),
+                    ("n3".into(), recorder("n3", Some(Arc::clone(&slow)))),
+                ],
+            )
+            .unwrap(),
+        );
+        let command = StoredCommand::new(EntryType::Command, b"store-drain".to_vec());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.register_command(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        command.hash(),
+                        command.payload,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&fast);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&slow);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn store_command_missing_admitted_reply_after_worker_exit_is_unknown() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let _release_pause = GateRelease::new(Arc::clone(&pause));
+        let fast_recorder = |recorder_id| {
+            Box::new(ScriptedCommandStoreRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate: Some(Arc::clone(&fast)),
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), fast_recorder("n1")),
+                    ("n2".into(), fast_recorder("n2")),
+                    (
+                        "n3".into(),
+                        Box::new(SuccessfulCommandStoreRecorder) as Box<dyn RecorderRpc>,
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+        consensus.control_workers[2].pause_after_next_pop(paused_tx, Arc::clone(&pause));
+        consensus.control_workers[2].panic_after_next_pop();
+
+        let command = StoredCommand::new(EntryType::Command, b"store-missing-reply".to_vec());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.register_command(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        command.hash(),
+                        command.payload,
+                    ))
+                    .unwrap()
+            })
+        };
+
+        paused_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_gate(&fast);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&pause);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.control_workers[2].is_idle());
+        let queue = &consensus.control_workers[2].state.queue;
+        let closed_deadline = Instant::now() + Duration::from_secs(1);
+        let mut queue_state = queue
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !queue_state.closed {
+            let Some(wait) = closed_deadline.checked_duration_since(Instant::now()) else {
+                panic!("n3 worker exit must publish its closed queue before dispatch is checked");
+            };
+            let (next, _) = queue
+                .available
+                .wait_timeout(queue_state, wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue_state = next;
+        }
+        drop(queue_state);
+        let (failed_tx, _failed_rx) = mpsc::sync_channel(1);
+        let rejected = StoredCommand::new(EntryType::Command, b"closed-worker".to_vec());
+        assert_eq!(
+            consensus.control_workers[2].dispatch(ControlJob::StoreCommand {
+                index: 2,
+                context: RecorderRpcContext::default_timeout(),
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: consensus.membership().digest(),
+                command_hash: rejected.hash(),
+                command: rejected,
+                result: failed_tx,
+            }),
+            ControlDispatch::Failed
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+
+        let retry = StoredCommand::new(EntryType::Command, b"store-survivor-retry".to_vec());
+        assert_eq!(
+            consensus.register_command(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                retry.hash(),
+                retry.payload,
+            ),
+            Ok(())
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn store_command_late_unknown_overrides_frozen_quorum_success() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorder = |recorder_id, gate, reply| {
+            Box::new(ScriptedCommandStoreRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                reply,
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1", Some(Arc::clone(&fast)), Ok(()))),
+                    ("n2".into(), recorder("n2", Some(Arc::clone(&fast)), Ok(()))),
+                    (
+                        "n3".into(),
+                        recorder("n3", Some(Arc::clone(&late)), Err(Error::UnknownOutcome)),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        let command = StoredCommand::new(EntryType::Command, b"store-late-unknown".to_vec());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.register_command(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        command.hash(),
+                        command.payload,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&fast);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn store_command_group_cleanup_cancellation_does_not_overwrite_quorum_success() {
+        let _blocking = lock_blocking_control_tests();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(SuccessfulCommandStoreRecorder) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(SuccessfulCommandStoreRecorder) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(BlockingControlRecorder {
+                    recorder_id: "n3",
+                    started: started_tx,
+                    release_first: Mutex::new(release_rx),
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
         let consensus =
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
-
-        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        let (inspection_tx, _inspection_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[2].dispatch(ControlJob::InspectProof {
+                index: 2,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 1,
+                result: inspection_tx,
+            }),
+            ControlDispatch::Accepted
+        );
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
-        assert_eq!(consensus.inspect_decision_proof_at(2).unwrap(), None);
-        assert_eq!(consensus.inspect_decision_proof_at(3).unwrap(), None);
-
+        let command = StoredCommand::new(EntryType::Command, b"store-cleanup-cancel".to_vec());
+        assert_eq!(
+            consensus.register_command(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                command.hash(),
+                command.payload,
+            ),
+            Ok(()),
+            "the pruned admitted n3 cleanup cancellation must count as a reply, not leave a missing-reply Unknown"
+        );
         release_tx.send(()).unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
-        assert!(matches!(
-            started_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+    }
 
-        assert_eq!(consensus.inspect_decision_proof_at(4).unwrap(), None);
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(4));
+    #[test]
+    fn store_command_partial_admission_cancellation_drains_before_unknown() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedCommandStoreRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(()),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook = pause_after_next_fetch_dispatch(
+            Arc::clone(&cancellation),
+            hook_tx,
+            Arc::clone(&dispatch_gate),
+        );
+        let command = StoredCommand::new(EntryType::Command, b"store-cancel".to_vec());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.register_command(&context, command.hash(), command.payload))
+                    .unwrap()
+            })
+        };
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)), Ok("n1"));
+        cancellation.store(true, Ordering::Release);
+        release_gate(&dispatch_gate);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn store_command_admission_shares_mutation_certainty_with_nested_fetch() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedCommandStoreRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(()),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let budget = ControlCallBudget::new(&context).unwrap();
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook = pause_after_next_fetch_dispatch(
+            Arc::clone(&cancellation),
+            hook_tx,
+            Arc::clone(&dispatch_gate),
+        );
+        let command = StoredCommand::new(EntryType::Command, b"store-nested-fetch".to_vec());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let mutation_started = Arc::clone(&mutation_started);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.store_command_on_quorum_with_budget(
+                        &budget,
+                        &mutation_started,
+                        command.hash(),
+                        &command,
+                    ))
+                    .unwrap()
+            })
+        };
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(mutation_started.load(Ordering::Acquire));
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)), Ok("n1"));
+        cancellation.store(true, Ordering::Release);
+        let value = AcceptedValue::from_command(
+            "cluster",
+            7,
+            1,
+            1,
+            LogHash::ZERO,
+            &StoredCommand::new(EntryType::Command, b"nested-fetch-value".to_vec()),
+        );
+        assert_eq!(
+            consensus.fetch_verified_value(7, &value, &context, &mutation_started),
+            Err(Error::UnknownOutcome)
+        );
+        release_gate(&dispatch_gate);
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn store_command_short_deadline_admits_no_backend_work() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedCommandStoreRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(()),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"store-short".to_vec());
+        assert_eq!(
+            consensus.register_command(
+                &RecorderRpcContext::with_timeout(Duration::ZERO),
+                command.hash(),
+                command.payload,
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn store_command_drain_miss_quarantines_before_unknown_and_survivors_recover() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let slow = Arc::new((Mutex::new(false), Condvar::new()));
+        let fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_slow = GateRelease::new(Arc::clone(&slow));
+        let _release_fast = GateRelease::new(Arc::clone(&fast));
+        let recorder = |recorder_id, gate| {
+            Box::new(ScriptedCommandStoreRecorder {
+                recorder_id,
+                entered: entered_tx.clone(),
+                gate,
+                reply: Ok(()),
+            }) as Box<dyn RecorderRpc>
+        };
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), recorder("n1", Some(Arc::clone(&slow)))),
+                    ("n2".into(), recorder("n2", Some(Arc::clone(&fast)))),
+                    ("n3".into(), recorder("n3", Some(Arc::clone(&fast)))),
+                ],
+            )
+            .unwrap(),
+        );
+        let root = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root),
+        );
+        let (token_tx, token_rx) = mpsc::sync_channel(1);
+        let _token = capture_next_fetch_group_token(Arc::clone(&root), token_tx);
+        let command = StoredCommand::new(EntryType::Command, b"store-drain-miss".to_vec());
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.register_command(&context, command.hash(), command.payload))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        let group_token = token_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        let _timeout = force_next_control_group_drain_timeout(
+            group_token,
+            Arc::clone(&consensus.control_workers[0].state),
+            ack_tx,
+        );
+        release_gate(&fast);
+        ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(Error::UnknownOutcome))
+        );
+        assert!(consensus.control_workers[0]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        release_gate(&slow);
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        let retry = StoredCommand::new(EntryType::Command, b"store-after-drain-miss".to_vec());
+        assert_eq!(
+            consensus.register_command(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                retry.hash(),
+                retry.payload,
+            ),
+            Ok(())
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
     #[test]
     fn command_registration_returns_no_quorum_when_all_control_queues_are_full() {
         let (started_tx, started_rx) = mpsc::sync_channel(3);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
         let recorders = ["n1", "n2", "n3"]
             .into_iter()
             .map(|recorder_id| {
@@ -9915,8 +19771,13 @@ mod tests {
         let registering = Arc::clone(&consensus);
         let first_hash = first.hash();
         let first_payload = first.payload.clone();
-        let registration =
-            thread::spawn(move || registering.register_command(first_hash, first_payload));
+        let registration = thread::spawn(move || {
+            registering.register_command(
+                &RecorderRpcContext::default_timeout(),
+                first_hash,
+                first_payload,
+            )
+        });
 
         for _ in 0..3 {
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -9927,6 +19788,7 @@ mod tests {
         for (index, worker) in consensus.control_workers.iter().enumerate() {
             worker.dispatch(ControlJob::StoreCommand {
                 index,
+                context: RecorderRpcContext::default_timeout(),
                 cluster_id: "cluster".into(),
                 epoch: 1,
                 config_id: 1,
@@ -9939,7 +19801,11 @@ mod tests {
 
         let saturated = StoredCommand::new(EntryType::Command, b"saturated".to_vec());
         assert_eq!(
-            consensus.register_command(saturated.hash(), saturated.payload),
+            consensus.register_command(
+                &RecorderRpcContext::default_timeout(),
+                saturated.hash(),
+                saturated.payload,
+            ),
             Err(Error::NoQuorum)
         );
 
@@ -9954,6 +19820,7 @@ mod tests {
     fn saturated_control_worker_keeps_command_quorum_retryable_after_worker_failure() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
         let recorders = vec![
             (
                 "n1".into(),
@@ -9976,14 +19843,20 @@ mod tests {
         );
         let first = StoredCommand::new(EntryType::Command, b"first".to_vec());
         let registering = Arc::clone(&consensus);
-        let registration =
-            thread::spawn(move || registering.register_command(first.hash(), first.payload));
+        let registration = thread::spawn(move || {
+            registering.register_command(
+                &RecorderRpcContext::default_timeout(),
+                first.hash(),
+                first.payload,
+            )
+        });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let queued = StoredCommand::new(EntryType::Command, b"queued".to_vec());
         let (queued_tx, _queued_rx) = mpsc::sync_channel(1);
         consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
             index: 0,
+            context: RecorderRpcContext::default_timeout(),
             cluster_id: "cluster".into(),
             epoch: 1,
             config_id: 1,
@@ -9995,7 +19868,11 @@ mod tests {
 
         let retry = StoredCommand::new(EntryType::Command, b"retry".to_vec());
         assert_eq!(
-            consensus.register_command(retry.hash(), retry.payload),
+            consensus.register_command(
+                &RecorderRpcContext::default_timeout(),
+                retry.hash(),
+                retry.payload,
+            ),
             Err(Error::NoQuorum)
         );
 
@@ -10008,6 +19885,7 @@ mod tests {
 
     #[test]
     fn control_worker_finish_and_drop_are_bounded() {
+        let _blocking = lock_blocking_control_tests();
         let new_consensus = || {
             let (started_tx, started_rx) = mpsc::sync_channel(1);
             let (release_tx, release_rx) = mpsc::sync_channel(0);
@@ -10046,9 +19924,19 @@ mod tests {
         };
 
         let (consensus, started_rx, release_tx) = new_consensus();
+        let mut release = ChannelRelease::new(release_tx);
         let consensus = Arc::new(consensus);
-        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let (inspection_tx, inspection_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            consensus.control_workers[1].dispatch(ControlJob::InspectProof {
+                index: 1,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 1,
+                result: inspection_tx,
+            }),
+            ControlDispatch::Accepted
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(10)), Ok(1));
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let finishing = Arc::clone(&consensus);
         let finisher = thread::spawn(move || {
@@ -10056,34 +19944,100 @@ mod tests {
                 .send(finishing.finish_pending_rpcs(Duration::from_millis(10)))
                 .unwrap();
         });
-        assert_eq!(finished_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        assert_eq!(finished_rx.recv_timeout(Duration::from_secs(5)), Ok(false));
         finisher.join().unwrap();
-        release_tx.send(()).unwrap();
+        release.release();
+        assert_eq!(
+            inspection_rx.recv_timeout(Duration::from_secs(5)),
+            Ok((1, Ok(None)))
+        );
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
-        let (consensus, started_rx, release_tx) = new_consensus();
-        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
-        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
-        let dropper = thread::spawn(move || {
-            drop(consensus);
-            dropped_tx.send(()).unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let mut release = ChannelRelease::new(release_tx);
+        let mut worker = ControlWorker::spawn(Arc::new(BlockingControlRecorder {
+            recorder_id: "n2",
+            started: started_tx,
+            release_first: Mutex::new(release_rx),
+        }))
+        .unwrap();
+        let state = Arc::clone(&worker.state);
+        let (seam_entered_tx, seam_entered_rx) = mpsc::sync_channel(1);
+        let (seam_release_tx, seam_release_rx) = mpsc::sync_channel(0);
+        let (result_tx, _result_rx) = mpsc::sync_channel(1);
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            let idle_transition = worker.shutdown_after_stale_idle_observation(|| {
+                seam_entered_tx.send(()).unwrap();
+                seam_release_rx.recv().unwrap();
+            });
+            shutdown_done_tx.send(idle_transition).unwrap();
         });
+        assert_eq!(seam_entered_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+
+        // This uses the exact admission function that normal worker dispatch
+        // uses. It is now definitely between the shutdown seam and close.
         assert_eq!(
-            dropped_rx.recv_timeout(Duration::from_millis(10)),
-            Err(mpsc::RecvTimeoutError::Timeout)
+            ControlWorker::dispatch_inner(
+                &state,
+                ControlJob::InspectProof {
+                    index: 1,
+                    context: RecorderRpcContext::default_timeout(),
+                    slot: 1,
+                    result: result_tx,
+                },
+                None,
+                None,
+                None,
+            ),
+            ControlDispatch::Accepted
         );
-        release_tx.send(()).unwrap();
-        assert_eq!(dropped_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
-        dropper.join().unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(10)), Ok(1));
+        seam_release_tx.send(()).unwrap();
+        // A stale pre-close idle snapshot would make shutdown join the blocked
+        // RPC here. The post-close snapshot instead chooses bounded detach.
+        assert_eq!(
+            shutdown_done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok((true, false))
+        );
+        release.release();
+        shutdown.join().unwrap();
     }
 
     #[test]
-    fn saturated_minority_queue_does_not_delay_or_contaminate_later_broadcasts() {
+    fn idle_file_recorders_release_root_locks_before_consensus_drop_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [
+            root.path().join("recorders/n1"),
+            root.path().join("recorders/n2"),
+            root.path().join("recorders/n3"),
+        ];
+        let consensus = ThreeNodeConsensus::from_recovered_tip(
+            "cluster",
+            "n1",
+            1,
+            1,
+            roots.clone(),
+            1,
+            LogHash::ZERO,
+        )
+        .unwrap();
+
+        // Drop is the lifecycle boundary: reopening the exact same recorder
+        // roots immediately proves that every idle record/control worker gave
+        // up its RecorderFileStore ownership before it returned.
+        drop(consensus);
+        let reopened =
+            ThreeNodeConsensus::from_recovered_tip("cluster", "n1", 1, 1, roots, 1, LogHash::ZERO);
+        assert!(reopened.is_ok());
+    }
+
+    #[test]
+    fn cooperative_record_hedge_is_reclaimed_without_contaminating_later_broadcasts() {
         let (started_tx, started_rx) = mpsc::sync_channel(2);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (_release_tx, release_rx) = mpsc::sync_channel(0);
         let (n1_seen_tx, n1_seen_rx) = mpsc::sync_channel(1);
-        let (reject_seen_tx, reject_seen_rx) = mpsc::sync_channel(1);
         let recorders = vec![
             (
                 "n1".into(),
@@ -10105,8 +20059,8 @@ mod tests {
                 "n3".into(),
                 Box::new(SlotRecorder {
                     recorder_id: "n3",
-                    reject_slot: Some(2),
-                    observed: Some(reject_seen_tx),
+                    reject_slot: None,
+                    observed: None,
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
@@ -10120,51 +20074,26 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
         assert_eq!(n1_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
-        assert_eq!(reject_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
 
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let second_consensus = Arc::clone(&consensus);
-        let second = thread::spawn(move || {
-            done_tx
-                .send(second_consensus.record_broadcast(record_requests(&second_consensus, 2)))
-                .unwrap();
-        });
-        assert_eq!(reject_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        let second = consensus
+            .record_broadcast(record_requests(&consensus, 2))
+            .unwrap();
         assert_eq!(n1_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
-        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|reply| reply.slot == 2));
 
-        let (third_done_tx, third_done_rx) = mpsc::sync_channel(1);
-        let third_consensus = Arc::clone(&consensus);
-        let third = thread::spawn(move || {
-            third_done_tx
-                .send(third_consensus.record_broadcast(record_requests(&third_consensus, 3)))
-                .unwrap();
-        });
-        let third_replies = third_done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
+        let third_replies = consensus
+            .record_broadcast(record_requests(&consensus, 3))
             .unwrap();
-        assert_eq!(third_replies.len(), 2);
+        assert!(third_replies.len() >= 2);
         assert!(third_replies.iter().all(|reply| reply.slot == 3));
-
-        release_tx.send(()).unwrap();
-
-        let replies = done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
-        assert_eq!(replies.len(), 2);
-        assert!(replies.iter().all(|reply| reply.slot == 2));
-        assert!(replies.iter().any(|reply| reply.recorder_id == "n2"));
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
-        second.join().unwrap();
-        third.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
     #[test]
-    fn saturated_recorder_keeps_a_minority_rejection_retryable() {
-        let (started_tx, started_rx) = mpsc::sync_channel(2);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
+    fn reclaimed_record_hedge_stays_retryable_across_two_hundred_operations() {
+        let (started_tx, started_rx) = mpsc::sync_channel(512);
+        let (_release_tx, release_rx) = mpsc::sync_channel(0);
         let recorders = vec![
             (
                 "n1".into(),
@@ -10184,9 +20113,10 @@ mod tests {
             ),
             (
                 "n3".into(),
-                Box::new(RejectFromSlotRecorder {
+                Box::new(SlotRecorder {
                     recorder_id: "n3",
-                    reject_from: 3,
+                    reject_slot: None,
+                    observed: None,
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
@@ -10209,32 +20139,28 @@ mod tests {
             2
         );
 
-        let failure = (3..=514).find_map(|slot| {
+        let failure = (3..=202).find_map(|slot| {
             let result = consensus.record_broadcast(record_requests(&consensus, slot));
             match &result {
                 Ok(replies)
-                    if replies.len() == 1
-                        && replies[0].recorder_id == "n1"
-                        && replies[0].slot == slot =>
+                    if replies.len() >= 2 && replies.iter().all(|reply| reply.slot == slot) =>
                 {
                     None
                 }
                 _ => Some((slot, result)),
             }
         });
-        release_tx.send(()).unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
         assert!(
             failure.is_none(),
-            "a saturated recorder must keep minority rejection retryable: {failure:?}"
+            "a reclaimed recorder hedge must stay retryable: {failure:?}"
         );
     }
 
     #[test]
     fn saturated_recorder_keeps_quorum_reachable_when_another_worker_fails() {
         let (started_tx, started_rx) = mpsc::sync_channel(2);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (_release_tx, release_rx) = mpsc::sync_channel(0);
         let recorders = vec![
             (
                 "n1".into(),
@@ -10281,33 +20207,36 @@ mod tests {
 
         let third = consensus.record_broadcast(record_requests(&consensus, 3));
         assert!(
-            matches!(third, Ok(ref replies) if replies.len() == 1 && replies[0].recorder_id == "n3"),
-            "a saturated healthy voter must keep the quorum retryable after a worker failure: {third:?}"
+            matches!(third, Ok(ref replies) if replies.len() == 2
+                && replies.iter().any(|reply| reply.recorder_id == "n1")
+                && replies.iter().any(|reply| reply.recorder_id == "n3")),
+            "a reclaimed healthy hedge must keep the quorum retryable after a worker failure: {third:?}"
         );
-
-        release_tx.send(()).unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
     }
 
     #[test]
-    fn command_lookup_waits_for_valid_reply_after_quorum_reports_missing() {
+    fn command_lookup_drain_does_not_improve_a_frozen_missing_candidate() {
         let command = StoredCommand::new(EntryType::Command, b"available".to_vec());
         let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
         let (observed_tx, observed_rx) = mpsc::sync_channel(2);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (_release_tx, release_rx) = mpsc::sync_channel(0);
+        let missing_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_missing = GateRelease::new(Arc::clone(&missing_gate));
         let recorders = vec![
             (
                 "n1".into(),
-                Box::new(MissingCommandRecorder {
+                Box::new(GatedMissingCommandRecorder {
                     observed: observed_tx.clone(),
+                    gate: Arc::clone(&missing_gate),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
                 "n2".into(),
-                Box::new(MissingCommandRecorder {
+                Box::new(GatedMissingCommandRecorder {
                     observed: observed_tx,
+                    gate: Arc::clone(&missing_gate),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
@@ -10319,26 +20248,1001 @@ mod tests {
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
-        let consensus =
-            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
         let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let fetching = Arc::clone(&consensus);
         let fetch = thread::spawn(move || {
             done_tx
-                .send(consensus.fetch_verified_value(7, &value))
+                .send(fetching.fetch_verified_value(
+                    7,
+                    &value,
+                    &RecorderRpcContext::default_timeout(),
+                    &AtomicBool::new(false),
+                ))
                 .unwrap();
         });
 
         assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
         assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        release_gate(&missing_gate);
         assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
-        release_tx.send(()).unwrap();
         assert_eq!(
             done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Ok(Some(command))
+            Ok(None)
         );
         fetch.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fetch_partial_admission_cancellation_drains_the_admitted_job() {
+        let _blocking = lock_blocking_control_tests();
+        let command = StoredCommand::new(EntryType::Command, b"fetch-cancel".to_vec());
+        let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedFetchRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook = pause_after_next_fetch_dispatch(
+            Arc::clone(&cancellation),
+            hook_tx,
+            Arc::clone(&dispatch_gate),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.fetch_verified_value(
+                        7,
+                        &value,
+                        &context,
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap()
+            })
+        };
+
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "n1"
+        );
+        cancellation.store(true, Ordering::Release);
+        release_gate(&dispatch_gate);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcCancelled)
+        );
+        caller.join().unwrap();
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fetch_late_unknown_or_invalid_evidence_beats_a_frozen_command() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |late_reply: super::Result<Option<StoredCommand>>, expected: Error| {
+            let command = StoredCommand::new(EntryType::Command, b"fetch-proof".to_vec());
+            let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+            let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+            let early = Arc::new((Mutex::new(false), Condvar::new()));
+            let late = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_early = GateRelease::new(Arc::clone(&early));
+            let _release_late = GateRelease::new(Arc::clone(&late));
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(ScriptedFetchRecorder {
+                        recorder_id: "n1",
+                        entered: entered_tx.clone(),
+                        gate: Some(Arc::clone(&early)),
+                        reply: Ok(Some(command.clone())),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(ScriptedFetchRecorder {
+                        recorder_id: "n2",
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(ScriptedFetchRecorder {
+                        recorder_id: "n3",
+                        entered: entered_tx,
+                        gate: Some(Arc::clone(&late)),
+                        reply: late_reply,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.fetch_verified_value(
+                            7,
+                            &value,
+                            &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                            &AtomicBool::new(false),
+                        ))
+                        .unwrap()
+                })
+            };
+            for _ in 0..3 {
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            release_gate(&early);
+            assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+            release_gate(&late);
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Err(expected)
+            );
+            caller.join().unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+        run(Err(Error::UnknownOutcome), Error::UnknownOutcome);
+        run(
+            Ok(Some(StoredCommand::new(
+                EntryType::Command,
+                b"wrong-hash".to_vec(),
+            ))),
+            Error::CommandHashMismatch,
+        );
+    }
+
+    #[test]
+    fn fetch_root_context_errors_are_exact_before_mutation_and_unknown_after() {
+        let command = StoredCommand::new(EntryType::Command, b"fetch-context".to_vec());
+        let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+        let make_consensus = || {
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ScriptedFetchRecorder {
+                            recorder_id,
+                            entered: entered_tx.clone(),
+                            gate: None,
+                            reply: Ok(None),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap()
+        };
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let cancelled = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        assert_eq!(
+            make_consensus().fetch_verified_value(7, &value, &cancelled, &AtomicBool::new(false)),
+            Err(Error::RpcCancelled)
+        );
+        assert_eq!(
+            make_consensus().fetch_verified_value(7, &value, &cancelled, &AtomicBool::new(true)),
+            Err(Error::UnknownOutcome)
+        );
+        let expired = RecorderRpcContext::with_timeout(Duration::ZERO);
+        assert_eq!(
+            make_consensus().fetch_verified_value(7, &value, &expired, &AtomicBool::new(false)),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert_eq!(
+            make_consensus().fetch_verified_value(7, &value, &expired, &AtomicBool::new(true)),
+            Err(Error::UnknownOutcome)
+        );
+    }
+
+    #[test]
+    fn fetch_short_deadline_admits_no_backend_work() {
+        let command = StoredCommand::new(EntryType::Command, b"fetch-short".to_vec());
+        let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedFetchRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.fetch_verified_value(
+                7,
+                &value,
+                &RecorderRpcContext::with_timeout(Duration::ZERO),
+                &AtomicBool::new(false),
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn read_fence_quorum_drains_late_unknown_and_later_occupied_evidence() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |late_reply: super::Result<ReadFenceSlotState>,
+                   expected: super::Result<CertifiedDecisionInspection>| {
+            let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+            let early = Arc::new((Mutex::new(false), Condvar::new()));
+            let late = Arc::new((Mutex::new(false), Condvar::new()));
+            let _release_early = GateRelease::new(Arc::clone(&early));
+            let _release_late = GateRelease::new(Arc::clone(&late));
+            let recorder = |recorder_id, gate, reply| {
+                Box::new(ScriptedFenceRecorder {
+                    recorder_id,
+                    entered: entered_tx.clone(),
+                    gate,
+                    reply,
+                }) as Box<dyn RecorderRpc>
+            };
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    recorder(
+                        "n1",
+                        Some(Arc::clone(&early)),
+                        Ok(ReadFenceSlotState::Empty),
+                    ),
+                ),
+                (
+                    "n2".into(),
+                    recorder(
+                        "n2",
+                        Some(Arc::clone(&early)),
+                        Ok(ReadFenceSlotState::Empty),
+                    ),
+                ),
+                (
+                    "n3".into(),
+                    recorder("n3", Some(Arc::clone(&late)), late_reply),
+                ),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.inspect_context_read_fence_at(
+                            &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                            1,
+                            LogHash::ZERO,
+                        ))
+                        .unwrap()
+                })
+            };
+            for _ in 0..3 {
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            release_gate(&early);
+            assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+            release_gate(&late);
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                expected
+            );
+            caller.join().unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+        run(
+            Ok(ReadFenceSlotState::Occupied { summary: None }),
+            Ok(CertifiedDecisionInspection::Empty),
+        );
+        run(Err(Error::UnknownOutcome), Err(Error::UnknownOutcome));
+    }
+
+    #[test]
+    fn read_fence_partial_admission_cancellation_drains_the_admitted_job() {
+        let _blocking = lock_blocking_control_tests();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_worker = GateRelease::new(Arc::clone(&worker_gate));
+        let _release_dispatch = GateRelease::new(Arc::clone(&dispatch_gate));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedFenceRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
+                        reply: Ok(ReadFenceSlotState::Empty),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let root = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root),
+        );
+        let (hook_tx, hook_rx) = mpsc::sync_channel(1);
+        let _hook =
+            pause_after_next_fetch_dispatch(Arc::clone(&root), hook_tx, Arc::clone(&dispatch_gate));
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_context_read_fence_at(&context, 1, LogHash::ZERO))
+                    .unwrap()
+            })
+        };
+        hook_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "n1"
+        );
+        root.store(true, Ordering::Release);
+        release_gate(&dispatch_gate);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&worker_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcCancelled)
+        );
+        caller.join().unwrap();
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn read_fence_short_deadline_admits_no_backend_work() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedFenceRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(ReadFenceSlotState::Empty),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.inspect_context_read_fence_at(
+                &RecorderRpcContext::with_timeout(Duration::ZERO),
+                1,
+                LogHash::ZERO,
+            ),
+            Err(Error::RpcDeadlineExceeded)
+        );
+        assert_eq!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn read_fence_drain_miss_is_deadline_for_reads_and_unknown_after_mutation() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |mutation_started: bool, expected: Error| {
+            let (slow_tx, slow_rx) = mpsc::sync_channel(1);
+            let slow = Arc::new((Mutex::new(false), Condvar::new()));
+            let fast = Arc::new((Mutex::new(false), Condvar::new()));
+            let (fast_tx, fast_rx) = mpsc::sync_channel(2);
+            let _release_slow = GateRelease::new(Arc::clone(&slow));
+            let _release_fast = GateRelease::new(Arc::clone(&fast));
+            let fast_recorder = |recorder_id| {
+                Box::new(ScriptedFenceRecorder {
+                    recorder_id,
+                    entered: fast_tx.clone(),
+                    gate: Some(Arc::clone(&fast)),
+                    reply: Ok(ReadFenceSlotState::Empty),
+                }) as Box<dyn RecorderRpc>
+            };
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(ScriptedFenceRecorder {
+                        recorder_id: "n1",
+                        entered: slow_tx,
+                        gate: Some(Arc::clone(&slow)),
+                        reply: Ok(ReadFenceSlotState::Empty),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                ("n2".into(), fast_recorder("n2")),
+                ("n3".into(), fast_recorder("n3")),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let root = Arc::new(AtomicBool::new(false));
+            let context = RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(1),
+                Arc::clone(&root),
+            );
+            let (token_tx, token_rx) = mpsc::sync_channel(1);
+            let _token = capture_next_fetch_group_token(Arc::clone(&root), token_tx);
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.inspect_context_read_fence_with_budget(
+                            &ControlCallBudget::new(&context).unwrap(),
+                            &AtomicBool::new(mutation_started),
+                            1,
+                            LogHash::ZERO,
+                        ))
+                        .unwrap()
+                })
+            };
+            slow_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let group_token = token_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            let _timeout = force_next_control_group_drain_timeout(
+                group_token,
+                Arc::clone(&consensus.read_fence_workers[0].state),
+                ack_tx,
+            );
+            release_gate(&fast);
+            ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Err(expected)
+            );
+            assert!(consensus.read_fence_workers[0]
+                .state
+                .quarantined
+                .load(Ordering::Acquire));
+            release_gate(&slow);
+            caller.join().unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            fast_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            fast_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                consensus.inspect_context_read_fence_at(
+                    &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    1,
+                    LogHash::ZERO,
+                ),
+                Ok(CertifiedDecisionInspection::Empty)
+            );
+        };
+        run(false, Error::RpcDeadlineExceeded);
+        run(true, Error::UnknownOutcome);
+    }
+
+    #[test]
+    fn read_fence_empty_quorum_is_independent_of_observation_order() {
+        let occupied = || ReadFenceSlotState::Occupied { summary: None };
+        let empty = || ReadFenceSlotState::Empty;
+        for states in [
+            [occupied(), empty(), empty()],
+            [empty(), occupied(), empty()],
+            [empty(), empty(), occupied()],
+        ] {
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(states)
+                .map(|(recorder_id, state)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ScriptedFenceRecorder {
+                            recorder_id,
+                            entered: entered_tx.clone(),
+                            gate: None,
+                            reply: Ok(state),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            assert_eq!(
+                consensus.inspect_context_read_fence_at(
+                    &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    1,
+                    LogHash::ZERO,
+                ),
+                Ok(CertifiedDecisionInspection::Empty)
+            );
+        }
+        let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+        let recorders = [("n1", empty()), ("n2", occupied()), ("n3", occupied())]
+            .into_iter()
+            .map(|(recorder_id, state)| {
+                (
+                    recorder_id.into(),
+                    Box::new(ScriptedFenceRecorder {
+                        recorder_id,
+                        entered: entered_tx.clone(),
+                        gate: None,
+                        reply: Ok(state),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.inspect_context_read_fence_at(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+            ),
+            Err(Error::NoQuorum)
+        );
+    }
+
+    #[test]
+    fn read_fence_summary_fetch_reuses_one_budget_after_each_group_drains() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"budget-handoff".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let recorders = membership
+            .members()
+            .iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.clone(),
+                    Box::new(SummaryFetchBudgetRecorder {
+                        summary: RecordSummary {
+                            recorder_id: recorder_id.clone(),
+                            slot: 1,
+                            config_id: 1,
+                            config_digest: membership.digest(),
+                            step: 4,
+                            first_current: Some(proposal.clone()),
+                            aggregate_prior: None,
+                            decided: None,
+                        },
+                        command: command.clone(),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let root = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root),
+        );
+        let (event_tx, event_rx) = mpsc::sync_channel(3);
+        let _hook = record_budget_identity_for(Arc::clone(&root), event_tx);
+        assert!(matches!(
+            consensus.inspect_context_read_fence_at(&context, 1, LogHash::ZERO),
+            Ok(CertifiedDecisionInspection::Committed(_))
+        ));
+        let BudgetIdentityEvent::ReadFenceHandoff {
+            deadline: fence_deadline,
+            work_deadline: fence_work_deadline,
+            outstanding: fence_outstanding,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected fence handoff event");
+        };
+        let BudgetIdentityEvent::SummaryHandoff {
+            deadline,
+            work_deadline,
+            outstanding,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected summary handoff event");
+        };
+        let BudgetIdentityEvent::FetchDispatch {
+            deadline: fetch_deadline,
+            work_deadline: fetch_work_deadline,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected fetch dispatch event");
+        };
+        assert_eq!(
+            outstanding, 0,
+            "summary group must drain before fetch starts"
+        );
+        assert_eq!(fence_outstanding, 0);
+        assert_eq!(fence_deadline, deadline);
+        assert_eq!(fence_work_deadline, work_deadline);
+        assert_eq!(fetch_deadline, deadline);
+        assert_eq!(fetch_work_deadline, work_deadline);
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn certified_config_fetch_hands_the_same_budget_and_mutation_to_install() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = ConfigChange::stop(1, membership.digest()).to_stored_command();
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let recorders = membership
+            .members()
+            .iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.clone(),
+                    Box::new(SummaryFetchBudgetRecorder {
+                        summary: RecordSummary {
+                            recorder_id: recorder_id.clone(),
+                            slot: 1,
+                            config_id: 1,
+                            config_digest: membership.digest(),
+                            step: 4,
+                            first_current: Some(proposal.clone()),
+                            aggregate_prior: None,
+                            decided: None,
+                        },
+                        command: command.clone(),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let root = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&root),
+        );
+        let (event_tx, event_rx) = mpsc::sync_channel(5);
+        let _hook = record_budget_identity_for(Arc::clone(&root), event_tx);
+        assert!(matches!(
+            consensus.inspect_context_read_fence_at(&context, 1, LogHash::ZERO),
+            Ok(CertifiedDecisionInspection::Committed(_))
+        ));
+        let BudgetIdentityEvent::ReadFenceHandoff {
+            deadline: fence_deadline,
+            work_deadline: fence_work_deadline,
+            outstanding: fence_outstanding,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected fence handoff event");
+        };
+        let BudgetIdentityEvent::SummaryHandoff {
+            deadline,
+            work_deadline,
+            outstanding,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected summary handoff event");
+        };
+        let BudgetIdentityEvent::FetchDispatch {
+            deadline: fetch_deadline,
+            work_deadline: fetch_work_deadline,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected fetch dispatch event");
+        };
+        let BudgetIdentityEvent::FetchHandoff {
+            deadline: handoff_deadline,
+            work_deadline: handoff_work_deadline,
+            outstanding: fetch_outstanding,
+            mutation_started: fetch_mutation,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected fetch-to-install handoff event");
+        };
+        let BudgetIdentityEvent::InstallDispatch {
+            deadline: install_deadline,
+            work_deadline: install_work_deadline,
+            mutation_started: install_mutation,
+            mutation_started_set,
+        } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected install dispatch event");
+        };
+        assert_eq!(fence_outstanding, 0);
+        assert_eq!(outstanding, 0);
+        assert_eq!(
+            fetch_outstanding, 0,
+            "fetch must drain before Install starts"
+        );
+        assert_eq!(fence_deadline, deadline);
+        assert_eq!(fence_work_deadline, work_deadline);
+        assert_eq!(fetch_deadline, deadline);
+        assert_eq!(fetch_work_deadline, work_deadline);
+        assert_eq!(handoff_deadline, deadline);
+        assert_eq!(handoff_work_deadline, work_deadline);
+        assert_eq!(install_deadline, deadline);
+        assert_eq!(install_work_deadline, work_deadline);
+        assert_eq!(fetch_mutation, install_mutation);
+        assert!(
+            mutation_started_set,
+            "Install admission must mark the shared root mutation state"
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn finish_decision_fetch_then_install_reuses_one_budget_without_recapture() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |known_command: Option<StoredCommand>| {
+            let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+            let command = ConfigChange::stop(1, membership.digest()).to_stored_command();
+            let proposal = Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                1,
+                AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+            );
+            let proof = DecisionProof::FastPath {
+                cluster_id: "cluster".into(),
+                slot: 1,
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                proposal: proposal.clone(),
+                summaries: membership.members()[..membership.quorum_size()]
+                    .iter()
+                    .map(|recorder_id| RecorderSummary {
+                        recorder_id: recorder_id.clone(),
+                        slot: 1,
+                        step: 4,
+                        first_current: Some(proposal.clone()),
+                        aggregate_prior: None,
+                    })
+                    .collect(),
+            };
+            let recorders = membership
+                .members()
+                .iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.clone(),
+                        Box::new(SummaryFetchBudgetRecorder {
+                            summary: RecordSummary {
+                                recorder_id: recorder_id.clone(),
+                                slot: 1,
+                                config_id: 1,
+                                config_digest: membership.digest(),
+                                step: 4,
+                                first_current: None,
+                                aggregate_prior: None,
+                                decided: None,
+                            },
+                            command: command.clone(),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            let root = Arc::new(AtomicBool::new(false));
+            let context = RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(1),
+                Arc::clone(&root),
+            );
+            let mutation_started = Arc::new(AtomicBool::new(false));
+            let mutation_identity = Arc::as_ptr(&mutation_started) as usize;
+            let constructor_calls = Arc::new(AtomicUsize::new(0));
+            let _constructor_hook = count_control_budget_constructors_for(
+                Arc::clone(&root),
+                Arc::clone(&constructor_calls),
+            );
+            let (event_tx, event_rx) = mpsc::sync_channel(3);
+            let _identity_hook = record_budget_identity_for(Arc::clone(&root), event_tx);
+            assert!(matches!(
+                consensus.finish_decision_with_context(
+                    proof.clone(),
+                    known_command.as_ref(),
+                    false,
+                    &context,
+                    &mutation_started,
+                ),
+                Ok(DriveOutcome::Decision(returned)) if returned == proof
+            ));
+            assert_eq!(
+                constructor_calls.load(Ordering::Acquire),
+                1,
+                "the production finish path must capture its control budget once before fetch and reuse it for Install"
+            );
+            let BudgetIdentityEvent::FetchDispatch {
+                deadline: fetch_deadline,
+                work_deadline: fetch_work_deadline,
+            } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected finish fetch dispatch event");
+            };
+            let BudgetIdentityEvent::FinishFetchHandoff {
+                deadline: handoff_deadline,
+                work_deadline: handoff_work_deadline,
+                outstanding,
+                mutation_started: fetch_mutation,
+            } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected finish fetch-to-install handoff event");
+            };
+            let BudgetIdentityEvent::InstallDispatch {
+                deadline: install_deadline,
+                work_deadline: install_work_deadline,
+                mutation_started: install_mutation,
+                mutation_started_set,
+            } = event_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected finish install dispatch event");
+            };
+            assert_eq!(outstanding, 0, "fetch must drain before finish installs");
+            assert_eq!(fetch_deadline, handoff_deadline);
+            assert_eq!(fetch_work_deadline, handoff_work_deadline);
+            assert_eq!(handoff_deadline, install_deadline);
+            assert_eq!(handoff_work_deadline, install_work_deadline);
+            assert_eq!(fetch_mutation, mutation_identity);
+            assert_eq!(install_mutation, mutation_identity);
+            assert!(mutation_started_set);
+            assert!(mutation_started.load(Ordering::Acquire));
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+        run(None);
+        run(Some(StoredCommand::new(
+            EntryType::Command,
+            b"mismatched-known-command".to_vec(),
+        )));
+    }
+
+    #[test]
+    fn fetch_drain_miss_is_deadline_for_reads_and_unknown_after_mutation() {
+        let _blocking = lock_blocking_control_tests();
+        let run = |mutation_started: bool, expected: Error| {
+            let command = StoredCommand::new(EntryType::Command, b"drain-miss".to_vec());
+            let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let slow = Arc::new((Mutex::new(false), Condvar::new()));
+            let fast = Arc::new((Mutex::new(false), Condvar::new()));
+            let (fast_tx, fast_rx) = mpsc::sync_channel(2);
+            let _release_slow = GateRelease::new(Arc::clone(&slow));
+            let _release_fast = GateRelease::new(Arc::clone(&fast));
+            let fast_recorder = |recorder_id| {
+                Box::new(ScriptedFetchRecorder {
+                    recorder_id,
+                    entered: fast_tx.clone(),
+                    gate: Some(Arc::clone(&fast)),
+                    reply: Ok(Some(command.clone())),
+                }) as Box<dyn RecorderRpc>
+            };
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(ScriptedFetchRecorder {
+                        recorder_id: "n1",
+                        entered: entered_tx,
+                        gate: Some(Arc::clone(&slow)),
+                        reply: Ok(None),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                ("n2".into(), fast_recorder("n2")),
+                ("n3".into(), fast_recorder("n3")),
+            ];
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+            );
+            let root = Arc::new(AtomicBool::new(false));
+            let context = RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(1),
+                Arc::clone(&root),
+            );
+            let (group_token_tx, group_token_rx) = mpsc::sync_channel(1);
+            let _group_token = capture_next_fetch_group_token(Arc::clone(&root), group_token_tx);
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let caller = {
+                let consensus = Arc::clone(&consensus);
+                let fetch_value = value.clone();
+                thread::spawn(move || {
+                    result_tx
+                        .send(consensus.fetch_verified_value(
+                            7,
+                            &fetch_value,
+                            &context,
+                            &AtomicBool::new(mutation_started),
+                        ))
+                        .unwrap()
+                })
+            };
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let group_token = group_token_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (timeout_tx, timeout_rx) = mpsc::sync_channel(1);
+            let _timeout = force_next_control_group_drain_timeout(
+                group_token,
+                Arc::clone(&consensus.control_workers[0].state),
+                timeout_tx,
+            );
+            fast_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            fast_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            release_gate(&fast);
+            timeout_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Err(expected)
+            );
+            assert!(consensus.control_workers[0]
+                .state
+                .quarantined
+                .load(Ordering::Acquire));
+            release_gate(&slow);
+            caller.join().unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            assert_eq!(
+                consensus.fetch_verified_value(
+                    7,
+                    &value,
+                    &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &AtomicBool::new(false),
+                ),
+                Ok(Some(command))
+            );
+        };
+        run(false, Error::RpcDeadlineExceeded);
+        run(true, Error::UnknownOutcome);
     }
 
     #[test]
@@ -10369,7 +21273,12 @@ mod tests {
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
         assert_eq!(
-            consensus.fetch_verified_value(7, &value),
+            consensus.fetch_verified_value(
+                7,
+                &value,
+                &RecorderRpcContext::default_timeout(),
+                &AtomicBool::new(false),
+            ),
             Err(Error::Rejected(RejectReason::InvalidValue))
         );
         assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
@@ -10379,6 +21288,7 @@ mod tests {
     fn command_lookup_returns_no_quorum_when_a_control_worker_queue_is_full() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&release));
         let (observed_tx, observed_rx) = mpsc::sync_channel(1);
         let recorders = vec![
             (
@@ -10406,6 +21316,7 @@ mod tests {
         assert!(matches!(
             consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
                 index: 0,
+                context: RecorderRpcContext::default_timeout(),
                 cluster_id: "cluster".into(),
                 epoch: 1,
                 config_id: 1,
@@ -10423,6 +21334,7 @@ mod tests {
         assert!(matches!(
             consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
                 index: 0,
+                context: RecorderRpcContext::default_timeout(),
                 cluster_id: "cluster".into(),
                 epoch: 1,
                 config_id: 1,
@@ -10437,7 +21349,12 @@ mod tests {
         let command = StoredCommand::new(EntryType::Command, b"missing".to_vec());
         let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
         assert_eq!(
-            consensus.fetch_verified_value(7, &value),
+            consensus.fetch_verified_value(
+                7,
+                &value,
+                &RecorderRpcContext::default_timeout(),
+                &AtomicBool::new(false),
+            ),
             Err(Error::NoQuorum)
         );
         assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
@@ -10450,8 +21367,11 @@ mod tests {
 
     #[test]
     fn full_record_worker_queue_is_transient_unavailable_not_fatal() {
-        let (started_tx, started_rx) = mpsc::sync_channel(2);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        // Every direct job emits a start event; leave room for the running,
+        // queued, and recovery jobs so observability itself cannot block n1.
+        let (started_tx, started_rx) = mpsc::sync_channel(4);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut release = ChannelRelease::new(release_tx);
         let recorders = vec![
             (
                 "n1".into(),
@@ -10463,7 +21383,11 @@ mod tests {
             ),
             (
                 "n2".into(),
-                Box::new(AlwaysIoRecorder) as Box<dyn RecorderRpc>,
+                Box::new(SlotRecorder {
+                    recorder_id: "n2",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
             ),
             (
                 "n3".into(),
@@ -10473,25 +21397,151 @@ mod tests {
         let consensus =
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-        assert!(consensus
-            .record_broadcast(record_requests(&consensus, 1))
-            .unwrap()
-            .is_empty());
+        // Occupy n1's sole running slot before any consensus broadcast.  The
+        // next direct admission fills its one queued slot, so the broadcast
+        // below deterministically observes saturation rather than racing the
+        // recorder's start signal.
+        let (running_tx, running_rx) = mpsc::sync_channel(1);
+        let running_request = record_requests(&consensus, 1).remove(0);
+        assert!(matches!(
+            consensus.record_workers[0].dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: running_request,
+                result: running_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
 
-        assert!(consensus
-            .record_broadcast(record_requests(&consensus, 2))
-            .unwrap()
-            .is_empty());
+        let (queued_tx, queued_rx) = mpsc::sync_channel(1);
+        let queued_request = record_requests(&consensus, 2).remove(0);
+        assert!(matches!(
+            consensus.record_workers[0].dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: queued_request,
+                result: queued_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
 
-        let third = consensus.record_broadcast(record_requests(&consensus, 3));
+        let saturated = consensus
+            .record_broadcast(record_requests(&consensus, 3))
+            .unwrap();
         assert!(
-            matches!(third, Ok(ref replies) if replies.is_empty()),
-            "a full worker queue must remain retryable, got {third:?}"
+            saturated.len() == 1 && saturated[0].recorder_id == "n2",
+            "a saturated n1 must leave the healthy n2 result retryable: {saturated:?}"
         );
+        release.release();
+        assert!(running_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .1
+            .is_ok());
+        assert!(queued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .1
+            .is_ok());
+
+        let recovered = consensus
+            .record_broadcast(record_requests(&consensus, 4))
+            .unwrap();
+        assert!(
+            recovered.iter().any(|reply| reply.recorder_id == "n1"),
+            "the worker must accept a later broadcast after running and queued work drain: {recovered:?}"
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn record_worker_queue_reports_saturation_after_one_running_and_one_queued_job() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = super::RecordWorker::spawn(
+            "n1".into(),
+            Arc::new(BlockingRecorder {
+                recorder_id: "n1",
+                started: started_tx,
+                release_first: Mutex::new(release_rx),
+            }),
+            1,
+            membership.digest(),
+        )
+        .unwrap();
+        let request = |slot| RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                slot,
+                AcceptedValue {
+                    command_hash: LogHash::ZERO,
+                    prev_hash: LogHash::ZERO,
+                    entry_hash: LogHash::ZERO,
+                },
+            ),
+            command: None,
+        };
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        let (second_tx, second_rx) = mpsc::sync_channel(1);
+        let (third_tx, third_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: request(1),
+                result: first_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert!(matches!(
+            worker.dispatch(super::RecordJob {
+                index: 1,
+                context: RecorderRpcContext::default_timeout(),
+                request: request(2),
+                result: second_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert!(matches!(
+            worker.dispatch(super::RecordJob {
+                index: 2,
+                context: RecorderRpcContext::default_timeout(),
+                request: request(3),
+                result: third_tx,
+            }),
+            super::RecordDispatch::Saturated
+        ));
+        assert!(matches!(
+            third_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::Io(message)) if message.contains("temporarily full")
+        ));
 
         release_tx.send(()).unwrap();
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        assert!(first_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .1
+            .is_ok());
+        assert!(second_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .1
+            .is_ok());
+        let idle_deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_idle() && Instant::now() < idle_deadline {
+            thread::yield_now();
+        }
+        assert!(worker.is_idle());
     }
 
     #[test]
@@ -10517,18 +21567,29 @@ mod tests {
             proposal,
             command: None,
         };
-        let (job_tx, job_rx) = mpsc::sync_channel(1);
-        drop(job_rx);
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker = super::RecordWorker {
-            sender: Some(job_tx),
+            state: Arc::new(super::RecordWorkerState {
+                queue: Arc::new(super::RecordQueue {
+                    state: Mutex::new(super::RecordQueueState {
+                        jobs: std::collections::VecDeque::new(),
+                        closed: true,
+                    }),
+                    available: Condvar::new(),
+                }),
+                pending: Arc::clone(&pending),
+                cancellation: Arc::new(AtomicBool::new(false)),
+                quarantined: AtomicBool::new(false),
+                #[cfg(feature = "test-hooks")]
+                live_groups: Mutex::new(BTreeMap::new()),
+            }),
             handle: None,
-            pending: Arc::clone(&pending),
         };
         let (result_tx, result_rx) = mpsc::sync_channel(1);
 
         worker.dispatch(super::RecordJob {
             index: 0,
+            context: RecorderRpcContext::default_timeout(),
             request,
             result: result_tx,
         });
@@ -10538,7 +21599,72 @@ mod tests {
     }
 
     #[test]
+    fn record_worker_survives_a_mutating_panic_and_processes_the_next_record() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let mutated = Arc::new(AtomicBool::new(false));
+        let recorder = Arc::new(PanicThenSuccessfulRecordRecorder {
+            recorder_id: "n1",
+            calls: AtomicUsize::new(0),
+            mutated: Arc::clone(&mutated),
+        });
+        let worker =
+            super::RecordWorker::spawn("n1".into(), recorder.clone(), 1, membership.digest())
+                .unwrap();
+        let request = |slot| RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                slot,
+                AcceptedValue {
+                    command_hash: LogHash::ZERO,
+                    prev_hash: LogHash::ZERO,
+                    entry_hash: LogHash::ZERO,
+                },
+            ),
+            command: None,
+        };
+
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: request(1),
+                result: first_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert_eq!(
+            first_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::UnknownOutcome)
+        );
+        assert!(mutated.load(Ordering::Acquire));
+
+        let (second_tx, second_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(super::RecordJob {
+                index: 1,
+                context: RecorderRpcContext::default_timeout(),
+                request: request(2),
+                result: second_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        let (_, reply) = second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(reply, Ok(summary) if summary.recorder_id == "n1" && summary.slot == 2));
+        assert_eq!(recorder.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
     fn recorder_panics_are_reported_without_panicking_the_proposer() {
+        let n2_mutated = Arc::new(AtomicBool::new(false));
+        let n3_mutated = Arc::new(AtomicBool::new(false));
         let recorders = vec![
             (
                 "n1".into(),
@@ -10550,11 +21676,15 @@ mod tests {
             ),
             (
                 "n2".into(),
-                Box::new(PanickingRecorder) as Box<dyn RecorderRpc>,
+                Box::new(PanickingRecorder {
+                    mutated: Arc::clone(&n2_mutated),
+                }) as Box<dyn RecorderRpc>,
             ),
             (
                 "n3".into(),
-                Box::new(PanickingRecorder) as Box<dyn RecorderRpc>,
+                Box::new(PanickingRecorder {
+                    mutated: Arc::clone(&n3_mutated),
+                }) as Box<dyn RecorderRpc>,
             ),
         ];
         let consensus =
@@ -10562,7 +21692,176 @@ mod tests {
 
         assert_eq!(
             consensus.record_broadcast(record_requests(&consensus, 1)),
+            Err(Error::UnknownOutcome)
+        );
+        assert!(
+            consensus.finish_pending_rpcs(Duration::from_secs(1)),
+            "all admitted record workers must finish before their mutation state is asserted"
+        );
+        assert!(n2_mutated.load(Ordering::Acquire));
+        assert!(n3_mutated.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn control_worker_panic_classifies_mutations_as_unknown_and_reads_as_definite() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let worker = ControlWorker::spawn(Arc::new(PanicAfterMutationControlRecorder {
+            mutations: Arc::clone(&mutations),
+        }))
+        .unwrap();
+        let context = RecorderRpcContext::default_timeout();
+
+        let (install_tx, install_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::InstallProof {
+                index: 0,
+                context: context.clone(),
+                proof: test_decision_proof(&membership),
+                membership: membership.clone(),
+                result: install_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(
+            install_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::UnknownOutcome)
+        );
+
+        let command = StoredCommand::new(EntryType::Command, b"panic-store".to_vec());
+        let (store_tx, store_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::StoreCommand {
+                index: 0,
+                context: context.clone(),
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                command_hash: command.hash(),
+                command,
+                result: store_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(
+            store_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::UnknownOutcome)
+        );
+        assert_eq!(mutations.load(Ordering::Acquire), 2);
+
+        let (fetch_tx, fetch_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::FetchCommand {
+                index: 0,
+                context,
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                command_hash: LogHash::ZERO,
+                result: fetch_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(
+            fetch_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
             Err(Error::ProposeFailed)
         );
+
+        let (inspect_tx, inspect_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::InspectProof {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 1,
+                result: inspect_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(
+            inspect_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::ProposeFailed)
+        );
+
+        let (summary_tx, summary_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::InspectSummary {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                slot: 1,
+                result: summary_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(
+            summary_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::ProposeFailed)
+        );
+
+        let (fence_tx, fence_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            worker.dispatch(ControlJob::ObserveReadFence {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: ReadFenceRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 1,
+                },
+                result: fence_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        assert_eq!(
+            fence_rx.recv_timeout(Duration::from_secs(1)).unwrap().1,
+            Err(Error::ProposeFailed)
+        );
+    }
+
+    #[test]
+    fn mutating_control_quorum_collectors_preserve_panic_unknown_outcomes() {
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(PanicAfterMutationControlRecorder {
+                        mutations: Arc::clone(&mutations),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let context = RecorderRpcContext::default_timeout();
+        let command = StoredCommand::new(EntryType::Command, b"quorum-panic".to_vec());
+        let mutation_started = AtomicBool::new(false);
+        let budget = ControlCallBudget::new(&context).unwrap();
+        assert_eq!(
+            consensus.store_command_on_quorum_with_budget(
+                &budget,
+                &mutation_started,
+                command.hash(),
+                &command,
+            ),
+            Err(Error::UnknownOutcome)
+        );
+        assert!(mutation_started.load(Ordering::Acquire));
+
+        let mutation_started = AtomicBool::new(false);
+        assert_eq!(
+            consensus.install_decision_proof_quorum(
+                test_decision_proof(consensus.membership()),
+                &context,
+                &mutation_started,
+            ),
+            Err(Error::UnknownOutcome)
+        );
+        assert!(mutation_started.load(Ordering::Acquire));
+        assert!(mutations.load(Ordering::Acquire) >= 2);
     }
 }

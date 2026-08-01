@@ -1,6 +1,9 @@
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -12,15 +15,25 @@ use rhiza_node::{
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
+#[cfg(feature = "test-hooks")]
+use rhizadb::HaServiceActivationGate;
 use rhizadb::{
     CertifiedTailRecord, CertifiedTailRequest, CertifiedTailResponse, CheckpointCoordinator,
-    DurabilityMode, ExecutionProfile, HaCertifiedTailError, HaCertifiedTailSource, HaNodeStatus,
-    HaPredecessor, HaRecorderTransport, HaServeConfig, HaStartupConfig, HaStartupMode,
-    HaSuccessorPrestageConfig, NodeConfig, PeerConfig, StopInformation,
+    DurabilityMode, ExecutionProfile, HaCertifiedTailError, HaCertifiedTailSource, HaNodeError,
+    HaNodeStatus, HaPredecessor, HaRecorderTransport, HaServeConfig, HaStartupConfig,
+    HaStartupError, HaStartupMode, HaSuccessorNode, HaSuccessorPrestageConfig, NodeConfig,
+    PeerConfig, StopInformation,
 };
+#[cfg(feature = "test-hooks")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(feature = "test-hooks")]
 async fn readiness_is_ok(address: std::net::SocketAddr) -> bool {
+    readiness_status(address).await.contains(" 200 ")
+}
+
+#[cfg(feature = "test-hooks")]
+async fn readiness_status(address: std::net::SocketAddr) -> String {
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     stream
         .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -32,13 +45,31 @@ async fn readiness_is_ok(address: std::net::SocketAddr) -> bool {
         .unwrap()
         .lines()
         .next()
-        .is_some_and(|status| status.contains(" 200 "))
+        .unwrap()
+        .to_owned()
+}
+
+#[cfg(feature = "test-hooks")]
+async fn staging_health_keepalive(address: std::net::SocketAddr) -> String {
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\nGET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8(response).unwrap()
 }
 
 #[derive(Clone)]
 struct ControlledTailSource {
     seed: LogAnchor,
     stop: Arc<Mutex<Option<CertifiedTailRecord>>>,
+    stop_page_blocked: Arc<AtomicBool>,
+    stop_page_entered: tokio::sync::watch::Sender<bool>,
+    stop_page_released: tokio::sync::watch::Sender<bool>,
 }
 
 impl ControlledTailSource {
@@ -46,6 +77,9 @@ impl ControlledTailSource {
         Self {
             seed,
             stop: Arc::new(Mutex::new(None)),
+            stop_page_blocked: Arc::new(AtomicBool::new(false)),
+            stop_page_entered: tokio::sync::watch::channel(false).0,
+            stop_page_released: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -54,6 +88,30 @@ impl ControlledTailSource {
             entry: stop.entry.clone(),
             proof: stop.proof.clone(),
         });
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn stop_page_entered(&self) {
+        let mut entered = self.stop_page_entered.subscribe();
+        while !*entered.borrow() {
+            entered.changed().await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn stop_page_release_guard(&self) -> ControlledTailPageRelease {
+        self.stop_page_blocked.store(true, Ordering::Release);
+        ControlledTailPageRelease(self.stop_page_released.clone())
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+struct ControlledTailPageRelease(tokio::sync::watch::Sender<bool>);
+
+#[cfg(feature = "test-hooks")]
+impl Drop for ControlledTailPageRelease {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -76,6 +134,17 @@ impl HaCertifiedTailSource for ControlledTailSource {
                     observed_tip: self.seed,
                 }),
                 Some(stop) if request.from == self.seed => {
+                    if self.stop_page_blocked.load(Ordering::Acquire) {
+                        self.stop_page_entered.send_replace(true);
+                        let mut released = self.stop_page_released.subscribe();
+                        while !*released.borrow() {
+                            released.changed().await.map_err(|_| {
+                                HaCertifiedTailError::Unavailable(
+                                    "test Stop-page release sender closed".into(),
+                                )
+                            })?;
+                        }
+                    }
                     let observed_tip = LogAnchor::new(stop.entry.index, stop.entry.hash);
                     Ok(CertifiedTailResponse {
                         records: vec![stop],
@@ -93,6 +162,105 @@ impl HaCertifiedTailSource for ControlledTailSource {
                     request.from.index()
                 ))),
             }
+        })
+    }
+}
+
+#[derive(Clone)]
+struct UnavailableTailSource {
+    attempts: tokio::sync::watch::Sender<u64>,
+}
+
+impl UnavailableTailSource {
+    fn new() -> Self {
+        Self {
+            attempts: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    async fn entered_retry(&self) {
+        let mut attempts = self.attempts.subscribe();
+        while *attempts.borrow() == 0 {
+            attempts.changed().await.unwrap();
+        }
+    }
+}
+
+impl HaCertifiedTailSource for UnavailableTailSource {
+    fn fetch<'a>(
+        &'a self,
+        _request: &'a CertifiedTailRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<CertifiedTailResponse, HaCertifiedTailError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let next = self.attempts.borrow().saturating_add(1);
+            self.attempts.send_replace(next);
+            Err(HaCertifiedTailError::Unavailable(
+                "injected transient tail outage".into(),
+            ))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct InvalidPageTailSource {
+    attempts: tokio::sync::watch::Sender<u64>,
+    record: tokio::sync::watch::Sender<Option<CertifiedTailRecord>>,
+}
+
+impl InvalidPageTailSource {
+    fn new() -> Self {
+        Self {
+            attempts: tokio::sync::watch::channel(0).0,
+            record: tokio::sync::watch::channel(None).0,
+        }
+    }
+
+    fn publish_stop(&self, stop: &StopInformation) {
+        self.record.send_replace(Some(CertifiedTailRecord {
+            entry: stop.entry.clone(),
+            proof: stop.proof.clone(),
+        }));
+    }
+
+    async fn entered(&self) {
+        let mut attempts = self.attempts.subscribe();
+        while *attempts.borrow() == 0 {
+            attempts.changed().await.unwrap();
+        }
+    }
+}
+
+impl HaCertifiedTailSource for InvalidPageTailSource {
+    fn fetch<'a>(
+        &'a self,
+        request: &'a CertifiedTailRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<CertifiedTailResponse, HaCertifiedTailError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut record = self.record.subscribe();
+            while record.borrow().is_none() {
+                record.changed().await.unwrap();
+            }
+            let record = record.borrow().clone().unwrap();
+            let next = self.attempts.borrow().saturating_add(1);
+            self.attempts.send_replace(next);
+            Ok(CertifiedTailResponse {
+                records: vec![record],
+                // Deliberately contradict the returned record tip so the real
+                // learner apply path rejects this certified page.
+                observed_tip: request.from,
+            })
         })
     }
 }
@@ -642,7 +810,288 @@ async fn finalized_successor_restart_handles_empty_target_archive_before_activat
     live.shutdown().await.unwrap();
 }
 
+async fn start_faulting_live_successor(
+    root: &Path,
+    tail_source: Arc<dyn HaCertifiedTailSource>,
+) -> (
+    HaSuccessorNode,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    StopInformation,
+) {
+    let store = ObjStore::new(ObjStoreConfig::Local {
+        root: root.join("archive"),
+    })
+    .unwrap();
+    let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+        store.clone(),
+        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+    );
+    source_archive.initialize_checkpoint().await.unwrap();
+    let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
+        .await
+        .unwrap();
+    let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let successor = Membership::new(["node-4", "node-5", "node-6"]).unwrap();
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorder_clients(&root.join("source-recorders")),
+        )
+        .unwrap(),
+    );
+    let source = NodeRuntime::open(node_config(&root.join("source")), consensus, &[]).unwrap();
+    source.write("seed-write", "key", "seed").unwrap();
+    source.checkpoint_compact(&coordinator).await.unwrap();
+    let stop = source
+        .stop_current_configuration_for_successor(&successor)
+        .unwrap();
+    assert!(source
+        .consensus()
+        .finish_pending_rpcs(Duration::from_secs(1)));
+
+    let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+        store,
+        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+    );
+    let peers = successor
+        .members()
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| {
+            PeerConfig::new(
+                node_id,
+                format!("http://127.0.0.1:{}", 9401 + index),
+                format!("fault-peer-token-{}", index + 1),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let target_config = NodeConfig::new_with_configuration(
+        "rhiza:sql:cluster-a",
+        "node-4",
+        root.join("successor"),
+        1,
+        successor.clone(),
+        ConfigurationState::active(2, successor.digest()),
+        peers,
+        "successor-client-token",
+    )
+    .unwrap();
+    let recorder_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let recorder_address = recorder_listener.local_addr().unwrap();
+    let service_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service_address = service_listener.local_addr().unwrap();
+    let node = HaSuccessorPrestageConfig::new(
+        source_archive,
+        root.join("prestage"),
+        "node-4",
+        ExecutionProfile::Sqlite,
+        predecessor.clone(),
+        successor.clone(),
+        "tail-token",
+    )
+    .start_live(
+        HaStartupConfig::new(
+            target_config,
+            target_archive,
+            DurabilityMode::Sync,
+            60_000,
+            HaStartupMode::Rejoin,
+        ),
+        HaServeConfig::new(
+            recorder_listener,
+            service_listener,
+            HaRecorderTransport::Http,
+            successor_recorder_clients(
+                &root.join("successor-recorders"),
+                &predecessor,
+                &successor,
+                &stop,
+            ),
+            Vec::new(),
+        ),
+        tail_source,
+    )
+    .unwrap();
+    (node, recorder_address, service_address, stop)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unavailable_tail_retry_is_interrupted_by_short_successor_shutdown_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ObjStore::new(ObjStoreConfig::Local {
+        root: root.path().join("archive"),
+    })
+    .unwrap();
+    let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+        store.clone(),
+        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+    );
+    source_archive.initialize_checkpoint().await.unwrap();
+    let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
+        .await
+        .unwrap();
+    let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let successor = Membership::new(["node-4", "node-5", "node-6"]).unwrap();
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorder_clients(&root.path().join("source-recorders")),
+        )
+        .unwrap(),
+    );
+    let source =
+        NodeRuntime::open(node_config(&root.path().join("source")), consensus, &[]).unwrap();
+    source.write("seed-write", "key", "seed").unwrap();
+    source.checkpoint_compact(&coordinator).await.unwrap();
+    let stop = source
+        .stop_current_configuration_for_successor(&successor)
+        .unwrap();
+    assert!(source
+        .consensus()
+        .finish_pending_rpcs(Duration::from_secs(1)));
+
+    let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+        store,
+        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+    );
+    let peers = successor
+        .members()
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| {
+            PeerConfig::new(
+                node_id,
+                format!("http://127.0.0.1:{}", 9401 + index),
+                format!("unavailable-peer-token-{}", index + 1),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let target_config = NodeConfig::new_with_configuration(
+        "rhiza:sql:cluster-a",
+        "node-4",
+        root.path().join("successor"),
+        1,
+        successor.clone(),
+        ConfigurationState::active(2, successor.digest()),
+        peers,
+        "successor-client-token",
+    )
+    .unwrap();
+    let recorder_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let recorder_address = recorder_listener.local_addr().unwrap();
+    let service_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service_address = service_listener.local_addr().unwrap();
+    let tail = UnavailableTailSource::new();
+    let node = HaSuccessorPrestageConfig::new(
+        source_archive,
+        root.path().join("prestage"),
+        "node-4",
+        ExecutionProfile::Sqlite,
+        predecessor.clone(),
+        successor.clone(),
+        "tail-token",
+    )
+    .start_live(
+        HaStartupConfig::new(
+            target_config,
+            target_archive,
+            DurabilityMode::Sync,
+            60_000,
+            HaStartupMode::Rejoin,
+        ),
+        HaServeConfig::new(
+            recorder_listener,
+            service_listener,
+            HaRecorderTransport::Http,
+            successor_recorder_clients(
+                &root.path().join("successor-recorders"),
+                &predecessor,
+                &successor,
+                &stop,
+            ),
+            Vec::new(),
+        ),
+        Arc::new(tail.clone()),
+    )
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), tail.entered_retry())
+        .await
+        .expect("live successor must enter the transient unavailable retry");
+    assert_eq!(node.status(), HaNodeStatus::CatchingUp);
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        node.shutdown_with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("shutdown must interrupt the 250ms retry before its 100ms D")
+    .unwrap();
+    let recorder_rebound = tokio::net::TcpListener::bind(recorder_address)
+        .await
+        .unwrap();
+    let service_rebound = tokio::net::TcpListener::bind(service_address)
+        .await
+        .unwrap();
+    drop((recorder_rebound, service_rebound));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_certified_page_cleans_up_live_successor_staging_before_returning_primary() {
+    let root = tempfile::tempdir().unwrap();
+    let tail = InvalidPageTailSource::new();
+    let (node, recorder_address, service_address, stop) =
+        start_faulting_live_successor(root.path(), Arc::new(tail.clone())).await;
+    tail.publish_stop(&stop);
+    tokio::time::timeout(Duration::from_secs(10), tail.entered())
+        .await
+        .expect("live successor must request the invalid certified page");
+
+    let error = tokio::time::timeout(Duration::from_secs(5), node.monitor())
+        .await
+        .expect("invalid certified page must terminate the live successor")
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            HaNodeError::Startup(HaStartupError::Source(message))
+                if message
+                    == "learner page is invalid: certified tail records are not consecutive from the request"
+        ),
+        "invalid-page primary was lost: {error}"
+    );
+    let shutdown = tokio::time::timeout(
+        Duration::from_secs(1),
+        node.shutdown_with_timeout(Duration::from_millis(500)),
+    )
+    .await
+    .expect("terminal live successor shutdown must complete");
+    let shutdown_error = shutdown.expect_err("terminal primary must remain observable");
+    assert!(matches!(
+        &shutdown_error,
+        HaNodeError::Startup(HaStartupError::Source(message))
+            if message
+                == "learner page is invalid: certified tail records are not consecutive from the request"
+    ));
+    let recorder_rebound = tokio::net::TcpListener::bind(recorder_address)
+        .await
+        .unwrap();
+    let service_rebound = tokio::net::TcpListener::bind(service_address)
+        .await
+        .unwrap();
+    drop((recorder_rebound, service_rebound));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "test-hooks")]
 async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_active() {
     let root = tempfile::tempdir().unwrap();
     let store = ObjStore::new(ObjStoreConfig::Local {
@@ -710,13 +1159,15 @@ async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_
     )
     .unwrap();
     let restart_config = target_config.clone();
+    let activation_gate = HaServiceActivationGate::new();
     let startup = HaStartupConfig::new(
         target_config,
         target_archive.clone(),
         DurabilityMode::Sync,
         60_000,
         HaStartupMode::Rejoin,
-    );
+    )
+    .with_service_activation_gate(activation_gate.clone());
     let recorder_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let recorder_address = recorder_listener.local_addr().unwrap();
     let service_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -752,25 +1203,63 @@ async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_
     .unwrap();
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !node.is_prestop_ready() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        while !readiness_is_ok(service_address).await {
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("successor must catch up before Stop");
+    .expect("staging readyz must become 200 after pre-Stop catchup");
     assert_eq!(node.status(), HaNodeStatus::PreStopReady);
-    assert!(readiness_is_ok(service_address).await);
+    assert!(readiness_status(service_address).await.contains(" 200 "));
     let initialized = target_archive.load_checkpoint().await.unwrap().unwrap();
     assert_eq!(initialized.manifest().tip().index(), 0);
 
+    let stop_page_release = tail.stop_page_release_guard();
     tail.publish_stop(&stop);
-    node.bind_predecessor(HaPredecessor::new(predecessor.clone(), stop.clone()))
-        .unwrap();
+    let bound = HaPredecessor::new(predecessor.clone(), stop.clone());
+    node.bind_predecessor(bound.clone()).unwrap();
+    node.bind_predecessor(bound).unwrap();
     assert!(node
         .bind_predecessor(HaPredecessor::new(successor.clone(), stop.clone()))
         .unwrap_err()
         .to_string()
         .contains("binding changed"));
+    tokio::time::timeout(Duration::from_secs(10), tail.stop_page_entered())
+        .await
+        .expect("successor must request the Stop page after the first binding");
+    assert_eq!(node.status(), HaNodeStatus::CatchingUp);
+    assert!(readiness_status(service_address).await.contains(" 503 "));
+    let blocked_response = staging_health_keepalive(service_address).await;
+    assert_eq!(blocked_response.matches("HTTP/1.1 200").count(), 1);
+    assert_eq!(blocked_response.matches("HTTP/1.1 503").count(), 1);
+
+    drop(stop_page_release);
+    tokio::time::timeout(Duration::from_secs(10), activation_gate.entered())
+        .await
+        .expect("child must reach the pre-service activation gate");
+    // The child has finished preparation/open/router construction but must
+    // not own the service FD yet.  Keep probing the actual staging socket,
+    // including HTTP/1 keep-alive, to prove there is no health outage before
+    // the late same-FD handoff.
+    for _ in 0..8 {
+        let response = staging_health_keepalive(service_address).await;
+        assert!(
+            response.contains("HTTP/1.1 200"),
+            "livez lost before handoff: {response}"
+        );
+        assert_eq!(
+            response.matches("HTTP/1.1 200").count(),
+            1,
+            "only livez may be ready before handoff: {response}"
+        );
+        assert_eq!(
+            response.matches("HTTP/1.1 503").count(),
+            1,
+            "readyz must remain 503 before handoff: {response}"
+        );
+    }
+    let release = activation_gate.release_guard();
+    drop(release);
     let handle = tokio::time::timeout(Duration::from_secs(15), node.ready())
         .await
         .unwrap_or_else(|_| panic!("same live owner stalled in {:?}", node.status()))

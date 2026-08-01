@@ -51,10 +51,13 @@ pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
 pub use ha::{
     HaCertifiedTailError, HaCertifiedTailSource, HaNode, HaNodeError, HaNodeStatus, HaPredecessor,
-    HaRecorderTransport, HaServeConfig, HaStartupConfig, HaStartupError, HaStartupMode,
-    HaSuccessorNode, HaSuccessorPrestageConfig, HaSuccessorPrestageIdentity,
-    PreparedHaSuccessorPrestage, PublishedHaSuccessorPrestage,
+    HaRecorderTransport, HaServeConfig, HaShutdownCause, HaShutdownPhase, HaStartupConfig,
+    HaStartupError, HaStartupMode, HaSuccessorNode, HaSuccessorPrestageConfig,
+    HaSuccessorPrestageIdentity, IngressDisposition, MutationCertainty,
+    PreparedHaSuccessorPrestage, PublishedHaSuccessorPrestage, ShutdownToken, TaskDisposition,
 };
+#[cfg(feature = "test-hooks")]
+pub use ha::{HaServiceActivationGate, HaServiceActivationRelease};
 
 const MATERIALIZER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
@@ -170,6 +173,151 @@ impl EmbeddedConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownPhase {
+    InFlightOperations,
+    BackgroundWorkers,
+    AppliedTipFlush,
+}
+
+#[derive(Debug)]
+pub enum ShutdownCause {
+    DeadlineExceeded,
+    RecorderOutcomeUnknown,
+    Source(Box<Error>),
+    TaskFailure(ShutdownTaskFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownTaskFailure {
+    Panicked,
+    Cancelled,
+}
+
+/// Opaque failure from an internal asynchronous task.
+///
+/// The Tokio receipt remains available through [`std::error::Error::source`],
+/// while callers receive only the stable failure kind.
+#[derive(Debug)]
+pub struct WorkerError {
+    failure: ShutdownTaskFailure,
+    source: JoinError,
+}
+
+impl WorkerError {
+    fn from_join(source: JoinError) -> Self {
+        let failure = if source.is_cancelled() {
+            ShutdownTaskFailure::Cancelled
+        } else {
+            ShutdownTaskFailure::Panicked
+        };
+        Self { failure, source }
+    }
+
+    pub fn failure(&self) -> ShutdownTaskFailure {
+        self.failure
+    }
+}
+
+impl fmt::Display for WorkerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "internal task failure: {:?}", self.failure)
+    }
+}
+
+impl std::error::Error for WorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
+pub struct ShutdownError {
+    phase: ShutdownPhase,
+    cause: ShutdownCause,
+    cleanup: Vec<ShutdownError>,
+    task_source: Option<Arc<WorkerError>>,
+}
+
+impl ShutdownError {
+    pub fn phase(&self) -> ShutdownPhase {
+        self.phase
+    }
+
+    pub fn cause(&self) -> &ShutdownCause {
+        &self.cause
+    }
+
+    pub fn cleanup(&self) -> &[ShutdownError] {
+        &self.cleanup
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ShutdownPhase,
+        ShutdownCause,
+        Vec<ShutdownError>,
+        Option<Arc<WorkerError>>,
+    ) {
+        (self.phase, self.cause, self.cleanup, self.task_source)
+    }
+
+    pub(crate) fn new(phase: ShutdownPhase, cause: ShutdownCause) -> Self {
+        Self {
+            phase,
+            cause,
+            cleanup: Vec::new(),
+            task_source: None,
+        }
+    }
+
+    fn task_failure(phase: ShutdownPhase, source: JoinError) -> Self {
+        let source = Arc::new(WorkerError::from_join(source));
+        Self {
+            phase,
+            cause: ShutdownCause::TaskFailure(source.failure()),
+            cleanup: Vec::new(),
+            task_source: Some(source),
+        }
+    }
+}
+
+impl fmt::Display for ShutdownCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineExceeded => formatter.write_str("deadline exceeded"),
+            Self::RecorderOutcomeUnknown => formatter.write_str("recorder outcome is unknown"),
+            Self::Source(error) => write!(formatter, "{error}"),
+            Self::TaskFailure(kind) => write!(formatter, "task failure: {kind:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownCause {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error.as_ref()),
+            Self::DeadlineExceeded | Self::RecorderOutcomeUnknown | Self::TaskFailure(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        shutdown_error_display(self, formatter)
+    }
+}
+
+impl std::error::Error for ShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.task_source
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+            .or_else(|| <ShutdownCause as std::error::Error>::source(&self.cause))
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Closed,
@@ -181,18 +329,11 @@ pub enum Error {
     Consensus(ConsensusError),
     Node(NodeError),
     Durability(DurabilityError),
-    PendingConsensusRpcs,
-    ShutdownDeadlineExceeded {
-        phase: &'static str,
-    },
-    Shutdown {
-        primary: Box<Error>,
-        cleanup: Vec<Error>,
-    },
+    Shutdown(ShutdownError),
     WorkerExited {
         worker: &'static str,
     },
-    Worker(JoinError),
+    Worker(WorkerError),
 }
 
 impl fmt::Display for Error {
@@ -207,22 +348,7 @@ impl fmt::Display for Error {
             Self::Consensus(error) => error.fmt(f),
             Self::Node(error) => error.fmt(f),
             Self::Durability(error) => error.fmt(f),
-            Self::PendingConsensusRpcs => {
-                write!(
-                    f,
-                    "consensus RPCs did not finish before the shutdown deadline"
-                )
-            }
-            Self::ShutdownDeadlineExceeded { phase } => {
-                write!(f, "shutdown deadline exceeded while {phase}")
-            }
-            Self::Shutdown { primary, cleanup } => {
-                write!(f, "shutdown failed: {primary}")?;
-                for error in cleanup {
-                    write!(f, "; cleanup also failed: {error}")?;
-                }
-                Ok(())
-            }
+            Self::Shutdown(error) => shutdown_error_display(error, f),
             Self::WorkerExited { worker } => {
                 write!(f, "embedded {worker} worker exited before shutdown")
             }
@@ -239,9 +365,11 @@ impl std::error::Error for Error {
             Self::Consensus(error) => Some(error),
             Self::Node(error) => Some(error),
             Self::Durability(error) => Some(error),
-            Self::PendingConsensusRpcs => None,
-            Self::ShutdownDeadlineExceeded { .. } => None,
-            Self::Shutdown { primary, .. } => Some(primary),
+            Self::Shutdown(error) => match &error.cause {
+                ShutdownCause::Source(error) => Some(error.as_ref()),
+                ShutdownCause::TaskFailure(_) => error.task_source.as_ref().map(|error| error as _),
+                ShutdownCause::DeadlineExceeded | ShutdownCause::RecorderOutcomeUnknown => None,
+            },
             Self::WorkerExited { .. } => None,
             Self::Worker(error) => Some(error),
         }
@@ -268,21 +396,52 @@ impl Error {
             Self::Durability(_) => {
                 ErrorClassification::new("durability_error", ErrorCategory::Unavailable, true)
             }
-            Self::PendingConsensusRpcs => {
-                ErrorClassification::new("pending_consensus_rpcs", ErrorCategory::Unavailable, true)
-            }
-            Self::ShutdownDeadlineExceeded { .. } => ErrorClassification::new(
-                "shutdown_deadline_exceeded",
-                ErrorCategory::Unavailable,
-                true,
-            ),
-            Self::Shutdown { primary, .. } => primary.classification(),
+            Self::Shutdown(error) => shutdown_error_classification(error),
             Self::WorkerExited { .. } => {
                 ErrorClassification::new("worker_exited", ErrorCategory::Internal, false)
             }
             Self::Worker(_) => {
                 ErrorClassification::new("worker_error", ErrorCategory::Internal, false)
             }
+        }
+    }
+}
+
+fn shutdown_error_display(
+    error: &ShutdownError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    write!(formatter, "shutdown failed during {:?}: ", error.phase)?;
+    match &error.cause {
+        ShutdownCause::DeadlineExceeded => formatter.write_str("deadline exceeded")?,
+        ShutdownCause::RecorderOutcomeUnknown => {
+            formatter.write_str("recorder outcome is unknown")?
+        }
+        ShutdownCause::Source(source) => write!(formatter, "{source}")?,
+        ShutdownCause::TaskFailure(kind) => write!(formatter, "task failure: {kind:?}")?,
+    }
+    for cleanup in &error.cleanup {
+        formatter.write_str("; cleanup also failed: ")?;
+        shutdown_error_display(cleanup, formatter)?;
+    }
+    Ok(())
+}
+
+fn shutdown_error_classification(error: &ShutdownError) -> ErrorClassification {
+    match &error.cause {
+        ShutdownCause::DeadlineExceeded => ErrorClassification::new(
+            "shutdown_deadline_exceeded",
+            ErrorCategory::Unavailable,
+            true,
+        ),
+        ShutdownCause::RecorderOutcomeUnknown => ErrorClassification::new(
+            "shutdown_recorder_outcome_unknown",
+            ErrorCategory::Unavailable,
+            true,
+        ),
+        ShutdownCause::Source(error) => error.classification(),
+        ShutdownCause::TaskFailure(_) => {
+            ErrorClassification::new("worker_error", ErrorCategory::Internal, false)
         }
     }
 }
@@ -490,8 +649,8 @@ impl Rhiza {
         self.shutdown_with_deadline(Instant::now() + timeout).await
     }
 
-    /// Drains embedded work before an absolute deadline.
-    pub async fn shutdown_with_deadline(mut self, deadline: Instant) -> Result<(), Error> {
+    /// Drains embedded work before an absolute deadline shared by HA internals.
+    pub(crate) async fn shutdown_with_deadline(mut self, deadline: Instant) -> Result<(), Error> {
         let inner = self.inner.take().expect("open owner has inner state");
         let mut errors = Vec::new();
 
@@ -503,9 +662,10 @@ impl Rhiza {
                     true
                 }
                 Err(_) => {
-                    errors.push(Error::ShutdownDeadlineExceeded {
-                        phase: "draining in-flight operations",
-                    });
+                    errors.push(ShutdownError::new(
+                        ShutdownPhase::InFlightOperations,
+                        ShutdownCause::DeadlineExceeded,
+                    ));
                     false
                 }
             };
@@ -515,13 +675,20 @@ impl Rhiza {
         while !self.workers.is_empty() {
             match tokio::time::timeout_at(deadline, self.workers.join_next()).await {
                 Ok(Some(Ok(Ok(())))) => {}
-                Ok(Some(Ok(Err(error)))) => errors.push(error),
-                Ok(Some(Err(error))) => errors.push(Error::Worker(error)),
+                Ok(Some(Ok(Err(error)))) => errors.push(shutdown_error_from_source(
+                    ShutdownPhase::BackgroundWorkers,
+                    error,
+                )),
+                Ok(Some(Err(error))) => errors.push(ShutdownError::task_failure(
+                    ShutdownPhase::BackgroundWorkers,
+                    error,
+                )),
                 Ok(None) => break,
                 Err(_) => {
-                    errors.push(Error::ShutdownDeadlineExceeded {
-                        phase: "stopping background workers",
-                    });
+                    errors.push(ShutdownError::new(
+                        ShutdownPhase::BackgroundWorkers,
+                        ShutdownCause::DeadlineExceeded,
+                    ));
                     self.workers.abort_all();
                     workers_stopped = false;
                     break;
@@ -532,16 +699,15 @@ impl Rhiza {
         if operations_drained && workers_stopped {
             match tokio::time::timeout_at(deadline, flush_applied_tip(&inner)).await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => errors.push(error),
-                Err(_) => errors.push(Error::ShutdownDeadlineExceeded {
-                    phase: "flushing the applied tip",
-                }),
+                Ok(Err(error)) => errors.push(shutdown_error_from_source(
+                    ShutdownPhase::AppliedTipFlush,
+                    error,
+                )),
+                Err(_) => errors.push(ShutdownError::new(
+                    ShutdownPhase::AppliedTipFlush,
+                    ShutdownCause::DeadlineExceeded,
+                )),
             }
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Err(error) = finish_pending_consensus_rpcs(&inner, remaining) {
-            errors.push(error);
         }
 
         drop(inner);
@@ -646,7 +812,7 @@ impl RhizaHandle {
         let runtime = inner.runtime.clone();
         let outcome = tokio::task::spawn_blocking(move || runtime.mutate_graph(command))
             .await
-            .map_err(Error::Worker)??;
+            .map_err(|error| Error::Worker(WorkerError::from_join(error)))??;
         confirm_embedded_write(&inner, outcome.applied_index()).await?;
         Ok(outcome)
     }
@@ -685,7 +851,7 @@ impl RhizaHandle {
             runtime.query_graph(&statement, &parameters, consistency, max_rows)
         })
         .await
-        .map_err(Error::Worker)?
+        .map_err(|error| Error::Worker(WorkerError::from_join(error)))?
         .map_err(Error::Node)
     }
 
@@ -701,7 +867,7 @@ impl RhizaHandle {
         let id = id.into();
         tokio::task::spawn_blocking(move || runtime.get_graph_document(&id, consistency))
             .await
-            .map_err(Error::Worker)?
+            .map_err(|error| Error::Worker(WorkerError::from_join(error)))?
             .map_err(Error::Node)
     }
 
@@ -710,7 +876,7 @@ impl RhizaHandle {
         let runtime = inner.runtime.clone();
         let mut status = tokio::task::spawn_blocking(move || runtime.status())
             .await
-            .map_err(Error::Worker)??;
+            .map_err(|error| Error::Worker(WorkerError::from_join(error)))??;
         if inner
             .coordinator
             .as_ref()
@@ -753,7 +919,9 @@ impl RhizaHandle {
         let runtime = inner.runtime.clone();
         let results = tokio::task::spawn_blocking(move || execute(runtime))
             .await
-            .map_err(|error| BatchWriteError::Indeterminate(Error::Worker(error)))?
+            .map_err(|error| {
+                BatchWriteError::Indeterminate(Error::Worker(WorkerError::from_join(error)))
+            })?
             .map_err(|error| BatchWriteError::NotAttempted(Error::Node(error)))?;
         if let Some(index) = results
             .iter()
@@ -948,36 +1116,25 @@ async fn flush_applied_tip(inner: &Inner) -> Result<(), Error> {
     Ok(())
 }
 
-fn finish_pending_consensus_rpcs(inner: &Inner, timeout: Duration) -> Result<(), Error> {
-    let consensus = inner.runtime.consensus();
-    let finished = if matches!(
-        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-    ) {
-        tokio::task::block_in_place(|| consensus.finish_pending_rpcs(timeout))
-    } else {
-        consensus.finish_pending_rpcs(timeout)
-    };
-    if finished {
-        Ok(())
-    } else {
-        Err(Error::PendingConsensusRpcs)
-    }
-}
-
-fn combine_shutdown_errors(mut errors: Vec<Error>) -> Result<(), Error> {
+fn combine_shutdown_errors(mut errors: Vec<ShutdownError>) -> Result<(), Error> {
     if errors.is_empty() {
         return Ok(());
     }
-    let primary = errors.remove(0);
+    let mut primary = errors.remove(0);
     if errors.is_empty() {
-        Err(primary)
+        Err(Error::Shutdown(primary))
     } else {
-        Err(Error::Shutdown {
-            primary: Box::new(primary),
-            cleanup: errors,
-        })
+        primary.cleanup = errors;
+        Err(Error::Shutdown(primary))
     }
+}
+
+fn shutdown_error_from_source(phase: ShutdownPhase, error: Error) -> ShutdownError {
+    let cause = match error {
+        Error::Consensus(ConsensusError::UnknownOutcome) => ShutdownCause::RecorderOutcomeUnknown,
+        error => ShutdownCause::Source(Box::new(error)),
+    };
+    ShutdownError::new(phase, cause)
 }
 
 fn close_inner(inner: &Inner) {
@@ -1006,6 +1163,447 @@ fn stop_inner(inner: &Inner) {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct TestBlockingRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl TestBlockingRelease {
+        fn wait(&self) {
+            let (released, condition) = &*self.0;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            let (released, condition) = &*self.0;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+        }
+    }
+
+    impl Drop for TestBlockingRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    const TEST_SLOT_GATE_MAX_WAIT: Duration = Duration::from_secs(15);
+
+    #[derive(Clone)]
+    struct TestSlotGate(Arc<(std::sync::Mutex<TestSlotGateState>, std::sync::Condvar)>);
+
+    #[derive(Default)]
+    struct TestSlotGateState {
+        entered: usize,
+        released: bool,
+    }
+
+    struct TestSlotGateRelease(TestSlotGate);
+
+    impl TestSlotGate {
+        fn new() -> (Self, TestSlotGateRelease) {
+            let gate = Self(Arc::new((
+                std::sync::Mutex::new(TestSlotGateState::default()),
+                std::sync::Condvar::new(),
+            )));
+            (gate.clone(), TestSlotGateRelease(gate))
+        }
+
+        /// Blocks one recorder RPC until the test releases this gate. The
+        /// bound turns a lost test release into an attributable recorder
+        /// error instead of an indefinitely stuck worker thread.
+        fn wait(&self) -> rhiza_quepaxa::Result<()> {
+            let started = std::time::Instant::now();
+            let (state, changed) = &*self.0;
+            let mut state = state.lock().unwrap();
+            state.entered += 1;
+            changed.notify_all();
+            while !state.released {
+                let Some(remaining) = TEST_SLOT_GATE_MAX_WAIT.checked_sub(started.elapsed()) else {
+                    return Err(ConsensusError::Io(
+                        "test slot gate timed out before release".into(),
+                    ));
+                };
+                let (next, timed_out) = changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if timed_out.timed_out() && !state.released {
+                    return Err(ConsensusError::Io(
+                        "test slot gate timed out before release".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn wait_for_entered(&self, required: usize, timeout: Duration) -> bool {
+            let started = std::time::Instant::now();
+            let (state, changed) = &*self.0;
+            let mut state = state.lock().unwrap();
+            while state.entered < required {
+                let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                    return false;
+                };
+                let (next, timed_out) = changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if timed_out.timed_out() && state.entered < required {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn release(&self) {
+            let (state, changed) = &*self.0;
+            state.lock().unwrap().released = true;
+            changed.notify_all();
+        }
+    }
+
+    impl TestSlotGateRelease {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+
+    impl Drop for TestSlotGateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestOperationProbes(
+        Arc<std::sync::Mutex<std::collections::BTreeMap<u64, Arc<std::sync::atomic::AtomicUsize>>>>,
+    );
+
+    impl TestOperationProbes {
+        fn register(&self, slot: u64) -> Arc<std::sync::atomic::AtomicUsize> {
+            let probe = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            self.0.lock().unwrap().insert(slot, Arc::clone(&probe));
+            probe
+        }
+
+        fn enter(&self, slot: u64) -> Option<TestOperationProbeLease> {
+            let probe = self.0.lock().unwrap().get(&slot).cloned()?;
+            probe.fetch_add(1, Ordering::AcqRel);
+            Some(TestOperationProbeLease { probe })
+        }
+    }
+
+    struct TestOperationProbeLease {
+        probe: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    static CONSENSUS_GROUP_STRESS_SERIALIZER: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    impl Drop for TestOperationProbeLease {
+        fn drop(&mut self) {
+            self.probe.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    struct TestBlockingRecorder {
+        inner: RecorderFileStore,
+        started: std::sync::mpsc::Sender<()>,
+        release: TestBlockingRelease,
+        probes: TestOperationProbes,
+    }
+
+    impl RecorderRpc for TestBlockingRecorder {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            self.inner.recorder_id()
+        }
+
+        fn store_command_for(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: rhiza_core::LogHash,
+            command_hash: rhiza_core::LogHash,
+            command: rhiza_core::StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.inner.store_command_for(
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: rhiza_core::LogHash,
+            command_hash: rhiza_core::LogHash,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
+
+        fn record(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            request: rhiza_quepaxa::RecordRequest,
+        ) -> rhiza_quepaxa::Result<rhiza_quepaxa::RecordSummary> {
+            let _probe = self.probes.enter(request.slot);
+            let _ = self.started.send(());
+            self.release.wait();
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            proof: rhiza_quepaxa::DecisionProof,
+            membership: &rhiza_quepaxa::Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.inner.install_decision_proof(proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_quepaxa::DecisionProof>> {
+            self.inner.inspect_decision_proof(slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_quepaxa::RecordSummary>> {
+            self.inner.inspect_record_summary(slot)
+        }
+    }
+
+    /// Test-only recorder wrapper. Slot gates are instance-owned and scoped
+    /// to this exact test configuration; no global hook can affect another
+    /// consensus instance or later stress iteration.
+    struct TestSlotGatedRecorder {
+        inner: RecorderFileStore,
+        gates: std::collections::BTreeMap<u64, TestSlotGate>,
+        probes: TestOperationProbes,
+    }
+
+    impl RecorderRpc for TestSlotGatedRecorder {
+        fn recorder_id(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            self.inner.recorder_id()
+        }
+
+        fn store_command_for(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: rhiza_core::LogHash,
+            command_hash: rhiza_core::LogHash,
+            command: rhiza_core::StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.inner.store_command_for(
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: rhiza_core::LogHash,
+            command_hash: rhiza_core::LogHash,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
+
+        fn record(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            request: rhiza_quepaxa::RecordRequest,
+        ) -> rhiza_quepaxa::Result<rhiza_quepaxa::RecordSummary> {
+            let _probe = self.probes.enter(request.slot);
+            if let Some(gate) = self.gates.get(&request.slot) {
+                gate.wait()?;
+            }
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            proof: rhiza_quepaxa::DecisionProof,
+            membership: &rhiza_quepaxa::Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.inner.install_decision_proof(proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_quepaxa::DecisionProof>> {
+            self.inner.inspect_decision_proof(slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            _context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_quepaxa::RecordSummary>> {
+            self.inner.inspect_record_summary(slot)
+        }
+    }
+
+    fn test_config_with_blocked_recorder(
+        root: &std::path::Path,
+    ) -> (
+        EmbeddedConfig,
+        std::sync::mpsc::Receiver<()>,
+        TestBlockingRelease,
+        TestOperationProbes,
+    ) {
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let cluster_id = effective_cluster_id(ExecutionProfile::Sqlite, "cluster-a").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = TestBlockingRelease::default();
+        let probes = TestOperationProbes::default();
+        let recorders = membership
+            .members()
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let recorder = RecorderFileStore::new_with_membership(
+                    root.join("recorders").join(id),
+                    id.clone(),
+                    &cluster_id,
+                    1,
+                    1,
+                    membership.clone(),
+                )?;
+                let recorder: Box<dyn RecorderRpc> = if index == 2 {
+                    Box::new(TestBlockingRecorder {
+                        inner: recorder,
+                        started: started_tx.clone(),
+                        release: release.clone(),
+                        probes: probes.clone(),
+                    })
+                } else {
+                    Box::new(recorder)
+                };
+                Ok((id.clone(), recorder))
+            })
+            .collect::<Result<Vec<_>, ConsensusError>>()
+            .unwrap();
+        (
+            EmbeddedConfig::new(
+                EmbeddedIdentity::new("cluster-a", "node-1", 1, 1),
+                root.join("node"),
+                ExecutionProfile::Sqlite,
+                membership.members().to_vec(),
+                recorders,
+                vec![],
+                None,
+            ),
+            started_rx,
+            release,
+            probes,
+        )
+    }
+
+    fn test_config_with_slot_gated_recorder_quorums(
+        root: &std::path::Path,
+        owned_slot: u64,
+        unowned_slot: u64,
+    ) -> (
+        EmbeddedConfig,
+        TestSlotGate,
+        TestSlotGateRelease,
+        TestSlotGate,
+        TestSlotGateRelease,
+        TestOperationProbes,
+    ) {
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let cluster_id = effective_cluster_id(ExecutionProfile::Sqlite, "cluster-a").unwrap();
+        let (owned_gate, owned_release) = TestSlotGate::new();
+        let (unowned_gate, unowned_release) = TestSlotGate::new();
+        let probes = TestOperationProbes::default();
+        let recorders = membership
+            .members()
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let recorder = RecorderFileStore::new_with_membership(
+                    root.join("recorders").join(id),
+                    id.clone(),
+                    &cluster_id,
+                    1,
+                    1,
+                    membership.clone(),
+                )?;
+                // The owned quorum occupies recorders 0/1. The unowned
+                // quorum is recorders 1/2. Recorder 1's unowned RPC queues
+                // behind its owned RPC, while recorder 2 is actively gated.
+                // Both unowned quorum jobs therefore remain admitted at the
+                // shutdown boundary without inventing a global test hook.
+                let mut gates = std::collections::BTreeMap::new();
+                if index <= 1 {
+                    gates.insert(owned_slot, owned_gate.clone());
+                }
+                if index >= 1 {
+                    gates.insert(unowned_slot, unowned_gate.clone());
+                }
+                Ok((
+                    id.clone(),
+                    Box::new(TestSlotGatedRecorder {
+                        inner: recorder,
+                        gates,
+                        probes: probes.clone(),
+                    }) as Box<dyn RecorderRpc>,
+                ))
+            })
+            .collect::<Result<Vec<_>, ConsensusError>>()
+            .unwrap();
+        (
+            EmbeddedConfig::new(
+                EmbeddedIdentity::new("cluster-a", "node-1", 1, 1),
+                root.join("node"),
+                ExecutionProfile::Sqlite,
+                membership.members().to_vec(),
+                recorders,
+                vec![],
+                None,
+            ),
+            owned_gate,
+            owned_release,
+            unowned_gate,
+            unowned_release,
+            probes,
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
         let root = tempfile::tempdir().unwrap();
@@ -1023,6 +1621,470 @@ mod tests {
             Err(Error::Config(ConfigError::PeerMembershipMismatch))
         ));
         assert!(!root.path().join("node").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_does_not_wait_for_an_unowned_shared_consensus_group() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, started_rx, release, _probes) = test_config_with_blocked_recorder(root.path());
+        let owner = Rhiza::open(config).await.unwrap();
+        let consensus = owner.inner.as_ref().unwrap().runtime.consensus().clone();
+        let unrelated = std::thread::spawn(move || {
+            consensus.propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                rhiza_core::LogHash::ZERO,
+                rhiza_core::Command::new(
+                    rhiza_core::CommandKind::Deterministic,
+                    b"outside".to_vec(),
+                ),
+            )
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            owner.shutdown_with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect("shutdown must not wait for an unowned consensus group")
+        .unwrap();
+        assert!(
+            !unrelated.is_finished(),
+            "shutdown must not cancel or quarantine the unrelated group"
+        );
+        release.release();
+        unrelated.join().unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_deadline_reports_only_the_owned_admitted_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = Rhiza::open(
+            EmbeddedConfig::local_file_backed("cluster-a", root.path(), ExecutionProfile::Sqlite)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let handle = owner.handle();
+        let (_, operation) = handle.begin_operation().await.unwrap();
+
+        let error = owner
+            .shutdown_with_timeout(Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Shutdown(ShutdownError {
+                phase: ShutdownPhase::InFlightOperations,
+                cause: ShutdownCause::DeadlineExceeded,
+                ..
+            })
+        ));
+        drop(operation);
+        assert!(matches!(
+            handle.put("after-shutdown", "key", "value").await,
+            Err(Error::Closed)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_deadline_bounds_a_blocked_owned_proposal_without_touching_other_groups() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, started_rx, release, _probes) = test_config_with_blocked_recorder(root.path());
+        let owner = Rhiza::open(config).await.unwrap();
+        let handle = owner.handle();
+        let owned_handle = handle.clone();
+        let owned = tokio::spawn(async move { owned_handle.put("owned", "key", "value").await });
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let shutdown = owner.shutdown_with_timeout(Duration::from_millis(1)).await;
+        assert!(matches!(
+            shutdown,
+            Err(Error::Shutdown(ShutdownError {
+                phase: ShutdownPhase::InFlightOperations,
+                cause: ShutdownCause::DeadlineExceeded,
+                ..
+            }))
+        ));
+        assert!(
+            !owned.is_finished(),
+            "the admitted proposal remains its caller's scope"
+        );
+        release.release();
+        let outcome = owned.await.unwrap();
+        assert!(
+            outcome.is_ok()
+                || matches!(
+                    outcome,
+                    Err(Error::Node(NodeError::Reconciliation(ref message)))
+                        if message == "QuePaxa recorder RPC outcome is unknown; recover recorder state"
+                ),
+            "the owned proposal must resolve to its exact success or mutation-unknown outcome: {outcome:?}"
+        );
+        assert!(matches!(
+            handle.put("after-shutdown", "key", "value").await,
+            Err(Error::Closed)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_and_unowned_consensus_groups_do_not_cross_cancel_under_shutdown_races() {
+        let _serial = CONSENSUS_GROUP_STRESS_SERIALIZER
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for iteration in 0..200 {
+            let root = tempfile::tempdir().unwrap();
+            let owned_slot = 1;
+            let unowned_slot = 100 + iteration;
+            let (config, owned_gate, owned_release, unowned_gate, unowned_release, probes) =
+                test_config_with_slot_gated_recorder_quorums(root.path(), owned_slot, unowned_slot);
+            let owner = Rhiza::open(config).await.unwrap();
+            let handle = owner.handle();
+            let consensus = owner.inner.as_ref().unwrap().runtime.consensus().clone();
+            let owned_probe = probes.register(owned_slot);
+            let unowned_probe = probes.register(unowned_slot);
+            let owned_group_probe = Arc::new(rhiza_quepaxa::TestControlOperationProbe::default());
+            let unowned_group_probe = Arc::new(rhiza_quepaxa::TestControlOperationProbe::default());
+            let _owned_group_probe = consensus
+                .install_test_record_operation_probe(owned_slot, Arc::clone(&owned_group_probe))
+                .unwrap();
+            let _unowned_group_probe = consensus
+                .install_test_record_operation_probe(unowned_slot, Arc::clone(&unowned_group_probe))
+                .unwrap();
+            let owned_handle = handle.clone();
+            let owned =
+                tokio::spawn(async move { owned_handle.put("owned", "key", "value").await });
+            let readiness_watchdog = Duration::from_secs(15);
+            assert!(
+                tokio::task::spawn_blocking({
+                    let owned_gate = owned_gate.clone();
+                    move || owned_gate.wait_for_entered(2, readiness_watchdog)
+                })
+                .await
+                .expect("owned gate waiter must not panic"),
+                "owned group {iteration} did not enter both slot-scoped quorum gates"
+            );
+            let unrelated_consensus = consensus.clone();
+            let unrelated = std::thread::spawn(move || {
+                unrelated_consensus.propose_at(
+                    // This is the caller-owned operation budget, not the
+                    // intentionally short shutdown deadline below. Keep it
+                    // generous so the test observes draining after its gate
+                    // opens rather than an unrelated RPC budget expiry.
+                    rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(30)),
+                    unowned_slot,
+                    rhiza_core::LogHash::ZERO,
+                    rhiza_core::Command::new(
+                        rhiza_core::CommandKind::Deterministic,
+                        format!("unowned-{iteration}").into_bytes(),
+                    ),
+                )
+            });
+            assert!(
+                tokio::task::spawn_blocking({
+                    let unowned_gate = unowned_gate.clone();
+                    move || unowned_gate.wait_for_entered(1, readiness_watchdog)
+                })
+                .await
+                .expect("unowned gate waiter must not panic"),
+                "unowned group {iteration} did not enter its non-overlapping slot gate"
+            );
+            assert!(
+                owned_group_probe.wait_for_admitted_outstanding(readiness_watchdog),
+                "owned group {iteration} did not admit an outstanding lease: \
+                 dispatched={} max_outstanding={} outstanding={} drained={} workers={:?}",
+                owned_group_probe.dispatch_count(),
+                owned_group_probe.observed_max_outstanding(),
+                owned_group_probe.outstanding(),
+                owned_group_probe.drained_count(),
+                owned_group_probe.worker_transitions(),
+            );
+            assert!(
+                unowned_group_probe.wait_for_admitted_outstanding(readiness_watchdog),
+                "unowned group {iteration} did not admit an outstanding lease: \
+                 dispatched={} max_outstanding={} outstanding={} drained={} workers={:?}",
+                unowned_group_probe.dispatch_count(),
+                unowned_group_probe.observed_max_outstanding(),
+                unowned_group_probe.outstanding(),
+                unowned_group_probe.drained_count(),
+                unowned_group_probe.worker_transitions(),
+            );
+            assert!(
+                owned_group_probe.outstanding() >= 2,
+                "owned group {iteration} did not retain its gated quorum at shutdown: workers={:?}",
+                owned_group_probe.worker_transitions(),
+            );
+            assert!(
+                unowned_group_probe.outstanding() >= 2,
+                "unowned group {iteration} did not retain its gated quorum at shutdown: workers={:?}",
+                unowned_group_probe.worker_transitions(),
+            );
+            assert!(
+                !unrelated.is_finished(),
+                "unowned group {iteration} completed before the shutdown boundary"
+            );
+
+            assert!(matches!(
+                owner.shutdown_with_timeout(Duration::from_millis(1)).await,
+                Err(Error::Shutdown(ShutdownError {
+                    phase: ShutdownPhase::InFlightOperations,
+                    cause: ShutdownCause::DeadlineExceeded,
+                    ..
+                }))
+            ));
+            assert!(
+                !unrelated.is_finished(),
+                "shutdown iteration {iteration} cross-cancelled the unrelated consensus group"
+            );
+            assert_eq!(
+                owned_group_probe.cancel_count(),
+                0,
+                "owned group {iteration} stays caller-owned and drains cooperatively after its gate releases"
+            );
+            assert_eq!(
+                owned_group_probe.quarantine_count(),
+                0,
+                "owned group {iteration} must not quarantine a cooperative recorder"
+            );
+            assert_eq!(
+                unowned_group_probe.cancel_count(),
+                0,
+                "shutdown iteration {iteration} cancelled the unrelated RPC group"
+            );
+            assert_eq!(
+                unowned_group_probe.quarantine_count(),
+                0,
+                "shutdown iteration {iteration} quarantined the unrelated RPC group"
+            );
+            assert!(
+                unowned_group_probe.outstanding() >= 2,
+                "shutdown iteration {iteration} drained the unrelated gated quorum"
+            );
+            assert!(matches!(
+                handle.put("after-shutdown", "key", "value").await,
+                Err(Error::Closed)
+            ));
+            owned_release.release();
+            unowned_release.release();
+            let owned_outcome = owned.await.unwrap();
+            assert!(
+                matches!(
+                    owned_outcome,
+                    Err(Error::Node(NodeError::Reconciliation(ref message)))
+                        if message == "QuePaxa recorder RPC outcome is unknown; recover recorder state"
+                ),
+                "owned operation {iteration} must report the exact shutdown mutation-indeterminate result: {owned_outcome:?}"
+            );
+            let unrelated_outcome = unrelated.join().unwrap();
+            assert!(
+                unrelated_outcome.is_ok(),
+                "unowned operation {iteration} must complete successfully after its gate releases: {unrelated_outcome:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while owned_group_probe.outstanding() != 0 || unowned_group_probe.outstanding() != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "iteration {iteration} RPC groups did not drain: owned \
+                     pending={} outstanding={} dispatched={} drained={} workers={:?}; unowned \
+                     pending={} outstanding={} dispatched={} drained={} workers={:?}",
+                    owned_group_probe.pending(),
+                    owned_group_probe.outstanding(),
+                    owned_group_probe.dispatch_count(),
+                    owned_group_probe.drained_count(),
+                    owned_group_probe.worker_transitions(),
+                    unowned_group_probe.pending(),
+                    unowned_group_probe.outstanding(),
+                    unowned_group_probe.dispatch_count(),
+                    unowned_group_probe.drained_count(),
+                    unowned_group_probe.worker_transitions(),
+                )
+            });
+            assert_eq!(
+                owned_probe.load(Ordering::Acquire),
+                0,
+                "owned group {iteration} leaked a recorder lease"
+            );
+            assert_eq!(
+                unowned_probe.load(Ordering::Acquire),
+                0,
+                "unowned group {iteration} leaked a recorder lease"
+            );
+            assert_eq!(
+                owned_group_probe.outstanding(),
+                0,
+                "owned group {iteration} retained an admitted QuePaxa lease"
+            );
+            assert_eq!(
+                unowned_group_probe.outstanding(),
+                0,
+                "unowned group {iteration} retained an admitted QuePaxa lease"
+            );
+            assert!(
+                owned_group_probe.drained_count() > 0,
+                "owned group {iteration} did not observe a completed lease"
+            );
+            assert!(
+                unowned_group_probe.drained_count() > 0,
+                "unowned group {iteration} did not observe a completed lease"
+            );
+            drop(_owned_group_probe);
+            drop(_unowned_group_probe);
+            assert_eq!(
+                consensus.test_record_operation_probe_registration_count(),
+                0,
+                "iteration {iteration} leaked an instance-scoped record probe"
+            );
+            // Keep the iteration boundary real: no caller, consensus handle,
+            // or operation-local probe escapes into the next race.
+            drop(handle);
+            drop(consensus);
+            drop(owned_release);
+            drop(unowned_release);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_probe_isolates_equal_slots_in_separate_consensus_instances() {
+        let _serial = CONSENSUS_GROUP_STRESS_SERIALIZER
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for _ in 0..200 {
+            let first_root = tempfile::tempdir().unwrap();
+            let second_root = tempfile::tempdir().unwrap();
+            let first_owner = Rhiza::open(
+                EmbeddedConfig::local_file_backed(
+                    "cluster-a",
+                    first_root.path(),
+                    ExecutionProfile::Sqlite,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let second_owner = Rhiza::open(
+                EmbeddedConfig::local_file_backed(
+                    "cluster-a",
+                    second_root.path(),
+                    ExecutionProfile::Sqlite,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let first_consensus = first_owner
+                .inner
+                .as_ref()
+                .unwrap()
+                .runtime
+                .consensus()
+                .clone();
+            let second_consensus = second_owner
+                .inner
+                .as_ref()
+                .unwrap()
+                .runtime
+                .consensus()
+                .clone();
+            let first_probe = Arc::new(rhiza_quepaxa::TestControlOperationProbe::default());
+            let second_probe = Arc::new(rhiza_quepaxa::TestControlOperationProbe::default());
+            let first_guard = first_consensus
+                .install_test_record_operation_probe(7, Arc::clone(&first_probe))
+                .unwrap();
+            let second_guard = second_consensus
+                .install_test_record_operation_probe(7, Arc::clone(&second_probe))
+                .unwrap();
+
+            first_consensus
+                .propose_at(
+                    rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                    7,
+                    rhiza_core::LogHash::ZERO,
+                    rhiza_core::Command::new(
+                        rhiza_core::CommandKind::Deterministic,
+                        b"first".to_vec(),
+                    ),
+                )
+                .unwrap();
+            assert!(first_consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            assert!(
+                first_probe.wait_for_quiescence(Duration::from_secs(15)),
+                "first probe did not quiesce after diagnostic finish: dispatched={} \
+                 outstanding={} drained={} cancel={} quarantine={} workers={:?}",
+                first_probe.dispatch_count(),
+                first_probe.outstanding(),
+                first_probe.drained_count(),
+                first_probe.cancel_count(),
+                first_probe.quarantine_count(),
+                first_probe.worker_transitions(),
+            );
+            assert!(first_probe.dispatch_count() > 0);
+            assert!(first_probe.observed_max_outstanding() > 0);
+            assert_eq!(second_probe.dispatch_count(), 0);
+            assert_eq!(second_probe.observed_max_outstanding(), 0);
+            assert_eq!(second_probe.outstanding(), 0);
+            assert_eq!(second_probe.cancel_count(), 0);
+            assert_eq!(second_probe.quarantine_count(), 0);
+            assert_eq!(second_probe.drained_count(), 0);
+            let first_snapshot = (
+                first_probe.dispatch_count(),
+                first_probe.observed_max_outstanding(),
+                first_probe.outstanding(),
+                first_probe.cancel_count(),
+                first_probe.quarantine_count(),
+                first_probe.drained_count(),
+            );
+
+            second_consensus
+                .propose_at(
+                    rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                    7,
+                    rhiza_core::LogHash::ZERO,
+                    rhiza_core::Command::new(
+                        rhiza_core::CommandKind::Deterministic,
+                        b"second".to_vec(),
+                    ),
+                )
+                .unwrap();
+            assert!(second_consensus.finish_pending_rpcs(Duration::from_secs(1)));
+            assert!(second_probe.dispatch_count() > 0);
+            assert!(second_probe.observed_max_outstanding() > 0);
+            assert_eq!(
+                first_snapshot,
+                (
+                    first_probe.dispatch_count(),
+                    first_probe.observed_max_outstanding(),
+                    first_probe.outstanding(),
+                    first_probe.cancel_count(),
+                    first_probe.quarantine_count(),
+                    first_probe.drained_count(),
+                ),
+                "same slot on a separate consensus instance mutated the first probe"
+            );
+            drop(first_guard);
+            drop(second_guard);
+            assert_eq!(
+                first_consensus.test_record_operation_probe_registration_count(),
+                0
+            );
+            assert_eq!(
+                second_consensus.test_record_operation_probe_registration_count(),
+                0
+            );
+        }
     }
 
     #[cfg(not(feature = "graph"))]

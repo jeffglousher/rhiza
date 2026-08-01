@@ -58,6 +58,7 @@ impl Fixture {
             let index = u64::try_from(offset).unwrap() + 1;
             let entry = consensus
                 .propose_at(
+                    rhiza_quepaxa::RecorderRpcContext::default_timeout(),
                     index,
                     previous,
                     Command::new(CommandKind::Deterministic, payload),

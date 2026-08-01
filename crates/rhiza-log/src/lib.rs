@@ -20,6 +20,17 @@ pub const QLOG_FRAME_MAGIC: [u8; 4] = *b"QFRM";
 pub const QLOG_FOOTER_MAGIC: [u8; 4] = *b"QEND";
 pub const OPEN_SEGMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const OPEN_SEGMENT_MAX_ENTRIES: usize = 4096;
+/// Format-stable decoded accounting reserved per qlog entry in addition to
+/// encoded object bytes and repeated cluster identity bytes.
+///
+/// This covers the supported-target `LogEntry` container and transient footer
+/// hash storage. The bounded decoder separately measures actual allocator
+/// capacities and fails closed if they ever exceed the resulting upper bound.
+pub const QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES: usize = 256;
+const _: () = assert!(
+    std::mem::size_of::<LogEntry>() + std::mem::size_of::<LogHash>()
+        <= QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES
+);
 
 const HEADER_WITHOUT_CRC_LEN: usize = 72;
 const FRAME_PREFIX_LEN: usize = 108;
@@ -66,6 +77,10 @@ pub enum Error {
         from: LogIndex,
         anchor: LogIndex,
     },
+    DecodeLimitExceeded {
+        limit: usize,
+        actual: usize,
+    },
     Decode(String),
     Io(String),
 }
@@ -96,6 +111,10 @@ impl fmt::Display for Error {
             Self::TruncateCompactedPrefix { from, anchor } => write!(
                 f,
                 "cannot truncate from {from} at or below compacted anchor {anchor}"
+            ),
+            Self::DecodeLimitExceeded { limit, actual } => write!(
+                f,
+                "qlog decoded bytes exceed limit: limit {limit} bytes, need at least {actual} bytes"
             ),
             Self::Decode(message) => write!(f, "qlog decode failed: {message}"),
             Self::Io(message) => write!(f, "qlog io failed: {message}"),
@@ -169,14 +188,105 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Vec<LogEntry>> {
 }
 
 pub fn decode_segment_for_cluster(bytes: &[u8], cluster_id: &str) -> Result<Vec<LogEntry>> {
+    decode_segment_for_cluster_bounded(bytes, cluster_id, usize::MAX).map(|(entries, _)| entries)
+}
+
+/// Decodes a closed qlog while capping owned decoded data before each frame
+/// allocates its payload and repeated cluster identity.
+pub fn decode_segment_for_cluster_bounded(
+    bytes: &[u8],
+    cluster_id: &str,
+    max_decoded_bytes: usize,
+) -> Result<(Vec<LogEntry>, usize)> {
     let (header, mut offset) = decode_header(bytes, cluster_id)?;
-    let cluster_id = if cluster_id.is_empty() {
-        header.cluster_id_hash.to_hex()
+    let mut decoded = DecodeBudget::new(max_decoded_bytes);
+    let owned_cluster_id = if cluster_id.is_empty() {
+        decoded.ensure_additional(64)?;
+        let cluster_id = header.cluster_id_hash.to_hex();
+        decoded.charge(cluster_id.capacity())?;
+        Some(cluster_id)
     } else {
-        cluster_id.to_string()
+        None
     };
+    let cluster_id = owned_cluster_id.as_deref().unwrap_or(cluster_id);
+    let preflight = preflight_closed_segment(bytes, offset, cluster_id)?;
+    let conservative_charge = decoded_charge_upper_bound(
+        bytes.len(),
+        preflight.entry_count,
+        cluster_id.len(),
+        max_decoded_bytes,
+    )?;
+    if conservative_charge > max_decoded_bytes {
+        return Err(Error::DecodeLimitExceeded {
+            limit: max_decoded_bytes,
+            actual: conservative_charge,
+        });
+    }
+    let entry_storage_min = preflight
+        .entry_count
+        .checked_mul(std::mem::size_of::<LogEntry>())
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: max_decoded_bytes,
+            actual: usize::MAX,
+        })?;
+    let hash_storage_min = preflight
+        .entry_count
+        .checked_mul(std::mem::size_of::<LogHash>())
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: max_decoded_bytes,
+            actual: usize::MAX,
+        })?;
+    let cluster_storage_min =
+        preflight
+            .entry_count
+            .checked_mul(cluster_id.len())
+            .ok_or(Error::DecodeLimitExceeded {
+                limit: max_decoded_bytes,
+                actual: usize::MAX,
+            })?;
+    let minimum_peak = entry_storage_min
+        .checked_add(hash_storage_min)
+        .and_then(|bytes| bytes.checked_add(cluster_storage_min))
+        .and_then(|bytes| bytes.checked_add(preflight.payload_bytes))
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: max_decoded_bytes,
+            actual: usize::MAX,
+        })?;
+    decoded.ensure_additional(minimum_peak)?;
+
     let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(preflight.entry_count)
+        .map_err(|error| Error::Decode(format!("qlog entry allocation failed: {error}")))?;
+    decoded.charge(
+        entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<LogEntry>())
+            .ok_or(Error::DecodeLimitExceeded {
+                limit: max_decoded_bytes,
+                actual: usize::MAX,
+            })?,
+    )?;
+    let hash_bytes = preflight
+        .entry_count
+        .checked_mul(std::mem::size_of::<LogHash>())
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: max_decoded_bytes,
+            actual: usize::MAX,
+        })?;
     let mut entry_hashes = Vec::new();
+    entry_hashes
+        .try_reserve_exact(hash_bytes)
+        .map_err(|error| Error::Decode(format!("qlog hash allocation failed: {error}")))?;
+    decoded.charge(entry_hashes.capacity())?;
+    decoded.ensure_additional(
+        cluster_storage_min
+            .checked_add(preflight.payload_bytes)
+            .ok_or(Error::DecodeLimitExceeded {
+                limit: max_decoded_bytes,
+                actual: usize::MAX,
+            })?,
+    )?;
 
     loop {
         if offset >= bytes.len() {
@@ -191,12 +301,184 @@ pub fn decode_segment_for_cluster(bytes: &[u8], cluster_id: &str) -> Result<Vec<
                 &entries,
             )?;
             validate_entries(&header, &entries)?;
-            return Ok(entries);
+            let actual_peak =
+                decoded_peak_owned_bytes(&entries, &entry_hashes, owned_cluster_id.as_ref())?;
+            if actual_peak > max_decoded_bytes {
+                return Err(Error::DecodeLimitExceeded {
+                    limit: max_decoded_bytes,
+                    actual: actual_peak,
+                });
+            }
+            if actual_peak > conservative_charge {
+                return Err(Error::DecodeLimitExceeded {
+                    limit: conservative_charge,
+                    actual: actual_peak,
+                });
+            }
+            return Ok((entries, actual_peak));
         }
-        let (entry, next_offset) = decode_frame(bytes, offset, &cluster_id)?;
+        let frame = inspect_frame(bytes, offset, cluster_id)?;
+        decoded.ensure_additional(cluster_id.len().checked_add(frame.payload.len()).ok_or(
+            Error::DecodeLimitExceeded {
+                limit: max_decoded_bytes,
+                actual: usize::MAX,
+            },
+        )?)?;
+
+        let mut owned_cluster = String::new();
+        owned_cluster
+            .try_reserve_exact(cluster_id.len())
+            .map_err(|error| Error::Decode(format!("qlog identity allocation failed: {error}")))?;
+        owned_cluster.push_str(cluster_id);
+        decoded.charge(owned_cluster.capacity())?;
+
+        decoded.ensure_additional(frame.payload.len())?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(frame.payload.len())
+            .map_err(|error| Error::Decode(format!("qlog payload allocation failed: {error}")))?;
+        payload.extend_from_slice(frame.payload);
+        decoded.charge(payload.capacity())?;
+
+        let entry = LogEntry {
+            cluster_id: owned_cluster,
+            epoch: frame.epoch,
+            config_id: frame.config_id,
+            index: frame.index,
+            entry_type: frame.entry_type,
+            payload,
+            prev_hash: frame.prev_hash,
+            hash: frame.hash,
+        };
         entry_hashes.extend_from_slice(entry.hash.as_bytes());
         entries.push(entry);
-        offset = next_offset;
+        offset = frame.end;
+    }
+}
+
+struct DecodePreflight {
+    entry_count: usize,
+    payload_bytes: usize,
+}
+
+fn decoded_charge_upper_bound(
+    encoded_bytes: usize,
+    entry_count: usize,
+    cluster_id_bytes: usize,
+    configured_limit: usize,
+) -> Result<usize> {
+    let per_entry = cluster_id_bytes
+        .checked_add(QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES)
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: configured_limit,
+            actual: usize::MAX,
+        })?;
+    entry_count
+        .checked_mul(per_entry)
+        .and_then(|bytes| bytes.checked_add(encoded_bytes))
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: configured_limit,
+            actual: usize::MAX,
+        })
+}
+
+fn preflight_closed_segment(
+    bytes: &[u8],
+    mut offset: usize,
+    cluster_id: &str,
+) -> Result<DecodePreflight> {
+    let mut entry_count = 0_usize;
+    let mut payload_bytes = 0_usize;
+    loop {
+        if offset >= bytes.len() {
+            return Err(Error::Decode("missing qlog footer".into()));
+        }
+        if bytes.len() - offset >= 4 && bytes[offset..offset + 4] == QLOG_FOOTER_MAGIC {
+            return Ok(DecodePreflight {
+                entry_count,
+                payload_bytes,
+            });
+        }
+        let frame = inspect_frame(bytes, offset, cluster_id)?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or(Error::Decode("qlog entry count overflow".into()))?;
+        payload_bytes = payload_bytes
+            .checked_add(frame.payload.len())
+            .ok_or(Error::Decode("qlog payload total overflow".into()))?;
+        offset = frame.end;
+    }
+}
+
+fn decoded_peak_owned_bytes(
+    entries: &Vec<LogEntry>,
+    entry_hashes: &Vec<u8>,
+    transient_cluster_id: Option<&String>,
+) -> Result<usize> {
+    let mut total = entries
+        .capacity()
+        .checked_mul(std::mem::size_of::<LogEntry>())
+        .and_then(|bytes| bytes.checked_add(entry_hashes.capacity()))
+        .and_then(|bytes| bytes.checked_add(transient_cluster_id.map_or(0, String::capacity)))
+        .ok_or(Error::DecodeLimitExceeded {
+            limit: usize::MAX,
+            actual: usize::MAX,
+        })?;
+    for entry in entries {
+        total = total
+            .checked_add(entry.cluster_id.capacity())
+            .and_then(|bytes| bytes.checked_add(entry.payload.capacity()))
+            .ok_or(Error::DecodeLimitExceeded {
+                limit: usize::MAX,
+                actual: usize::MAX,
+            })?;
+    }
+    Ok(total)
+}
+
+struct DecodeBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl DecodeBudget {
+    const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        let actual = self
+            .used
+            .checked_add(bytes)
+            .ok_or(Error::DecodeLimitExceeded {
+                limit: self.limit,
+                actual: usize::MAX,
+            })?;
+        if actual > self.limit {
+            return Err(Error::DecodeLimitExceeded {
+                limit: self.limit,
+                actual,
+            });
+        }
+        self.used = actual;
+        Ok(())
+    }
+
+    fn ensure_additional(&self, bytes: usize) -> Result<()> {
+        let actual = self
+            .used
+            .checked_add(bytes)
+            .ok_or(Error::DecodeLimitExceeded {
+                limit: self.limit,
+                actual: usize::MAX,
+            })?;
+        if actual > self.limit {
+            return Err(Error::DecodeLimitExceeded {
+                limit: self.limit,
+                actual,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -351,6 +633,34 @@ fn encode_frame(entry: &LogEntry) -> Vec<u8> {
 }
 
 fn decode_frame(bytes: &[u8], offset: usize, cluster_id: &str) -> Result<(LogEntry, usize)> {
+    let frame = inspect_frame(bytes, offset, cluster_id)?;
+    Ok((
+        LogEntry {
+            cluster_id: cluster_id.to_string(),
+            epoch: frame.epoch,
+            config_id: frame.config_id,
+            index: frame.index,
+            entry_type: frame.entry_type,
+            payload: frame.payload.to_vec(),
+            prev_hash: frame.prev_hash,
+            hash: frame.hash,
+        },
+        frame.end,
+    ))
+}
+
+struct FrameView<'a> {
+    end: usize,
+    index: LogIndex,
+    epoch: u64,
+    config_id: u64,
+    entry_type: EntryType,
+    payload: &'a [u8],
+    prev_hash: LogHash,
+    hash: LogHash,
+}
+
+fn inspect_frame<'a>(bytes: &'a [u8], offset: usize, cluster_id: &str) -> Result<FrameView<'a>> {
     if bytes.len().saturating_sub(offset) < FRAME_MIN_LEN {
         return Err(Error::Decode("short qlog frame".into()));
     }
@@ -386,25 +696,27 @@ fn decode_frame(bytes: &[u8], offset: usize, cluster_id: &str) -> Result<(LogEnt
     let payload_end = payload_start
         .checked_add(payload_len)
         .ok_or_else(|| Error::Decode("invalid qlog payload_len".into()))?;
-    let payload = bytes[payload_start..payload_end].to_vec();
-    if LogHash::digest(&[&payload]) != payload_hash {
+    let payload = &bytes[payload_start..payload_end];
+    if LogHash::digest(&[payload]) != payload_hash {
         return Err(Error::Decode("qlog payload_hash mismatch".into()));
     }
     let hash = read_hash(bytes, payload_end)?;
-    let entry = LogEntry {
-        cluster_id: cluster_id.to_string(),
+    if LogEntry::calculate_hash(
+        cluster_id, index, epoch, config_id, entry_type, prev_hash, payload,
+    ) != hash
+    {
+        return Err(Error::Decode("qlog entry_hash mismatch".into()));
+    }
+    Ok(FrameView {
+        end: frame_end,
+        index,
         epoch,
         config_id,
-        index,
         entry_type,
         payload,
         prev_hash,
         hash,
-    };
-    if entry.recompute_hash() != hash {
-        return Err(Error::Decode("qlog entry_hash mismatch".into()));
-    }
-    Ok((entry, frame_end))
+    })
 }
 
 fn encode_footer(
@@ -760,6 +1072,82 @@ impl FileLogStore {
             first_retained_index,
             tip,
         })
+    }
+
+    /// Inspects the durable qlog state without creating, truncating, removing,
+    /// or recovering any filesystem object.
+    ///
+    /// Startup uses [`Self::open_with_configuration`] because it is permitted
+    /// to complete an interrupted qlog operation. Restore fencing must make a
+    /// different promise: it uses this inspector before downloading a remote
+    /// checkpoint, so a failed or stale restore cannot itself alter the local
+    /// epoch it is meant to compare. An incomplete open segment or a pending
+    /// qlog operation is consequently reported as an error rather than being
+    /// repaired here.
+    pub fn inspect_logical_state_read_only(
+        dir: impl AsRef<Path>,
+        cluster_id: &str,
+        epoch: u64,
+        initial_configuration: ConfigurationState,
+    ) -> Result<Option<LogState>> {
+        let dir = dir.as_ref();
+        match fs::symlink_metadata(dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::Io(error.to_string())),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(Error::Decode("qlog path is not a regular directory".into()));
+            }
+            Ok(_) => {}
+        }
+        if dir.join(TRUNCATE_INTENT_FILE_NAME).exists()
+            || dir.join(COMPACT_INTENT_FILE_NAME).exists()
+        {
+            return Err(Error::Decode(
+                "qlog has an interrupted operation requiring runtime recovery".into(),
+            ));
+        }
+
+        let anchor = read_anchor(dir)?;
+        validate_anchor_identity(anchor.as_ref(), cluster_id, epoch)?;
+        let (segments, configuration_state) = scan_closed_segments(
+            dir,
+            cluster_id,
+            epoch,
+            &initial_configuration,
+            anchor.as_ref(),
+        )?;
+        let (open_entries, _configuration_state) = scan_open_segment_read_only(
+            dir,
+            cluster_id,
+            epoch,
+            anchor.as_ref(),
+            &segments,
+            configuration_state,
+        )?;
+        let first_retained_index = match &anchor {
+            Some(anchor) => anchor
+                .compacted()
+                .index()
+                .checked_add(1)
+                .ok_or_else(|| Error::Decode("qlog anchor index overflow".into()))?,
+            None => 1,
+        };
+        let tip = open_entries
+            .as_ref()
+            .and_then(|entries| entries.last())
+            .map(|entry| LogAnchor::new(entry.index, entry.hash))
+            .or_else(|| {
+                segments.last().map(|segment| {
+                    let entry = segment.entries.last().expect("non-empty segment");
+                    LogAnchor::new(entry.index, entry.hash)
+                })
+            })
+            .or_else(|| anchor.as_ref().map(|anchor| *anchor.compacted()));
+        Ok(Some(LogState {
+            anchor,
+            first_retained_index,
+            tip,
+        }))
     }
 
     pub fn configuration_state(&self) -> Result<ConfigurationState> {
@@ -1200,6 +1588,100 @@ fn scan_open_segment(
         }),
         configuration_state,
     ))
+}
+
+/// The read-only counterpart to `scan_open_segment`.  It deliberately never
+/// invokes `recover_open_segment_file`: an incomplete frame, a duplicated
+/// open segment, or any other state that startup would repair remains an
+/// observable mismatch for restore fencing.
+fn scan_open_segment_read_only(
+    dir: &Path,
+    cluster_id: &str,
+    epoch: u64,
+    anchor: Option<&RecoveryAnchor>,
+    segments: &[ClosedSegment],
+    mut configuration_state: ConfigurationState,
+) -> Result<(Option<Vec<LogEntry>>, ConfigurationState)> {
+    let mut paths = fs::read_dir(dir)
+        .map_err(|err| Error::Io(err.to_string()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.ends_with("-open.qlog").then_some((name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    if paths.len() > 1 {
+        return Err(Error::Decode("multiple open qlog segments".into()));
+    }
+    let Some((name, path)) = paths.pop() else {
+        return Ok((None, configuration_state));
+    };
+    let start = parse_open_segment_name(&name)?;
+    let bytes = fs::read(&path).map_err(|err| Error::Io(err.to_string()))?;
+    let (header, _) = decode_header(&bytes, cluster_id)?;
+    if header.start_index != start || header.epoch != epoch {
+        return Err(Error::Decode(
+            "open qlog filename or epoch does not match header".into(),
+        ));
+    }
+    let (entries, valid_len) = recover_open_segment_prefix(&bytes, cluster_id)?;
+    if valid_len != bytes.len() {
+        return Err(Error::Decode(
+            "open qlog requires truncation before it can be inspected".into(),
+        ));
+    }
+
+    if let Some(segment) = segments
+        .iter()
+        .find(|segment| segment.start() == start && segment.entries == entries)
+    {
+        if segment.end() != entries.last().map_or(start, |entry| entry.index) {
+            return Err(Error::Decode("open qlog duplicate range mismatch".into()));
+        }
+        return Err(Error::Decode(
+            "open qlog duplicates a sealed segment and requires recovery".into(),
+        ));
+    }
+
+    let (expected_index, expected_prev_hash) = match segments.last() {
+        Some(segment) => (
+            segment
+                .end()
+                .checked_add(1)
+                .ok_or_else(|| Error::Decode("qlog index overflow".into()))?,
+            segment.entries.last().expect("non-empty segment").hash,
+        ),
+        None => match anchor {
+            Some(anchor) => (
+                anchor
+                    .compacted()
+                    .index()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Decode("qlog index overflow".into()))?,
+                anchor.compacted().hash(),
+            ),
+            None => (1, LogHash::ZERO),
+        },
+    };
+    if start != expected_index {
+        return Err(Error::Decode(
+            "open qlog does not start at the retained tip".into(),
+        ));
+    }
+    if let Some(first) = entries.first() {
+        if first.prev_hash != expected_prev_hash {
+            return Err(Error::Decode(
+                "qlog hash chain mismatch before open segment".into(),
+            ));
+        }
+    }
+    for entry in &entries {
+        configuration_state = configuration_state
+            .validate_entry(entry)
+            .map_err(|err| Error::Decode(err.to_string()))?;
+    }
+    Ok((Some(entries), configuration_state))
 }
 
 fn parse_closed_segment_name(name: &str) -> Result<IndexRange> {
@@ -2562,6 +3044,159 @@ mod tests {
     use super::*;
     const INJECTED_CRASH: &str = "injected crash";
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct InspectionTreeEntry {
+        kind: &'static str,
+        bytes: Option<Vec<u8>>,
+        len: u64,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(unix)]
+        dev: u64,
+        #[cfg(unix)]
+        ino: u64,
+    }
+
+    fn inspection_tree_snapshot(
+        root: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, InspectionTreeEntry> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            snapshot: &mut std::collections::BTreeMap<PathBuf, InspectionTreeEntry>,
+        ) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let kind = if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            snapshot.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                InspectionTreeEntry {
+                    kind,
+                    bytes: metadata.is_file().then(|| fs::read(path).unwrap()),
+                    len: metadata.len(),
+                    #[cfg(unix)]
+                    mode: {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.mode()
+                    },
+                    #[cfg(unix)]
+                    dev: {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.dev()
+                    },
+                    #[cfg(unix)]
+                    ino: {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.ino()
+                    },
+                },
+            );
+            if metadata.is_dir() {
+                let mut children = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, snapshot);
+                }
+            }
+        }
+
+        let mut snapshot = std::collections::BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn read_only_inspection_returns_the_valid_tip_without_mutating_the_qlog_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = chain(&[b"one", b"two", b"three", b"four"]);
+        drop(segmented_store(dir.path(), &entries));
+        let before = inspection_tree_snapshot(dir.path());
+
+        let state = FileLogStore::inspect_logical_state_read_only(
+            dir.path(),
+            "cluster-a",
+            1,
+            ConfigurationState::active(1, LogHash::ZERO),
+        )
+        .unwrap()
+        .expect("a populated qlog must have a logical state");
+
+        assert_eq!(state.anchor, None);
+        assert_eq!(state.first_retained_index, 1);
+        assert_eq!(
+            state.tip,
+            Some(LogAnchor::new(
+                entries.last().unwrap().index,
+                entries.last().unwrap().hash
+            ))
+        );
+        assert_eq!(inspection_tree_snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn read_only_inspection_rejects_a_torn_open_segment_without_mutating_the_qlog_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = chain(&[b"one"]);
+        let open_path = dir.path().join(open_segment_file_name(1));
+        let mut bytes = encode_open_segment(&entries);
+        bytes.extend_from_slice(&QLOG_FRAME_MAGIC[..2]);
+        fs::write(&open_path, bytes).unwrap();
+        let before = inspection_tree_snapshot(dir.path());
+
+        assert!(matches!(
+            FileLogStore::inspect_logical_state_read_only(
+                dir.path(),
+                "cluster-a",
+                1,
+                ConfigurationState::active(1, LogHash::ZERO),
+            ),
+            Err(Error::Decode(message)) if message.contains("requires truncation")
+        ));
+        assert_eq!(inspection_tree_snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn read_only_inspection_neither_recovers_an_intent_nor_creates_a_missing_qlog_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = dir.path().join(TRUNCATE_INTENT_FILE_NAME);
+        fs::write(&intent, b"must-not-recover").unwrap();
+        let before = inspection_tree_snapshot(dir.path());
+
+        assert!(matches!(
+            FileLogStore::inspect_logical_state_read_only(
+                dir.path(),
+                "cluster-a",
+                1,
+                ConfigurationState::active(1, LogHash::ZERO),
+            ),
+            Err(Error::Decode(message)) if message.contains("interrupted operation")
+        ));
+        assert_eq!(inspection_tree_snapshot(dir.path()), before);
+
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            FileLogStore::inspect_logical_state_read_only(
+                &missing,
+                "cluster-a",
+                1,
+                ConfigurationState::active(1, LogHash::ZERO),
+            ),
+            Ok(None)
+        );
+        assert!(!missing.exists());
+        assert_eq!(inspection_tree_snapshot(dir.path()), before);
+    }
+
     #[test]
     fn unsupported_anchor_binary_version_is_rejected() {
         let entry = chain(&[b"one"]).pop().unwrap();
@@ -2819,6 +3454,116 @@ mod tests {
         let crc = crc32c(&out);
         put_u32(&mut out, crc);
         out
+    }
+
+    #[test]
+    fn bounded_decode_accounts_for_actual_capacities_at_the_exact_boundary() {
+        let cluster_id = "cluster-identity-17";
+        let mut entries = Vec::new();
+        let mut previous = LogHash::ZERO;
+        for (index, payload_len) in [(1, 3), (2, 5), (3, 9)] {
+            let payload = vec![u8::try_from(index).unwrap(); payload_len];
+            let hash = LogEntry::calculate_hash(
+                cluster_id,
+                index,
+                1,
+                1,
+                EntryType::Command,
+                previous,
+                &payload,
+            );
+            entries.push(LogEntry {
+                cluster_id: cluster_id.into(),
+                epoch: 1,
+                config_id: 1,
+                index,
+                entry_type: EntryType::Command,
+                payload,
+                prev_hash: previous,
+                hash,
+            });
+            previous = hash;
+        }
+        let encoded = encode_segment(&entries);
+        let (decoded, charged) =
+            decode_segment_for_cluster_bounded(&encoded, cluster_id, usize::MAX).unwrap();
+        assert_eq!(decoded, entries);
+        let retained_bytes = decoded.capacity() * std::mem::size_of::<LogEntry>()
+            + decoded
+                .iter()
+                .map(|entry| entry.cluster_id.capacity() + entry.payload.capacity())
+                .sum::<usize>();
+        let transient_hash_bytes = decoded.len() * std::mem::size_of::<LogHash>();
+        assert!(charged >= retained_bytes + transient_hash_bytes);
+
+        let conservative_charge = encoded.len()
+            + decoded.len() * (cluster_id.len() + QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES);
+        assert!(charged <= conservative_charge);
+
+        let (exact, exact_charge) =
+            decode_segment_for_cluster_bounded(&encoded, cluster_id, conservative_charge).unwrap();
+        assert_eq!(exact, entries);
+        assert_eq!(exact_charge, charged);
+        assert_eq!(
+            decode_segment_for_cluster_bounded(&encoded, cluster_id, conservative_charge - 1)
+                .unwrap_err(),
+            Error::DecodeLimitExceeded {
+                limit: conservative_charge - 1,
+                actual: conservative_charge,
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_decode_stable_charge_covers_varied_identity_payload_and_container_shapes() {
+        for (cluster_id, payload_lengths) in [
+            ("a".to_string(), vec![0]),
+            ("b".repeat(31), vec![1, 2, 3, 5, 8, 13, 21]),
+            ("c".repeat(200), vec![0; 16]),
+        ] {
+            let mut entries = Vec::new();
+            let mut previous = LogHash::ZERO;
+            for (position, payload_len) in payload_lengths.into_iter().enumerate() {
+                let index = u64::try_from(position).unwrap() + 1;
+                let payload = vec![u8::try_from(position).unwrap(); payload_len];
+                let hash = LogEntry::calculate_hash(
+                    &cluster_id,
+                    index,
+                    1,
+                    1,
+                    EntryType::Command,
+                    previous,
+                    &payload,
+                );
+                entries.push(LogEntry {
+                    cluster_id: cluster_id.clone(),
+                    epoch: 1,
+                    config_id: 1,
+                    index,
+                    entry_type: EntryType::Command,
+                    payload,
+                    prev_hash: previous,
+                    hash,
+                });
+                previous = hash;
+            }
+            let encoded = encode_segment(&entries);
+            let stable_charge = encoded.len()
+                + entries.len() * (cluster_id.len() + QLOG_DECODED_ENTRY_OVERHEAD_BUDGET_BYTES);
+
+            let (decoded, actual_charge) =
+                decode_segment_for_cluster_bounded(&encoded, &cluster_id, stable_charge).unwrap();
+            assert_eq!(decoded, entries);
+            assert!(actual_charge <= stable_charge);
+            assert_eq!(
+                decode_segment_for_cluster_bounded(&encoded, &cluster_id, stable_charge - 1)
+                    .unwrap_err(),
+                Error::DecodeLimitExceeded {
+                    limit: stable_charge - 1,
+                    actual: stable_charge,
+                }
+            );
+        }
     }
 
     fn chain(payloads: &[&[u8]]) -> Vec<LogEntry> {

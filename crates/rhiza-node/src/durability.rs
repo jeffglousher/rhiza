@@ -45,6 +45,7 @@ use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const SYNC_COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
+const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
@@ -59,7 +60,188 @@ const REPAIR_ARTIFACT_OWNER_FILE: &str = ".rhiza-recovery-owner.json";
 pub const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity.json";
 static RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
+use std::sync::{mpsc, OnceLock};
+
+#[cfg(test)]
+struct TestRestoreLockGate {
+    id: u64,
+    data_dir: PathBuf,
+    entered: mpsc::SyncSender<()>,
+    release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+}
+
+#[cfg(test)]
+impl Clone for TestRestoreLockGate {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            data_dir: self.data_dir.clone(),
+            entered: self.entered.clone(),
+            release: Arc::clone(&self.release),
+        }
+    }
+}
+
+#[cfg(test)]
+struct InstalledTestRestoreLockGate {
+    id: u64,
+}
+
+#[cfg(test)]
+static TEST_RESTORE_LOCK_GATES: OnceLock<Mutex<Vec<TestRestoreLockGate>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_restore_lock_gates() -> &'static Mutex<Vec<TestRestoreLockGate>> {
+    TEST_RESTORE_LOCK_GATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn install_test_restore_lock_gate(
+    data_dir: PathBuf,
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+) -> InstalledTestRestoreLockGate {
+    let id = RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut gates = test_restore_lock_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !gates.iter().any(|gate| gate.data_dir == data_dir),
+        "restore lock gate is already installed for this data directory"
+    );
+    gates.push(TestRestoreLockGate {
+        id,
+        data_dir,
+        entered,
+        release: Arc::new(Mutex::new(Some(release))),
+    });
+    InstalledTestRestoreLockGate { id }
+}
+
+#[cfg(test)]
+impl Drop for InstalledTestRestoreLockGate {
+    fn drop(&mut self) {
+        test_restore_lock_gates()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|gate| gate.id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn test_restore_lock_acquired(data_dir: &Path) {
+    let gate = test_restore_lock_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|gate| gate.data_dir == data_dir)
+        .cloned();
+    if let Some(gate) = gate {
+        gate.entered
+            .send(())
+            .expect("restore lock test gate receiver must remain live");
+        let release = gate
+            .release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("restore lock test gate may fire only once");
+        release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("restore lock test gate must release within its bounded wait");
+    }
+}
+
+/// Test-only interposition exactly after the installer owns its lock handle
+/// and before the pathname is trusted again. The replacement file is sent on
+/// a bounded channel so the test retains its lock while the installer
+/// validates the pathname-to-handle identity fence.
+#[cfg(test)]
+struct TestRestoreLockPathReplacementHook {
+    id: u64,
+    data_dir: PathBuf,
+    replacement: mpsc::SyncSender<fs::File>,
+}
+
+#[cfg(test)]
+impl Clone for TestRestoreLockPathReplacementHook {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            data_dir: self.data_dir.clone(),
+            replacement: self.replacement.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+struct InstalledTestRestoreLockPathReplacementHook {
+    id: u64,
+}
+
+#[cfg(test)]
+static TEST_RESTORE_LOCK_PATH_REPLACEMENT_HOOKS: OnceLock<
+    Mutex<Vec<TestRestoreLockPathReplacementHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn test_restore_lock_path_replacement_hooks(
+) -> &'static Mutex<Vec<TestRestoreLockPathReplacementHook>> {
+    TEST_RESTORE_LOCK_PATH_REPLACEMENT_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn install_test_restore_lock_path_replacement_hook(
+    data_dir: PathBuf,
+    replacement: mpsc::SyncSender<fs::File>,
+) -> InstalledTestRestoreLockPathReplacementHook {
+    let id = RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut hooks = test_restore_lock_path_replacement_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !hooks.iter().any(|hook| hook.data_dir == data_dir),
+        "restore lock path replacement hook is already installed for this data directory"
+    );
+    hooks.push(TestRestoreLockPathReplacementHook {
+        id,
+        data_dir,
+        replacement,
+    });
+    InstalledTestRestoreLockPathReplacementHook { id }
+}
+
+#[cfg(test)]
+impl Drop for InstalledTestRestoreLockPathReplacementHook {
+    fn drop(&mut self) {
+        test_restore_lock_path_replacement_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|hook| hook.id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn test_restore_lock_before_path_revalidation(data_dir: &Path) {
+    let hook = test_restore_lock_path_replacement_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|hook| hook.data_dir == data_dir)
+        .cloned();
+    if let Some(hook) = hook {
+        let path = data_dir.join(crate::NODE_DATA_ROOT_LOCK_FILE);
+        fs::remove_file(&path).expect("test hook must remove the installer-created lock");
+        let replacement = crate::acquire_node_data_root_lock(data_dir)
+            .expect("test hook must create and lock the replacement lock file");
+        hook.replacement
+            .send(replacement.into_file())
+            .expect("replacement lock test receiver must remain live");
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreIntentIdentity {
     cluster_id: String,
@@ -231,6 +413,449 @@ pub struct SuccessorRestorePreparation {
     _lock: fs::File,
 }
 
+/// A verified remote checkpoint that is ready for a synchronous local install.
+///
+/// This owns the downloaded snapshot and log suffix. It is deliberately not
+/// `Clone`: callers retain and retry the same prepared bytes rather than
+/// re-reading a potentially newer remote checkpoint or copying a large buffer.
+pub struct PreparedCheckpointRestore {
+    identity: CheckpointIdentity,
+    execution_profile: ExecutionProfile,
+    restored: RestoredCheckpoint,
+    checkpoint_root: LogAnchor,
+}
+
+/// The two local installation contracts. Fresh installation owns every
+/// rebuildable component; rejoin deliberately leaves the recorder outside the
+/// mutation and comparison set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointInstallMode {
+    Fresh,
+    RejoinPreservingRecorder,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedPathIdentity {
+    Missing,
+    Directory(PathIdentity),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PathIdentity {
+    kind: ExpectedEntryKind,
+    len: u64,
+    object: crate::NodeDataPathIdentity,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedEntryKind {
+    Directory,
+    RegularFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedRegularFile {
+    Missing,
+    Exact {
+        identity: PathIdentity,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedArtifact {
+    name: String,
+    identity: PathIdentity,
+    owner: ExpectedRegularFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedPathEntry {
+    name: String,
+    identity: PathIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedQlogState {
+    Missing,
+    Logical {
+        state: Box<rhiza_log::LogState>,
+        paths: Vec<ExpectedPathEntry>,
+    },
+    /// A corrupt or interrupted qlog is still represented by a stable,
+    /// bounded read-only stamp. The installer will fail closed later during
+    /// normal preflight; this state exists so a concurrent qlog repair or
+    /// replacement cannot make an old restore token appear current.
+    Unreadable {
+        reason: String,
+        entries: Vec<ExpectedPathEntry>,
+    },
+}
+
+/// An opaque, non-cloneable snapshot of every local state an installer may
+/// mutate or trust. It is captured before remote checkpoint I/O, consumed by
+/// exactly one local installer, and revalidated while `.node.lock` is held.
+///
+/// Keeping the token private-fielded and non-`Clone` prevents callers from
+/// reusing an old observation after a different recovery generation has
+/// completed locally.
+pub struct ExpectedLocalRestoreState {
+    data_dir: PathBuf,
+    parent: PathIdentity,
+    data_dir_identity: ExpectedPathIdentity,
+    lock: ExpectedRegularFile,
+    mode: CheckpointInstallMode,
+    target_node_id: String,
+    identity: CheckpointIdentity,
+    execution_profile: ExecutionProfile,
+    initial_configuration: ConfigurationState,
+    completion_marker_name: Option<String>,
+    completion_marker: ExpectedRegularFile,
+    restore_intent: ExpectedRegularFile,
+    restore_receipt: ExpectedRegularFile,
+    recovery_artifacts: Vec<ExpectedArtifact>,
+    qlog: ExpectedQlogState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreInstallReceipt {
+    format_version: u8,
+    mode: CheckpointInstallMode,
+    identity: RestoreIntentIdentity,
+    checkpoint_index: LogIndex,
+    checkpoint_hash: String,
+    completion_marker_name: Option<String>,
+    completion_marker_hash: Option<String>,
+}
+
+impl PreparedCheckpointRestore {
+    pub const fn identity(&self) -> &CheckpointIdentity {
+        &self.identity
+    }
+
+    pub const fn execution_profile(&self) -> ExecutionProfile {
+        self.execution_profile
+    }
+
+    pub const fn restored(&self) -> &RestoredCheckpoint {
+        &self.restored
+    }
+
+    pub const fn checkpoint_root(&self) -> LogAnchor {
+        self.checkpoint_root
+    }
+
+    fn validate(&self) -> Result<(), DurabilityError> {
+        if snapshot_profile(self.identity.cluster_id())? != self.execution_profile {
+            return Err(DurabilityError::SnapshotVerification(
+                "prepared checkpoint profile does not match checkpoint identity".into(),
+            ));
+        }
+        let restored_root = LogAnchor::new(self.restored.tip().index(), self.restored.tip().hash());
+        if self.checkpoint_root != restored_root {
+            return Err(DurabilityError::SnapshotVerification(
+                "prepared checkpoint root does not match restored tip".into(),
+            ));
+        }
+        validate_restored_suffix(self.execution_profile, self.restored.suffix())
+    }
+}
+
+impl PathIdentity {
+    fn capture(path: &Path, metadata: &fs::Metadata) -> Result<Self, DurabilityError> {
+        let kind = if metadata.is_dir() {
+            ExpectedEntryKind::Directory
+        } else if metadata.is_file() {
+            ExpectedEntryKind::RegularFile
+        } else {
+            return Err(DurabilityError::SnapshotVerification(
+                "restore expected-state path is not a regular file or directory".into(),
+            ));
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(DurabilityError::SnapshotVerification(
+                "restore expected-state path is a symlink".into(),
+            ));
+        }
+        let object = crate::capture_node_data_path_identity(
+            path,
+            matches!(kind, ExpectedEntryKind::Directory),
+        )
+        .map_err(|error| {
+            DurabilityError::SnapshotVerification(format!(
+                "cannot capture exact restore expected-state path identity: {error}"
+            ))
+        })?;
+        Ok(Self {
+            kind,
+            len: metadata.len(),
+            object,
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+        })
+    }
+
+    fn same_path_identity(&self, other: &Self) -> bool {
+        if self.kind != other.kind {
+            return false;
+        }
+        if self.kind == ExpectedEntryKind::Directory {
+            return self.object == other.object;
+        }
+        self == other
+    }
+}
+
+/// Captures the local state that must remain unchanged while a remote
+/// checkpoint is downloaded. This function is deliberately read-only: it
+/// does not create the data directory, the shared lock, qlog paths, intents,
+/// staging directories, or receipts.
+pub fn capture_expected_local_restore_state(
+    data_dir: impl AsRef<Path>,
+    mode: CheckpointInstallMode,
+    target_node_id: &str,
+    identity: &CheckpointIdentity,
+    execution_profile: ExecutionProfile,
+    initial_configuration: ConfigurationState,
+    completion_marker_name: Option<&str>,
+) -> Result<ExpectedLocalRestoreState, DurabilityError> {
+    validate_restore_target_node_id(target_node_id)?;
+    if snapshot_profile(identity.cluster_id())? != execution_profile {
+        return Err(DurabilityError::SnapshotVerification(
+            "expected local restore profile does not match checkpoint identity".into(),
+        ));
+    }
+    if let Some(name) = completion_marker_name {
+        validate_restore_completion_marker_name(name)?;
+    }
+    let data_dir = data_dir.as_ref().to_path_buf();
+    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(DurabilityError::DataDirNotFresh(data_dir));
+    }
+    let parent = PathIdentity::capture(parent, &parent_metadata)?;
+    let data_dir_identity = match fs::symlink_metadata(&data_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(DurabilityError::DataDirNotFresh(data_dir));
+        }
+        Ok(metadata) => {
+            ExpectedPathIdentity::Directory(PathIdentity::capture(&data_dir, &metadata)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExpectedPathIdentity::Missing,
+        Err(error) => return Err(error.into()),
+    };
+
+    let (lock, completion_marker, restore_intent, restore_receipt, recovery_artifacts, qlog) =
+        match &data_dir_identity {
+            ExpectedPathIdentity::Missing => (
+                ExpectedRegularFile::Missing,
+                ExpectedRegularFile::Missing,
+                ExpectedRegularFile::Missing,
+                ExpectedRegularFile::Missing,
+                Vec::new(),
+                ExpectedQlogState::Missing,
+            ),
+            ExpectedPathIdentity::Directory(_) => {
+                let lock =
+                    capture_restore_regular_file(&data_dir.join(crate::NODE_DATA_ROOT_LOCK_FILE))?;
+                if let ExpectedRegularFile::Exact { identity, bytes } = &lock {
+                    if identity.kind != ExpectedEntryKind::RegularFile || !bytes.is_empty() {
+                        return Err(DurabilityError::SnapshotVerification(
+                            "node data lock is not a zero-length regular file".into(),
+                        ));
+                    }
+                }
+                let completion_marker = match completion_marker_name {
+                    Some(name) => capture_restore_regular_file(&data_dir.join(name))?,
+                    None => ExpectedRegularFile::Missing,
+                };
+                let restore_intent =
+                    capture_restore_regular_file(&data_dir.join(RESTORE_INTENT_FILE))?;
+                let restore_receipt =
+                    capture_restore_regular_file(&data_dir.join(RESTORE_RECEIPT_FILE))?;
+                if matches!(&restore_receipt, ExpectedRegularFile::Exact { .. })
+                    && !is_valid_restore_install_receipt(&data_dir.join(RESTORE_RECEIPT_FILE))?
+                {
+                    return Err(DurabilityError::SnapshotVerification(
+                        "local checkpoint restore receipt is invalid".into(),
+                    ));
+                }
+                let recovery_artifacts = capture_recovery_artifact_set(&data_dir)?;
+                let qlog = capture_expected_qlog_state(
+                    &data_dir,
+                    identity,
+                    initial_configuration.clone(),
+                )?;
+                (
+                    lock,
+                    completion_marker,
+                    restore_intent,
+                    restore_receipt,
+                    recovery_artifacts,
+                    qlog,
+                )
+            }
+        };
+    Ok(ExpectedLocalRestoreState {
+        data_dir,
+        parent,
+        data_dir_identity,
+        lock,
+        mode,
+        target_node_id: target_node_id.to_owned(),
+        identity: identity.clone(),
+        execution_profile,
+        initial_configuration,
+        completion_marker_name: completion_marker_name.map(str::to_owned),
+        completion_marker,
+        restore_intent,
+        restore_receipt,
+        recovery_artifacts,
+        qlog,
+    })
+}
+
+fn capture_restore_regular_file(path: &Path) -> Result<ExpectedRegularFile, DurabilityError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExpectedRegularFile::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 16 * 1024 {
+        return Err(DurabilityError::SnapshotVerification(
+            "restore control file is not a bounded regular file".into(),
+        ));
+    }
+    let bytes = read_bounded_regular_file(path, 16 * 1024)?.ok_or_else(|| {
+        DurabilityError::SnapshotVerification(
+            "restore control file disappeared during capture".into(),
+        )
+    })?;
+    Ok(ExpectedRegularFile::Exact {
+        identity: PathIdentity::capture(path, &metadata)?,
+        bytes,
+    })
+}
+
+fn capture_recovery_artifact_set(
+    data_dir: &Path,
+) -> Result<Vec<ExpectedArtifact>, DurabilityError> {
+    let mut artifacts = Vec::new();
+    for entry in fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(RESTORE_STAGING_PREFIX)
+            && !name.starts_with(".rebuildable-quarantine-")
+            && !name.starts_with(RESTORE_MARKER_TMP_PREFIX)
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            return Err(DurabilityError::SnapshotVerification(
+                "recovery artifact is a symlink".into(),
+            ));
+        }
+        let owner = if metadata.is_dir() {
+            capture_restore_regular_file(&entry.path().join(REPAIR_ARTIFACT_OWNER_FILE))?
+        } else {
+            ExpectedRegularFile::Missing
+        };
+        artifacts.push(ExpectedArtifact {
+            name,
+            identity: PathIdentity::capture(&entry.path(), &metadata)?,
+            owner,
+        });
+    }
+    artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(artifacts)
+}
+
+fn capture_expected_qlog_state(
+    data_dir: &Path,
+    identity: &CheckpointIdentity,
+    initial_configuration: ConfigurationState,
+) -> Result<ExpectedQlogState, DurabilityError> {
+    let qlog_dir = data_dir.join("consensus/log");
+    match FileLogStore::inspect_logical_state_read_only(
+        &qlog_dir,
+        identity.cluster_id(),
+        identity.epoch(),
+        initial_configuration,
+    ) {
+        Ok(None) => Ok(ExpectedQlogState::Missing),
+        Ok(Some(state)) => Ok(ExpectedQlogState::Logical {
+            state: Box::new(state),
+            paths: capture_qlog_metadata_stamp(&qlog_dir)?,
+        }),
+        Err(error) => Ok(ExpectedQlogState::Unreadable {
+            reason: error.to_string(),
+            entries: capture_qlog_metadata_stamp(&qlog_dir)?,
+        }),
+    }
+}
+
+fn capture_qlog_metadata_stamp(qlog_dir: &Path) -> Result<Vec<ExpectedPathEntry>, DurabilityError> {
+    let metadata = match fs::symlink_metadata(qlog_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = vec![ExpectedPathEntry {
+        name: String::new(),
+        identity: PathIdentity::capture(qlog_dir, &metadata)?,
+    }];
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(entries);
+    }
+    for entry in fs::read_dir(qlog_dir)? {
+        let entry = entry?;
+        if entries.len() == 129 {
+            return Err(DurabilityError::SnapshotVerification(
+                "qlog metadata stamp exceeds its bounded entry limit".into(),
+            ));
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        entries.push(ExpectedPathEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            identity: PathIdentity::capture(&path, &metadata)?,
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+/// A caller-owned completion marker published only after checkpoint component
+/// promotion. Its constructor validates that the marker cannot collide with
+/// recovery-control files or escape the configured data directory.
+pub struct RestoreCompletionMarker<'a> {
+    name: &'a str,
+    contents: &'a [u8],
+}
+
+impl<'a> RestoreCompletionMarker<'a> {
+    pub fn new(name: &'a str, contents: &'a [u8]) -> Result<Self, DurabilityError> {
+        validate_restore_completion_marker_name(name)?;
+        Ok(Self { name, contents })
+    }
+
+    fn as_parts(&self) -> (&'a str, &'a [u8]) {
+        (self.name, self.contents)
+    }
+}
+
 impl SuccessorRestorePreparation {
     pub const fn tip(&self) -> CheckpointTip {
         self.tip
@@ -377,7 +1002,10 @@ impl fmt::Display for DurabilityError {
                 anchor.compacted().index()
             ),
             Self::LocalLogGap { expected, actual } => {
-                write!(f, "local qlog gap: expected index {expected}, got {actual:?}")
+                write!(
+                    f,
+                    "local qlog gap: expected index {expected}, got {actual:?}"
+                )
             }
             Self::LocalLogConflict { index } => {
                 write!(f, "local qlog hash chain conflicts at index {index}")
@@ -511,8 +1139,11 @@ impl CheckpointCoordinator {
             .await?;
         let loaded = publisher.cached_checkpoint().await;
         let durable_tip = *loaded.manifest().tip();
-        let restored = store.restore_checkpoint_state().await?;
-        let restored_tip = *restored.tip();
+        let restored = store
+            .load_checkpoint_restore()
+            .await?
+            .ok_or(DurabilityError::MissingCheckpoint)?;
+        let restored_tip = *restored.restored().tip();
         if restored_tip != durable_tip {
             return Err(DurabilityError::Archive(
                 rhiza_archive::Error::InvalidCheckpoint(
@@ -733,8 +1364,12 @@ impl CheckpointCoordinator {
                 "target checkpoint namespace conflicts with the successor baseline".into(),
             ));
         }
-        let restored = self.store.restore_checkpoint_state().await?;
-        let published = restored.snapshot().ok_or_else(|| {
+        let restored = self
+            .store
+            .load_checkpoint_restore()
+            .await?
+            .ok_or(DurabilityError::MissingCheckpoint)?;
+        let published = restored.restored().snapshot().ok_or_else(|| {
             DurabilityError::SnapshotVerification(
                 "successor checkpoint baseline has no snapshot".into(),
             )
@@ -913,8 +1548,12 @@ impl CheckpointCoordinator {
         self.publisher
             .publish_checkpoint_snapshot(anchor.clone(), &snapshot.archive_bytes)
             .await?;
-        let restored = self.store.restore_checkpoint_state().await?;
-        let published = restored.snapshot().ok_or_else(|| {
+        let restored = self
+            .store
+            .load_checkpoint_restore()
+            .await?
+            .ok_or(DurabilityError::MissingCheckpoint)?;
+        let published = restored.restored().snapshot().ok_or_else(|| {
             DurabilityError::SnapshotVerification("published checkpoint has no snapshot".into())
         })?;
         if published.anchor() != &anchor || published.bytes() != snapshot.archive_bytes {
@@ -1189,52 +1828,116 @@ impl Drop for CheckpointFence<'_> {
     }
 }
 
-pub async fn restore_checkpoint_to_fresh_data_dir(
-    store: ObjectArchiveStore,
-    data_dir: impl AsRef<Path>,
-) -> Result<CheckpointTip, DurabilityError> {
-    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None).await
-}
-
-pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
-    store: ObjectArchiveStore,
-    data_dir: impl AsRef<Path>,
-    target_node_id: &str,
-) -> Result<CheckpointTip, DurabilityError> {
-    if target_node_id.is_empty() {
+/// Downloads and validates one remote checkpoint without touching local data.
+///
+/// The archive layer pins the manifest and all restored bytes under one reader
+/// lease. Local installers borrow this value so an interrupted install retries
+/// the exact same remote checkpoint without re-fetching or copying it.
+pub async fn prepare_checkpoint_restore(
+    store: &ObjectArchiveStore,
+) -> Result<PreparedCheckpointRestore, DurabilityError> {
+    let loaded_restore = store
+        .load_checkpoint_restore()
+        .await?
+        .ok_or(DurabilityError::MissingCheckpoint)?;
+    let (loaded, restored) = loaded_restore.into_parts();
+    let identity = loaded.manifest().identity().clone();
+    let execution_profile = snapshot_profile(identity.cluster_id())?;
+    let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
+    if loaded.manifest().tip() != restored.tip() {
         return Err(DurabilityError::SnapshotVerification(
-            "target node_id is empty".into(),
+            "loaded checkpoint manifest tip does not match restored checkpoint tip".into(),
         ));
     }
-    restore_checkpoint_to_fresh_data_dir_with_target(
-        store,
-        data_dir.as_ref(),
-        Some(target_node_id),
-        None,
-    )
-    .await
+    let prepared = PreparedCheckpointRestore {
+        identity,
+        execution_profile,
+        restored,
+        checkpoint_root,
+    };
+    prepared.validate()?;
+    Ok(prepared)
 }
 
-pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
-    store: ObjectArchiveStore,
-    data_dir: impl AsRef<Path>,
-    target_node_id: &str,
-    marker_name: &str,
-    marker_contents: &[u8],
+/// Synchronously installs a prepared checkpoint into a fresh node directory.
+///
+/// The configured data-directory parent is trusted by deployment configuration.
+/// Protecting against a hostile ancestor replacement would require a separate
+/// descriptor-relative (`openat`) filesystem design; this installer rejects a
+/// symlink or non-directory final path before making any local mutation.
+pub fn install_prepared_checkpoint_to_fresh_data_dir(
+    prepared: &PreparedCheckpointRestore,
+    expected: ExpectedLocalRestoreState,
+    completion_marker: Option<RestoreCompletionMarker<'_>>,
 ) -> Result<CheckpointTip, DurabilityError> {
-    if target_node_id.is_empty() {
-        return Err(DurabilityError::SnapshotVerification(
-            "target node_id is empty".into(),
-        ));
-    }
-    validate_restore_marker_name(marker_name)?;
-    restore_checkpoint_to_fresh_data_dir_with_target(
-        store,
-        data_dir.as_ref(),
-        Some(target_node_id),
-        Some((marker_name, marker_contents)),
+    install_prepared_checkpoint(
+        prepared,
+        expected,
+        CheckpointInstallMode::Fresh,
+        completion_marker,
     )
-    .await
+}
+
+fn install_prepared_checkpoint(
+    prepared: &PreparedCheckpointRestore,
+    expected: ExpectedLocalRestoreState,
+    mode: CheckpointInstallMode,
+    completion_marker: Option<RestoreCompletionMarker<'_>>,
+) -> Result<CheckpointTip, DurabilityError> {
+    validate_expected_restore_request(&expected, prepared, mode, completion_marker.as_ref())?;
+    let _lock = expected.acquire_lock_and_revalidate()?;
+    #[cfg(test)]
+    test_restore_lock_acquired(&expected.data_dir);
+    if let Some(tip) = finalize_completed_restore_if_present(
+        prepared,
+        &expected,
+        mode,
+        completion_marker.as_ref(),
+    )? {
+        return Ok(tip);
+    }
+    let data_dir = expected.data_dir.as_path();
+    let target_node_id = expected.target_node_id.as_str();
+    validate_prepared_fresh_install(
+        prepared,
+        data_dir,
+        target_node_id,
+        completion_marker.as_ref(),
+    )?;
+    let marker = completion_marker
+        .as_ref()
+        .map(RestoreCompletionMarker::as_parts);
+    let intent = checkpoint_restore_intent_bytes(
+        prepared.identity(),
+        target_node_id,
+        prepared.execution_profile(),
+        prepared.checkpoint_root(),
+    )?;
+    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
+        prepared.identity(),
+        target_node_id,
+        prepared.execution_profile(),
+        prepared.checkpoint_root(),
+    ));
+    // The validation above precedes every create/remove/rename. The existing
+    // recovery artifact protocol then preserves its crash-retriable semantics.
+    prepare_fresh_restore_data_dir(data_dir, marker.map(|(name, _)| name), &intent)?;
+    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
+    install_restored_checkpoint(
+        prepared.identity(),
+        prepared.restored(),
+        data_dir,
+        RestoreInstallOptions {
+            target_node_id: Some(target_node_id),
+            replace_rebuildable: false,
+            recovery_identity: Some(&recovery_identity),
+            completion_marker: marker,
+        },
+    )?;
+    publish_restore_receipt(data_dir, prepared, mode, target_node_id, marker)?;
+    fs::remove_file(data_dir.join(RESTORE_INTENT_FILE))?;
+    sync_directory(data_dir)?;
+    Ok(*prepared.restored().tip())
 }
 
 fn restore_intent_identity(
@@ -1255,7 +1958,12 @@ fn restore_intent_identity(
     }
 }
 
-fn encode_restore_intent(
+/// Encodes the byte-exact restore-intent protocol used to resume an
+/// interrupted local checkpoint installation.
+///
+/// Callers that persist the intent must use these bytes verbatim: recovery
+/// compares the durable file byte-for-byte before permitting cleanup.
+pub fn checkpoint_restore_intent_bytes(
     identity: &CheckpointIdentity,
     node_id: &str,
     execution_profile: ExecutionProfile,
@@ -1455,105 +2163,472 @@ fn validate_local_materializer_identity(
     })
 }
 
-pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
-    store: ObjectArchiveStore,
-    data_dir: impl AsRef<Path>,
+/// Synchronously replaces only the rebuildable recovery view of a rejoining
+/// node. Recorder files are intentionally not part of the quarantine or
+/// promotion set and therefore survive byte-for-byte across the install.
+pub fn install_prepared_checkpoint_for_rejoin_preserving_recorder(
+    prepared: &PreparedCheckpointRestore,
+    expected: ExpectedLocalRestoreState,
+    completion_marker: RestoreCompletionMarker<'_>,
+) -> Result<CheckpointTip, DurabilityError> {
+    install_prepared_checkpoint_for_rejoin(prepared, expected, completion_marker)
+}
+
+fn install_prepared_checkpoint_for_rejoin(
+    prepared: &PreparedCheckpointRestore,
+    expected: ExpectedLocalRestoreState,
+    completion_marker: RestoreCompletionMarker<'_>,
+) -> Result<CheckpointTip, DurabilityError> {
+    validate_expected_restore_request(
+        &expected,
+        prepared,
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        Some(&completion_marker),
+    )?;
+    let _lock = expected.acquire_lock_and_revalidate()?;
+    #[cfg(test)]
+    test_restore_lock_acquired(&expected.data_dir);
+    if let Some(tip) = finalize_completed_restore_if_present(
+        prepared,
+        &expected,
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        Some(&completion_marker),
+    )? {
+        return Ok(tip);
+    }
+    let data_dir = expected.data_dir.as_path();
+    let target_node_id = expected.target_node_id.as_str();
+    let execution_profile = expected.execution_profile;
+    validate_prepared_rejoin_install(
+        prepared,
+        data_dir,
+        target_node_id,
+        execution_profile,
+        &completion_marker,
+    )?;
+    let completion_marker = completion_marker.as_parts();
+    let intent = checkpoint_restore_intent_bytes(
+        prepared.identity(),
+        target_node_id,
+        execution_profile,
+        prepared.checkpoint_root(),
+    )?;
+    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
+        prepared.identity(),
+        target_node_id,
+        execution_profile,
+        prepared.checkpoint_root(),
+    ));
+    cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
+    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
+    install_restored_checkpoint(
+        prepared.identity(),
+        prepared.restored(),
+        data_dir,
+        RestoreInstallOptions {
+            target_node_id: Some(target_node_id),
+            replace_rebuildable: true,
+            recovery_identity: Some(&recovery_identity),
+            completion_marker: Some(completion_marker),
+        },
+    )?;
+    publish_restore_receipt(
+        data_dir,
+        prepared,
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        target_node_id,
+        Some(completion_marker),
+    )?;
+    fs::remove_file(data_dir.join(RESTORE_INTENT_FILE))?;
+    sync_directory(data_dir)?;
+    Ok(*prepared.restored().tip())
+}
+
+impl ExpectedLocalRestoreState {
+    fn acquire_lock_and_revalidate(&self) -> Result<crate::NodeDataRootLock, DurabilityError> {
+        self.revalidate_parent_and_data_dir_before_lock()?;
+        let created_data_dir_identity =
+            if matches!(&self.data_dir_identity, ExpectedPathIdentity::Missing) {
+                match fs::create_dir(&self.data_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(DurabilityError::SnapshotVerification(
+                        "expected missing restore data directory appeared before lock acquisition"
+                            .into(),
+                    ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                sync_directory(self.data_dir.parent().unwrap_or_else(|| Path::new(".")))?;
+                let metadata = fs::symlink_metadata(&self.data_dir)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(DurabilityError::SnapshotVerification(
+                        "installer-created restore data directory is invalid".into(),
+                    ));
+                }
+                Some(PathIdentity::capture(&self.data_dir, &metadata)?)
+            } else {
+                None
+            };
+        let lock = crate::acquire_node_data_root_lock(&self.data_dir).map_err(|error| {
+            DurabilityError::SnapshotVerification(format!(
+                "cannot acquire the node data-root restore lock: {error}"
+            ))
+        })?;
+        if matches!(&self.lock, ExpectedRegularFile::Missing) && !lock.was_created() {
+            return Err(DurabilityError::SnapshotVerification(
+                "expected missing node data lock appeared before lock acquisition".into(),
+            ));
+        }
+        #[cfg(test)]
+        test_restore_lock_before_path_revalidation(&self.data_dir);
+        self.revalidate_under_lock(created_data_dir_identity.as_ref(), &lock)?;
+        Ok(lock)
+    }
+
+    fn revalidate_parent_and_data_dir_before_lock(&self) -> Result<(), DurabilityError> {
+        let parent = self.data_dir.parent().unwrap_or_else(|| Path::new("."));
+        let parent_metadata = fs::symlink_metadata(parent)?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || !self
+                .parent
+                .same_path_identity(&PathIdentity::capture(parent, &parent_metadata)?)
+        {
+            return Err(DurabilityError::SnapshotVerification(
+                "restore data directory parent changed after expected state capture".into(),
+            ));
+        }
+        match (
+            &self.data_dir_identity,
+            fs::symlink_metadata(&self.data_dir),
+        ) {
+            (ExpectedPathIdentity::Missing, Err(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            (ExpectedPathIdentity::Directory(expected), Ok(actual))
+                if !actual.file_type().is_symlink()
+                    && actual.is_dir()
+                    && expected
+                        .same_path_identity(&PathIdentity::capture(&self.data_dir, &actual)?) =>
+            {
+                Ok(())
+            }
+            _ => Err(DurabilityError::SnapshotVerification(
+                "restore data directory changed after expected state capture".into(),
+            )),
+        }
+    }
+
+    fn revalidate_under_lock(
+        &self,
+        created_data_dir_identity: Option<&PathIdentity>,
+        lock: &crate::NodeDataRootLock,
+    ) -> Result<(), DurabilityError> {
+        lock.revalidate_path(&self.data_dir.join(crate::NODE_DATA_ROOT_LOCK_FILE))
+            .map_err(|error| {
+                DurabilityError::SnapshotVerification(format!(
+                    "cannot revalidate the node data-root restore lock: {error}"
+                ))
+            })?;
+        let data_metadata = fs::symlink_metadata(&self.data_dir)?;
+        if data_metadata.file_type().is_symlink() || !data_metadata.is_dir() {
+            return Err(DurabilityError::SnapshotVerification(
+                "restore data directory changed to an invalid form under lock".into(),
+            ));
+        }
+        match (&self.data_dir_identity, created_data_dir_identity) {
+            (ExpectedPathIdentity::Directory(expected), _)
+                if !expected.same_path_identity(&PathIdentity::capture(
+                    &self.data_dir,
+                    &data_metadata,
+                )?) =>
+            {
+                return Err(DurabilityError::SnapshotVerification(
+                    "restore data directory identity changed under lock".into(),
+                ));
+            }
+            (ExpectedPathIdentity::Missing, Some(created))
+                if !created.same_path_identity(&PathIdentity::capture(
+                    &self.data_dir,
+                    &data_metadata,
+                )?) =>
+            {
+                return Err(DurabilityError::SnapshotVerification(
+                    "installer-created restore data directory changed before lock revalidation"
+                        .into(),
+                ));
+            }
+            (ExpectedPathIdentity::Missing, None) => {
+                return Err(DurabilityError::SnapshotVerification(
+                    "missing restore data directory was not created by this installer".into(),
+                ));
+            }
+            _ => {}
+        }
+        let current_lock =
+            capture_restore_regular_file(&self.data_dir.join(crate::NODE_DATA_ROOT_LOCK_FILE))?;
+        match (&self.lock, &current_lock) {
+            (ExpectedRegularFile::Missing, ExpectedRegularFile::Exact { identity, bytes })
+                if identity.kind == ExpectedEntryKind::RegularFile && bytes.is_empty() => {}
+            (expected, current) if expected == current => {}
+            _ => {
+                return Err(DurabilityError::SnapshotVerification(
+                    "node data lock changed after expected state capture".into(),
+                ));
+            }
+        }
+        self.revalidate_control_file(
+            self.completion_marker_name.as_deref(),
+            &self.completion_marker,
+        )?;
+        self.revalidate_control_file(Some(RESTORE_INTENT_FILE), &self.restore_intent)?;
+        self.revalidate_control_file(Some(RESTORE_RECEIPT_FILE), &self.restore_receipt)?;
+        if capture_recovery_artifact_set(&self.data_dir)? != self.recovery_artifacts {
+            return Err(DurabilityError::SnapshotVerification(
+                "recovery artifact set changed after expected state capture".into(),
+            ));
+        }
+        let current_qlog = capture_expected_qlog_state(
+            &self.data_dir,
+            &self.identity,
+            self.initial_configuration.clone(),
+        )?;
+        if current_qlog != self.qlog {
+            return Err(DurabilityError::SnapshotVerification(
+                "local qlog state changed after expected state capture".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn revalidate_control_file(
+        &self,
+        name: Option<&str>,
+        expected: &ExpectedRegularFile,
+    ) -> Result<(), DurabilityError> {
+        let Some(name) = name else {
+            return Ok(());
+        };
+        if capture_restore_regular_file(&self.data_dir.join(name))? != *expected {
+            return Err(DurabilityError::SnapshotVerification(format!(
+                "restore control file {name} changed after expected state capture"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_expected_restore_request(
+    expected: &ExpectedLocalRestoreState,
+    prepared: &PreparedCheckpointRestore,
+    mode: CheckpointInstallMode,
+    completion_marker: Option<&RestoreCompletionMarker<'_>>,
+) -> Result<(), DurabilityError> {
+    prepared.validate()?;
+    validate_restore_target_node_id(&expected.target_node_id)?;
+    if expected.mode != mode
+        || expected.identity != *prepared.identity()
+        || expected.execution_profile != prepared.execution_profile()
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "prepared checkpoint does not match the expected local restore contract".into(),
+        ));
+    }
+    match (
+        expected.completion_marker_name.as_deref(),
+        completion_marker,
+    ) {
+        (None, None) => {}
+        (Some(expected_name), Some(marker)) if expected_name == marker.name => {}
+        _ => {
+            return Err(DurabilityError::SnapshotVerification(
+                "restore completion marker does not match the expected local restore contract"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_install_receipt(
+    prepared: &PreparedCheckpointRestore,
+    mode: CheckpointInstallMode,
+    target_node_id: &str,
+    completion_marker: Option<(&str, &[u8])>,
+) -> RestoreInstallReceipt {
+    RestoreInstallReceipt {
+        format_version: 1,
+        mode,
+        identity: restore_intent_identity(
+            prepared.identity(),
+            target_node_id,
+            prepared.execution_profile(),
+            prepared.checkpoint_root(),
+        ),
+        checkpoint_index: prepared.restored().tip().index(),
+        checkpoint_hash: prepared.restored().tip().hash().to_hex(),
+        completion_marker_name: completion_marker.map(|(name, _)| name.to_owned()),
+        completion_marker_hash: completion_marker
+            .map(|(_, bytes)| LogHash::digest(&[bytes]).to_hex()),
+    }
+}
+
+fn publish_restore_receipt(
+    data_dir: &Path,
+    prepared: &PreparedCheckpointRestore,
+    mode: CheckpointInstallMode,
+    target_node_id: &str,
+    completion_marker: Option<(&str, &[u8])>,
+) -> Result<(), DurabilityError> {
+    let receipt = serde_json::to_vec(&restore_install_receipt(
+        prepared,
+        mode,
+        target_node_id,
+        completion_marker,
+    ))
+    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+    publish_restore_marker(data_dir, RESTORE_RECEIPT_FILE, &receipt)
+}
+
+fn finalize_completed_restore_if_present(
+    prepared: &PreparedCheckpointRestore,
+    expected: &ExpectedLocalRestoreState,
+    mode: CheckpointInstallMode,
+    completion_marker: Option<&RestoreCompletionMarker<'_>>,
+) -> Result<Option<CheckpointTip>, DurabilityError> {
+    let ExpectedRegularFile::Exact { bytes, .. } = &expected.restore_receipt else {
+        return Ok(None);
+    };
+    let actual: RestoreInstallReceipt = serde_json::from_slice(bytes).map_err(|_| {
+        DurabilityError::SnapshotVerification("local checkpoint restore receipt is invalid".into())
+    })?;
+    let marker = completion_marker.map(RestoreCompletionMarker::as_parts);
+    if actual != restore_install_receipt(prepared, mode, &expected.target_node_id, marker) {
+        if mode == CheckpointInstallMode::RejoinPreservingRecorder {
+            // A rejoin may deliberately advance from a previously committed
+            // checkpoint. The old receipt remains durable until this install
+            // publishes its replacement; the exact expected-state token keeps
+            // a concurrently completed restore from being mistaken for that
+            // known predecessor receipt.
+            return Ok(None);
+        }
+        return Err(DurabilityError::SnapshotVerification(
+            "local checkpoint restore receipt does not match the prepared checkpoint".into(),
+        ));
+    }
+    if let Some((name, contents)) = marker {
+        let actual_marker = read_bounded_regular_file(&expected.data_dir.join(name), 16 * 1024)?;
+        if actual_marker.as_deref() != Some(contents) {
+            return Err(DurabilityError::SnapshotVerification(
+                "local checkpoint completion marker does not match its receipt".into(),
+            ));
+        }
+    }
+    let intent = checkpoint_restore_intent_bytes(
+        prepared.identity(),
+        &expected.target_node_id,
+        prepared.execution_profile(),
+        prepared.checkpoint_root(),
+    )?;
+    match read_bounded_regular_file(&expected.data_dir.join(RESTORE_INTENT_FILE), 16 * 1024)? {
+        None => {}
+        Some(actual) if actual == intent => {
+            fs::remove_file(expected.data_dir.join(RESTORE_INTENT_FILE))?;
+            sync_directory(&expected.data_dir)?;
+        }
+        Some(_) => {
+            return Err(DurabilityError::SnapshotVerification(
+                "local checkpoint restore intent does not match its receipt".into(),
+            ));
+        }
+    }
+    Ok(Some(*prepared.restored().tip()))
+}
+
+fn validate_prepared_fresh_install(
+    prepared: &PreparedCheckpointRestore,
+    data_dir: &Path,
+    target_node_id: &str,
+    completion_marker: Option<&RestoreCompletionMarker<'_>>,
+) -> Result<(), DurabilityError> {
+    prepared.validate()?;
+    validate_restore_target_node_id(target_node_id)?;
+    validate_restore_data_dir_path(data_dir)?;
+    if let Some(marker) = completion_marker {
+        validate_restore_completion_marker_name(marker.name)?;
+    }
+    let intent = checkpoint_restore_intent_bytes(
+        prepared.identity(),
+        target_node_id,
+        prepared.execution_profile(),
+        prepared.checkpoint_root(),
+    )?;
+    validate_fresh_restore_data_dir(
+        data_dir,
+        completion_marker.map(|marker| marker.name),
+        &intent,
+    )
+}
+
+fn validate_prepared_rejoin_install(
+    prepared: &PreparedCheckpointRestore,
+    data_dir: &Path,
     target_node_id: &str,
     execution_profile: ExecutionProfile,
-    marker_name: &str,
-    marker_contents: &[u8],
-) -> Result<CheckpointTip, DurabilityError> {
+    completion_marker: &RestoreCompletionMarker<'_>,
+) -> Result<(), DurabilityError> {
+    prepared.validate()?;
+    validate_restore_target_node_id(target_node_id)?;
+    validate_restore_completion_marker_name(completion_marker.name)?;
+    validate_restore_data_dir_path(data_dir)?;
+    if prepared.execution_profile() != execution_profile {
+        return Err(DurabilityError::SnapshotVerification(
+            "rejoin recovery profile does not match prepared checkpoint".into(),
+        ));
+    }
+    checkpoint_restore_in_progress(
+        data_dir,
+        prepared.identity(),
+        target_node_id,
+        execution_profile,
+        prepared.checkpoint_root(),
+    )?;
+    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
+        prepared.identity(),
+        target_node_id,
+        execution_profile,
+        prepared.checkpoint_root(),
+    ));
+    collect_owned_recovery_artifacts(data_dir, &recovery_identity)?;
+    validate_rebuildable_recovery_view(data_dir, execution_profile)?;
+    Ok(())
+}
+
+fn validate_restore_target_node_id(target_node_id: &str) -> Result<(), DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
             "target node_id is empty".into(),
         ));
     }
-    validate_restore_marker_name(marker_name)?;
-    let data_dir = data_dir.as_ref();
-    let identity = store.checkpoint_identity()?.clone();
-    if snapshot_profile(identity.cluster_id())? != execution_profile {
-        return Err(DurabilityError::SnapshotVerification(
-            "rejoin recovery only replaces a matching recovery view".into(),
-        ));
-    }
-    let restored = store.restore_checkpoint_state().await?;
-    let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
-    let intent = encode_restore_intent(
-        &identity,
-        target_node_id,
-        execution_profile,
-        checkpoint_root,
-    )?;
-    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
-        &identity,
-        target_node_id,
-        execution_profile,
-        checkpoint_root,
-    ));
-    checkpoint_restore_in_progress(
-        data_dir,
-        &identity,
-        target_node_id,
-        execution_profile,
-        checkpoint_root,
-    )?;
-    cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
-    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
-    install_restored_checkpoint(
-        &identity,
-        &restored,
-        data_dir,
-        RestoreInstallOptions {
-            target_node_id: Some(target_node_id),
-            remove_generic_intent: true,
-            replace_rebuildable: true,
-            recovery_identity: Some(&recovery_identity),
-            completion_marker: Some((marker_name, marker_contents)),
-        },
-    )
+    Ok(())
 }
 
-async fn restore_checkpoint_to_fresh_data_dir_with_target(
-    store: ObjectArchiveStore,
-    data_dir: &Path,
-    target_node_id: Option<&str>,
-    completion_marker: Option<(&str, &[u8])>,
-) -> Result<CheckpointTip, DurabilityError> {
-    let identity = store.checkpoint_identity()?.clone();
-    store
-        .load_checkpoint()
-        .await?
-        .ok_or(DurabilityError::MissingCheckpoint)?;
-    let restored = store.restore_checkpoint_state().await?;
-    let target_node_id = target_node_id.unwrap_or("<unbound-restore>");
-    let profile = snapshot_profile(identity.cluster_id())?;
-    let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
-    let intent = encode_restore_intent(&identity, target_node_id, profile, checkpoint_root)?;
-    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
-        &identity,
-        target_node_id,
-        profile,
-        checkpoint_root,
-    ));
-    prepare_fresh_restore_data_dir(data_dir, completion_marker.map(|(name, _)| name), &intent)?;
-    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
-    install_restored_checkpoint(
-        &identity,
-        &restored,
-        data_dir,
-        RestoreInstallOptions {
-            target_node_id: Some(target_node_id),
-            remove_generic_intent: true,
-            replace_rebuildable: false,
-            recovery_identity: Some(&recovery_identity),
-            completion_marker,
-        },
-    )
+fn validate_restore_data_dir_path(data_dir: &Path) -> Result<(), DurabilityError> {
+    match fs::symlink_metadata(data_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 struct RestoreInstallOptions<'a> {
     target_node_id: Option<&'a str>,
-    remove_generic_intent: bool,
     replace_rebuildable: bool,
     recovery_identity: Option<&'a RecoveryArtifactIdentity>,
     completion_marker: Option<(&'a str, &'a [u8])>,
@@ -1584,12 +2659,7 @@ fn install_restored_checkpoint(
         if options.replace_rebuildable {
             quarantine_rebuildable_view(data_dir, profile, options.recovery_identity)?;
         }
-        publish_restore_staging(
-            &staging,
-            data_dir,
-            options.remove_generic_intent,
-            options.completion_marker,
-        )
+        publish_restore_staging(&staging, data_dir, options.completion_marker)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -1910,10 +2980,11 @@ pub async fn prestage_successor_checkpoint(
             "successor prestage target config_id is not the next configuration".into(),
         ));
     }
-    let loaded = store
-        .load_checkpoint()
+    let loaded_restore = store
+        .load_checkpoint_restore()
         .await?
         .ok_or(DurabilityError::MissingCheckpoint)?;
+    let (loaded, restored) = loaded_restore.into_parts();
     if loaded.manifest().identity() != &identity {
         return Err(DurabilityError::SnapshotVerification(
             "successor prestage checkpoint identity changed while loading".into(),
@@ -1944,7 +3015,6 @@ pub async fn prestage_successor_checkpoint(
     }
 
     cleanup_preparing_successor_prestage(prestage_dir, &expected)?;
-    let restored = store.restore_checkpoint_state().await?;
     if restored.tip() != loaded.manifest().tip() {
         return Err(DurabilityError::SnapshotVerification(
             "successor prestage checkpoint changed during restore".into(),
@@ -1958,7 +3028,7 @@ pub async fn prestage_successor_checkpoint(
         Some(target_node_id),
         Some(&recovery_identity),
     )?;
-    if let Err(error) = publish_restore_staging(&staged.path, prestage_dir, false, None) {
+    if let Err(error) = publish_restore_staging(&staged.path, prestage_dir, None) {
         let _ = fs::remove_dir_all(&staged.path);
         return Err(error);
     }
@@ -2238,7 +3308,7 @@ pub fn adopt_finalized_successor_prestage(
         _ => {
             return Err(DurabilityError::DataDirNotFresh(
                 prestage.path.to_path_buf(),
-            ))
+            ));
         }
     }
     fs::remove_file(prestage.path.join(SUCCESSOR_PRESTAGE_FINALIZED_FILE))?;
@@ -2321,7 +3391,6 @@ fn create_restore_staging_dir(
 fn publish_restore_staging(
     staging: &Path,
     data_dir: &Path,
-    remove_generic_intent: bool,
     completion_marker: Option<(&str, &[u8])>,
 ) -> Result<(), DurabilityError> {
     sync_directory(staging)?;
@@ -2339,9 +3408,6 @@ fn publish_restore_staging(
     if let Some((marker_name, marker_contents)) = completion_marker {
         publish_restore_marker(data_dir, marker_name, marker_contents)?;
     }
-    if remove_generic_intent {
-        fs::remove_file(data_dir.join(RESTORE_INTENT_FILE))?;
-    }
     sync_directory(data_dir)
 }
 
@@ -2350,28 +3416,15 @@ fn quarantine_rebuildable_view(
     profile: ExecutionProfile,
     recovery_identity: Option<&RecoveryArtifactIdentity>,
 ) -> Result<Option<PathBuf>, DurabilityError> {
+    if !validate_rebuildable_recovery_view(data_dir, profile)? {
+        return Ok(None);
+    }
     let materializer = match profile {
         ExecutionProfile::Sqlite => "sqlite",
         ExecutionProfile::Kv => "kv",
         ExecutionProfile::Graph => "ladybug",
     };
     let names = [materializer, "consensus"];
-    let mut has_rebuildable_view = false;
-    for name in names {
-        match fs::symlink_metadata(data_dir.join(name)) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(DurabilityError::SnapshotVerification(
-                    "rebuildable recovery view is not a regular directory".into(),
-                ));
-            }
-            Ok(_) => has_rebuildable_view = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if !has_rebuildable_view {
-        return Ok(None);
-    }
     for _ in 0..128 {
         let sequence = RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let quarantine = data_dir.join(format!(
@@ -2413,6 +3466,31 @@ fn quarantine_rebuildable_view(
     .into())
 }
 
+fn validate_rebuildable_recovery_view(
+    data_dir: &Path,
+    profile: ExecutionProfile,
+) -> Result<bool, DurabilityError> {
+    let materializer = match profile {
+        ExecutionProfile::Sqlite => "sqlite",
+        ExecutionProfile::Kv => "kv",
+        ExecutionProfile::Graph => "ladybug",
+    };
+    let mut has_rebuildable_view = false;
+    for name in [materializer, "consensus"] {
+        match fs::symlink_metadata(data_dir.join(name)) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(DurabilityError::SnapshotVerification(
+                    "rebuildable recovery view is not a regular directory".into(),
+                ));
+            }
+            Ok(_) => has_rebuildable_view = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(has_rebuildable_view)
+}
+
 fn publish_restore_marker(
     data_dir: &Path,
     marker_name: &str,
@@ -2435,16 +3513,116 @@ fn publish_restore_marker(
     sync_directory(data_dir)
 }
 
+fn is_valid_node_data_root_lock(path: &Path) -> Result<bool, DurabilityError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(!metadata.file_type().is_symlink() && metadata.is_file() && metadata.len() == 0)
+}
+
+fn is_valid_restore_install_receipt(path: &Path) -> Result<bool, DurabilityError> {
+    let Some(bytes) = read_bounded_regular_file(path, 16 * 1024)? else {
+        return Ok(false);
+    };
+    Ok(
+        serde_json::from_slice::<RestoreInstallReceipt>(&bytes).is_ok_and(|receipt| {
+            receipt.format_version == 1
+                && !receipt.identity.cluster_id.is_empty()
+                && !receipt.identity.node_id.is_empty()
+                && LogHash::from_hex(&receipt.identity.checkpoint_hash).is_some()
+                && LogHash::from_hex(&receipt.checkpoint_hash).is_some()
+        }),
+    )
+}
+
 fn validate_restore_marker_name(marker_name: &str) -> Result<(), DurabilityError> {
+    let mut components = Path::new(marker_name).components();
+    let is_exactly_one_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    // `Path::components` recognizes a drive prefix only on Windows. Reject
+    // the portable drive-prefix spelling here as well, so a marker accepted
+    // on Unix cannot become rooted or prefixed when the same data is handled
+    // on Windows. Backslashes are forbidden independently for the same
+    // cross-platform reason.
+    let has_windows_drive_prefix = marker_name
+        .as_bytes()
+        .get(0..2)
+        .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1] == b':');
     if marker_name.is_empty()
-        || matches!(marker_name, "." | "..")
-        || marker_name.contains(std::path::MAIN_SEPARATOR)
+        || marker_name.contains(['/', '\\', '\0'])
+        || has_windows_drive_prefix
+        || !is_exactly_one_normal_component
     {
         return Err(DurabilityError::SnapshotVerification(
             "restore marker name must be one local file name".into(),
         ));
     }
     Ok(())
+}
+
+fn validate_restore_completion_marker_name(marker_name: &str) -> Result<(), DurabilityError> {
+    validate_restore_marker_name(marker_name)?;
+    if !is_portable_completion_marker_name(marker_name) {
+        return Err(DurabilityError::SnapshotVerification(
+            "restore completion marker name is not portable ASCII".into(),
+        ));
+    }
+    // Recovery control names are ASCII protocol names. Compare them with
+    // ASCII case folding so a marker accepted on a case-sensitive filesystem
+    // cannot later alias a control path on a case-insensitive filesystem.
+    let folded = marker_name.to_ascii_lowercase();
+    let internal_name = matches!(
+        folded.as_str(),
+        RESTORE_INTENT_FILE
+            | SUCCESSOR_RESTORE_LOCK_FILE
+            | SUCCESSOR_RESTORE_INTENT_FILE
+            | SUCCESSOR_RESTORE_COMPLETE_FILE
+            | SUCCESSOR_PRESTAGE_LOCK_FILE
+            | SUCCESSOR_PRESTAGE_INTENT_FILE
+            | SUCCESSOR_PRESTAGE_READY_FILE
+            | SUCCESSOR_PRESTAGE_PUBLISHED_FILE
+            | SUCCESSOR_PRESTAGE_FINALIZED_FILE
+            | REPAIR_ARTIFACT_OWNER_FILE
+            | "sqlite"
+            | "ladybug"
+            | "kv"
+            | "consensus"
+    );
+    let internal_prefix = folded.starts_with(RESTORE_STAGING_PREFIX)
+        || folded.starts_with(RESTORE_MARKER_TMP_PREFIX)
+        || folded.starts_with(".rebuildable-quarantine-");
+    if internal_name || internal_prefix {
+        return Err(DurabilityError::SnapshotVerification(
+            "restore completion marker collides with an internal recovery path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_portable_completion_marker_name(marker_name: &str) -> bool {
+    let bytes = marker_name.as_bytes();
+    if bytes.is_empty()
+        || bytes.ends_with(b".")
+        || bytes.ends_with(b" ")
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let stem = marker_name.split('.').next().unwrap_or_default();
+    let reserved_device = stem.eq_ignore_ascii_case("con")
+        || stem.eq_ignore_ascii_case("prn")
+        || stem.eq_ignore_ascii_case("aux")
+        || stem.eq_ignore_ascii_case("nul")
+        || (stem.len() == 4
+            && (stem[..3].eq_ignore_ascii_case("com") || stem[..3].eq_ignore_ascii_case("lpt"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    !reserved_device
 }
 
 fn is_owned_generated_recovery_name(name: &str, prefix: &str) -> bool {
@@ -2507,10 +3685,10 @@ fn is_owned_recovery_directory(
     Ok(true)
 }
 
-fn cleanup_owned_recovery_artifacts(
+fn collect_owned_recovery_artifacts(
     data_dir: &Path,
     identity: &RecoveryArtifactIdentity,
-) -> Result<(), DurabilityError> {
+) -> Result<Vec<PathBuf>, DurabilityError> {
     let mut cleanup = Vec::new();
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
@@ -2545,6 +3723,14 @@ fn cleanup_owned_recovery_artifacts(
         }
         cleanup.push(entry.path());
     }
+    Ok(cleanup)
+}
+
+fn cleanup_owned_recovery_artifacts(
+    data_dir: &Path,
+    identity: &RecoveryArtifactIdentity,
+) -> Result<(), DurabilityError> {
+    let cleanup = collect_owned_recovery_artifacts(data_dir, identity)?;
     for path in cleanup.iter() {
         fs::remove_dir_all(path)?;
     }
@@ -2919,6 +4105,7 @@ fn prepare_fresh_restore_data_dir(
     completion_marker_name: Option<&str>,
     expected_intent: &[u8],
 ) -> Result<(), DurabilityError> {
+    validate_fresh_restore_data_dir(data_dir, completion_marker_name, expected_intent)?;
     if !path_has_state(data_dir)? {
         return Ok(());
     }
@@ -2949,9 +4136,17 @@ fn prepare_fresh_restore_data_dir(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             is_safe_restore_marker_tmp(&entry.path(), &name).unwrap_or(false)
+                || (name == crate::NODE_DATA_ROOT_LOCK_FILE
+                    && is_valid_node_data_root_lock(&entry.path()).unwrap_or(false))
+                || (name == RESTORE_RECEIPT_FILE
+                    && is_valid_restore_install_receipt(&entry.path()).unwrap_or(false))
         }) {
             for entry in entries {
-                fs::remove_file(entry.path())?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if is_safe_restore_marker_tmp(&entry.path(), &name)? {
+                    fs::remove_file(entry.path())?;
+                }
             }
             sync_directory(data_dir)?;
             return Ok(());
@@ -2988,6 +4183,9 @@ fn prepare_fresh_restore_data_dir(
             || name == "ladybug"
             || name == "kv"
             || name == "consensus"
+            || (name == crate::NODE_DATA_ROOT_LOCK_FILE
+                && is_valid_node_data_root_lock(&entry.path())?)
+            || (name == RESTORE_RECEIPT_FILE && is_valid_restore_install_receipt(&entry.path())?)
             || marker_tmp
             || is_staging;
         if !owned {
@@ -3016,6 +4214,94 @@ fn prepare_fresh_restore_data_dir(
     Ok(())
 }
 
+/// Validates every existing fresh-install artifact before the installer creates,
+/// removes, renames, or quarantines any path. The data-directory parent is a
+/// trusted configuration boundary; this does not attempt to defend a hostile
+/// ancestor replacement between this check and the subsequent filesystem work.
+fn validate_fresh_restore_data_dir(
+    data_dir: &Path,
+    completion_marker_name: Option<&str>,
+    expected_intent: &[u8],
+) -> Result<(), DurabilityError> {
+    if !path_has_state(data_dir)? {
+        return Ok(());
+    }
+
+    let intent = data_dir.join(RESTORE_INTENT_FILE);
+    let intent_metadata = match fs::symlink_metadata(&intent) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let (active_intent, recovery_identity) = if let Some(metadata) = intent_metadata {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || read_bounded_regular_file(&intent, 4096)?.as_deref() != Some(expected_intent)
+        {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        (
+            &intent,
+            Some(RecoveryArtifactIdentity::Restore(
+                parse_restore_intent_identity(expected_intent)
+                    .ok_or_else(|| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?,
+            )),
+        )
+    } else {
+        for entry in fs::read_dir(data_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(is_safe_restore_marker_tmp(&entry.path(), &name)?
+                || (name == crate::NODE_DATA_ROOT_LOCK_FILE
+                    && is_valid_node_data_root_lock(&entry.path())?)
+                || (name == RESTORE_RECEIPT_FILE
+                    && is_valid_restore_install_receipt(&entry.path())?))
+            {
+                return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+            }
+        }
+        return Ok(());
+    };
+
+    for entry in fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let marker_tmp = is_safe_restore_marker_tmp(&entry.path(), &name)?;
+        if name.starts_with(RESTORE_MARKER_TMP_PREFIX) && !marker_tmp {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        let is_staging = name.starts_with(RESTORE_STAGING_PREFIX);
+        if is_staging
+            && (!is_owned_generated_recovery_name(&name, RESTORE_STAGING_PREFIX)
+                || !recovery_identity.as_ref().is_some_and(|identity| {
+                    is_owned_recovery_directory(
+                        &entry.path(),
+                        &["sqlite", "ladybug", "kv", "consensus"],
+                        RepairArtifactRole::Staging,
+                        identity,
+                    )
+                    .unwrap_or(false)
+                }))
+        {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        let owned = entry.path() == active_intent.as_path()
+            || completion_marker_name.is_some_and(|marker| name == marker)
+            || ["sqlite", "ladybug", "kv", "consensus"].contains(&name.as_ref())
+            || (name == crate::NODE_DATA_ROOT_LOCK_FILE
+                && is_valid_node_data_root_lock(&entry.path())?)
+            || (name == RESTORE_RECEIPT_FILE && is_valid_restore_install_receipt(&entry.path())?)
+            || marker_tmp
+            || is_staging;
+        if !owned {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+    }
+    Ok(())
+}
+
 fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -3038,25 +4324,661 @@ mod prestage_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        mark_durable_state, observe_durable_tip, snapshot_profile, validate_local_qlog,
-        validate_restored_suffix, write_repair_artifact_ownership, CheckpointTip, CoordinatorState,
-        DurabilityError, DurabilityHealth, ExecutionProfile, LogAnchor, LogHash, PendingLag,
-        RecoveryArtifactIdentity, RepairArtifactRole, SuccessorRestorePreparation,
-        RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
-        SUCCESSOR_RESTORE_LOCK_FILE,
+        capture_expected_local_restore_state, capture_expected_qlog_state,
+        checkpoint_restore_intent_bytes,
+        install_prepared_checkpoint_for_rejoin_preserving_recorder, install_test_restore_lock_gate,
+        install_test_restore_lock_path_replacement_hook, mark_durable_state, observe_durable_tip,
+        snapshot_profile, validate_local_qlog, validate_restored_suffix,
+        write_repair_artifact_ownership, CheckpointInstallMode, CheckpointTip, CoordinatorState,
+        DurabilityError, DurabilityHealth, ExecutionProfile, ExpectedLocalRestoreState,
+        ExpectedQlogState, LogAnchor, LogHash, PendingLag, PreparedCheckpointRestore,
+        RecoveryArtifactIdentity, RepairArtifactRole, RestoreCompletionMarker,
+        SuccessorRestorePreparation, RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_COMPLETE_FILE,
+        SUCCESSOR_RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_LOCK_FILE,
     };
+    use super::{install_prepared_checkpoint_to_fresh_data_dir, prepare_checkpoint_restore};
     #[cfg(feature = "kv")]
-    use crate::{KvCommandV1, NodeConfig, NodeRuntime};
-    use rhiza_archive::CheckpointIdentity;
+    use super::{validate_local_recovery_view, CheckpointCoordinator, DurabilityMode};
     #[cfg(feature = "kv")]
-    use rhiza_archive::ObjectArchiveStore;
-    use rhiza_core::{EntryType, LogEntry};
+    use crate::KvCommandV1;
+    #[cfg(any(feature = "sql", feature = "kv"))]
+    use crate::{NodeConfig, NodeRuntime};
+    use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+    use rhiza_core::{ConfigurationState, EntryType, LogEntry};
     use rhiza_log::{FileLogStore, LogStore};
-    #[cfg(feature = "kv")]
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-    #[cfg(feature = "kv")]
     use rhiza_quepaxa::ThreeNodeConsensus;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::{mpsc, Arc, Barrier, Mutex},
+        time::Duration,
+    };
+
+    #[test]
+    fn completion_marker_names_follow_one_portable_ascii_grammar() {
+        let cases = [
+            ("identity.json", true),
+            ("marker-1_2", true),
+            ("CON.txt", false),
+            ("con.JSON", false),
+            ("COM1.log", false),
+            ("lpt9.txt", false),
+            ("file:ads", false),
+            ("file.", false),
+            ("file ", false),
+            ("é.json", false),
+            ("control\u{001f}.json", false),
+            ("<", false),
+            (">", false),
+            ("\"", false),
+            ("|", false),
+            ("?", false),
+            ("*", false),
+            (".", false),
+            ("..", false),
+            ("dir/file", false),
+            ("dir\\file", false),
+            ("C:marker", false),
+            ("\\\\server\\share", false),
+            (".RHIZA-RESTORE.JSON", false),
+            ("CONSENSUS", false),
+        ];
+        for (name, accepted) in cases {
+            assert_eq!(
+                RestoreCompletionMarker::new(name, b"marker").is_ok(),
+                accepted,
+                "completion marker grammar result for {name:?}"
+            );
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RestoreTreeEntry {
+        kind: &'static str,
+        bytes: Vec<u8>,
+        len: u64,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(unix)]
+        dev: u64,
+        #[cfg(unix)]
+        ino: u64,
+    }
+
+    /// Captures all restore-owned and recorder state so a failed installer can
+    /// prove it did not publish an intent, receipt, marker, staging artifact,
+    /// qlog mutation, or recorder mutation. The hook deliberately replaces
+    /// only `.node.lock`, so only that synchronization pathname is omitted.
+    fn restore_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, RestoreTreeEntry> {
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, RestoreTreeEntry>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                if relative == Path::new(crate::NODE_DATA_ROOT_LOCK_FILE) {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                let kind = if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else if metadata.is_dir() {
+                    "directory"
+                } else if metadata.is_file() {
+                    "file"
+                } else {
+                    "other"
+                };
+                entries.insert(
+                    relative.clone(),
+                    RestoreTreeEntry {
+                        kind,
+                        bytes: if metadata.is_file() {
+                            fs::read(entry.path()).unwrap()
+                        } else {
+                            Vec::new()
+                        },
+                        len: metadata.len(),
+                        #[cfg(unix)]
+                        mode: {
+                            use std::os::unix::fs::MetadataExt;
+                            metadata.mode()
+                        },
+                        #[cfg(unix)]
+                        dev: {
+                            use std::os::unix::fs::MetadataExt;
+                            metadata.dev()
+                        },
+                        #[cfg(unix)]
+                        ino: {
+                            use std::os::unix::fs::MetadataExt;
+                            metadata.ino()
+                        },
+                    },
+                );
+                if metadata.is_dir() {
+                    visit(root, &entry.path(), entries);
+                }
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    fn expected_restore_state_for_test(
+        prepared: &PreparedCheckpointRestore,
+        data_dir: &Path,
+        node_id: &str,
+        mode: CheckpointInstallMode,
+        marker: Option<&str>,
+    ) -> Result<ExpectedLocalRestoreState, DurabilityError> {
+        capture_expected_local_restore_state(
+            data_dir,
+            mode,
+            node_id,
+            prepared.identity(),
+            prepared.execution_profile(),
+            ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+            marker,
+        )
+    }
+
+    #[cfg(feature = "sql")]
+    async fn prepared_sql_target(root: &tempfile::TempDir) -> (PreparedCheckpointRestore, PathBuf) {
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+        let target = root.path().join("target");
+        install_prepared_checkpoint_to_fresh_data_dir(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+        )
+        .unwrap();
+        (prepared, target)
+    }
+
+    #[cfg(feature = "sql")]
+    fn replace_regular_file_with_same_bytes(path: &Path, bytes: &[u8]) {
+        let replacement = path.with_extension("identity-replacement");
+        fs::write(&replacement, bytes).unwrap();
+        fs::rename(replacement, path).unwrap();
+    }
+
+    #[cfg(feature = "sql")]
+    fn qlog_state_for_test(
+        prepared: &PreparedCheckpointRestore,
+        target: &Path,
+    ) -> ExpectedQlogState {
+        capture_expected_qlog_state(
+            target,
+            prepared.identity(),
+            ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "sql")]
+    fn assert_same_logical_qlog_with_replaced_paths(
+        before: &ExpectedQlogState,
+        after: &ExpectedQlogState,
+    ) {
+        match (before, after) {
+            (
+                ExpectedQlogState::Logical {
+                    state: before_state,
+                    paths: before_paths,
+                },
+                ExpectedQlogState::Logical {
+                    state: after_state,
+                    paths: after_paths,
+                },
+            ) => {
+                assert_eq!(before_state, after_state);
+                assert_ne!(before_paths, after_paths);
+            }
+            _ => panic!("qlog replacement fixture must retain an exact logical qlog state"),
+        }
+    }
+
+    #[cfg(feature = "sql")]
+    fn copy_regular_tree(source: &Path, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                copy_regular_tree(&source_path, &destination_path);
+            } else {
+                assert!(metadata.is_file());
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "sql")]
+    fn seed_qlog_identity_test_entry(prepared: &PreparedCheckpointRestore, target: &Path) {
+        let identity = prepared.identity();
+        let log = FileLogStore::open(
+            target.join("consensus/log"),
+            identity.cluster_id(),
+            identity.epoch(),
+            identity.config_id(),
+        )
+        .unwrap();
+        let hash = LogEntry::calculate_hash(
+            identity.cluster_id(),
+            1,
+            identity.epoch(),
+            identity.config_id(),
+            EntryType::Noop,
+            LogHash::ZERO,
+            &[],
+        );
+        log.append(&LogEntry {
+            cluster_id: identity.cluster_id().into(),
+            epoch: identity.epoch(),
+            config_id: identity.config_id(),
+            index: 1,
+            entry_type: EntryType::Noop,
+            payload: Vec::new(),
+            prev_hash: LogHash::ZERO,
+            hash,
+        })
+        .unwrap();
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn held_installer_lock_rejects_node_runtime_open() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+        let target = root.path().join("target");
+        install_prepared_checkpoint_to_fresh_data_dir(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+        )
+        .unwrap();
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let _gate = install_test_restore_lock_gate(target.clone(), entered, release_rx);
+        let worker = std::thread::spawn(move || {
+            install_prepared_checkpoint_for_rejoin_preserving_recorder(
+                &prepared,
+                expected,
+                RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("installer must acquire its lock before runtime contention check");
+
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            target.clone(),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:sql:cluster-a",
+                "node-1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/node-1"),
+                    root.path().join("recorders/node-2"),
+                    root.path().join("recorders/node-3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            NodeRuntime::open(config, consensus, &[]),
+            Err(crate::NodeError::DataRootLocked(path)) if path == target
+        ));
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn missing_lock_path_replacement_after_acquisition_fails_before_restore_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+        let target = root.path().join("target");
+        install_prepared_checkpoint_to_fresh_data_dir(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+        )
+        .unwrap();
+
+        // The expected state deliberately begins with no lock. The hook then
+        // replaces the lock A owns with a separately locked zero-length L2.
+        fs::remove_file(target.join(crate::NODE_DATA_ROOT_LOCK_FILE)).unwrap();
+        let recorder_sentinel = target.join("recorders/node-1/retained.bin");
+        fs::create_dir_all(recorder_sentinel.parent().unwrap()).unwrap();
+        fs::write(&recorder_sentinel, b"recorder bytes must survive").unwrap();
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let before = restore_tree_snapshot(&target);
+        let (replacement_tx, replacement_rx) = mpsc::sync_channel(1);
+        let _hook = install_test_restore_lock_path_replacement_hook(target.clone(), replacement_tx);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+        let replacement_lock = replacement_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hook must retain the replacement L2 lock");
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("does not identify the acquired lock")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), before);
+        assert_eq!(
+            fs::read(&recorder_sentinel).unwrap(),
+            b"recorder bytes must survive"
+        );
+        assert!(replacement_lock.metadata().unwrap().is_file());
+        assert_eq!(replacement_lock.metadata().unwrap().len(), 0);
+        drop(replacement_lock);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn same_size_completion_marker_replacement_after_capture_fails_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (prepared, target) = prepared_sql_target(&root).await;
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let marker = target.join("identity.json");
+        replace_regular_file_with_same_bytes(&marker, &fs::read(&marker).unwrap());
+        let before = restore_tree_snapshot(&target);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("restore control file identity.json changed")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), before);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn same_size_restore_intent_replacement_after_capture_fails_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (prepared, target) = prepared_sql_target(&root).await;
+        let intent = checkpoint_restore_intent_bytes(
+            prepared.identity(),
+            "node-1",
+            prepared.execution_profile(),
+            prepared.checkpoint_root(),
+        )
+        .unwrap();
+        let intent_path = target.join(RESTORE_INTENT_FILE);
+        fs::write(&intent_path, &intent).unwrap();
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        replace_regular_file_with_same_bytes(&intent_path, &intent);
+        let before = restore_tree_snapshot(&target);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("restore control file .rhiza-restore.json changed")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), before);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn same_size_existing_lock_replacement_after_capture_fails_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (prepared, target) = prepared_sql_target(&root).await;
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let lock_path = target.join(crate::NODE_DATA_ROOT_LOCK_FILE);
+        replace_regular_file_with_same_bytes(&lock_path, b"");
+        let before = restore_tree_snapshot(&target);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("node data lock changed after expected state capture")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), before);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn data_directory_replacement_after_capture_fails_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (prepared, target) = prepared_sql_target(&root).await;
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let displaced = root.path().join("displaced-target");
+        fs::rename(&target, &displaced).unwrap();
+        fs::create_dir(&target).unwrap();
+        let target_before = restore_tree_snapshot(&target);
+        let displaced_before = restore_tree_snapshot(&displaced);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("restore data directory changed after expected state capture")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), target_before);
+        assert_eq!(restore_tree_snapshot(&displaced), displaced_before);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn same_content_qlog_root_replacement_after_capture_fails_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (prepared, target) = prepared_sql_target(&root).await;
+        seed_qlog_identity_test_entry(&prepared, &target);
+        let qlog_dir = target.join("consensus/log");
+        let qlog_before = qlog_state_for_test(&prepared, &target);
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let displaced_qlog = root.path().join("replacement-owned-qlog");
+        fs::rename(&qlog_dir, &displaced_qlog).unwrap();
+        copy_regular_tree(&displaced_qlog, &qlog_dir);
+        let qlog_after = qlog_state_for_test(&prepared, &target);
+        assert_same_logical_qlog_with_replaced_paths(&qlog_before, &qlog_after);
+        let target_before = restore_tree_snapshot(&target);
+        let displaced_before = restore_tree_snapshot(&displaced_qlog);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("local qlog state changed after expected state capture")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), target_before);
+        assert_eq!(restore_tree_snapshot(&displaced_qlog), displaced_before);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn same_content_qlog_entry_replacement_after_capture_fails_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (prepared, target) = prepared_sql_target(&root).await;
+        seed_qlog_identity_test_entry(&prepared, &target);
+        let qlog_dir = target.join("consensus/log");
+        let qlog_before = qlog_state_for_test(&prepared, &target);
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::RejoinPreservingRecorder,
+            Some("identity.json"),
+        )
+        .unwrap();
+        let entry = fs::read_dir(&qlog_dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .find(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()))
+            .expect("fresh restored qlog must contain a regular anchor or segment entry");
+        replace_regular_file_with_same_bytes(&entry, &fs::read(&entry).unwrap());
+        let qlog_after = qlog_state_for_test(&prepared, &target);
+        assert_same_logical_qlog_with_replaced_paths(&qlog_before, &qlog_after);
+        let before = restore_tree_snapshot(&target);
+
+        let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected,
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurabilityError::SnapshotVerification(message)
+                if message.contains("local qlog state changed after expected state capture")
+        ));
+        assert_eq!(restore_tree_snapshot(&target), before);
+    }
 
     #[test]
     fn snapshot_profile_requires_a_canonical_effective_cluster_identity() {
@@ -3079,11 +5001,59 @@ mod tests {
         assert!(snapshot_profile("rhiza:graph:").is_err());
     }
 
+    #[tokio::test]
+    async fn prepared_install_rejects_inconsistent_root_or_profile_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: root.path().join("archive"),
+        })
+        .unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store,
+            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let mut prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+        let data_dir = root.path().join("data");
+        let valid_root = prepared.checkpoint_root;
+
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &data_dir,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            None,
+        )
+        .unwrap();
+        prepared.checkpoint_root = LogAnchor::new(1, LogHash::digest(&[b"wrong-root"]));
+        assert!(matches!(
+            install_prepared_checkpoint_to_fresh_data_dir(&prepared, expected, None),
+            Err(DurabilityError::SnapshotVerification(_))
+        ));
+        assert!(!data_dir.exists());
+
+        prepared.checkpoint_root = valid_root;
+        let expected = expected_restore_state_for_test(
+            &prepared,
+            &data_dir,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            None,
+        )
+        .unwrap();
+        prepared.execution_profile = ExecutionProfile::Graph;
+        assert!(matches!(
+            install_prepared_checkpoint_to_fresh_data_dir(&prepared, expected, None),
+            Err(DurabilityError::SnapshotVerification(_))
+        ));
+        assert!(!data_dir.exists());
+    }
+
     #[test]
     fn generic_restore_prepare_keeps_prefix_spoofed_staging_and_fails_closed() {
         let root = tempfile::tempdir().unwrap();
         let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
-        let intent = super::encode_restore_intent(
+        let intent = super::checkpoint_restore_intent_bytes(
             &identity,
             "node-1",
             ExecutionProfile::Sqlite,
@@ -3296,11 +5266,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_intent_remains_until_completion_marker_is_durable_and_retryable() {
+    fn restore_intent_survives_failed_or_pre_receipt_staging_for_retry() {
         let root = tempfile::tempdir().unwrap();
         let data_dir = root.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let intent = super::encode_restore_intent(
+        let intent = super::checkpoint_restore_intent_bytes(
             &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
             "node-1",
             ExecutionProfile::Sqlite,
@@ -3314,7 +5284,6 @@ mod tests {
         assert!(super::publish_restore_staging(
             &staging,
             &data_dir,
-            true,
             Some(("identity.json", b"identity-fixture")),
         )
         .is_err());
@@ -3328,7 +5297,6 @@ mod tests {
         super::publish_restore_staging(
             &retry_staging,
             &data_dir,
-            true,
             Some(("identity.json", b"identity-fixture")),
         )
         .unwrap();
@@ -3336,7 +5304,11 @@ mod tests {
             std::fs::read(data_dir.join("identity.json")).unwrap(),
             b"identity-fixture"
         );
-        assert!(!data_dir.join(RESTORE_INTENT_FILE).exists());
+        assert_eq!(
+            std::fs::read(data_dir.join(RESTORE_INTENT_FILE)).unwrap(),
+            intent,
+            "the generic intent may be removed only after the durable install receipt"
+        );
     }
 
     #[cfg(feature = "kv")]
@@ -3397,9 +5369,20 @@ mod tests {
         let checkpoint_root = runtime.checkpoint_compact(&coordinator).await.unwrap();
 
         let target = root.path().join("target");
-        restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &target, "node-1")
-            .await
-            .unwrap();
+        let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+        install_prepared_checkpoint_to_fresh_data_dir(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
         validate_local_recovery_view(
             &target,
             &identity,
@@ -3420,15 +5403,18 @@ mod tests {
             *checkpoint_root.compacted(),
         )
         .is_err());
-        restore_checkpoint_for_rejoin_preserving_recorder(
-            archive.clone(),
-            &target,
-            "node-1",
-            ExecutionProfile::Kv,
-            "identity.json",
-            b"identity-fixture",
+        install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::RejoinPreservingRecorder,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            RestoreCompletionMarker::new("identity.json", b"identity-fixture").unwrap(),
         )
-        .await
         .unwrap();
 
         std::fs::write(target.join("kv/data.redb"), b"corrupt").unwrap();
@@ -3440,15 +5426,18 @@ mod tests {
             *checkpoint_root.compacted(),
         )
         .is_err());
-        restore_checkpoint_for_rejoin_preserving_recorder(
-            archive,
-            &target,
-            "node-1",
-            ExecutionProfile::Kv,
-            "identity.json",
-            b"identity-fixture",
+        install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::RejoinPreservingRecorder,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            RestoreCompletionMarker::new("identity.json", b"identity-fixture").unwrap(),
         )
-        .await
         .unwrap();
         assert_eq!(
             std::fs::read(target.join("recorder/sentinel")).unwrap(),

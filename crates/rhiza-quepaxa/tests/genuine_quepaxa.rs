@@ -121,7 +121,11 @@ fn command_registration_surfaces_a_hash_mismatch() {
     let consensus = consensus(root.path(), "n1");
 
     assert_eq!(
-        consensus.register_command(LogHash::ZERO, b"different hash".to_vec()),
+        consensus.register_command(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            LogHash::ZERO,
+            b"different hash".to_vec(),
+        ),
         Err(Error::CommandHashMismatch)
     );
 }
@@ -132,18 +136,25 @@ fn preferred_proposer_decides_in_step_four_with_fast_proof() {
     let consensus = consensus(root.path(), "n1");
     let command = StoredCommand::new(EntryType::Command, b"fast".to_vec());
     consensus
-        .register_command(command.hash(), command.payload.clone())
+        .register_command(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            command.hash(),
+            command.payload.clone(),
+        )
         .unwrap();
     let outcome = consensus
-        .drive(ProposerProgress::new(
-            1,
-            Proposal::new(
-                ProposalPriority::MAX,
-                "n1",
+        .drive(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            ProposerProgress::new(
                 1,
-                AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+                Proposal::new(
+                    ProposalPriority::MAX,
+                    "n1",
+                    1,
+                    AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+                ),
             ),
-        ))
+        )
         .unwrap();
     assert!(matches!(
         outcome,
@@ -151,7 +162,11 @@ fn preferred_proposer_decides_in_step_four_with_fast_proof() {
     ));
     assert!(matches!(
         consensus
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Committed(_)
     ));
@@ -192,6 +207,7 @@ fn unsorted_recorder_pairs_preserve_identity_and_reach_quorum() {
 
     let entry = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"unsorted-recorders".to_vec()),
@@ -209,6 +225,7 @@ fn root_constructor_installs_membership_before_proof_installation() {
 
     let entry = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"configured-roots".to_vec()),
@@ -257,7 +274,11 @@ fn priority_randomness_failure_is_typed_and_fail_stop() {
     let consensus = consensus(root.path(), "n2").with_priority_source(Arc::new(FailingPriority));
     let command = StoredCommand::new(EntryType::Command, b"rng-failure".to_vec());
     consensus
-        .register_command(command.hash(), command.payload.clone())
+        .register_command(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            command.hash(),
+            command.payload.clone(),
+        )
         .unwrap();
     let progress = ProposerProgress::new(
         1,
@@ -270,7 +291,7 @@ fn priority_randomness_failure_is_typed_and_fail_stop() {
     );
 
     assert!(matches!(
-        consensus.drive(progress),
+        consensus.drive(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), progress),
         Err(Error::RandomnessUnavailable(message)) if message.contains("entropy")
     ));
 }
@@ -281,7 +302,11 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
     let engine = consensus(root.path(), "n2").with_priority_source(Arc::new(FixedPriority));
     let command = StoredCommand::new(EntryType::Command, b"slow".to_vec());
     engine
-        .register_command(command.hash(), command.payload.clone())
+        .register_command(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            command.hash(),
+            command.payload.clone(),
+        )
         .unwrap();
     let mut progress = ProposerProgress::new(
         1,
@@ -293,7 +318,13 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
         ),
     );
     let proof = loop {
-        match engine.drive(progress).unwrap() {
+        match engine
+            .drive(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                progress,
+            )
+            .unwrap()
+        {
             DriveOutcome::Progress(next) | DriveOutcome::Pending(next) => progress = next,
             DriveOutcome::Decision(proof) => break proof,
         }
@@ -301,17 +332,23 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
     assert!(matches!(proof, DecisionProof::Phase2 { step, .. } if step % 4 == 2));
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     assert!(matches!(
-        engine.inspect_decision_proof_at(1).unwrap(),
+        engine
+            .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
+            .unwrap(),
         Some(DecisionProof::Phase2 { .. })
     ));
     assert!(matches!(
         engine
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Committed(_)
     ));
     assert!(matches!(
-        engine.recover_decision_at(1, LogHash::ZERO).unwrap(),
+        engine.recover_decision_at(rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1, LogHash::ZERO).unwrap(),
         rhiza_quepaxa::DecisionInspection::Committed(entry) if entry.payload == b"slow"
     ));
     drop(engine);
@@ -319,7 +356,7 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
     let reopened = consensus(root.path(), "n1").with_priority_source(Arc::new(FixedPriority));
     assert!(matches!(
         reopened
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1, LogHash::ZERO)
             .unwrap(),
         CertifiedDecisionInspection::Committed(certified)
             if matches!(certified.proof, DecisionProof::Phase2 { .. })
@@ -400,12 +437,13 @@ struct FailingRecord {
 }
 
 impl RecorderRpc for FailingRecord {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         self.store.recorder_id()
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -425,6 +463,7 @@ impl RecorderRpc for FailingRecord {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -435,7 +474,11 @@ impl RecorderRpc for FailingRecord {
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         if self
             .failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -450,6 +493,7 @@ impl RecorderRpc for FailingRecord {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> Result<(), Error> {
@@ -487,14 +531,24 @@ fn drive_has_no_fixed_retry_cap_and_eventually_decides() {
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
     let command = StoredCommand::new(EntryType::Command, b"eventual".to_vec());
     consensus
-        .register_command(command.hash(), command.payload.clone())
+        .register_command(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            command.hash(),
+            command.payload.clone(),
+        )
         .unwrap();
     let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
     let mut progress =
         ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "n1", 1, value));
     let mut pending = 0;
     loop {
-        match consensus.drive(progress).unwrap() {
+        match consensus
+            .drive(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                progress,
+            )
+            .unwrap()
+        {
             DriveOutcome::Pending(next) => {
                 pending += 1;
                 progress = next;
@@ -548,7 +602,11 @@ fn three_interleaved_proposers_cooperate_on_one_value() {
             let command =
                 StoredCommand::new(EntryType::Command, format!("value-{index}").into_bytes());
             engine
-                .register_command(command.hash(), command.payload.clone())
+                .register_command(
+                    &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                    command.hash(),
+                    command.payload.clone(),
+                )
                 .unwrap();
             let accepted = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
             let proposer = format!("n{}", index + 1);
@@ -567,7 +625,13 @@ fn three_interleaved_proposers_cooperate_on_one_value() {
             let Some(current) = progress.take() else {
                 continue;
             };
-            match engine.drive(current).unwrap() {
+            match engine
+                .drive(
+                    &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                    current,
+                )
+                .unwrap()
+            {
                 DriveOutcome::Pending(next) | DriveOutcome::Progress(next) => {
                     *progress = Some(next);
                 }
@@ -594,25 +658,34 @@ fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
     let engine = consensus(root.path(), "n1");
     let before = engine
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"reopen".to_vec()),
         )
         .unwrap();
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
-    assert!(engine.inspect_decision_proof_at(1).unwrap().is_none());
+    assert!(engine
+        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
+        .unwrap()
+        .is_none());
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     drop(engine);
 
     let reopened = consensus(root.path(), "n3").with_priority_source(Arc::new(FixedPriority));
     assert!(matches!(
         reopened
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Committed(_)
     ));
     let after = reopened
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"different".to_vec()),
@@ -628,6 +701,7 @@ fn proof_cache_absent_restart_recovers_after_one_recorder_is_lost() {
     let producer = consensus(root.path(), "n1");
     let before = producer
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(
@@ -637,7 +711,10 @@ fn proof_cache_absent_restart_recovers_after_one_recorder_is_lost() {
         )
         .unwrap();
     assert!(producer.finish_pending_rpcs(Duration::from_secs(1)));
-    assert!(producer.inspect_decision_proof_at(1).unwrap().is_none());
+    assert!(producer
+        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
+        .unwrap()
+        .is_none());
     drop(producer);
 
     let recorders = ["n1", "n2"]
@@ -663,7 +740,11 @@ fn proof_cache_absent_restart_recovers_after_one_recorder_is_lost() {
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n2", 1, 1, recorders).unwrap();
 
     let inspection = restarted
-        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+        )
         .unwrap();
     let CertifiedDecisionInspection::Committed(certified) = inspection else {
         panic!("surviving typed quorum did not reconstruct the decision: {inspection:?}");
@@ -685,12 +766,13 @@ struct TypedInspectionRecorder {
 }
 
 impl RecorderRpc for TypedInspectionRecorder {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         self.store.recorder_id()
     }
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -701,14 +783,22 @@ impl RecorderRpc for TypedInspectionRecorder {
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
-    fn inspect_decision_proof(&self, _slot: u64) -> Result<Option<DecisionProof>, Error> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<DecisionProof>, Error> {
         self.proof_inspections.fetch_add(1, Ordering::SeqCst);
         Err(Error::Io(
             "typed inspection must not issue a separate proof RPC".into(),
         ))
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         self.summary_inspections.fetch_add(1, Ordering::SeqCst);
         self.store.inspect_record_summary(slot)
     }
@@ -720,7 +810,11 @@ struct ProofStrippingInspectionRecorder {
 }
 
 impl RecorderRpc for ProofStrippingInspectionRecorder {
-    fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         let mut summary = self.store.inspect_record_summary(slot)?;
         if let Some(summary) = &mut summary {
             summary.decided = None;
@@ -781,6 +875,16 @@ enum SummaryGate {
         started: Arc<(Mutex<bool>, Condvar)>,
         release: Arc<(Mutex<bool>, Condvar)>,
     },
+}
+
+struct SummaryGateRelease(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for SummaryGateRelease {
+    fn drop(&mut self) {
+        let (released, condition) = &*self.0;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+    }
 }
 
 #[derive(Clone)]
@@ -846,12 +950,13 @@ impl QueuedFetchInspectionRecorder {
 }
 
 impl RecorderRpc for QueuedFetchInspectionRecorder {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         Ok(self.id.clone())
     }
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _cluster_id: String,
         _epoch: u64,
         _config_id: u64,
@@ -878,7 +983,11 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
         }))
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         match &self.summary_gate {
             SummaryGate::WaitForStart(started) => {
                 let (started, condition) = &**started;
@@ -916,19 +1025,11 @@ impl RecorderRpc for QueuedFetchInspectionRecorder {
 #[test]
 fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let commands = vec![
-        (1, StoredCommand::new(EntryType::Command, b"first".to_vec())),
-        (
-            2,
-            StoredCommand::new(EntryType::Command, b"second".to_vec()),
-        ),
-    ];
+    let commands = vec![(1, StoredCommand::new(EntryType::Command, b"first".to_vec()))];
     let summary_started = Arc::new((Mutex::new(false), Condvar::new()));
     let summary_release = Arc::new((Mutex::new(false), Condvar::new()));
-    let (fetch_started, fetch_started_receiver) = std::sync::mpsc::sync_channel(1);
-    let fetch_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let _release_summary = SummaryGateRelease(Arc::clone(&summary_release));
     let blocked_fetches = Arc::new(AtomicUsize::new(0));
-    let second_command_hash = commands[1].1.hash();
     let recorders = vec![
         (
             "n1".into(),
@@ -941,7 +1042,7 @@ fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
                     started: Arc::clone(&summary_started),
                     release: Arc::clone(&summary_release),
                 },
-                command_slots: vec![2],
+                command_slots: vec![1],
                 fetches: Some(Arc::clone(&blocked_fetches)),
                 fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
@@ -953,7 +1054,7 @@ fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
                 membership: membership.clone(),
                 commands: commands.clone(),
                 summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
-                command_slots: vec![1],
+                command_slots: Vec::new(),
                 fetches: None,
                 fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
@@ -967,48 +1068,50 @@ fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
                 summary_gate: SummaryGate::WaitForStart(Arc::clone(&summary_started)),
                 command_slots: Vec::new(),
                 fetches: None,
-                fetch_gate: Some(FetchGate {
-                    command_hash: second_command_hash,
-                    started: fetch_started,
-                    release: Arc::clone(&fetch_release),
-                }),
+                fetch_gate: None,
             }) as Box<dyn RecorderRpc>,
         ),
     ];
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-    assert!(matches!(
-        consensus
-            .inspect_certified_decision_at(1, LogHash::ZERO)
-            .unwrap(),
-        CertifiedDecisionInspection::Committed(_)
-    ));
-
     let consensus = Arc::new(consensus);
-    let inspecting = Arc::clone(&consensus);
-    let inspection =
-        thread::spawn(move || inspecting.inspect_certified_decision_at(2, LogHash::ZERO));
-
-    let fetch_started = fetch_started_receiver.recv_timeout(Duration::from_secs(1));
-    let (released, condition) = &*summary_release;
-    *released.lock().unwrap() = true;
-    condition.notify_all();
-    let (released, condition) = &*fetch_release;
-    *released.lock().unwrap() = true;
-    condition.notify_all();
-
-    let inspected = inspection.join().unwrap().unwrap();
-    assert!(
-        fetch_started.is_ok(),
-        "n3 slot-2 fetch must start after n1 fetch dispatch: {fetch_started:?}"
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let context = rhiza_quepaxa::RecorderRpcContext::with_timeout_and_cancellation(
+        Duration::from_secs(1),
+        Arc::clone(&cancellation),
     );
-    assert!(matches!(
-        inspected,
-        CertifiedDecisionInspection::Committed(_)
-    ));
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    let inspecting = Arc::clone(&consensus);
+    let inspection = thread::spawn(move || {
+        result_sender
+            .send(inspecting.inspect_certified_decision_at(&context, 1, LogHash::ZERO))
+            .unwrap();
+    });
+
+    let (started, condition) = &*summary_started;
+    let (started, _) = condition
+        .wait_timeout_while(started.lock().unwrap(), Duration::from_secs(1), |started| {
+            !*started
+        })
+        .unwrap();
+    assert!(*started, "blocked summary did not start");
+    drop(started);
+    cancellation.store(true, Ordering::Release);
+    assert_eq!(
+        result_receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    );
+    drop(_release_summary);
+    assert_eq!(
+        result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        Err(Error::RpcCancelled)
+    );
+    inspection.join().unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-    assert_eq!(blocked_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(blocked_fetches.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1023,6 +1126,7 @@ fn typed_inspection_reconstructs_fast_proof_without_a_proof_cache_or_proof_rpc()
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
     let committed = producer
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"fast-summary-proof".to_vec()),
@@ -1041,7 +1145,11 @@ fn typed_inspection_reconstructs_fast_proof_without_a_proof_cache_or_proof_rpc()
         Arc::clone(&summary_inspections),
     );
     let inspected = inspector
-        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+        )
         .unwrap();
 
     let CertifiedDecisionInspection::Committed(certified) = inspected else {
@@ -1066,6 +1174,7 @@ fn typed_inspection_recovers_phase2_proof_from_durable_quorum_without_a_proof_rp
         .with_priority_source(Arc::new(FixedPriority));
     let committed = producer
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"phase2-summary-proof".to_vec()),
@@ -1088,7 +1197,11 @@ fn typed_inspection_recovers_phase2_proof_from_durable_quorum_without_a_proof_rp
         Arc::clone(&summary_inspections),
     );
     let inspected = inspector
-        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+        )
         .unwrap();
 
     let CertifiedDecisionInspection::Committed(certified) = inspected else {
@@ -1196,7 +1309,11 @@ fn phase2_recovery_does_not_substitute_a_later_summary_quorum() {
     .unwrap();
     assert_eq!(
         summary_only
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Pending
     );
@@ -1221,7 +1338,11 @@ fn phase2_recovery_does_not_substitute_a_later_summary_quorum() {
     )
     .unwrap();
     let CertifiedDecisionInspection::Committed(decision) = recovered
-        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+        )
         .unwrap()
     else {
         panic!("installed phase-2 proof was not recoverable");
@@ -1239,18 +1360,26 @@ struct ScriptedTypedInspectionRecorder {
 }
 
 impl RecorderRpc for ScriptedTypedInspectionRecorder {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         Ok(self.id.clone())
     }
 
-    fn inspect_decision_proof(&self, _slot: u64) -> Result<Option<DecisionProof>, Error> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<DecisionProof>, Error> {
         self.proof_inspections.fetch_add(1, Ordering::SeqCst);
         Err(Error::Io(
             "typed inspection must not issue a separate proof RPC".into(),
         ))
     }
 
-    fn inspect_record_summary(&self, _slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         self.summary_inspections.fetch_add(1, Ordering::SeqCst);
         Ok(self.summary.clone())
     }
@@ -1288,7 +1417,7 @@ struct ScriptedReadFenceRecorder {
 }
 
 impl RecorderRpc for ScriptedReadFenceRecorder {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         Ok(self.id.clone())
     }
 
@@ -1298,13 +1427,18 @@ impl RecorderRpc for ScriptedReadFenceRecorder {
 
     fn observe_read_fence(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _request: ReadFenceRequest,
     ) -> Result<ReadFenceObservation, Error> {
         thread::sleep(self.delay);
         self.observation.clone()
     }
 
-    fn inspect_record_summary(&self, _slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         self.summary_inspections.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
@@ -1359,7 +1493,7 @@ fn scripted_read_fence_consensus_with_results(
 }
 
 #[test]
-fn context_read_fence_returns_before_a_slow_voter_when_quorum_is_impossible() {
+fn context_read_fence_drains_a_slow_admitted_voter_when_quorum_is_impossible() {
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let recorders = [
         ("n1", Duration::ZERO),
@@ -1382,16 +1516,15 @@ fn context_read_fence_returns_before_a_slow_voter_when_quorum_is_impossible() {
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-    let started = std::time::Instant::now();
     assert_eq!(
         consensus
-            .inspect_context_read_fence_at(1, LogHash::ZERO)
+            .inspect_context_read_fence_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Unavailable
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "an impossible quorum waited for the slow voter"
     );
     assert_eq!(membership.quorum_size(), 2);
 }
@@ -1409,7 +1542,11 @@ fn context_read_fence_succeeds_with_one_unavailable_voter() {
 
     assert_eq!(
         consensus
-            .inspect_context_read_fence_at(1, LogHash::ZERO)
+            .inspect_context_read_fence_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Empty
     );
@@ -1428,7 +1565,11 @@ fn context_read_fence_is_unavailable_with_two_unavailable_voters() {
 
     assert_eq!(
         consensus
-            .inspect_context_read_fence_at(1, LogHash::ZERO)
+            .inspect_context_read_fence_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Unavailable
     );
@@ -1448,7 +1589,11 @@ fn context_read_fence_returns_empty_from_an_exact_empty_quorum_without_summary_r
 
     assert_eq!(
         consensus
-            .inspect_context_read_fence_at(1, LogHash::ZERO)
+            .inspect_context_read_fence_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Empty
     );
@@ -1469,7 +1614,11 @@ fn context_read_fence_maps_a_crossed_slot_to_pending() {
 
     assert_eq!(
         consensus
-            .inspect_context_read_fence_at(1, LogHash::ZERO)
+            .inspect_context_read_fence_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Pending
     );
@@ -1493,10 +1642,12 @@ fn context_read_fence_rejects_wrong_identity_or_context_from_the_empty_quorum() 
     );
 
     assert_eq!(
-        consensus
-            .inspect_context_read_fence_at(1, LogHash::ZERO)
-            .unwrap(),
-        CertifiedDecisionInspection::Unavailable
+        consensus.inspect_context_read_fence_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO
+        ),
+        Err(Error::Rejected(RejectReason::InvalidCertificate))
     );
 }
 
@@ -1554,7 +1705,11 @@ fn typed_inspection_classifies_quorum_none_as_empty_without_proof_rpc() {
 
     assert_eq!(
         inspector
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Empty
     );
@@ -1578,7 +1733,11 @@ fn typed_inspection_classifies_uncertified_accepted_state_as_pending() {
 
     assert_eq!(
         inspector
-            .inspect_certified_decision_at(1, LogHash::ZERO)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO
+            )
             .unwrap(),
         CertifiedDecisionInspection::Pending
     );
@@ -1601,7 +1760,11 @@ fn typed_inspection_rejects_conflicting_embedded_certificates() {
     );
 
     assert_eq!(
-        inspector.inspect_certified_decision_at(1, LogHash::ZERO),
+        inspector.inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO
+        ),
         Err(Error::ConflictingCertificates)
     );
     assert_eq!(proof_inspections.load(Ordering::SeqCst), 0);
@@ -1627,7 +1790,11 @@ fn typed_inspection_rejects_embedded_proof_for_another_configuration() {
     );
 
     assert_eq!(
-        inspector.inspect_certified_decision_at(1, LogHash::ZERO),
+        inspector.inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO
+        ),
         Err(Error::Rejected(RejectReason::WrongConfig))
     );
     assert_eq!(proof_inspections.load(Ordering::SeqCst), 0);
@@ -1653,22 +1820,34 @@ fn typed_inspection_rejects_embedded_proof_for_another_cluster() {
     );
 
     assert_eq!(
-        inspector.inspect_certified_decision_at(1, LogHash::ZERO),
+        inspector.inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO
+        ),
         Err(Error::Rejected(RejectReason::WrongCluster))
     );
     assert_eq!(proof_inspections.load(Ordering::SeqCst), 0);
 }
 
 impl RecorderRpc for StaleSummaryRecorder {
-    fn recorder_id(&self) -> Result<String, Error> {
+    fn recorder_id(&self, _context: &rhiza_quepaxa::RecorderRpcContext) -> Result<String, Error> {
         Ok(self.id.clone())
     }
 
-    fn inspect_decision_proof(&self, _slot: u64) -> Result<Option<DecisionProof>, Error> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<DecisionProof>, Error> {
         Ok(None)
     }
 
-    fn inspect_record_summary(&self, _slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         Ok(Some(self.summary.clone()))
     }
 }
@@ -1690,7 +1869,10 @@ fn recorder_without_typed_record_fails_closed() {
         command: None,
     };
     assert_eq!(
-        MissingTypedRecord.record(request),
+        MissingTypedRecord.record(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            request
+        ),
         Err(Error::TypedRecordRequired)
     );
 }
@@ -1730,12 +1912,14 @@ fn typed_summary_inspection_rejects_stale_configuration_evidence() {
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-    assert!(matches!(
-        consensus
-            .inspect_certified_decision_at(1, LogHash::ZERO)
-            .unwrap(),
-        CertifiedDecisionInspection::Unavailable
-    ));
+    assert_eq!(
+        consensus.inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO
+        ),
+        Err(Error::Rejected(RejectReason::InvalidCertificate))
+    );
 }
 
 #[test]
@@ -1790,10 +1974,10 @@ fn hedged_proposer_finishes_another_proposers_exact_h_quorum() {
     let n2 = ThreeNodeConsensus::from_recorders_with_ids("cluster", "n2", 1, 1, recorders).unwrap();
 
     let outcome = n2
-        .drive(ProposerProgress::new(
-            1,
-            Proposal::new(ProposalPriority::MAX, "n2", 1, n2_value),
-        ))
+        .drive(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "n2", 1, n2_value)),
+        )
         .unwrap();
     let DriveOutcome::Decision(proof) = outcome else {
         panic!("hedged proposer did not finish the observed H proof");
@@ -1854,19 +2038,26 @@ fn hedged_proposer_installs_an_adopted_config_change_on_a_quorum() {
         .collect();
     let n2 = ThreeNodeConsensus::from_recorders_with_ids("cluster", "n2", 1, 1, recorders).unwrap();
     let local = StoredCommand::new(EntryType::Command, b"ordinary".to_vec());
-    n2.register_command(local.hash(), local.payload.clone())
-        .unwrap();
+    n2.register_command(
+        &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+        local.hash(),
+        local.payload.clone(),
+    )
+    .unwrap();
 
     let outcome = n2
-        .drive(ProposerProgress::new(
-            1,
-            Proposal::new(
-                ProposalPriority::MAX,
-                "n2",
+        .drive(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            ProposerProgress::new(
                 1,
-                AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &local),
+                Proposal::new(
+                    ProposalPriority::MAX,
+                    "n2",
+                    1,
+                    AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &local),
+                ),
             ),
-        ))
+        )
         .unwrap();
 
     assert!(matches!(outcome, DriveOutcome::Decision(_)));
@@ -1910,7 +2101,11 @@ struct ObservedRecorder {
 }
 
 impl RecorderRpc for ObservedRecorder {
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         if request.command.is_some() {
             self.counts.piggybacks.fetch_add(1, Ordering::SeqCst);
         }
@@ -1919,6 +2114,7 @@ impl RecorderRpc for ObservedRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -1932,6 +2128,7 @@ impl RecorderRpc for ObservedRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> Result<(), Error> {
@@ -1940,11 +2137,19 @@ impl RecorderRpc for ObservedRecorder {
         Ok(())
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> Result<Option<DecisionProof>, Error> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<DecisionProof>, Error> {
         self.store.inspect_decision_proof(slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> Result<Option<RecordSummary>, Error> {
         self.store.inspect_record_summary(slot)
     }
 }
@@ -1955,12 +2160,17 @@ struct ProofInstallFailingRecorder {
 }
 
 impl RecorderRpc for ProofInstallFailingRecorder {
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         self.store.record(request)
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<(), Error> {
@@ -1971,12 +2181,17 @@ impl RecorderRpc for ProofInstallFailingRecorder {
 struct DeadRecorder;
 
 impl RecorderRpc for DeadRecorder {
-    fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         Err(Error::Io("recorder unavailable".into()))
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<(), Error> {
@@ -1991,7 +2206,11 @@ struct RejectingRecordRecorder {
 }
 
 impl RecorderRpc for RejectingRecordRecorder {
-    fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         if let Some(rejected) = &self.rejected {
             let (state, condition) = &**rejected;
             *state.lock().unwrap() = true;
@@ -2002,6 +2221,7 @@ impl RecorderRpc for RejectingRecordRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<(), Error> {
@@ -2016,7 +2236,11 @@ struct WaitForRejectionRecorder {
 }
 
 impl RecorderRpc for WaitForRejectionRecorder {
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         let (state, condition) = &*self.rejected;
         let rejected = condition
             .wait_while(state.lock().unwrap(), |rejected| !*rejected)
@@ -2027,6 +2251,7 @@ impl RecorderRpc for WaitForRejectionRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> Result<(), Error> {
@@ -2042,7 +2267,11 @@ struct RecordThroughStepThenDead {
 }
 
 impl RecorderRpc for RecordThroughStepThenDead {
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         if request.step > self.last_live_step {
             self.crashed.store(true, Ordering::Release);
             Err(Error::Io("recorder crashed".into()))
@@ -2053,6 +2282,7 @@ impl RecorderRpc for RecordThroughStepThenDead {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> Result<(), Error> {
@@ -2071,7 +2301,11 @@ struct UnavailableBeforeStep {
 }
 
 impl RecorderRpc for UnavailableBeforeStep {
-    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         if request.step < self.first_live_step {
             return Err(Error::Io("recorder unavailable".into()));
         }
@@ -2083,6 +2317,7 @@ impl RecorderRpc for UnavailableBeforeStep {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> Result<(), Error> {
@@ -2096,7 +2331,11 @@ struct BlockingRecordRecorder {
 }
 
 impl RecorderRpc for BlockingRecordRecorder {
-    fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         let (started, started_condition) = &*self.started;
         *started.lock().unwrap() = true;
         started_condition.notify_all();
@@ -2111,6 +2350,7 @@ impl RecorderRpc for BlockingRecordRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<(), Error> {
@@ -2123,12 +2363,17 @@ struct CountingProofRecorder {
 }
 
 impl RecorderRpc for CountingProofRecorder {
-    fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        _request: RecordRequest,
+    ) -> Result<RecordSummary, Error> {
         Err(Error::Io("recorder unavailable".into()))
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _cluster_id: String,
         _epoch: u64,
         _config_id: u64,
@@ -2141,6 +2386,7 @@ impl RecorderRpc for CountingProofRecorder {
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<(), Error> {
@@ -2190,7 +2436,12 @@ fn preferred_fast_path_piggybacks_command_without_post_ack_proof_writes() {
     let command = StoredCommand::new(EntryType::Command, b"one-round-trip".to_vec());
 
     let entry = consensus
-        .propose_stored_at(1, LogHash::ZERO, command.clone())
+        .propose_stored_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+            command.clone(),
+        )
         .unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
@@ -2238,6 +2489,7 @@ fn non_preferred_path_piggybacks_command_and_installs_a_proof_quorum_before_ack(
 
     consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"slow-path".to_vec()),
@@ -2304,6 +2556,7 @@ fn non_preferred_path_does_not_ack_when_phase2_proof_install_lacks_a_quorum() {
 
     assert_eq!(
         consensus.propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(
@@ -2354,10 +2607,18 @@ fn stop_and_activation_transitions_still_install_proofs_on_a_quorum() {
     let predecessor =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
     let stop = predecessor
-        .propose_stop_for_successor_at(1, LogHash::ZERO, &membership)
+        .propose_stop_for_successor_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+            &membership,
+        )
         .unwrap();
     assert!(predecessor.finish_pending_rpcs(Duration::from_secs(1)));
-    let stop_proof = predecessor.inspect_decision_proof_at(1).unwrap().unwrap();
+    let stop_proof = predecessor
+        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
+        .unwrap()
+        .unwrap();
     assert!(counts.proof_installs.load(Ordering::SeqCst) >= membership.quorum_size());
     drop(predecessor);
 
@@ -2385,7 +2646,10 @@ fn stop_and_activation_transitions_still_install_proofs_on_a_quorum() {
     let successor =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 2, recorders).unwrap();
     let activation = successor
-        .propose_activation_for_stop_at(&stop_proof)
+        .propose_activation_for_stop_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            &stop_proof,
+        )
         .unwrap();
     assert_eq!(activation.index, 2);
     assert!(successor.finish_pending_rpcs(Duration::from_secs(1)));
@@ -2464,6 +2728,7 @@ fn adopted_command_is_redistributed_after_a_holder_crashes_in_a_later_phase() {
 
     let entry = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"offered".to_vec()),
@@ -2514,6 +2779,7 @@ fn record_broadcast_ignores_a_minority_typed_rejection() {
 
     let entry = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"minority-rejection".to_vec()),
@@ -2541,6 +2807,7 @@ fn record_broadcast_returns_typed_rejection_when_quorum_is_impossible() {
 
     assert_eq!(
         consensus.propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"rejected".to_vec()),
@@ -2550,7 +2817,7 @@ fn record_broadcast_returns_typed_rejection_when_quorum_is_impossible() {
 }
 
 #[test]
-fn consensus_drop_joins_a_blocked_minority_rpc_before_returning() {
+fn consensus_drop_is_bounded_with_a_blocked_minority_rpc() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let started = Arc::new((Mutex::new(false), Condvar::new()));
@@ -2577,13 +2844,15 @@ fn consensus_drop_joins_a_blocked_minority_rpc_before_returning() {
     ));
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
-    consensus
-        .propose_at(
+    assert_eq!(
+        consensus.propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"background-record".to_vec()),
-        )
-        .unwrap();
+        ),
+        Err(Error::UnknownOutcome)
+    );
 
     let (started_lock, started_condition) = &*started;
     let (record_started, _) = started_condition
@@ -2603,18 +2872,14 @@ fn consensus_drop_joins_a_blocked_minority_rpc_before_returning() {
         dropped_sender.send(()).unwrap();
     });
     drop_started_receiver.recv().unwrap();
-    assert_eq!(
-        dropped_receiver.recv_timeout(Duration::from_millis(10)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    );
+    dropped_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
 
     let (release_lock, release_condition) = &*release;
     *release_lock.lock().unwrap() = true;
     release_condition.notify_all();
 
-    dropped_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
     drop_thread.join().unwrap();
 }
 
@@ -2747,6 +3012,7 @@ fn ordinary_fast_path_never_installs_a_proof_cache() {
 
     consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"fast".to_vec()),
@@ -2797,6 +3063,7 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
 
     let first = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"first".to_vec()),
@@ -2805,6 +3072,7 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     let second = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             2,
             first.hash,
             Command::new(CommandKind::Deterministic, b"second".to_vec()),
@@ -2813,6 +3081,7 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     let third = consensus
         .propose_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             3,
             second.hash,
             Command::new(CommandKind::Deterministic, b"third".to_vec()),
@@ -2843,7 +3112,11 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
         (third, second_hash),
     ] {
         let inspection = consensus
-            .inspect_certified_decision_at(entry.index, prev_hash)
+            .inspect_certified_decision_at(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                entry.index,
+                prev_hash,
+            )
             .unwrap();
         assert!(
             matches!(
@@ -2962,7 +3235,10 @@ fn proposer_failure_after_piggyback_recovers_with_restarted_quorum_and_one_dead_
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
     let outcome = replacement
-        .drive(ProposerProgress::new(1, proposal))
+        .drive(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            ProposerProgress::new(1, proposal),
+        )
         .unwrap();
     assert!(matches!(
         outcome,

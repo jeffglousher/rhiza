@@ -1,13 +1,16 @@
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
 
-use rhiza_archive::{CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore};
+use rhiza_archive::{
+    CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore, RestoredCheckpoint,
+};
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::ExecutionProfile;
 use rhiza_core::{ConfigurationState, LogHash};
@@ -17,19 +20,146 @@ use rhiza_node::effective_cluster_id;
 #[cfg(feature = "kv")]
 use rhiza_node::KvCommandV1;
 use rhiza_node::{
-    rehydrate_recorder_after_checkpoint, restore_checkpoint_to_fresh_data_dir,
-    restore_checkpoint_to_fresh_data_dir_for_node, CheckpointCoordinator, DurabilityError,
-    DurabilityHealth, DurabilityMode, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
-    StartupIoContext,
+    capture_expected_local_restore_state,
+    install_prepared_checkpoint_for_rejoin_preserving_recorder,
+    install_prepared_checkpoint_to_fresh_data_dir, prepare_checkpoint_restore,
+    rehydrate_recorder_after_checkpoint, CheckpointCoordinator, CheckpointInstallMode,
+    DurabilityError, DurabilityHealth, DurabilityMode, NodeConfig, NodeRuntime, PeerConfig,
+    ReadConsistency, RestoreCompletionMarker, StartupIoContext,
 };
 #[cfg(feature = "graph")]
 use rhiza_node::{GraphCommandV1, GraphValueV1};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
-    DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
-    RecordSummary, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
+    install_test_control_operation_probe, DecisionProof, Membership, ReadFenceObservation,
+    ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
+    RecorderRpcContext, TestControlOperationProbe, ThreeNodeConsensus,
 };
 use rhiza_sql::SqliteStateMachine;
+
+async fn load_restored_for_test(archive: &ObjectArchiveStore) -> RestoredCheckpoint {
+    archive
+        .load_checkpoint_restore()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .1
+}
+
+async fn install_fresh_for_test(
+    archive: &ObjectArchiveStore,
+    data_dir: &Path,
+    node_id: &str,
+) -> Result<rhiza_archive::CheckpointTip, DurabilityError> {
+    let prepared = prepare_checkpoint_restore(archive).await?;
+    install_prepared_checkpoint_to_fresh_data_dir(
+        &prepared,
+        expected_restore_state_for_test(
+            &prepared,
+            data_dir,
+            node_id,
+            CheckpointInstallMode::Fresh,
+            None,
+        )?,
+        None,
+    )
+}
+
+fn expected_restore_state_for_test(
+    prepared: &rhiza_node::PreparedCheckpointRestore,
+    data_dir: &Path,
+    node_id: &str,
+    mode: CheckpointInstallMode,
+    completion_marker_name: Option<&str>,
+) -> Result<rhiza_node::ExpectedLocalRestoreState, DurabilityError> {
+    capture_expected_local_restore_state(
+        data_dir,
+        mode,
+        node_id,
+        prepared.identity(),
+        prepared.execution_profile(),
+        ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+        completion_marker_name,
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RestoreTreeEntry {
+    kind: &'static str,
+    bytes: Vec<u8>,
+    len: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn restore_tree_snapshot(root: &Path) -> BTreeMap<std::path::PathBuf, RestoreTreeEntry> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut BTreeMap<std::path::PathBuf, RestoreTreeEntry>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+            // Opening or locking the shared runtime/restore lock can update
+            // platform-specific access metadata. Every mutable restore object
+            // remains in the comparison; only this synchronization inode is
+            // deliberately normalized out.
+            if relative == Path::new(".node.lock") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+            let kind = if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            entries.insert(
+                relative.clone(),
+                RestoreTreeEntry {
+                    kind,
+                    bytes: if metadata.is_file() {
+                        std::fs::read(entry.path()).unwrap()
+                    } else {
+                        Vec::new()
+                    },
+                    len: metadata.len(),
+                    #[cfg(unix)]
+                    mode: {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.mode()
+                    },
+                    #[cfg(unix)]
+                    dev: {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.dev()
+                    },
+                    #[cfg(unix)]
+                    ino: {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.ino()
+                    },
+                },
+            );
+            if metadata.is_dir() {
+                visit(root, &entry.path(), entries);
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
 
 #[test]
 fn durability_mode_rejects_zero_intervals() {
@@ -181,12 +311,23 @@ fn cancelled_recorder_rehydration_is_joined_without_late_persistence() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
     let blocked = Arc::new(AtomicBool::new(false));
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gates = [
+        ("node-1", Arc::new((Mutex::new(false), Condvar::new()))),
+        ("node-2", Arc::new((Mutex::new(false), Condvar::new()))),
+        ("node-3", Arc::new((Mutex::new(false), Condvar::new()))),
+    ];
     let (started, entered) = mpsc::sync_channel(3);
+    let (finished, drained) = mpsc::sync_channel(3);
+    let active = Arc::new(AtomicUsize::new(0));
     let recorders = membership
         .members()
         .iter()
         .map(|node_id| {
+            let gate = gates
+                .iter()
+                .find(|(candidate, _)| *candidate == node_id.as_str())
+                .map(|(_, gate)| Arc::clone(gate))
+                .expect("every recorder has a deterministic gate");
             let recorder = RecorderFileStore::new_with_membership(
                 root.path().join("recorders").join(node_id),
                 node_id.clone(),
@@ -199,10 +340,13 @@ fn cancelled_recorder_rehydration_is_joined_without_late_persistence() {
             (
                 node_id.clone(),
                 Box::new(BlockingRehydrateRecorder {
+                    recorder_id: node_id.clone(),
                     recorder,
                     blocked: Arc::clone(&blocked),
                     started: started.clone(),
-                    gate: Arc::clone(&gate),
+                    finished: finished.clone(),
+                    active: Arc::clone(&active),
+                    gate,
                 }) as Box<dyn RecorderRpc>,
             )
         })
@@ -239,9 +383,6 @@ fn cancelled_recorder_rehydration_is_joined_without_late_persistence() {
         .unwrap(),
     );
     let committed = runtime.write("request-1", "alpha", "one").unwrap();
-    assert!(runtime
-        .consensus()
-        .finish_pending_rpcs(Duration::from_secs(1)));
     let recorder = RecorderFileStore::new_with_membership(
         root.path().join("fresh-recorder"),
         "node-1",
@@ -253,36 +394,99 @@ fn cancelled_recorder_rehydration_is_joined_without_late_persistence() {
     .unwrap();
     blocked.store(true, Ordering::Release);
     let startup = StartupIoContext::new();
+    let probe = Arc::new(TestControlOperationProbe::default());
+    let _probe_guard =
+        install_test_control_operation_probe(&startup.recorder_context(), Arc::clone(&probe));
+    let unrelated_probe = Arc::new(TestControlOperationProbe::default());
+    let _unrelated_probe_guard = install_test_control_operation_probe(
+        &RecorderRpcContext::default_timeout(),
+        Arc::clone(&unrelated_probe),
+    );
     let attempt_startup = startup.clone();
     let attempt_runtime = Arc::clone(&runtime);
     let attempt_recorder = recorder.clone();
-    let attempt = std::thread::spawn(move || {
-        rehydrate_recorder_after_checkpoint(
-            &attempt_runtime,
-            &attempt_recorder,
-            0,
-            &attempt_startup,
-        )
-    });
-
-    entered.recv().unwrap();
-    startup.cancel(Instant::now() + Duration::from_millis(10));
-    std::thread::sleep(Duration::from_millis(20));
-    assert!(
-        !attempt.is_finished(),
-        "rehydration must retain an admitted recorder inspection"
+    let (completion_tx, completion) = mpsc::sync_channel(1);
+    let mut attempt = RehydrationAttempt::spawn(
+        gates.iter().map(|(_, gate)| Arc::clone(gate)).collect(),
+        move || {
+            let result = rehydrate_recorder_after_checkpoint(
+                &attempt_runtime,
+                &attempt_recorder,
+                0,
+                &attempt_startup,
+            );
+            // The parent may already be unwinding when this finishes.  A
+            // disconnected observer must not turn cleanup into a second
+            // panic in this worker.
+            let _ = completion_tx.send(result);
+        },
     );
-    let (released, changed) = &*gate;
-    *released.lock().unwrap() = true;
-    changed.notify_all();
 
-    let error = attempt.join().unwrap().unwrap_err();
+    let mut admitted = (0..3)
+        .map(|_| entered.recv_timeout(Duration::from_secs(1)).unwrap())
+        .collect::<Vec<_>>();
+    admitted.sort();
+    assert_eq!(
+        admitted,
+        vec![
+            "node-1".to_owned(),
+            "node-2".to_owned(),
+            "node-3".to_owned(),
+        ]
+    );
+    assert_eq!(probe.pending(), 3);
+    assert_eq!(probe.outstanding(), 3);
+    assert_eq!(probe.dispatch_count(), 3);
+    assert_eq!(probe.observed_max_outstanding(), 3);
+    startup.cancel(Instant::now() + Duration::from_secs(1));
+    for (_, gate) in gates.iter().take(2) {
+        release_gate(gate);
+    }
+    let mut first_two_drained = (0..2)
+        .map(|_| drained.recv_timeout(Duration::from_secs(1)).unwrap())
+        .collect::<Vec<_>>();
+    first_two_drained.sort();
+    assert_eq!(
+        first_two_drained,
+        vec!["node-1".to_owned(), "node-2".to_owned()]
+    );
     assert!(
-        error
-            .to_string()
-            .contains("startup cancelled during recorder rehydration decision inspection"),
+        matches!(
+            completion.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "rehydration must retain the third admitted recorder inspection"
+    );
+    let (_, gate) = &gates[2];
+    release_gate(gate);
+
+    let error = completion
+        .recv_timeout(Duration::from_secs(1))
+        .expect("rehydration did not complete after the admitted inspection drained")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("QuePaxa recorder RPC cancelled"),
         "{error}"
     );
+    assert_eq!(
+        drained.recv_timeout(Duration::from_secs(1)),
+        Ok("node-3".to_owned())
+    );
+    attempt
+        .join_after_completion(Duration::from_secs(1))
+        .expect("rehydration worker must terminate after the final gate opens");
+    assert_eq!(active.load(Ordering::Acquire), 0);
+    assert_eq!(probe.pending(), 0);
+    assert_eq!(probe.outstanding(), 0);
+    assert!(probe.cancel_count() >= 1);
+    assert_eq!(probe.quarantine_count(), 0);
+    assert_eq!(probe.drained_count(), 3);
+    assert_eq!(unrelated_probe.dispatch_count(), 0);
+    assert_eq!(unrelated_probe.observed_max_outstanding(), 0);
+    assert_eq!(unrelated_probe.outstanding(), 0);
+    assert_eq!(unrelated_probe.cancel_count(), 0);
+    assert_eq!(unrelated_probe.quarantine_count(), 0);
+    assert_eq!(unrelated_probe.drained_count(), 0);
     let entry = runtime
         .log_store()
         .read(committed.applied_index)
@@ -290,44 +494,471 @@ fn cancelled_recorder_rehydration_is_joined_without_late_persistence() {
         .unwrap();
     let command = rhiza_core::StoredCommand::new(entry.entry_type, entry.payload);
     assert_eq!(recorder.fetch_command(command.hash()).unwrap(), None);
+    blocked.store(false, Ordering::Release);
+    rehydrate_recorder_after_checkpoint(&runtime, &recorder, 0, &StartupIoContext::new()).unwrap();
+    assert_eq!(
+        recorder.fetch_command(command.hash()).unwrap(),
+        Some(command)
+    );
+}
+
+struct GateRelease {
+    gates: Vec<Arc<(Mutex<bool>, Condvar)>>,
+}
+
+impl GateRelease {
+    fn new(gates: Vec<Arc<(Mutex<bool>, Condvar)>>) -> Self {
+        Self { gates }
+    }
+
+    fn release_all(&self) {
+        for gate in &self.gates {
+            let (released, changed) = &**gate;
+            // A panic while a test was inspecting a gate must not prevent the
+            // remaining workers from being released during unwinding.
+            *released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            changed.notify_all();
+        }
+    }
+}
+
+impl Drop for GateRelease {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+struct RehydrationAttempt {
+    handle: Option<std::thread::JoinHandle<()>>,
+    gates: GateRelease,
+    cleanup_timeout: Duration,
+    cleanup_events: Option<mpsc::Sender<CleanupEvent>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RehydrationAttemptJoinError {
+    TimedOut,
+    Panicked,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CleanupEvent {
+    ExternalGateReleased,
+    AttemptCleanup { joined: bool, detached: bool },
+}
+
+struct ObservedGateRelease {
+    gates: GateRelease,
+    events: mpsc::Sender<CleanupEvent>,
+}
+
+impl ObservedGateRelease {
+    fn new(gates: Vec<Arc<(Mutex<bool>, Condvar)>>, events: mpsc::Sender<CleanupEvent>) -> Self {
+        Self {
+            gates: GateRelease::new(gates),
+            events,
+        }
+    }
+}
+
+impl Drop for ObservedGateRelease {
+    fn drop(&mut self) {
+        self.gates.release_all();
+        let _ = self.events.send(CleanupEvent::ExternalGateReleased);
+    }
+}
+
+impl RehydrationAttempt {
+    fn spawn(gates: Vec<Arc<(Mutex<bool>, Condvar)>>, run: impl FnOnce() + Send + 'static) -> Self {
+        Self::spawn_with_cleanup_timeout(gates, Duration::from_millis(250), run)
+    }
+
+    fn spawn_with_cleanup_timeout(
+        gates: Vec<Arc<(Mutex<bool>, Condvar)>>,
+        cleanup_timeout: Duration,
+        run: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            handle: Some(std::thread::spawn(run)),
+            gates: GateRelease::new(gates),
+            cleanup_timeout,
+            cleanup_events: None,
+        }
+    }
+
+    fn with_cleanup_events(mut self, events: mpsc::Sender<CleanupEvent>) -> Self {
+        self.cleanup_events = Some(events);
+        self
+    }
+
+    fn join_after_completion(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), RehydrationAttemptJoinError> {
+        // Take ownership before waiting.  On timeout this deliberately drops
+        // the JoinHandle, so Drop cannot perform a second, potentially
+        // unbounded join while an assertion is unwinding.
+        let handle = self
+            .handle
+            .take()
+            .ok_or(RehydrationAttemptJoinError::TimedOut)?;
+        let deadline = Instant::now() + timeout;
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                drop(handle);
+                return Err(RehydrationAttemptJoinError::TimedOut);
+            }
+            std::thread::yield_now();
+        }
+        handle
+            .join()
+            .map_err(|_| RehydrationAttemptJoinError::Panicked)
+    }
+}
+
+impl Drop for RehydrationAttempt {
+    fn drop(&mut self) {
+        // Cleanup must open every backend gate before it waits for the caller
+        // thread; this path runs during assertion unwinding as well.  Never
+        // block or panic indefinitely from Drop: a non-cooperative external
+        // dependency is detached after the bounded grace period.
+        self.gates.release_all();
+        let mut joined = false;
+        let mut detached = self.handle.is_none();
+        if let Some(handle) = self.handle.take() {
+            let deadline = Instant::now() + self.cleanup_timeout;
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+                joined = true;
+            } else {
+                drop(handle);
+                detached = true;
+            }
+        }
+        if let Some(events) = &self.cleanup_events {
+            let _ = events.send(CleanupEvent::AttemptCleanup { joined, detached });
+        }
+    }
+}
+
+fn await_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+    let (released, changed) = &**gate;
+    let mut released = released
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while !*released {
+        released = changed
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+fn release_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+    let (released, changed) = &**gate;
+    *released
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    changed.notify_all();
+}
+
+#[test]
+fn rehydration_attempt_unwind_releases_all_gates_and_returns_bounded() {
+    let gates = [
+        Arc::new((Mutex::new(false), Condvar::new())),
+        Arc::new((Mutex::new(false), Condvar::new())),
+        Arc::new((Mutex::new(false), Condvar::new())),
+    ];
+    let worker_gates = gates.clone();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+    let started = Instant::now();
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _attempt = RehydrationAttempt::spawn(worker_gates.to_vec(), move || {
+            entered_tx.send(()).unwrap();
+            for gate in &worker_gates {
+                await_gate(gate);
+            }
+            exited_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        panic!("exercise assertion unwinding through RehydrationAttempt::drop");
+    }));
+
+    assert!(unwound.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "unwinding cleanup exceeded its bounded ceiling"
+    );
+    for gate in &gates {
+        assert!(
+            *gate
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "Drop must release every registered gate"
+        );
+    }
+    assert_eq!(exited_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+}
+
+#[test]
+fn rehydration_attempt_drop_and_timeout_detach_stubborn_workers_then_recover_out_of_band() {
+    // Keep the attempt binding before the external guard.  Should this scope
+    // unwind before the explicit release below, reverse-drop opens the
+    // external dependency before attempt cleanup starts polling its worker.
+    let attempt: RehydrationAttempt;
+    let registered_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let external_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let _external_gate_release = GateRelease::new(vec![Arc::clone(&external_gate)]);
+    let worker_registered_gate = Arc::clone(&registered_gate);
+    let worker_external_gate = Arc::clone(&external_gate);
+    let active = Arc::new(AtomicUsize::new(0));
+    let worker_active = Arc::clone(&active);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (external_wait_tx, external_wait_rx) = mpsc::sync_channel(1);
+    let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+    attempt = RehydrationAttempt::spawn_with_cleanup_timeout(
+        vec![registered_gate],
+        Duration::from_millis(50),
+        move || {
+            worker_active.fetch_add(1, Ordering::AcqRel);
+            entered_tx.send(()).unwrap();
+            await_gate(&worker_registered_gate);
+            external_wait_tx.send(()).unwrap();
+            await_gate(&worker_external_gate);
+            worker_active.fetch_sub(1, Ordering::AcqRel);
+            exited_tx.send(()).unwrap();
+        },
+    );
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    // Drop itself must release the owned gate, see the worker reach its
+    // unowned stubborn dependency, and detach rather than joining forever.
+    let drop_started = Instant::now();
+    drop(attempt);
+    assert!(
+        drop_started.elapsed() < Duration::from_secs(2),
+        "Drop waited forever on an unowned stubborn dependency"
+    );
+    external_wait_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("registered gate was not released by Drop");
+    assert_eq!(active.load(Ordering::Acquire), 1);
+
+    release_gate(&external_gate);
+    assert_eq!(exited_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    assert_eq!(active.load(Ordering::Acquire), 0);
+
+    // Exercise the explicit bounded join path too.  It takes the handle
+    // before waiting, so the following Drop must not retry the timed-out
+    // thread; the out-of-band completion proves it can still drain cleanly.
+    {
+        // This is a separate scope so its external guard has the same
+        // reverse-drop relationship to its pre-declared attempt binding.
+        let mut attempt: RehydrationAttempt;
+        let registered_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let external_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _external_gate_release = GateRelease::new(vec![Arc::clone(&external_gate)]);
+        let worker_registered_gate = Arc::clone(&registered_gate);
+        let worker_external_gate = Arc::clone(&external_gate);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (external_wait_tx, external_wait_rx) = mpsc::sync_channel(1);
+        let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+        attempt = RehydrationAttempt::spawn(vec![Arc::clone(&registered_gate)], move || {
+            entered_tx.send(()).unwrap();
+            await_gate(&worker_registered_gate);
+            external_wait_tx.send(()).unwrap();
+            await_gate(&worker_external_gate);
+            exited_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_gate(&registered_gate);
+        external_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not reach its external stubborn dependency");
+
+        let timeout_started = Instant::now();
+        assert_eq!(
+            attempt.join_after_completion(Duration::from_millis(50)),
+            Err(RehydrationAttemptJoinError::TimedOut)
+        );
+        assert!(
+            timeout_started.elapsed() < Duration::from_secs(2),
+            "bounded completion timeout did not return promptly"
+        );
+        let detached_drop_started = Instant::now();
+        drop(attempt);
+        assert!(
+            detached_drop_started.elapsed() < Duration::from_secs(2),
+            "Drop retried the handle consumed by the timeout path"
+        );
+        release_gate(&external_gate);
+        assert_eq!(exited_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+}
+
+fn assert_stubborn_stage_unwind_releases_external_gate_before_attempt_cleanup(stage: &str) {
+    let active = Arc::new(AtomicUsize::new(0));
+    let worker_active = Arc::clone(&active);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (external_wait_tx, external_wait_rx) = mpsc::sync_channel(1);
+    let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+    let (events_tx, events_rx) = mpsc::channel();
+    let started = Instant::now();
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // This declaration intentionally precedes the external gate guard.
+        // Locals drop in reverse declaration order, so the guard opens the
+        // external dependency before RehydrationAttempt starts its own bounded
+        // cleanup poll.
+        let _attempt: RehydrationAttempt;
+        let registered_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let external_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _external_gate_release =
+            ObservedGateRelease::new(vec![Arc::clone(&external_gate)], events_tx.clone());
+        let worker_registered_gate = Arc::clone(&registered_gate);
+        let worker_external_gate = Arc::clone(&external_gate);
+        _attempt = RehydrationAttempt::spawn_with_cleanup_timeout(
+            vec![registered_gate],
+            Duration::from_millis(50),
+            move || {
+                worker_active.fetch_add(1, Ordering::AcqRel);
+                entered_tx.send(()).unwrap();
+                await_gate(&worker_registered_gate);
+                external_wait_tx.send(()).unwrap();
+                await_gate(&worker_external_gate);
+                worker_active.fetch_sub(1, Ordering::AcqRel);
+                exited_tx.send(()).unwrap();
+            },
+        )
+        .with_cleanup_events(events_tx.clone());
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        panic!("exercise {stage} external gate RAII before manual release");
+    }));
+
+    assert!(unwound.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "unwinding with an external dependency exceeded its bounded ceiling"
+    );
+    assert_eq!(
+        events_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(CleanupEvent::ExternalGateReleased),
+        "external gate release must precede attempt cleanup"
+    );
+    assert_eq!(
+        events_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(CleanupEvent::AttemptCleanup {
+            joined: true,
+            detached: false,
+        }),
+        "attempt must join after the external RAII release rather than detach"
+    );
+    external_wait_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("attempt cleanup did not release its registered gate");
+    assert_eq!(exited_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    assert_eq!(active.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn rehydration_attempt_stubborn_stages_release_external_gate_before_cleanup() {
+    assert_stubborn_stage_unwind_releases_external_gate_before_attempt_cleanup("drop stage");
+    assert_stubborn_stage_unwind_releases_external_gate_before_attempt_cleanup("timeout stage");
+}
+
+#[test]
+fn rehydration_attempt_receiver_disconnect_is_bounded_and_does_not_panic_worker() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_gate = Arc::clone(&gate);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (completion_tx, completion_rx) = mpsc::sync_channel::<()>(1);
+    let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+    drop(completion_rx);
+    let attempt = RehydrationAttempt::spawn(vec![gate], move || {
+        entered_tx.send(()).unwrap();
+        await_gate(&worker_gate);
+        assert!(
+            completion_tx.send(()).is_err(),
+            "the completion observer is intentionally gone"
+        );
+        exited_tx.send(()).unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let started = Instant::now();
+    drop(attempt);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "receiver-disconnect cleanup exceeded its bounded ceiling"
+    );
+    assert_eq!(exited_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
 }
 
 struct BlockingRehydrateRecorder {
+    recorder_id: String,
     recorder: RecorderFileStore,
     blocked: Arc<AtomicBool>,
-    started: mpsc::SyncSender<()>,
+    started: mpsc::SyncSender<String>,
+    finished: mpsc::SyncSender<String>,
+    active: Arc<AtomicUsize>,
     gate: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl RecorderRpc for BlockingRehydrateRecorder {
-    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+    fn recorder_id(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+    ) -> rhiza_quepaxa::Result<String> {
         self.recorder.recorder_id()
     }
 
-    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+    fn record(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
         self.recorder.record(request)
     }
 
     fn install_decision_proof(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         proof: DecisionProof,
         membership: &Membership,
     ) -> rhiza_quepaxa::Result<()> {
         self.recorder.install_decision_proof(proof, membership)
     }
 
-    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+    fn inspect_decision_proof(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         self.recorder.inspect_decision_proof(slot)
     }
 
-    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+    fn inspect_record_summary(
+        &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         if self.blocked.load(Ordering::Acquire) {
-            self.started.send(()).unwrap();
+            self.active.fetch_add(1, Ordering::AcqRel);
+            self.started.send(self.recorder_id.clone()).unwrap();
             let (released, changed) = &*self.gate;
             let mut released = released.lock().unwrap();
             while !*released {
                 released = changed.wait(released).unwrap();
             }
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            self.finished.send(self.recorder_id.clone()).unwrap();
         }
         self.recorder.inspect_record_summary(slot)
     }
@@ -338,13 +969,15 @@ impl RecorderRpc for BlockingRehydrateRecorder {
 
     fn observe_read_fence(
         &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
         request: ReadFenceRequest,
     ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
-        self.recorder.observe_read_fence(request)
+        RecorderRpc::observe_read_fence(&self.recorder, context, request)
     }
 
     fn store_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -364,6 +997,7 @@ impl RecorderRpc for BlockingRehydrateRecorder {
 
     fn fetch_command_for(
         &self,
+        _context: &rhiza_quepaxa::RecorderRpcContext,
         cluster_id: String,
         epoch: u64,
         config_id: u64,
@@ -547,7 +1181,7 @@ async fn concurrent_flushes_are_serialized_idempotent_and_clamped_to_local_qlog(
     coordinator.flush_runtime(&runtime, u64::MAX).await.unwrap();
 
     assert_eq!(coordinator.durable_tip().index(), 6);
-    assert_eq!(archive.restore_checkpoint().await.unwrap().len(), 6);
+    assert_eq!(load_restored_for_test(&archive).await.suffix().len(), 6);
     assert_eq!(
         archive
             .load_checkpoint()
@@ -598,7 +1232,7 @@ async fn periodic_background_flushes_in_bounded_batches() {
     assert!(loaded.manifest().segments().len() > 1);
 
     let restored_dir = root.path().join("restored-batches");
-    let tip = restore_checkpoint_to_fresh_data_dir(archive, &restored_dir)
+    let tip = install_fresh_for_test(&archive, &restored_dir, "node-1")
         .await
         .unwrap();
     assert_eq!(tip.index(), 40);
@@ -830,10 +1464,498 @@ async fn restore_requires_an_existing_checkpoint() {
     let data_dir = root.path().join("data");
 
     assert!(matches!(
-        restore_checkpoint_to_fresh_data_dir(archive, &data_dir).await,
+        prepare_checkpoint_restore(&archive).await,
         Err(DurabilityError::MissingCheckpoint)
     ));
     assert!(!data_dir.exists());
+}
+
+#[tokio::test]
+async fn prepared_fresh_install_rejects_hostile_inputs_without_local_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+    let untouched = root.path().join("untouched");
+
+    assert!(matches!(
+        expected_restore_state_for_test(
+            &prepared,
+            &untouched,
+            "",
+            CheckpointInstallMode::Fresh,
+            None,
+        ),
+        Err(DurabilityError::SnapshotVerification(_))
+    ));
+    assert!(!untouched.exists());
+
+    for name in [
+        "../escape",
+        "/absolute",
+        "C:relative",
+        "C:/absolute",
+        r"C:\\absolute",
+        r"\\\\server\\share",
+        r"\\rooted",
+        "back\\slash",
+        "nul\0name",
+        ".rhiza-restore.json",
+        ".successor-restore.lock",
+        ".successor-restore.intent",
+        ".successor-restore.complete",
+        ".successor-prestage.lock",
+        ".successor-prestage.intent",
+        ".successor-prestage.ready",
+        ".successor-prestage.published",
+        ".successor-prestage.finalized",
+        ".restore-marker-tmp-1-1",
+        "sqlite",
+        "ladybug",
+        "kv",
+        "consensus",
+        ".restore-stage-1-1",
+        ".rebuildable-quarantine-1-1",
+        ".RhIzA-ReStOrE.JsOn",
+        ".SuCcEsSoR-ReStOrE.LoCk",
+        ".SuCcEsSoR-PrEsTaGe.FiNaLiZeD",
+        ".RhIzA-ReCoVeRy-OwNeR.JsOn",
+        "SqLiTe",
+        "LaDyBuG",
+        "CoNsEnSuS",
+        ".ReStOrE-StAgE-1-1",
+        ".ReStOrE-MaRkEr-TmP-1-1",
+        ".ReBuIlDaBlE-QuArAnTiNe-1-1",
+    ] {
+        assert!(
+            RestoreCompletionMarker::new(name, b"marker").is_err(),
+            "{name:?}"
+        );
+        assert!(!untouched.exists());
+    }
+
+    let regular_file = root.path().join("not-a-directory");
+    std::fs::write(&regular_file, b"sentinel").unwrap();
+    assert!(matches!(
+        expected_restore_state_for_test(
+            &prepared,
+            &regular_file,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            None,
+        ),
+        Err(DurabilityError::DataDirNotFresh(_))
+    ));
+    assert_eq!(std::fs::read(&regular_file).unwrap(), b"sentinel");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let symlink_target = root.path().join("symlink-target");
+        std::fs::create_dir(&symlink_target).unwrap();
+        let symlink_path = root.path().join("symlink-data");
+        symlink(&symlink_target, &symlink_path).unwrap();
+        assert!(matches!(
+            expected_restore_state_for_test(
+                &prepared,
+                &symlink_path,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                None,
+            ),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(std::fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_dir(&symlink_target).unwrap().next().is_none());
+    }
+}
+
+#[tokio::test]
+async fn prepared_rejoin_installer_preserves_recorder_bytes_across_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+    let data_dir = root.path().join("data");
+    install_prepared_checkpoint_to_fresh_data_dir(
+        &prepared,
+        expected_restore_state_for_test(
+            &prepared,
+            &data_dir,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            None,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let recorder = data_dir.join("recorder/sentinel");
+    std::fs::create_dir_all(recorder.parent().unwrap()).unwrap();
+    std::fs::write(&recorder, b"keep-recorder-bytes").unwrap();
+
+    for _ in 0..2 {
+        install_prepared_checkpoint_for_rejoin_preserving_recorder(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &data_dir,
+                "node-1",
+                CheckpointInstallMode::RejoinPreservingRecorder,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&recorder).unwrap(), b"keep-recorder-bytes");
+        assert_eq!(
+            std::fs::read(data_dir.join("identity.json")).unwrap(),
+            b"identity"
+        );
+        assert!(!data_dir.join(".rhiza-restore.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn stale_rejoin_restore_cannot_mutate_a_newer_installed_checkpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
+        .await
+        .unwrap();
+    let source = runtime(root.path().join("source"));
+
+    let r10 = source.write("request-r10", "key-r10", "value-r10").unwrap();
+    coordinator.note_committed(r10.applied_index);
+    coordinator
+        .flush_runtime(&source, r10.applied_index)
+        .await
+        .unwrap();
+    let prepared_a = prepare_checkpoint_restore(&archive).await.unwrap();
+
+    let target = root.path().join("target");
+    install_prepared_checkpoint_to_fresh_data_dir(
+        &prepared_a,
+        expected_restore_state_for_test(
+            &prepared_a,
+            &target,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            Some("identity.json"),
+        )
+        .unwrap(),
+        Some(RestoreCompletionMarker::new("identity.json", b"r10").unwrap()),
+    )
+    .unwrap();
+    let recorder = target.join("recorder/sentinel");
+    std::fs::create_dir_all(recorder.parent().unwrap()).unwrap();
+    std::fs::write(&recorder, b"must-survive").unwrap();
+
+    // A captures R10's exact local epoch before waiting on the remote archive.
+    let expected_a = expected_restore_state_for_test(
+        &prepared_a,
+        &target,
+        "node-1",
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        Some("identity.json"),
+    )
+    .unwrap();
+
+    let r11 = source.write("request-r11", "key-r11", "value-r11").unwrap();
+    coordinator.note_committed(r11.applied_index);
+    coordinator
+        .flush_runtime(&source, r11.applied_index)
+        .await
+        .unwrap();
+    let prepared_b = prepare_checkpoint_restore(&archive).await.unwrap();
+    assert_eq!(prepared_a.restored().tip().index(), r10.applied_index);
+    assert_eq!(prepared_b.restored().tip().index(), r11.applied_index);
+
+    let expected_b = expected_restore_state_for_test(
+        &prepared_b,
+        &target,
+        "node-1",
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        Some("identity.json"),
+    )
+    .unwrap();
+    install_prepared_checkpoint_for_rejoin_preserving_recorder(
+        &prepared_b,
+        expected_b,
+        RestoreCompletionMarker::new("identity.json", b"r11").unwrap(),
+    )
+    .unwrap();
+
+    let before_a = restore_tree_snapshot(&target);
+    let recorder_before = std::fs::read(&recorder).unwrap();
+    let stale = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+        &prepared_a,
+        expected_a,
+        RestoreCompletionMarker::new("identity.json", b"r10").unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&stale, DurabilityError::SnapshotVerification(message) if message.contains("changed after expected state capture")),
+        "stale restore must fail in token revalidation before any restore mutation: {stale}"
+    );
+    assert_eq!(restore_tree_snapshot(&target), before_a);
+    assert_eq!(std::fs::read(&recorder).unwrap(), recorder_before);
+    assert_eq!(std::fs::read(target.join("identity.json")).unwrap(), b"r11");
+    assert!(target.join(".rhiza-checkpoint-install.json").is_file());
+    assert!(!target.join(".rhiza-restore.json").exists());
+    // The B install may retain its own crash-retriable quarantine. Equality
+    // with the pre-A tree proves A added no staging/quarantine artifact.
+}
+
+#[tokio::test]
+async fn runtime_qlog_advance_after_capture_rejects_restore_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+    let target = root.path().join("target");
+    install_prepared_checkpoint_to_fresh_data_dir(
+        &prepared,
+        expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            Some("identity.json"),
+        )
+        .unwrap(),
+        Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+    )
+    .unwrap();
+    let expected = expected_restore_state_for_test(
+        &prepared,
+        &target,
+        "node-1",
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        Some("identity.json"),
+    )
+    .unwrap();
+
+    let runtime = runtime(&target);
+    runtime.write("runtime-advance", "key", "value").unwrap();
+    drop(runtime);
+
+    let before = restore_tree_snapshot(&target);
+    let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+        &prepared,
+        expected,
+        RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, DurabilityError::SnapshotVerification(message) if message.contains("local qlog state changed after expected state capture")),
+        "qlog advance must fail before restore mutation: {error}"
+    );
+    assert_eq!(restore_tree_snapshot(&target), before);
+}
+
+#[tokio::test]
+async fn durable_fresh_receipt_retries_exactly_and_finalizes_pending_intent_without_reinstall() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+    let target = root.path().join("target");
+    let marker = RestoreCompletionMarker::new("identity.json", b"identity").unwrap();
+    let tip = install_prepared_checkpoint_to_fresh_data_dir(
+        &prepared,
+        expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            Some("identity.json"),
+        )
+        .unwrap(),
+        Some(marker),
+    )
+    .unwrap();
+
+    let committed = restore_tree_snapshot(&target);
+    assert_eq!(
+        install_prepared_checkpoint_to_fresh_data_dir(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+        )
+        .unwrap(),
+        tip
+    );
+    assert_eq!(restore_tree_snapshot(&target), committed);
+
+    // A valid Fresh receipt is explicitly idempotent only for the exact
+    // prepared checkpoint. A newer remote checkpoint cannot repurpose this
+    // token to overwrite the completed fresh data root.
+    let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
+        .await
+        .unwrap();
+    let source = runtime(root.path().join("source"));
+    let newer_entry = source.write("newer", "key", "value").unwrap();
+    coordinator.note_committed(newer_entry.applied_index);
+    coordinator
+        .flush_runtime(&source, newer_entry.applied_index)
+        .await
+        .unwrap();
+    let newer = prepare_checkpoint_restore(&archive).await.unwrap();
+    let before_mismatch = restore_tree_snapshot(&target);
+    let error = install_prepared_checkpoint_to_fresh_data_dir(
+        &newer,
+        expected_restore_state_for_test(
+            &newer,
+            &target,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            Some("identity.json"),
+        )
+        .unwrap(),
+        Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, DurabilityError::SnapshotVerification(message) if message.contains("receipt does not match"))
+    );
+    assert_eq!(restore_tree_snapshot(&target), before_mismatch);
+
+    // Model a crash after durable receipt publication and before generic
+    // intent cleanup. An exact retry is permitted to remove only the intent;
+    // it must not stage, quarantine, or rewrite the completed checkpoint.
+    let intent = rhiza_node::durability::checkpoint_restore_intent_bytes(
+        prepared.identity(),
+        "node-1",
+        prepared.execution_profile(),
+        prepared.checkpoint_root(),
+    )
+    .unwrap();
+    std::fs::write(target.join(".rhiza-restore.json"), intent).unwrap();
+    let mut expected_after_finalize = committed.clone();
+    assert!(expected_after_finalize
+        .remove(&std::path::PathBuf::from(".rhiza-restore.json"))
+        .is_none());
+    assert_eq!(
+        install_prepared_checkpoint_to_fresh_data_dir(
+            &prepared,
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                Some("identity.json"),
+            )
+            .unwrap(),
+            Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+        )
+        .unwrap(),
+        tip
+    );
+    assert!(!target.join(".rhiza-restore.json").exists());
+    assert_eq!(restore_tree_snapshot(&target), expected_after_finalize);
+}
+
+#[tokio::test]
+async fn live_runtime_lock_rejects_installer_without_restore_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+    let target = root.path().join("target");
+    install_prepared_checkpoint_to_fresh_data_dir(
+        &prepared,
+        expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            Some("identity.json"),
+        )
+        .unwrap(),
+        Some(RestoreCompletionMarker::new("identity.json", b"identity").unwrap()),
+    )
+    .unwrap();
+    let expected = expected_restore_state_for_test(
+        &prepared,
+        &target,
+        "node-1",
+        CheckpointInstallMode::RejoinPreservingRecorder,
+        Some("identity.json"),
+    )
+    .unwrap();
+    let runtime = runtime(&target);
+    let before = restore_tree_snapshot(&target);
+    let error = install_prepared_checkpoint_for_rejoin_preserving_recorder(
+        &prepared,
+        expected,
+        RestoreCompletionMarker::new("identity.json", b"identity").unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, DurabilityError::SnapshotVerification(message) if message.contains("data-root restore lock")),
+        "live runtime lock must fence installer: {error}"
+    );
+    assert_eq!(restore_tree_snapshot(&target), before);
+    drop(runtime);
+}
+
+#[tokio::test]
+async fn expected_restore_capture_rejects_hostile_node_lock_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+    for kind in ["nonzero-file", "directory"] {
+        let target = root.path().join(kind);
+        std::fs::create_dir(&target).unwrap();
+        let lock = target.join(".node.lock");
+        match kind {
+            "nonzero-file" => std::fs::write(&lock, b"not-empty").unwrap(),
+            "directory" => std::fs::create_dir(&lock).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = restore_tree_snapshot(&target);
+        assert!(matches!(
+            expected_restore_state_for_test(
+                &prepared,
+                &target,
+                "node-1",
+                CheckpointInstallMode::Fresh,
+                None,
+            ),
+            Err(DurabilityError::SnapshotVerification(_))
+        ));
+        assert_eq!(restore_tree_snapshot(&target), before);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let target = root.path().join("symlink");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&victim, b"do-not-follow").unwrap();
+        symlink(&victim, target.join(".node.lock")).unwrap();
+        let before = restore_tree_snapshot(&target);
+        assert!(expected_restore_state_for_test(
+            &prepared,
+            &target,
+            "node-1",
+            CheckpointInstallMode::Fresh,
+            None,
+        )
+        .is_err());
+        assert_eq!(restore_tree_snapshot(&target), before);
+        assert_eq!(std::fs::read(victim).unwrap(), b"do-not-follow");
+    }
 }
 
 #[tokio::test]
@@ -847,7 +1969,7 @@ async fn restore_rejects_existing_state_without_mutation() {
     std::fs::write(&sentinel, b"keep-me").unwrap();
 
     assert!(matches!(
-        restore_checkpoint_to_fresh_data_dir(archive, &data_dir).await,
+        install_fresh_for_test(&archive, &data_dir, "node-1").await,
         Err(DurabilityError::DataDirNotFresh(_))
     ));
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep-me");
@@ -874,10 +1996,9 @@ async fn restore_roundtrip_replays_normally_through_node_runtime() {
     drop(source);
 
     let restored_dir = root.path().join("restored");
-    let tip =
-        restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "node-1")
-            .await
-            .unwrap();
+    let tip = install_fresh_for_test(&archive, &restored_dir, "node-1")
+        .await
+        .unwrap();
     assert_eq!(tip.index(), second.applied_index);
     assert_eq!(tip.hash(), second.hash);
     assert_ne!(tip.hash(), first.hash);
@@ -902,7 +2023,7 @@ async fn restore_roundtrip_replays_normally_through_node_runtime() {
     );
 
     let other_node_dir = root.path().join("restored-node-2");
-    restore_checkpoint_to_fresh_data_dir_for_node(archive, &other_node_dir, "node-2")
+    install_fresh_for_test(&archive, &other_node_dir, "node-2")
         .await
         .unwrap();
     let other = SqliteStateMachine::open_with_configuration(
@@ -927,7 +2048,7 @@ async fn empty_initialized_checkpoint_restores_as_genesis() {
     let archive = initialized_checkpoint(&root.path().join("archive")).await;
     let data_dir = root.path().join("data");
 
-    let tip = restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
+    let tip = install_fresh_for_test(&archive, &data_dir, "node-1")
         .await
         .unwrap();
 
@@ -944,7 +2065,7 @@ async fn restore_preserves_an_existing_empty_data_directory() {
     std::fs::create_dir(&data_dir).unwrap();
 
     let before = std::fs::metadata(&data_dir).unwrap();
-    restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
+    install_fresh_for_test(&archive, &data_dir, "node-1")
         .await
         .unwrap();
     let after = std::fs::metadata(&data_dir).unwrap();
@@ -955,7 +2076,19 @@ async fn restore_preserves_an_existing_empty_data_directory() {
         assert_eq!(before.dev(), after.dev());
         assert_eq!(before.ino(), after.ino());
     }
-    assert!(std::fs::read_dir(&data_dir).unwrap().next().is_none());
+    let entries = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        2,
+        "genesis restore may retain only its shared lock and durable receipt"
+    );
+    assert!(entries.iter().any(|name| name == ".node.lock"));
+    assert!(entries
+        .iter()
+        .any(|name| name == ".rhiza-checkpoint-install.json"));
 }
 
 #[tokio::test]
@@ -986,12 +2119,11 @@ async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
         .await
         .unwrap();
     let restored_dir = root.path().join("restored");
-    let tip =
-        restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "node-1")
-            .await
-            .unwrap();
+    let tip = install_fresh_for_test(&archive, &restored_dir, "node-1")
+        .await
+        .unwrap();
     assert_eq!(tip.index(), second.applied_index);
-    let restored_checkpoint = archive.restore_checkpoint_state().await.unwrap();
+    let restored_checkpoint = load_restored_for_test(&archive).await;
     assert_eq!(restored_checkpoint.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(restored_checkpoint.suffix().len(), 1);
     assert_eq!(restored_checkpoint.suffix()[0].index, second.applied_index);
@@ -1045,13 +2177,13 @@ async fn graph_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_no
         .await
         .unwrap();
 
-    let remote = archive.restore_checkpoint_state().await.unwrap();
+    let remote = load_restored_for_test(&archive).await;
     assert_eq!(remote.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(remote.suffix().len(), 1);
     assert_eq!(remote.suffix()[0].index, second.applied_index());
 
     let restored_dir = root.path().join("restored");
-    restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "n2")
+    install_fresh_for_test(&archive, &restored_dir, "n2")
         .await
         .unwrap();
     assert!(restored_dir.join("ladybug/graph.lbug").is_file());
@@ -1077,10 +2209,14 @@ async fn graph_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_no
         Some(GraphValueV1::U64(2))
     );
     drop(restored);
-    assert!(matches!(
-        restore_checkpoint_to_fresh_data_dir_for_node(archive, &restored_dir, "n2").await,
-        Err(DurabilityError::DataDirNotFresh(_))
-    ));
+    let committed = restore_tree_snapshot(&restored_dir);
+    assert_eq!(
+        install_fresh_for_test(&archive, &restored_dir, "n2")
+            .await
+            .unwrap(),
+        *remote.tip()
+    );
+    assert_eq!(restore_tree_snapshot(&restored_dir), committed);
 }
 
 #[cfg(feature = "kv")]
@@ -1109,13 +2245,13 @@ async fn kv_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node(
         .await
         .unwrap();
 
-    let remote = archive.restore_checkpoint_state().await.unwrap();
+    let remote = load_restored_for_test(&archive).await;
     assert_eq!(remote.snapshot().unwrap().anchor(), &anchor);
     assert_eq!(remote.suffix().len(), 1);
     assert_eq!(remote.suffix()[0].index, second.applied_index());
 
     let restored_dir = root.path().join("restored");
-    restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "n2")
+    install_fresh_for_test(&archive, &restored_dir, "n2")
         .await
         .unwrap();
     assert!(restored_dir.join("kv/data.redb").is_file());
@@ -1141,10 +2277,14 @@ async fn kv_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node(
         Some(b"two".to_vec())
     );
     drop(restored);
-    assert!(matches!(
-        restore_checkpoint_to_fresh_data_dir_for_node(archive, &restored_dir, "n2").await,
-        Err(DurabilityError::DataDirNotFresh(_))
-    ));
+    let committed = restore_tree_snapshot(&restored_dir);
+    assert_eq!(
+        install_fresh_for_test(&archive, &restored_dir, "n2")
+            .await
+            .unwrap(),
+        *remote.tip()
+    );
+    assert_eq!(restore_tree_snapshot(&restored_dir), committed);
 }
 
 #[tokio::test]

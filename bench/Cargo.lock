@@ -1908,6 +1908,7 @@ name = "rhiza-node"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "http-body",
  "postcard",
  "postcard-rpc",
  "reqwest",
@@ -1965,6 +1966,8 @@ name = "rhizadb"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "hyper",
+ "hyper-util",
  "rhiza-archive",
  "rhiza-core",
  "rhiza-log",
@@ -1974,6 +1977,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

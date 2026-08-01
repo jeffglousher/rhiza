@@ -18,12 +18,33 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
-    AlreadyExists { key: String },
-    Precondition { key: String },
-    NotFound { key: String },
-    MissingVersion { key: String },
+    AlreadyExists {
+        key: String,
+    },
+    Precondition {
+        key: String,
+    },
+    NotFound {
+        key: String,
+    },
+    MissingVersion {
+        key: String,
+    },
+    ReadLimitExceeded {
+        key: String,
+        limit: u64,
+        actual: u64,
+    },
+    ContentLengthMismatch {
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
     Configuration(String),
-    Transport { key: String, message: String },
+    Transport {
+        key: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -35,6 +56,18 @@ impl std::fmt::Display for Error {
             Self::MissingVersion { key } => {
                 write!(f, "object has no safe version identity: {key}")
             }
+            Self::ReadLimitExceeded { key, limit, actual } => write!(
+                f,
+                "object read exceeds limit for {key}: limit {limit} bytes, got at least {actual} bytes"
+            ),
+            Self::ContentLengthMismatch {
+                key,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "object content length mismatch for {key}: metadata declared {expected} bytes, stream yielded {actual} bytes"
+            ),
             Self::Configuration(message) => {
                 write!(f, "object store configuration failed: {message}")
             }
@@ -121,7 +154,7 @@ pub struct ObjStore {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionedObject {
-    bytes: Bytes,
+    bytes: Vec<u8>,
     version: UpdateVersion,
 }
 
@@ -332,23 +365,46 @@ impl ObjStore {
     }
 
     pub async fn get(&self, key: &str) -> Result<Vec<u8>> {
-        Ok(self.get_with_version(key).await?.bytes.to_vec())
+        Ok(self.get_with_version(key).await?.bytes)
     }
 
     pub async fn get_with_version(&self, key: &str) -> Result<VersionedObject> {
+        self.get_with_version_bounded(key, u64::MAX).await
+    }
+
+    /// Reads one object without allowing provider metadata or streamed bytes
+    /// to exceed the caller's mandatory cap.
+    pub async fn get_bounded(&self, key: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        Ok(self.get_with_version_bounded(key, max_bytes).await?.bytes)
+    }
+
+    /// Reads one versioned object without allowing provider metadata or
+    /// streamed bytes to exceed the caller's mandatory cap.
+    pub async fn get_with_version_bounded(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<VersionedObject> {
         let result = self
             .inner
             .get(&ObjPath::from(key))
             .await
             .map_err(|err| map_store_error(key, err))?;
+        let declared_size = result.meta.size;
+        if declared_size > max_bytes {
+            return Err(Error::ReadLimitExceeded {
+                key: key.to_string(),
+                limit: max_bytes,
+                actual: declared_size,
+            });
+        }
         let version = UpdateVersion {
             e_tag: result.meta.e_tag.clone(),
             version: result.meta.version.clone(),
         };
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|err| map_store_error(key, err))?;
+        let bytes = collect_bounded_stream(key, result.into_stream(), max_bytes).await?;
+        let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        validate_content_length(key, declared_size, actual_size)?;
         Ok(VersionedObject { bytes, version })
     }
 
@@ -473,6 +529,55 @@ impl ObjStore {
     }
 }
 
+async fn collect_bounded_stream(
+    key: &str,
+    mut stream: futures::stream::BoxStream<'static, object_store::Result<Bytes>>,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut actual = 0_u64;
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| map_store_error(key, error))?
+    {
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        actual = actual
+            .checked_add(chunk_len)
+            .ok_or_else(|| Error::ReadLimitExceeded {
+                key: key.to_string(),
+                limit: max_bytes,
+                actual: u64::MAX,
+            })?;
+        if actual > max_bytes {
+            return Err(Error::ReadLimitExceeded {
+                key: key.to_string(),
+                limit: max_bytes,
+                actual,
+            });
+        }
+        bytes
+            .try_reserve(chunk.len())
+            .map_err(|error| Error::Transport {
+                key: key.to_string(),
+                message: format!("object read allocation failed: {error}"),
+            })?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn validate_content_length(key: &str, expected: u64, actual: u64) -> Result<()> {
+    if actual != expected {
+        return Err(Error::ContentLengthMismatch {
+            key: key.to_string(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 fn validate_required(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(Error::Configuration(format!("{name} must not be empty")));
@@ -504,5 +609,64 @@ fn map_store_error(key: &str, error: object_store::Error) -> Error {
             key: key.to_string(),
             message: error.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn bounded_get_accepts_exact_boundary_and_rejects_metadata_before_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: directory.path().to_path_buf(),
+        })
+        .unwrap();
+        store.put("bounded", b"four").await.unwrap();
+
+        assert_eq!(store.get_bounded("bounded", 4).await.unwrap(), b"four");
+        assert_eq!(
+            store.get_bounded("bounded", 3).await.unwrap_err(),
+            Error::ReadLimitExceeded {
+                key: "bounded".into(),
+                limit: 3,
+                actual: 4,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_rejects_a_dishonest_chunk_without_accumulating_it() {
+        let stream = futures::stream::iter([
+            Ok(Bytes::from_static(b"four")),
+            Ok(Bytes::from_static(b"dishonest")),
+        ])
+        .boxed();
+
+        assert_eq!(
+            collect_bounded_stream("dishonest", stream, 4)
+                .await
+                .unwrap_err(),
+            Error::ReadLimitExceeded {
+                key: "dishonest".into(),
+                limit: 4,
+                actual: 13,
+            }
+        );
+    }
+
+    #[test]
+    fn content_length_mismatch_is_typed_with_path_and_exact_sizes() {
+        assert_eq!(
+            validate_content_length("dishonest", 5, 4).unwrap_err(),
+            Error::ContentLengthMismatch {
+                key: "dishonest".into(),
+                expected: 5,
+                actual: 4,
+            }
+        );
+        validate_content_length("boundary", 4, 4).unwrap();
     }
 }
