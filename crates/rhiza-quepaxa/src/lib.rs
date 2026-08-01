@@ -7011,7 +7011,7 @@ impl ThreeNodeConsensus {
         &self,
         proof: DecisionProof,
         known_command: Option<&StoredCommand>,
-        transition_involved: bool,
+        _transition_involved: bool,
         context: &RecorderRpcContext,
         mutation_started: &AtomicBool,
     ) -> Result<DriveOutcome> {
@@ -7031,7 +7031,7 @@ impl ThreeNodeConsensus {
             .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
         let mut control_budget = None;
         let mut fetched_command = false;
-        let command = match known_command {
+        let _command = match known_command {
             Some(command)
                 if self.command_matches_value(proof_context(&proof).0, value, command) =>
             {
@@ -7048,12 +7048,6 @@ impl ThreeNodeConsensus {
                 .ok_or(Error::CommandUnavailable)?
             }
         };
-        if !matches!(&proof, DecisionProof::Phase2 { .. })
-            && command.entry_type != EntryType::ConfigChange
-            && !transition_involved
-        {
-            return Ok(DriveOutcome::Decision(proof));
-        }
         let budget = Self::finish_control_budget(&mut control_budget, context, mutation_started)?;
         if fetched_command {
             #[cfg(test)]
@@ -7068,7 +7062,23 @@ impl ThreeNodeConsensus {
                 },
             );
         }
-        self.install_decision_proof_quorum_with_budget(budget, proof.clone(), mutation_started)?;
+        if let Err(error) =
+            self.install_decision_proof_quorum_with_budget(budget, proof.clone(), mutation_started)
+        {
+            // Once a decision proof exists, any non-safety failure while
+            // durably installing it may follow a partial install.  Returning
+            // a retryable transport/quorum failure would permit a caller to
+            // treat the decided slot as uncommitted.
+            if Self::is_control_safety_error(&error)
+                || matches!(
+                    error,
+                    Error::TypedProofInstallRequired | Error::TypedRecordRequired
+                )
+            {
+                return Err(error);
+            }
+            return Err(Error::UnknownOutcome);
+        }
         Ok(DriveOutcome::Decision(proof))
     }
 
@@ -7171,6 +7181,7 @@ impl ThreeNodeConsensus {
         let mut worker_failed = dispatches.contains(&Some(ControlDispatch::Failed));
         let mut observed_unknown = false;
         let mut safety_error = None;
+        let mut typed_error = None;
         let mut frozen = dispatch_error.map(Err);
         let mut disconnected = false;
         while frozen.is_none() {
@@ -7225,6 +7236,11 @@ impl ThreeNodeConsensus {
                     Err(error) if Self::is_control_safety_error(&error) => {
                         safety_error.get_or_insert(error);
                     }
+                    Err(
+                        error @ (Error::TypedProofInstallRequired | Error::TypedRecordRequired),
+                    ) => {
+                        typed_error.get_or_insert(error);
+                    }
                     Err(_) => {}
                 }
             }
@@ -7267,6 +7283,11 @@ impl ThreeNodeConsensus {
                     Err(error) if Self::is_control_safety_error(&error) => {
                         safety_error.get_or_insert(error);
                     }
+                    Err(
+                        error @ (Error::TypedProofInstallRequired | Error::TypedRecordRequired),
+                    ) => {
+                        typed_error.get_or_insert(error);
+                    }
                     // Cleanup cancellation is delivery, not an independently
                     // ambiguous proof installation.
                     Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) | Err(_) => {}
@@ -7282,9 +7303,14 @@ impl ThreeNodeConsensus {
         if let Err(error) = budget.check_admission() {
             return Err(Self::store_context_error(error, mutation_started));
         }
+        if installed >= quorum {
+            return Ok(());
+        }
+        if let Some(error) = typed_error {
+            return Err(error);
+        }
         match frozen {
             Some(result) => result,
-            None if installed >= quorum => Ok(()),
             None if worker_failed && !control_quorum_reachable(installed, saturated, quorum) => {
                 Err(Error::ProposeFailed)
             }
@@ -15608,6 +15634,53 @@ mod tests {
             }
             Ok(record_summary(self.recorder_id, request))
         }
+
+        fn install_decision_proof(
+            &self,
+            _context: &RecorderRpcContext,
+            _proof: DecisionProof,
+            _membership: &Membership,
+        ) -> super::Result<()> {
+            Err(Error::ProposeFailed)
+        }
+    }
+
+    struct FailInstallFileStore {
+        inner: RecorderFileStore,
+        fail_install: Arc<AtomicBool>,
+    }
+
+    impl RecorderRpc for FailInstallFileStore {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            context.check()?;
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> super::Result<()> {
+            if self.fail_install.load(Ordering::Acquire) {
+                return Err(Error::ProposeFailed);
+            }
+            context.check()?;
+            self.inner.install_decision_proof(proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            slot: Slot,
+        ) -> super::Result<Option<DecisionProof>> {
+            context.check()?;
+            self.inner.inspect_decision_proof(slot)
+        }
     }
 
     struct GatedRecordRecorder {
@@ -15827,6 +15900,29 @@ mod tests {
             proposal,
             summaries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn installed_proof_is_idempotent_for_the_same_value_and_rejects_conflict() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let proof = test_decision_proof(&membership);
+        let mut state = RecorderSlotState::new_with_digest(1, "cluster", 1, 1, membership.digest());
+        assert_eq!(state.install_proof(proof.clone()), Ok(()));
+        assert_eq!(state.install_proof(proof.clone()), Ok(()));
+
+        let mut conflicting = proof;
+        let DecisionProof::FastPath { proposal, .. } = &mut conflicting else {
+            unreachable!("test decision proof is FastPath");
+        };
+        proposal
+            .value
+            .as_mut()
+            .expect("test decision proof has a value")
+            .entry_hash = LogHash::digest(&[b"conflicting"]);
+        assert_eq!(
+            state.install_proof(conflicting),
+            Err(RejectReason::AlreadyDecided)
+        );
     }
 
     struct FailingFromSlotRecorder {
@@ -18917,6 +19013,74 @@ mod tests {
     }
 
     #[test]
+    fn install_proof_typed_errors_follow_terminal_precedence() {
+        let run = |replies: [super::Result<()>; 3], expected: super::Result<()>| {
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(replies)
+                .map(|(recorder_id, reply)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ScriptedInstallProofRecorder {
+                            recorder_id,
+                            entered: entered_tx.clone(),
+                            gate: None,
+                            reply,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            assert_eq!(
+                consensus.install_decision_proof_quorum(
+                    test_decision_proof(consensus.membership()),
+                    &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &AtomicBool::new(false),
+                ),
+                expected
+            );
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::TypedProofInstallRequired),
+            ],
+            Err(Error::TypedProofInstallRequired),
+        );
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Ok(()),
+                Err(Error::Io("transient install failure".into())),
+            ],
+            Err(Error::TypedProofInstallRequired),
+        );
+        run([Err(Error::TypedRecordRequired), Ok(()), Ok(())], Ok(()));
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::Rejected(RejectReason::AlreadyDecided)),
+                Err(Error::ProposeFailed),
+            ],
+            Err(Error::Rejected(RejectReason::AlreadyDecided)),
+        );
+        run(
+            [
+                Err(Error::TypedProofInstallRequired),
+                Err(Error::UnknownOutcome),
+                Err(Error::ProposeFailed),
+            ],
+            Err(Error::UnknownOutcome),
+        );
+    }
+
+    #[test]
     fn install_proof_preclosed_worker_is_arrival_order_independent() {
         let _blocking = lock_blocking_control_tests();
         let run = |n2_reply: super::Result<()>| {
@@ -20087,6 +20251,263 @@ mod tests {
             .unwrap();
         assert!(third_replies.len() >= 2);
         assert!(third_replies.iter().all(|reply| reply.slot == 3));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fast_path_partial_proof_install_is_unknown_and_fences_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let n1 = RecorderFileStore::new_with_membership(
+            root.path().join("n1"),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let n3 = RecorderFileStore::new_with_membership(
+            root.path().join("n3"),
+            "n3",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let fail_install = Arc::new(AtomicBool::new(true));
+        let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
+        let (n2_release_tx, n2_release_rx) = mpsc::sync_channel(1);
+        let mut n2_release = ChannelRelease::new(n2_release_tx);
+        let first = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    (
+                        "n1".into(),
+                        Box::new(FailInstallFileStore {
+                            inner: n1.clone(),
+                            fail_install: Arc::clone(&fail_install),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
+                    (
+                        "n2".into(),
+                        Box::new(BlockingRecorder {
+                            recorder_id: "n2",
+                            started: n2_started_tx,
+                            release_first: Mutex::new(n2_release_rx),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
+                    (
+                        "n3".into(),
+                        Box::new(FailInstallFileStore {
+                            inner: n3.clone(),
+                            fail_install: Arc::clone(&fail_install),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+
+        // Hold n2's record worker on an unrelated request. The foreign
+        // FastPath is therefore exactly n1+n3, while every proof installer
+        // returns a bounded failure without a durable proof write.
+        let (background_tx, background_rx) = mpsc::sync_channel(1);
+        let background = record_requests(&first, 1).remove(1);
+        assert!(matches!(
+            first.record_workers[1].dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: background,
+                result: background_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert_eq!(n2_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(
+            first.propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::ReadBarrier, Vec::new()),
+            ),
+            Err(Error::UnknownOutcome),
+            "a decided FastPath with zero durable proof installs is not retryable"
+        );
+        assert_eq!(n1.inspect_decision_proof(2).unwrap(), None);
+        assert_eq!(n3.inspect_decision_proof(2).unwrap(), None);
+        assert_eq!(
+            first
+                .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+                .unwrap(),
+            None,
+            "an uninstalled FastPath proof is not a published proof"
+        );
+        fail_install.store(false, Ordering::Release);
+        n2_release.release();
+        assert!(background_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .1
+            .is_ok());
+
+        let n2 = RecorderFileStore::new_with_membership(
+            root.path().join("n2"),
+            "n2",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let second = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n2",
+            1,
+            1,
+            vec![
+                ("n1".into(), Box::new(n1.clone()) as Box<dyn RecorderRpc>),
+                ("n2".into(), Box::new(n2) as Box<dyn RecorderRpc>),
+                ("n3".into(), Box::new(n3.clone()) as Box<dyn RecorderRpc>),
+            ],
+        )
+        .unwrap();
+        let recovered = second
+            .inspect_certified_decision_at(&RecorderRpcContext::default_timeout(), 2, LogHash::ZERO)
+            .unwrap();
+        let CertifiedDecisionInspection::Committed(recovered) = recovered else {
+            panic!("the n1+n3 FastPath summaries must reconstruct the foreign decision");
+        };
+        let foreign = recovered.entry.clone();
+        assert!(matches!(recovered.proof, DecisionProof::FastPath { .. }));
+
+        let conflicting = second
+            .propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::Deterministic, b"conflicting".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(conflicting, foreign);
+        let published = second
+            .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+            .unwrap()
+            .expect("the recovered foreign decision must be published");
+        assert_eq!(
+            published.proposal().value,
+            recovered.proof.proposal().value,
+            "a later Phase2 certificate may replace the FastPath shape, but never its decision"
+        );
+        assert!(first.finish_pending_rpcs(Duration::from_secs(1)));
+        assert!(second.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fast_path_decision_is_durable_before_a_conflicting_slot_proposal() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let n1 = RecorderFileStore::new_with_membership(
+            root.path().join("n1"),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let n3 = RecorderFileStore::new_with_membership(
+            root.path().join("n3"),
+            "n3",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
+        let (n2_release_tx, n2_release_rx) = mpsc::sync_channel(1);
+        let mut n2_release = ChannelRelease::new(n2_release_tx);
+        let recorders = vec![
+            ("n1".into(), Box::new(n1.clone()) as Box<dyn RecorderRpc>),
+            (
+                "n2".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n2",
+                    started: n2_started_tx,
+                    release_first: Mutex::new(n2_release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            ("n3".into(), Box::new(n3.clone()) as Box<dyn RecorderRpc>),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+
+        // Occupy n2's record worker before the foreign proposal. Its slot-2
+        // hedge must remain queued, so n1+n3 are the exact FastPath quorum.
+        let (background_tx, background_rx) = mpsc::sync_channel(1);
+        let background = record_requests(&consensus, 1).remove(1);
+        assert!(matches!(
+            consensus.record_workers[1].dispatch(super::RecordJob {
+                index: 0,
+                context: RecorderRpcContext::default_timeout(),
+                request: background,
+                result: background_tx,
+            }),
+            super::RecordDispatch::Accepted
+        ));
+        assert_eq!(n2_started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+
+        let foreign = consensus
+            .propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::ReadBarrier, Vec::new()),
+            )
+            .unwrap();
+        let foreign_proof = consensus
+            .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+            .unwrap()
+            .expect("a successful FastPath decision must be quorum-durable");
+        assert!(matches!(foreign_proof, DecisionProof::FastPath { .. }));
+        assert_eq!(
+            n1.inspect_decision_proof(2).unwrap(),
+            Some(foreign_proof.clone())
+        );
+        assert_eq!(
+            n3.inspect_decision_proof(2).unwrap(),
+            Some(foreign_proof.clone())
+        );
+
+        n2_release.release();
+        assert!(background_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .1
+            .is_ok());
+
+        let conflicting = consensus
+            .propose_at(
+                RecorderRpcContext::default_timeout(),
+                2,
+                LogHash::ZERO,
+                Command::new(CommandKind::Deterministic, b"conflicting".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(conflicting, foreign);
+        assert_eq!(
+            consensus
+                .inspect_decision_proof_at(&RecorderRpcContext::default_timeout(), 2)
+                .unwrap(),
+            Some(foreign_proof)
+        );
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
