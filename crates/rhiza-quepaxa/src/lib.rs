@@ -12276,6 +12276,8 @@ mod tests {
         let (n1_release_tx, n1_release_rx) = mpsc::sync_channel(1);
         let (n2_seen_tx, n2_seen_rx) = mpsc::sync_channel(4);
         let (n3_seen_tx, n3_seen_rx) = mpsc::sync_channel(4);
+        let record_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _record_gate = GateRelease::new(Arc::clone(&record_gate));
         let recorders = vec![
             (
                 "n1".into(),
@@ -12287,18 +12289,18 @@ mod tests {
             ),
             (
                 "n2".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedObservedSlotRecorder {
                     recorder_id: "n2",
-                    reject_slot: None,
-                    observed: Some(n2_seen_tx),
+                    observed: n2_seen_tx,
+                    release: Arc::clone(&record_gate),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
                 "n3".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedObservedSlotRecorder {
                     recorder_id: "n3",
-                    reject_slot: None,
-                    observed: Some(n3_seen_tx),
+                    observed: n3_seen_tx,
+                    release: Arc::clone(&record_gate),
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
@@ -12345,6 +12347,7 @@ mod tests {
         );
         #[cfg(not(feature = "test-hooks"))]
         assert_eq!(n1_started_rx.recv_timeout(event_timeout), Ok(1));
+        release_gate(&record_gate);
         assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(1));
         assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(1));
 
@@ -12361,12 +12364,19 @@ mod tests {
         });
         assert_eq!(n2_seen_rx.recv_timeout(event_timeout), Ok(2));
         assert_eq!(n3_seen_rx.recv_timeout(event_timeout), Ok(2));
-        assert!(
-            matches!(
-                b_done_rx.recv_timeout(event_timeout),
-                Ok(Ok(replies)) if replies.len() == 2
-            ),
-            "the frozen quorum must reclaim B's queued n1 job without waiting for B's W"
+        let b_replies = b_done_rx
+            .recv_timeout(event_timeout)
+            .expect("B must reclaim its queued n1 hedge after the n2+n3 quorum")
+            .expect("the frozen quorum must reclaim B's queued n1 job without waiting for B's W");
+        let b_recorder_ids: HashSet<_> = b_replies
+            .iter()
+            .map(|reply| reply.recorder_id.clone())
+            .collect();
+        assert_eq!(b_recorder_ids, HashSet::from(["n2".into(), "n3".into()]));
+        assert_eq!(
+            a_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "A must remain blocked on its running n1 hedge while B reclaims only B's queued hedge"
         );
         caller_b.join().unwrap();
         #[cfg(feature = "test-hooks")]
@@ -12403,10 +12413,15 @@ mod tests {
             .load(Ordering::Acquire));
 
         assert!(caller_a_guard.finish());
-        assert!(matches!(
-            a_done_rx.recv_timeout(event_timeout),
-            Ok(Ok(replies)) if replies.len() == 2
-        ));
+        let a_replies = a_done_rx
+            .recv_timeout(event_timeout)
+            .expect("A must finish after its running n1 hedge is released")
+            .expect("A frozen quorum must succeed");
+        let a_recorder_ids: HashSet<_> = a_replies
+            .iter()
+            .map(|reply| reply.recorder_id.clone())
+            .collect();
+        assert_eq!(a_recorder_ids, HashSet::from(["n2".into(), "n3".into()]));
         assert!(matches!(
             consensus.record_broadcast_with_context(
                 record_requests(&consensus, 3),
@@ -16126,6 +16141,38 @@ mod tests {
             while !*released {
                 released = condition.wait(released).unwrap();
             }
+            Ok(record_summary(self.recorder_id, request))
+        }
+    }
+
+    /// A cooperative, observable recorder gate used to freeze a quorum after
+    /// its jobs are admitted, without relying on scheduler timing.
+    struct GatedObservedSlotRecorder {
+        recorder_id: &'static str,
+        observed: mpsc::SyncSender<Slot>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecorderRpc for GatedObservedSlotRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            let (released, condition) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                context.check()?;
+                let (next, _) = condition
+                    .wait_timeout(released, Duration::from_millis(5))
+                    .unwrap();
+                released = next;
+            }
+            context.check()?;
+            drop(released);
+            self.observed
+                .send(request.slot)
+                .expect("observable test recorder receiver must remain live");
             Ok(record_summary(self.recorder_id, request))
         }
     }
