@@ -8129,6 +8129,7 @@ impl ThreeNodeConsensus {
         let mut worker_failed = false;
         let mut observed_unknown = false;
         let mut safety_error = None;
+        let mut summary_error = None;
         let mut frozen: Option<Result<Option<DecisionProof>>> = None;
         let mut provisional_none_hook_fired = false;
         // An admitted summary RPC remains safety-relevant even after a
@@ -8168,11 +8169,19 @@ impl ThreeNodeConsensus {
                     summaries.extend(summary);
                 }
                 Err(Error::UnknownOutcome) => observed_unknown = true,
-                Err(Error::ProposeFailed) => worker_failed = true,
+                Err(Error::ProposeFailed) => {
+                    worker_failed = true;
+                    summary_error.get_or_insert(Error::ProposeFailed);
+                }
+                Err(error) if Self::is_control_safety_error(&error) => {
+                    safety_error.get_or_insert(error);
+                }
                 Ok(_) => {
                     safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
                 }
-                Err(_) => {}
+                Err(error) => {
+                    summary_error.get_or_insert(error);
+                }
             }
             if successful >= quorum {
                 let proof = self.proof_from_record_summaries(slot, &summaries);
@@ -8229,7 +8238,16 @@ impl ThreeNodeConsensus {
                     safety_error.get_or_insert(Error::Rejected(RejectReason::InvalidCertificate));
                 }
                 Err(Error::UnknownOutcome) => observed_unknown = true,
-                _ => {}
+                Err(Error::ProposeFailed) => {
+                    worker_failed = true;
+                    summary_error.get_or_insert(Error::ProposeFailed);
+                }
+                Err(error) if Self::is_control_safety_error(&error) => {
+                    safety_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    summary_error.get_or_insert(error);
+                }
             }
         }
         if safety_error.is_none() {
@@ -8271,7 +8289,10 @@ impl ThreeNodeConsensus {
                 error
             });
         }
-        let proof = frozen?;
+        let proof = match frozen {
+            Ok(proof) => proof,
+            Err(error) => return Err(summary_error.unwrap_or(error)),
+        };
         if let Some(proof) = proof {
             #[cfg(test)]
             record_budget_identity(
@@ -8290,8 +8311,11 @@ impl ThreeNodeConsensus {
                 proof,
             );
         }
+        if let Some(error) = summary_error {
+            return Err(error);
+        }
         if successful < quorum {
-            if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
+            if worker_failed {
                 return Err(Error::ProposeFailed);
             }
             return Ok(CertifiedDecisionInspection::Unavailable);
@@ -14045,6 +14069,113 @@ mod tests {
     }
 
     #[test]
+    fn summary_error_never_turns_a_none_quorum_into_empty() {
+        let run = |error: Error, expected: Error| {
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+            let recorders = [("n1", Ok(None)), ("n2", Ok(None)), ("n3", Err(error))]
+                .into_iter()
+                .map(|(recorder_id, reply)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(ScriptedSummaryRecorder {
+                            recorder_id,
+                            entered: entered_tx.clone(),
+                            gate: None,
+                            reply,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            assert_eq!(
+                consensus.inspect_certified_decision_at(
+                    &RecorderRpcContext::default_timeout(),
+                    1,
+                    LogHash::ZERO,
+                ),
+                Err(expected)
+            );
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        };
+        run(
+            Error::Io("summary io".into()),
+            Error::Io("summary io".into()),
+        );
+        run(
+            Error::Decode("summary decode".into()),
+            Error::Decode("summary decode".into()),
+        );
+        run(Error::TypedRecordRequired, Error::TypedRecordRequired);
+        run(Error::ProposeFailed, Error::ProposeFailed);
+        run(Error::RpcCancelled, Error::RpcCancelled);
+    }
+
+    #[test]
+    fn summary_direct_safety_error_beats_a_valid_proof_quorum() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"direct-safety".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, _entered_rx) = mpsc::sync_channel(3);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(Some(summary("n1"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(Some(summary("n2"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: None,
+                    reply: Err(Error::Rejected(RejectReason::WrongConfig)),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        assert_eq!(
+            consensus.inspect_certified_decision_at(
+                &RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO,
+            ),
+            Err(Error::Rejected(RejectReason::WrongConfig))
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn summary_drain_promotes_late_quorum_proof_after_pending_freeze() {
         let _blocking = lock_blocking_control_tests();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
@@ -14147,6 +14278,112 @@ mod tests {
             panic!("a valid late quorum proof must be promoted: {inspection:?}");
         };
         assert_eq!(certified.proof.proposal().value, proposal.value);
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_none_quorum_waits_for_a_late_certified_single_copy() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"late-single-proof".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: membership.members()[..membership.quorum_size()]
+                .iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.clone(),
+                    slot: 1,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        let late_summary = RecordSummary {
+            recorder_id: "n1".into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal),
+            aggregate_prior: None,
+            decided: Some(proof.clone()),
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryFetchRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&late)),
+                    cancellation_observed: None,
+                    summary: late_summary,
+                    command: command.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: None,
+                    reply: Ok(None),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        wait_for_control_worker_idle(&consensus.control_workers[1], "n2");
+        wait_for_control_worker_idle(&consensus.control_workers[2], "n3");
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        let Ok(CertifiedDecisionInspection::Committed(certified)) =
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("a late certified single-copy proof must prevent Empty");
+        };
+        assert_eq!(certified.proof, proof);
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
@@ -14831,6 +15068,91 @@ mod tests {
         assert_eq!(
             result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Err(Error::Rejected(RejectReason::InvalidCertificate))
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn summary_late_direct_safety_error_beats_a_frozen_valid_proof() {
+        let _blocking = lock_blocking_control_tests();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"late-direct-safety".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let summary = |recorder_id: &str| RecordSummary {
+            recorder_id: recorder_id.into(),
+            slot: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            step: 4,
+            first_current: Some(proposal.clone()),
+            aggregate_prior: None,
+            decided: None,
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(3);
+        let early = Arc::new((Mutex::new(false), Condvar::new()));
+        let late = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_early = GateRelease::new(Arc::clone(&early));
+        let _release_late = GateRelease::new(Arc::clone(&late));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n1",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(summary("n1"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n2",
+                    entered: entered_tx.clone(),
+                    gate: Some(Arc::clone(&early)),
+                    reply: Ok(Some(summary("n2"))),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(ScriptedSummaryRecorder {
+                    recorder_id: "n3",
+                    entered: entered_tx,
+                    gate: Some(Arc::clone(&late)),
+                    reply: Err(Error::Rejected(RejectReason::WrongConfig)),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.inspect_certified_decision_at(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        1,
+                        LogHash::ZERO,
+                    ))
+                    .unwrap()
+            })
+        };
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        release_gate(&early);
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&late);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::Rejected(RejectReason::WrongConfig))
         );
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
@@ -15923,6 +16245,63 @@ mod tests {
             state.install_proof(conflicting),
             Err(RejectReason::AlreadyDecided)
         );
+    }
+
+    #[test]
+    fn one_record_summary_without_a_proof_is_unavailable_not_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = |recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        };
+        let n1 = store("n1");
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            vec![
+                ("n1".into(), Box::new(n1.clone()) as Box<dyn RecorderRpc>),
+                ("n2".into(), Box::new(store("n2")) as Box<dyn RecorderRpc>),
+                ("n3".into(), Box::new(store("n3")) as Box<dyn RecorderRpc>),
+            ],
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"one-summary".to_vec());
+        n1.record_proposal(RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot: 1,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                1,
+                AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+            ),
+            command: Some(command),
+        })
+        .unwrap();
+        assert_eq!(n1.inspect_decision_proof(1).unwrap(), None);
+        assert_eq!(
+            consensus.inspect_certified_decision_at(
+                &RecorderRpcContext::default_timeout(),
+                1,
+                LogHash::ZERO,
+            ),
+            Ok(CertifiedDecisionInspection::Unavailable)
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
     struct FailingFromSlotRecorder {
@@ -21249,7 +21628,7 @@ mod tests {
                 1,
                 LogHash::ZERO,
             ),
-            Err(Error::NoQuorum)
+            Err(Error::TypedRecordRequired)
         );
     }
 

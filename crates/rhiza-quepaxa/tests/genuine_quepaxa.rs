@@ -653,7 +653,7 @@ fn three_interleaved_proposers_cooperate_on_one_value() {
 }
 
 #[test]
-fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
+fn recorder_crash_reopen_reconstructs_decision_from_a_durable_fast_proof() {
     let root = tempfile::tempdir().unwrap();
     let engine = consensus(root.path(), "n1");
     let before = engine
@@ -665,10 +665,12 @@ fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
         )
         .unwrap();
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
-    assert!(engine
-        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
-        .unwrap()
-        .is_none());
+    assert!(matches!(
+        engine
+            .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
+            .unwrap(),
+        Some(DecisionProof::FastPath { .. })
+    ));
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     drop(engine);
 
@@ -695,7 +697,7 @@ fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
 }
 
 #[test]
-fn proof_cache_absent_restart_recovers_after_one_recorder_is_lost() {
+fn durable_fast_proof_restart_recovers_after_one_recorder_is_lost() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let producer = consensus(root.path(), "n1");
@@ -711,10 +713,12 @@ fn proof_cache_absent_restart_recovers_after_one_recorder_is_lost() {
         )
         .unwrap();
     assert!(producer.finish_pending_rpcs(Duration::from_secs(1)));
-    assert!(producer
-        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
-        .unwrap()
-        .is_none());
+    assert!(matches!(
+        producer
+            .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 1)
+            .unwrap(),
+        Some(DecisionProof::FastPath { .. })
+    ));
     drop(producer);
 
     let recorders = ["n1", "n2"]
@@ -1115,7 +1119,7 @@ fn certified_inspection_cancels_queued_summary_before_nested_fetch() {
 }
 
 #[test]
-fn typed_inspection_reconstructs_fast_proof_without_a_proof_cache_or_proof_rpc() {
+fn typed_inspection_reads_durable_fast_proof_without_a_proof_rpc() {
     let root = tempfile::tempdir().unwrap();
     let (_, stores) = recorder_stores(root.path());
     let recorders = stores
@@ -1133,9 +1137,18 @@ fn typed_inspection_reconstructs_fast_proof_without_a_proof_cache_or_proof_rpc()
         )
         .unwrap();
     assert!(producer.finish_pending_rpcs(Duration::from_secs(1)));
-    assert!(stores
-        .iter()
-        .all(|(_, store)| store.inspect_decision_proof(1).unwrap().is_none()));
+    assert!(
+        stores
+            .iter()
+            .filter(|(_, store)| {
+                matches!(
+                    store.inspect_decision_proof(1).unwrap(),
+                    Some(DecisionProof::FastPath { .. })
+                )
+            })
+            .count()
+            >= 2
+    );
 
     let proof_inspections = Arc::new(AtomicUsize::new(0));
     let summary_inspections = Arc::new(AtomicUsize::new(0));
@@ -1214,7 +1227,7 @@ fn typed_inspection_recovers_phase2_proof_from_durable_quorum_without_a_proof_rp
 }
 
 #[test]
-fn phase2_recovery_does_not_substitute_a_later_summary_quorum() {
+fn phase2_recovery_does_not_substitute_summary_quorum_without_typed_command_fetch() {
     let root = tempfile::tempdir().unwrap();
     let (membership, stores) = recorder_stores(root.path());
     let v_command = StoredCommand::new(EntryType::Command, b"higher-prior".to_vec());
@@ -1308,14 +1321,12 @@ fn phase2_recovery_does_not_substitute_a_later_summary_quorum() {
     )
     .unwrap();
     assert_eq!(
-        summary_only
-            .inspect_certified_decision_at(
-                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
-                1,
-                LogHash::ZERO
-            )
-            .unwrap(),
-        CertifiedDecisionInspection::Pending
+        summary_only.inspect_certified_decision_at(
+            &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO
+        ),
+        Err(Error::TypedRecordRequired)
     );
     drop(summary_only);
 
@@ -2396,7 +2407,7 @@ impl RecorderRpc for CountingProofRecorder {
 }
 
 #[test]
-fn preferred_fast_path_piggybacks_command_without_post_ack_proof_writes() {
+fn preferred_fast_path_piggybacks_command_and_installs_a_proof_quorum_before_ack() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -2448,7 +2459,7 @@ fn preferred_fast_path_piggybacks_command_without_post_ack_proof_writes() {
     assert_eq!(entry.payload, command.payload);
     assert_eq!(counts.fetches.load(Ordering::SeqCst), 0);
     assert!(counts.piggybacks.load(Ordering::SeqCst) >= membership.quorum_size());
-    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
+    assert!(counts.proof_installs.load(Ordering::SeqCst) >= membership.quorum_size());
     for store in stores {
         assert_eq!(
             store.fetch_command(command.hash()).unwrap(),
@@ -2505,7 +2516,7 @@ fn non_preferred_path_piggybacks_command_and_installs_a_proof_quorum_before_ack(
 }
 
 #[test]
-fn non_preferred_path_does_not_ack_when_phase2_proof_install_lacks_a_quorum() {
+fn non_preferred_path_returns_unknown_outcome_when_phase2_proof_install_is_partial() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -2564,7 +2575,7 @@ fn non_preferred_path_does_not_ack_when_phase2_proof_install_lacks_a_quorum() {
                 b"proof-install-failure".to_vec()
             ),
         ),
-        Err(Error::NoQuorum)
+        Err(Error::UnknownOutcome)
     );
     assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 1);
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
@@ -2975,7 +2986,7 @@ fn proof_cache_accepts_different_metadata_for_the_same_decided_value() {
 }
 
 #[test]
-fn ordinary_fast_path_never_installs_a_proof_cache() {
+fn ordinary_fast_path_installs_a_proof_quorum_before_ack() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -3020,12 +3031,11 @@ fn ordinary_fast_path_never_installs_a_proof_cache() {
         .unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
-    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
-    assert_eq!(minority_proof_installs.load(Ordering::SeqCst), 0);
+    assert!(counts.proof_installs.load(Ordering::SeqCst) >= membership.quorum_size());
 }
 
 #[test]
-fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() {
+fn consecutive_ordinary_decisions_remain_reconstructable_from_durable_proofs() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -3088,11 +3098,15 @@ fn consecutive_ordinary_decisions_remain_reconstructable_without_proof_caches() 
         )
         .unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
-    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
+    assert!(counts.proof_installs.load(Ordering::SeqCst) >= membership.quorum_size() * 3);
     for slot in 1..=3 {
-        assert!(stores
-            .iter()
-            .all(|store| store.inspect_decision_proof(slot).unwrap().is_none()));
+        assert!(
+            stores
+                .iter()
+                .filter(|store| store.inspect_decision_proof(slot).unwrap().is_some())
+                .count()
+                >= membership.quorum_size()
+        );
     }
     for payload in [
         b"first".as_slice(),

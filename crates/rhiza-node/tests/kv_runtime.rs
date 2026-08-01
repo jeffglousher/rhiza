@@ -1,6 +1,10 @@
 #![cfg(feature = "kv")]
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{ExecutionProfile, LogHash};
@@ -14,15 +18,21 @@ use rhiza_node::{
     PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{
-    Error as QuePaxaError, Membership, RecordRequest, RecordSummary, RecorderFileStore,
-    RecorderRpc, RecorderRpcContext, ThreeNodeConsensus,
-};
+use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
 
 const CLUSTER_ID: &str = "rhiza:kv:cluster-a";
 
+static KV_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn kv_runtime_test_lock() -> MutexGuard<'static, ()> {
+    KV_RUNTIME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn kv_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
     let runtime =
@@ -59,6 +69,7 @@ fn kv_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
 
 #[test]
 fn kv_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
     let runtime =
@@ -83,14 +94,11 @@ fn kv_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
 
 #[test]
 fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
-    let runtime = NodeRuntime::open(
-        config.clone(),
-        consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
-        &[],
-    )
-    .unwrap();
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
     let first = runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
@@ -99,6 +107,7 @@ fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() 
         .unwrap();
     drop(runtime);
 
+    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
@@ -131,15 +140,12 @@ fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() 
 
 #[test]
 fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders() {
+    let _lock = kv_runtime_test_lock();
     for attempt in 0..20 {
         let dir = tempfile::tempdir().unwrap();
         let config = kv_config(dir.path());
-        let runtime = NodeRuntime::open(
-            config.clone(),
-            consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
-            &[],
-        )
-        .unwrap();
+        let runtime =
+            NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
         runtime
             .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
             .unwrap();
@@ -150,6 +156,7 @@ fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders()
             .unwrap();
         drop(runtime);
 
+        std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
         std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
         std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
@@ -168,6 +175,7 @@ fn corrupt_unanchored_kv_recovery_stably_restores_two_slots_from_two_recorders()
 
 #[test]
 fn missing_partial_and_identity_invalid_unanchored_kv_rebuild_from_qlog() {
+    let _lock = kv_runtime_test_lock();
     #[derive(Clone, Copy, Debug)]
     enum Fault {
         Missing,
@@ -224,43 +232,36 @@ fn missing_partial_and_identity_invalid_unanchored_kv_rebuild_from_qlog() {
 }
 
 #[test]
-fn corrupt_unanchored_kv_fails_closed_when_only_one_recorder_has_the_tail() {
+fn corrupt_unanchored_kv_recovers_from_one_certified_recorder_copy() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
-    let runtime = NodeRuntime::open(
-        config.clone(),
-        consensus_with_unavailable_third_recorder(dir.path(), "recorders"),
-        &[],
-    )
-    .unwrap();
-    runtime
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let committed = runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
     drop(runtime);
 
     std::fs::remove_dir_all(dir.path().join("recorders/n2")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
     std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
     std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
 
-    let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]);
-    let classification = match &reopened {
-        Ok(_) => "ok",
-        Err(NodeError::Unavailable(_)) => "unavailable",
-        Err(NodeError::Reconciliation(_)) => "reconciliation",
-        Err(_) => "other_error",
-    };
-    let diagnostic = match &reopened {
-        Ok(_) => "Ok(NodeRuntime)".to_owned(),
-        Err(error) => format!("Err({error:?})"),
-    };
-    assert!(
-        matches!(&reopened, Err(NodeError::Unavailable(_))),
-        "expected fail-closed Unavailable; result={diagnostic}; classification={classification}; tail_recorder_count=1; local_consensus_log=removed; kv_cache=corrupt"
+    let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]).unwrap();
+    let read = reopened.get_kv(b"key", ReadConsistency::Local).unwrap();
+    assert_eq!(read.value, Some(b"value".to_vec()));
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (committed.applied_index(), committed.hash())
     );
+    assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn corrupt_anchored_kv_requires_snapshot_without_quarantining_the_view() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
     let archive = initialized_checkpoint(&dir.path().join("archive")).await;
@@ -301,6 +302,7 @@ async fn corrupt_anchored_kv_requires_snapshot_without_quarantining_the_view() {
 
 #[test]
 fn corrupt_qlog_fails_before_kv_quarantine_and_preserves_both_views() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_config(dir.path());
     let runtime =
@@ -346,6 +348,7 @@ fn corrupt_qlog_fails_before_kv_quarantine_and_preserves_both_views() {
 
 #[test]
 fn kv_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let runtime = NodeRuntime::open(
         kv_config(dir.path()),
@@ -370,6 +373,7 @@ fn kv_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
 
 #[test]
 fn kv_scan_pages_ranges_and_prefixes_with_the_exact_snapshot_tip() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let runtime = NodeRuntime::open(
         kv_config(dir.path()),
@@ -422,8 +426,10 @@ fn kv_scan_pages_ranges_and_prefixes_with_the_exact_snapshot_tip() {
     assert_eq!(prefix.tip().applied_hash(), runtime.applied_hash().unwrap());
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_http_routes_use_base64_and_map_invalid_input_without_mutating_state() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -554,8 +560,10 @@ async fn kv_http_routes_use_base64_and_map_invalid_input_without_mutating_state(
     server.abort();
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn largest_node_valid_kv_record_scans_without_latching_readiness() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -629,8 +637,10 @@ async fn largest_node_valid_kv_record_scans_without_latching_readiness() {
     server.abort();
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
+    let _lock = kv_runtime_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let config = kv_http_config(dir.path())
         .with_writer_batching(8, Duration::from_millis(20))
@@ -710,8 +720,10 @@ async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
     server.abort();
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_original_outcome() {
+    let _lock = kv_runtime_test_lock();
     let root = tempfile::tempdir().unwrap();
     let archive_root = root.path().join("archive");
     let archive_backup = root.path().join("archive-backup");
@@ -917,67 +929,6 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
             ],
             1,
             LogHash::ZERO,
-        )
-        .unwrap(),
-    )
-}
-
-struct UnavailableRecorder;
-
-impl RecorderRpc for UnavailableRecorder {
-    fn record(
-        &self,
-        _context: &RecorderRpcContext,
-        _request: RecordRequest,
-    ) -> Result<RecordSummary, QuePaxaError> {
-        Err(QuePaxaError::ProposeFailed)
-    }
-
-    fn inspect_record_summary(
-        &self,
-        _context: &RecorderRpcContext,
-        _slot: u64,
-    ) -> Result<Option<RecordSummary>, QuePaxaError> {
-        Err(QuePaxaError::ProposeFailed)
-    }
-}
-
-fn consensus_with_unavailable_third_recorder(
-    root: &Path,
-    recorder_dir: &str,
-) -> Arc<ThreeNodeConsensus> {
-    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let recorder = |recorder_id| {
-        RecorderFileStore::new_with_membership(
-            root.join(recorder_dir).join(recorder_id),
-            recorder_id,
-            CLUSTER_ID,
-            1,
-            1,
-            membership.clone(),
-        )
-        .unwrap()
-    };
-    Arc::new(
-        ThreeNodeConsensus::from_recorders_with_ids(
-            CLUSTER_ID,
-            "n1",
-            1,
-            1,
-            vec![
-                (
-                    "n1".into(),
-                    Box::new(recorder("n1")) as Box<dyn RecorderRpc>,
-                ),
-                (
-                    "n2".into(),
-                    Box::new(recorder("n2")) as Box<dyn RecorderRpc>,
-                ),
-                (
-                    "n3".into(),
-                    Box::new(UnavailableRecorder) as Box<dyn RecorderRpc>,
-                ),
-            ],
         )
         .unwrap(),
     )
