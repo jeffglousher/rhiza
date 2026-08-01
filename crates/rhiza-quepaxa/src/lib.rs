@@ -7077,9 +7077,59 @@ impl ThreeNodeConsensus {
             {
                 return Err(error);
             }
-            return Err(Error::UnknownOutcome);
+            return self.reconcile_post_decision_unknown_outcome(
+                budget,
+                mutation_started,
+                &proof,
+                &_command,
+            );
         }
         Ok(DriveOutcome::Decision(proof))
+    }
+
+    /// A failed durable-proof acknowledgement is ambiguous only after a
+    /// decision exists. The installer has already drained its worker group
+    /// before returning, so this bounded inspection can reuse the same
+    /// caller deadline without nesting control-worker groups.
+    fn reconcile_post_decision_unknown_outcome(
+        &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
+        proof: &DecisionProof,
+        offered_command: &StoredCommand,
+    ) -> Result<DriveOutcome> {
+        let slot = proof_context(proof).0;
+        let value = proof
+            .proposal()
+            .value
+            .as_ref()
+            .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
+        match self.inspect_typed_record_summaries_with_budget(
+            budget,
+            mutation_started,
+            slot,
+            value.prev_hash,
+        ) {
+            Ok(CertifiedDecisionInspection::Committed(certified))
+                if certified.certificate.value == *value
+                    && certified.entry.entry_type == offered_command.entry_type
+                    && certified.entry.payload == offered_command.payload
+                    && self.command_matches_value(slot, value, offered_command) =>
+            {
+                Ok(DriveOutcome::Decision(proof.clone()))
+            }
+            // Both certificates were individually validated for this exact
+            // slot and predecessor. A different decided value is therefore
+            // safety evidence, never permission to acknowledge our offer.
+            Ok(CertifiedDecisionInspection::Committed(_)) => Err(Error::ConflictingCertificates),
+            Ok(
+                CertifiedDecisionInspection::Empty
+                | CertifiedDecisionInspection::Pending
+                | CertifiedDecisionInspection::Unavailable,
+            ) => Err(Error::UnknownOutcome),
+            Err(error) if Self::is_control_safety_error(&error) => Err(error),
+            Err(_) => Err(Error::UnknownOutcome),
+        }
     }
 
     fn finish_control_budget<'a>(
@@ -11089,14 +11139,14 @@ mod tests {
         pause_after_next_summary_provisional_none, record_budget_identity_for,
         reset_command_file_reads, reset_sync_counts, sync_counts, sync_wal_append,
         sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
-        CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus,
-        ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob, ControlJobCancellation,
-        ControlWorker, DecisionInspection, DecisionProof, DriveOutcome, Error, FileSyncKind,
-        Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
-        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
-        RecordedHeadProvenance, RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc,
-        RecorderRpcContext, RecorderSlotState, RecorderSummary, RejectReason, SealFaultPoint,
-        SingleNodeConsensus, Slot, ThreeNodeConsensus,
+        CertifiedDecisionInspection, ClusterId, ConfigChange, ConfigId, ConfigurationState,
+        Consensus, ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob,
+        ControlJobCancellation, ControlWorker, DecisionInspection, DecisionProof, DriveOutcome,
+        Epoch, Error, FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority,
+        ProposerProgress, ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState,
+        RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderPreflight,
+        RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState, RecorderSummary,
+        RejectReason, SealFaultPoint, SingleNodeConsensus, Slot, ThreeNodeConsensus,
     };
     #[cfg(feature = "test-hooks")]
     use super::{
@@ -16005,6 +16055,61 @@ mod tests {
         }
     }
 
+    /// Models a recorder which made the proof durable but lost the response.
+    /// The production caller must recover only from the independently
+    /// certified durable state, not from this wrapper's acknowledgement.
+    struct PersistThenUnknownInstallFileStore {
+        inner: RecorderFileStore,
+        persist: bool,
+    }
+
+    impl RecorderRpc for PersistThenUnknownInstallFileStore {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            context.check()?;
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> super::Result<()> {
+            context.check()?;
+            if self.persist {
+                self.inner.install_decision_proof(proof, membership)?;
+            }
+            Err(Error::UnknownOutcome)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: Slot,
+        ) -> super::Result<Option<RecordSummary>> {
+            context.check()?;
+            self.inner.inspect_record_summary(slot)
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: ClusterId,
+            epoch: Epoch,
+            config_id: ConfigId,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            context.check()?;
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
+    }
+
     struct GatedRecordRecorder {
         recorder_id: &'static str,
         release: Arc<(Mutex<bool>, Condvar)>,
@@ -20788,6 +20893,249 @@ mod tests {
     }
 
     #[test]
+    fn post_decision_unknown_recovers_only_from_a_certified_matching_entry() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(PersistThenUnknownInstallFileStore {
+                            inner: store.clone(),
+                            persist: true,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"durable-unknown".to_vec());
+        let entry = consensus
+            .propose_stored_at(
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+                command.clone(),
+            )
+            .expect("a quorum-certified durable matching proof resolves post-install ambiguity");
+        assert_eq!(entry.entry_type, command.entry_type);
+        assert_eq!(entry.payload, command.payload);
+        let CertifiedDecisionInspection::Committed(decision) = consensus
+            .inspect_certified_decision_at(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap()
+        else {
+            panic!("the reconciliation acknowledgement requires a certified decision");
+        };
+        assert_eq!(decision.entry, entry);
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert!(
+            consensus
+                .control_workers
+                .iter()
+                .all(|worker| !worker.state.quarantined.load(Ordering::Acquire)),
+            "an immediately drained lost response must not quarantine a reusable control worker"
+        );
+    }
+
+    #[test]
+    fn post_decision_unknown_never_acknowledges_a_certified_different_value() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let foreign = StoredCommand::new(EntryType::Command, b"foreign".to_vec());
+        let seed = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        seed.propose_stored_at(
+            RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+            1,
+            LogHash::ZERO,
+            foreign,
+        )
+        .unwrap();
+        drop(seed);
+
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(PersistThenUnknownInstallFileStore {
+                            inner: store.clone(),
+                            persist: false,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let offered = StoredCommand::new(EntryType::Command, b"offered".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &offered),
+        );
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: membership.members()[..membership.quorum_size()]
+                .iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.clone(),
+                    slot: 1,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            consensus.finish_decision_with_context(
+                proof,
+                Some(&offered),
+                false,
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &AtomicBool::new(false),
+            ),
+            Err(Error::ConflictingCertificates),
+            "a different certified value is safety evidence, never an acknowledgement of the offer"
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn post_decision_reconciliation_does_not_revive_a_cancelled_budget() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            membership
+                .members()
+                .iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.clone(),
+                        Box::new(SlotRecorder {
+                            recorder_id: match recorder_id.as_str() {
+                                "n1" => "n1",
+                                "n2" => "n2",
+                                "n3" => "n3",
+                                _ => unreachable!(),
+                            },
+                            reject_slot: None,
+                            observed: None,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"cancelled".to_vec());
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command),
+        );
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 1,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: membership.members()[..membership.quorum_size()]
+                .iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.clone(),
+                    slot: 1,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancelled),
+        );
+        let budget = ControlCallBudget::new(&context).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            consensus.reconcile_post_decision_unknown_outcome(
+                &budget,
+                &AtomicBool::new(true),
+                &proof,
+                &command,
+            ),
+            Err(Error::UnknownOutcome)
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn fast_path_decision_is_durable_before_a_conflicting_slot_proposal() {
         let root = tempfile::tempdir().unwrap();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
@@ -20888,6 +21236,138 @@ mod tests {
             Some(foreign_proof)
         );
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn concurrent_proposers_same_command_publish_one_durable_decision() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let proposer = |proposer_id| {
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                proposer_id,
+                1,
+                1,
+                ["n1", "n2", "n3"]
+                    .into_iter()
+                    .zip(stores.iter())
+                    .map(|(recorder_id, store)| {
+                        (
+                            recorder_id.into(),
+                            Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let consensuses = ["p1", "p2", "p3"].map(|proposer_id| Arc::new(proposer(proposer_id)));
+        let command = StoredCommand::new(EntryType::Command, b"same-concurrent-command".to_vec());
+        consensuses[0]
+            .register_command(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                command.hash(),
+                command.payload.clone(),
+            )
+            .unwrap();
+
+        let contexts: [RecorderRpcContext; 3] = std::array::from_fn(|_| {
+            RecorderRpcContext::with_timeout_and_cancellation(
+                Duration::from_secs(5),
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let record_probes: [Arc<TestControlOperationProbe>; 3] =
+            std::array::from_fn(|_| Arc::new(TestControlOperationProbe::default()));
+        let control_probes: [Arc<TestControlOperationProbe>; 3] =
+            std::array::from_fn(|_| Arc::new(TestControlOperationProbe::default()));
+        let _record_guards: [super::TestControlOperationProbeGuard; 3] =
+            std::array::from_fn(|index| {
+                consensuses[index]
+                    .install_test_record_operation_probe(1, Arc::clone(&record_probes[index]))
+                    .unwrap()
+            });
+        let _control_guards: [super::TestControlOperationProbeGuard; 3] =
+            std::array::from_fn(|index| {
+                super::install_test_control_operation_probe(
+                    &contexts[index],
+                    Arc::clone(&control_probes[index]),
+                )
+                .unwrap()
+            });
+        let start = Arc::new(Barrier::new(consensuses.len() + 1));
+        let callers: Vec<_> = consensuses
+            .iter()
+            .zip(contexts)
+            .map(|(consensus, context)| {
+                let consensus = Arc::clone(consensus);
+                let start = Arc::clone(&start);
+                let command = command.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    consensus.propose_stored_at(context, 1, LogHash::ZERO, command)
+                })
+            })
+            .collect();
+        start.wait();
+        let results: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect();
+
+        for consensus in &consensuses {
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        }
+        for (record, control) in record_probes.iter().zip(&control_probes) {
+            assert!(
+                record.dispatch_count() > 0,
+                "record broadcast was not admitted"
+            );
+            assert_eq!(record.pending(), 0);
+            assert_eq!(record.cancel_count(), 0);
+            assert_eq!(record.quarantine_count(), 0);
+            assert!(
+                control.dispatch_count() > 0,
+                "decision proof install was not admitted"
+            );
+            assert_eq!(control.pending(), 0);
+            assert_eq!(control.quarantine_count(), 0);
+        }
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent same-command proposal returned an ambiguous result; record/control dispatches: {:?}",
+            record_probes
+                .iter()
+                .zip(&control_probes)
+                .map(|(record, control)| (record.dispatch_count(), control.dispatch_count()))
+                .collect::<Vec<_>>(),
+        );
+        let entries: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        assert!(entries.iter().all(|entry| entry == &entries[0]));
+        let CertifiedDecisionInspection::Committed(decision) = consensuses[0]
+            .inspect_certified_decision_at(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap()
+        else {
+            panic!("a completed concurrent proposal must be authoritatively discoverable");
+        };
+        assert_eq!(decision.entry, entries[0]);
     }
 
     #[test]
