@@ -341,17 +341,68 @@ fn startup_recovers_after_recorder_rotation_and_one_permanent_voter_loss() {
 }
 
 #[test]
-fn startup_fails_closed_when_only_one_recorder_remembers_the_lost_local_tail() {
+fn startup_fails_closed_when_only_one_recorder_has_an_unproven_lost_local_tail() {
     let dir = tempfile::tempdir().unwrap();
     let config = node_config(dir.path());
-    let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
-    runtime.write("request-1", "alpha", "one").unwrap();
-    drop(runtime);
+    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let recorder = RecorderFileStore::new_with_membership(
+        dir.path().join("recorders/node-1"),
+        "node-1",
+        "rhiza:sql:cluster-a",
+        1,
+        1,
+        membership.clone(),
+    )
+    .unwrap();
+    let command = StoredCommand::new(
+        EntryType::Command,
+        b"put\trequest-unproven\talpha\tone".to_vec(),
+    );
+    let proposal = rhiza_quepaxa::Proposal::new(
+        rhiza_quepaxa::ProposalPriority::MAX,
+        "node-1",
+        1,
+        rhiza_quepaxa::AcceptedValue::from_command(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            1,
+            LogHash::ZERO,
+            &command,
+        ),
+    );
+    let summary = recorder
+        .record(RecordRequest {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot: 1,
+            step: 4,
+            proposal,
+            command: Some(command.clone()),
+        })
+        .unwrap();
+    assert_eq!(summary.decided, None);
+    assert_eq!(
+        recorder
+            .fetch_command_for(
+                "rhiza:sql:cluster-a".into(),
+                1,
+                1,
+                membership.digest(),
+                command.hash(),
+            )
+            .unwrap(),
+        Some(command)
+    );
+    assert_eq!(recorder.inspect_decision_proof(1).unwrap(), None);
+    drop(recorder);
 
-    std::fs::remove_dir_all(dir.path().join("recorders/node-2")).unwrap();
-    std::fs::remove_dir_all(dir.path().join("recorders/node-3")).unwrap();
-    std::fs::remove_dir_all(dir.path().join("consensus/log")).unwrap();
-    std::fs::remove_dir_all(dir.path().join("sqlite")).unwrap();
+    assert!(!dir.path().join("recorders/node-2").exists());
+    assert!(!dir.path().join("recorders/node-3").exists());
+    assert!(!dir.path().join("consensus/log").exists());
+    assert!(!dir.path().join("sqlite").exists());
 
     assert!(matches!(
         NodeRuntime::open(config, consensus(dir.path()), &[]),

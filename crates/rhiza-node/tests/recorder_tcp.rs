@@ -725,7 +725,7 @@ async fn recorder_tcp_lifecycle_receipts_listener_and_closes_a_partial_idle_read
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn three_tcp_recorders_reconstruct_ordinary_proof_from_typed_summaries() {
+async fn three_tcp_recorders_durably_record_ordinary_proof_in_typed_summaries() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
     let mut servers = Vec::new();
@@ -811,14 +811,17 @@ async fn three_tcp_recorders_reconstruct_ordinary_proof_from_typed_summaries() {
             .inspect_record_summary(&context, 1)
             .unwrap()
             .unwrap();
-        assert_eq!(summary.decided, None);
+        assert_eq!(summary.decided.as_ref(), Some(&proof));
         assert_eq!(summary.step, 4);
         assert_eq!(summary.first_current.as_ref(), Some(proof.proposal()));
         assert_eq!(summary.aggregate_prior, None);
-        assert_eq!(inspector.inspect_decision_proof(&context, 1).unwrap(), None);
+        assert_eq!(
+            inspector.inspect_decision_proof(&context, 1).unwrap(),
+            Some(proof.clone())
+        );
 
-        // The explicit proof-install transport remains for Phase2 and
-        // configuration transitions; this ordinary FastPath elides it.
+        // The explicit proof-install transport remains idempotent for ordinary
+        // decisions as well as Phase2 and configuration transitions.
         inspector
             .install_decision_proof(&context, proof.clone(), &install_membership)
             .unwrap();
