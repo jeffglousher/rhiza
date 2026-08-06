@@ -5526,11 +5526,6 @@ async fn handle_kv_batch(
             Ok(WriteOperationResult::Runtime(Err(error))) => {
                 return node_error_response(error);
             }
-            Ok(WriteOperationResult::Runtime(_)) => {
-                return node_error_response(NodeError::Invariant(
-                    "KV batch handler received non-KV response from writer".into(),
-                ));
-            }
             Ok(WriteOperationResult::DurabilityUnavailable) => {
                 return node_error_response(NodeError::Unavailable(
                     "durability confirmation is unavailable".into(),
