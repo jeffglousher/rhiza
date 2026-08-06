@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.1
+
+- Removes unreachable match arm in KV batch handler that caused clippy failure
+  under `-D warnings` in the KV profile CI.
+
 ## v0.6.0
 
 - Promotes Graph and KV profiles to production-ready status.
