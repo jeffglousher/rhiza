@@ -38,8 +38,8 @@ pub const MAX_GRAPH_PARAMETER_DEPTH: usize = 16;
 const MAX_GRAPH_PARAMETER_VALUES: usize = 4096;
 const MAX_GRAPH_PARAMETER_CONTAINER_VALUES: usize = 1024;
 const MAX_GRAPH_PARAMETER_NAME_BYTES: usize = 256;
-const LADYBUG_BUFFER_POOL_BYTES: u64 = 512 * 1024 * 1024;
-const LADYBUG_MAX_NUM_THREADS: u64 = 2;
+const DEFAULT_LADYBUG_BUFFER_POOL_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_LADYBUG_MAX_NUM_THREADS: u64 = 2;
 const LADYBUG_BUFFER_POOL_EXHAUSTED: &str =
     "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!";
 const LADYBUG_CONVERSION_ERROR_PREFIX: &str = "Conversion exception:";
@@ -862,6 +862,7 @@ pub struct LadybugStateMachine {
 }
 
 impl LadybugStateMachine {
+    #[tracing::instrument(level = "info", skip_all, fields(cluster_id, node_id, epoch, config_id))]
     pub fn open(
         path: impl AsRef<Path>,
         cluster_id: &str,
@@ -879,6 +880,7 @@ impl LadybugStateMachine {
         };
         let database = open_database(&path)?;
         initialize_or_validate(&database, &identity)?;
+        tracing::info!(cluster_id, node_id, epoch, config_id, "graph state machine opened");
         Ok(Self {
             path,
             identity,
@@ -887,6 +889,7 @@ impl LadybugStateMachine {
         })
     }
 
+    #[tracing::instrument(skip(self, entry), fields(index = entry.index))]
     pub fn apply_entry(&self, entry: &LogEntry) -> Result<ApplyOutcome> {
         if entry.recompute_hash() != entry.hash {
             return Err(Error::InvalidEntry(
@@ -1496,7 +1499,43 @@ fn open_database(path: &Path) -> Result<Database> {
 }
 
 fn ladybug_system_config() -> SystemConfig {
-    ladybug_system_config_with_limits(LADYBUG_BUFFER_POOL_BYTES, LADYBUG_MAX_NUM_THREADS)
+    let buffer_pool_size = match std::env::var("RHIZA_GRAPH_BUFFER_POOL_BYTES") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_BUFFER_POOL_BYTES=0 is invalid, using default {DEFAULT_LADYBUG_BUFFER_POOL_BYTES}"
+                );
+                DEFAULT_LADYBUG_BUFFER_POOL_BYTES
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_BUFFER_POOL_BYTES={val} is not a valid u64, using default {DEFAULT_LADYBUG_BUFFER_POOL_BYTES}"
+                );
+                DEFAULT_LADYBUG_BUFFER_POOL_BYTES
+            }
+        },
+        Err(_) => DEFAULT_LADYBUG_BUFFER_POOL_BYTES,
+    };
+    let max_num_threads = match std::env::var("RHIZA_GRAPH_MAX_NUM_THREADS") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_MAX_NUM_THREADS=0 is invalid, using default {DEFAULT_LADYBUG_MAX_NUM_THREADS}"
+                );
+                DEFAULT_LADYBUG_MAX_NUM_THREADS
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_MAX_NUM_THREADS={val} is not a valid u64, using default {DEFAULT_LADYBUG_MAX_NUM_THREADS}"
+                );
+                DEFAULT_LADYBUG_MAX_NUM_THREADS
+            }
+        },
+        Err(_) => DEFAULT_LADYBUG_MAX_NUM_THREADS,
+    };
+    ladybug_system_config_with_limits(buffer_pool_size, max_num_threads)
 }
 
 fn ladybug_system_config_with_limits(buffer_pool_size: u64, max_num_threads: u64) -> SystemConfig {

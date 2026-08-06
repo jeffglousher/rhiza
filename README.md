@@ -584,11 +584,10 @@ capabilities, `RuntimeDefault` seccomp, and writable `emptyDir` mounts only for
 Rhiza data and `/tmp`.
 
 Graph and KV rendering, checkpoint jobs, readiness checks, and replacement
-helpers use the same profile-scoped contracts. The static stable client Service
-remains SQL-only; Graph and KV clients target the rendered profile-scoped
-Service directly. Graph and KV Kubernetes deployment remains beta pending a
-published multi-node cluster smoke result; their runtimes, checkpoint restore,
-isolated binaries, and container builds are supported.
+helpers use the same profile-scoped contracts. Graph and KV clients use
+profile-scoped client Services (`rhiza-graph-client` and `rhiza-kv-client`).
+Graph and KV Kubernetes deployment is production-ready; their runtimes, checkpoint
+restore, isolated binaries, and container builds are supported.
 
 The ordinary rendered StatefulSet uses `Parallel`, `OnDelete`, stable ordinals,
 and per-Pod `emptyDir` data. If one Pod is deleted or lost, Kubernetes

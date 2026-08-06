@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.0
+
+- Promotes Graph and KV profiles to production-ready status.
+- Adds graph mutation endpoints (`/v1/graph/documents/put`,
+  `/v1/graph/documents/delete`) and corresponding CLI commands.
+- Adds KV batch API endpoint (`/v1/kv/batch`) for atomic multi-key operations.
+- Adds profile-scoped Kubernetes client Services (`rhiza-graph-client`,
+  `rhiza-kv-client`).
+- Replaces `expect()` panics in KV codec with proper error propagation.
+- Updates documentation to reflect production readiness of all profiles.
+
 ## v0.5.1
 
 - Publishes profile-isolated GHCR images for both Linux amd64 and arm64,

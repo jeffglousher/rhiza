@@ -11,10 +11,10 @@ fn put_and_delete_commands_have_one_canonical_encoding() {
     ];
 
     for command in commands {
-        let encoded = command.encode();
+        let encoded = command.encode().unwrap();
         assert!(encoded.starts_with(b"RHKV\0\x01"));
         assert_eq!(KvCommandV1::decode(&encoded).unwrap(), command);
-        assert_eq!(command.encode(), encoded);
+        assert_eq!(command.encode().unwrap(), encoded);
 
         let replicated = encode_replicated_kv_command(&command).unwrap();
         let envelope = ReplicatedCommandEnvelope::decode(&replicated).unwrap();
@@ -37,7 +37,7 @@ fn command_codec_rejects_empty_oversized_and_noncanonical_values() {
     );
 
     let command = KvCommandV1::delete("request", b"key".to_vec()).unwrap();
-    let mut trailing = command.encode();
+    let mut trailing = command.encode().unwrap();
     trailing.push(0);
     assert!(matches!(
         KvCommandV1::decode(&trailing),

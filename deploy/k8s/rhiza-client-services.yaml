@@ -15,3 +15,39 @@ spec:
     - name: client
       port: 8080
       targetPort: client
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-graph-client
+  labels:
+    app.kubernetes.io/name: rhiza
+    app.kubernetes.io/component: client
+    rhiza.dev/execution-profile: graph
+spec:
+  selector:
+    app.kubernetes.io/name: rhiza
+    rhiza.dev/execution-profile: graph
+    rhiza.dev/member-role: voter
+  ports:
+    - name: client
+      port: 8080
+      targetPort: client
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-kv-client
+  labels:
+    app.kubernetes.io/name: rhiza
+    app.kubernetes.io/component: client
+    rhiza.dev/execution-profile: kv
+spec:
+  selector:
+    app.kubernetes.io/name: rhiza
+    rhiza.dev/execution-profile: kv
+    rhiza.dev/member-role: voter
+  ports:
+    - name: client
+      port: 8080
+      targetPort: client

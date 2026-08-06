@@ -224,7 +224,7 @@ fn malformed_or_wrong_profile_commands_fail_closed_without_advancing() {
         ExecutionProfile::Sqlite,
         1,
         command.request_id(),
-        command.encode(),
+        command.encode().unwrap(),
     )
     .unwrap()
     .encode()
@@ -233,7 +233,7 @@ fn malformed_or_wrong_profile_commands_fail_closed_without_advancing() {
         ExecutionProfile::Kv,
         2,
         command.request_id(),
-        command.encode(),
+        command.encode().unwrap(),
     )
     .unwrap()
     .encode()
@@ -242,7 +242,7 @@ fn malformed_or_wrong_profile_commands_fail_closed_without_advancing() {
         ExecutionProfile::Kv,
         1,
         "different-request",
-        command.encode(),
+        command.encode().unwrap(),
     )
     .unwrap()
     .encode()
@@ -251,7 +251,7 @@ fn malformed_or_wrong_profile_commands_fail_closed_without_advancing() {
     trailing.push(0);
 
     for payload in [
-        command.encode(),
+        command.encode().unwrap(),
         sqlite_profile,
         unknown_version,
         mismatched_request,

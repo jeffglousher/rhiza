@@ -2060,16 +2060,19 @@ dependencies = [
  "proptest",
  "rhiza-core",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
 name = "rhiza-kv"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "redb",
  "rhiza-core",
  "rhiza-log",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

@@ -12,3 +12,7 @@ rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
 redb = "=4.1.0"
 tempfile.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1"

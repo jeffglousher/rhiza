@@ -43,11 +43,15 @@ use rhiza_node::{
     TcpPostcardRpcRecorderClient,
 };
 #[cfg(feature = "graph")]
-use rhiza_node::{GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto};
+use rhiza_node::{
+    GraphDeleteDocumentRequest, GraphMutationResponse, GraphPutDocumentRequest, GraphQueryRequest,
+    GraphQueryResponse, GraphQueryStatementDto, GraphValueDto,
+};
 #[cfg(feature = "kv")]
 use rhiza_node::{
-    KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvPutRequest, KvScanRequest,
-    KvScanResponse, MAX_KV_SCAN_ROWS,
+    KvBatchMemberRequest, KvBatchRequest, KvBatchResponse, KvDeleteRequest, KvGetRequest,
+    KvGetResponse, KvMutationResponse, KvPutRequest, KvScanRequest, KvScanResponse,
+    MAX_KV_SCAN_ROWS,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
@@ -252,6 +256,28 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             },
             Err(error) => fail("graph query", error),
         },
+        #[cfg(feature = "graph")]
+        Command::GraphPutDocument(args) => match request_graph_put_document(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("graph put-document", error.to_string()),
+            },
+            Err(error) => fail("graph put-document", error),
+        },
+        #[cfg(feature = "graph")]
+        Command::GraphDeleteDocument(args) => match request_graph_delete_document(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("graph delete-document", error.to_string()),
+            },
+            Err(error) => fail("graph delete-document", error),
+        },
         #[cfg(feature = "kv")]
         Command::KvGet(args) => match request_kv_get(&args).await {
             Ok(response) => match serde_json::to_string(&response) {
@@ -296,6 +322,17 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             },
             Err(error) => fail("kv delete", error),
         },
+        #[cfg(feature = "kv")]
+        Command::KvBatch(args) => match request_kv_batch(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv batch", error.to_string()),
+            },
+            Err(error) => fail("kv batch", error),
+        },
         Command::Health(args) => match request_health(&args).await {
             Ok(()) => {
                 println!("ok");
@@ -334,6 +371,10 @@ enum Command {
     SqlQuery(SqlQueryArgs),
     #[cfg(feature = "graph")]
     GraphQuery(GraphQueryArgs),
+    #[cfg(feature = "graph")]
+    GraphPutDocument(GraphPutDocumentArgs),
+    #[cfg(feature = "graph")]
+    GraphDeleteDocument(GraphDeleteDocumentArgs),
     #[cfg(feature = "kv")]
     KvGet(KvGetArgs),
     #[cfg(feature = "kv")]
@@ -342,6 +383,8 @@ enum Command {
     KvPut(KvPutArgs),
     #[cfg(feature = "kv")]
     KvDelete(KvDeleteArgs),
+    #[cfg(feature = "kv")]
+    KvBatch(KvBatchArgs),
     Health(HealthArgs),
 }
 
@@ -389,6 +432,20 @@ struct GraphQueryArgs {
     max_rows: Option<u32>,
 }
 
+#[cfg(feature = "graph")]
+struct GraphPutDocumentArgs {
+    urls: Vec<String>,
+    token: String,
+    request: GraphPutDocumentRequest,
+}
+
+#[cfg(feature = "graph")]
+struct GraphDeleteDocumentArgs {
+    urls: Vec<String>,
+    token: String,
+    request: GraphDeleteDocumentRequest,
+}
+
 #[cfg(feature = "kv")]
 struct KvGetArgs {
     urls: Vec<String>,
@@ -415,6 +472,13 @@ struct KvDeleteArgs {
     urls: Vec<String>,
     token: String,
     request: KvDeleteRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvBatchArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvBatchRequest,
 }
 
 struct HealthArgs {
@@ -1357,8 +1421,12 @@ fn parse_graph_command(args: impl IntoIterator<Item = String>) -> Result<Command
         Some("query") => {
             parse_graph_query(args, |name| env::var(name).ok()).map(Command::GraphQuery)
         }
+        Some("put-document") => parse_graph_put_document(args, |name| env::var(name).ok())
+            .map(Command::GraphPutDocument),
+        Some("delete-document") => parse_graph_delete_document(args, |name| env::var(name).ok())
+            .map(Command::GraphDeleteDocument),
         Some(other) => Err(format!("unknown graph command: {other}")),
-        None => Err("missing graph command: query".into()),
+        None => Err("missing graph command: query|put-document|delete-document".into()),
     }
 }
 
@@ -1411,6 +1479,70 @@ fn parse_graph_query(
     })
 }
 
+#[cfg(feature = "graph")]
+fn parse_graph_put_document(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<GraphPutDocumentArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut request_id = None;
+    let mut id = None;
+    let mut value = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--request-id" => request_id = Some(next_value(&mut args, "--request-id")?),
+            "--id" => id = Some(next_value(&mut args, "--id")?),
+            "--value-json" => value = Some(next_value(&mut args, "--value-json")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    let value_json = required_arg(value, "--value-json")?;
+    let value: GraphValueDto = serde_json::from_str(&value_json)
+        .map_err(|error| format!("invalid --value-json: {error}"))?;
+    Ok(GraphPutDocumentArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: GraphPutDocumentRequest {
+            request_id: required_arg(request_id, "--request-id")?,
+            id: required_arg(id, "--id")?,
+            value,
+        },
+    })
+}
+
+#[cfg(feature = "graph")]
+fn parse_graph_delete_document(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<GraphDeleteDocumentArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut request_id = None;
+    let mut id = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--request-id" => request_id = Some(next_value(&mut args, "--request-id")?),
+            "--id" => id = Some(next_value(&mut args, "--id")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(GraphDeleteDocumentArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: GraphDeleteDocumentRequest {
+            request_id: required_arg(request_id, "--request-id")?,
+            id: required_arg(id, "--id")?,
+        },
+    })
+}
+
 #[cfg(feature = "kv")]
 fn parse_kv_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
@@ -1419,8 +1551,9 @@ fn parse_kv_command(args: impl IntoIterator<Item = String>) -> Result<Command, S
         Some("scan") => parse_kv_scan(args, |name| env::var(name).ok()).map(Command::KvScan),
         Some("put") => parse_kv_put(args, |name| env::var(name).ok()).map(Command::KvPut),
         Some("delete") => parse_kv_delete(args, |name| env::var(name).ok()).map(Command::KvDelete),
+        Some("batch") => parse_kv_batch(args, |name| env::var(name).ok()).map(Command::KvBatch),
         Some(other) => Err(format!("unknown kv command: {other}")),
-        None => Err("missing kv command: get|scan|put|delete".into()),
+        None => Err("missing kv command: get|scan|put|delete|batch".into()),
     }
 }
 
@@ -1579,6 +1712,33 @@ fn parse_kv_delete(
             request_id: required_arg(request_id, "--request-id")?,
             key: required_arg(key, "--key-base64")?,
         },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_batch(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvBatchArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut members_json = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--members-json" => members_json = Some(next_value(&mut args, "--members-json")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    let members_json = required_arg(members_json, "--members-json")?;
+    let members: Vec<KvBatchMemberRequest> = serde_json::from_str(&members_json)
+        .map_err(|error| format!("invalid --members-json: {error}"))?;
+    Ok(KvBatchArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvBatchRequest { members },
     })
 }
 
@@ -4276,6 +4436,26 @@ async fn request_graph_query(args: &GraphQueryArgs) -> Result<GraphQueryResponse
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "graph")]
+async fn request_graph_put_document(
+    args: &GraphPutDocumentArgs,
+) -> Result<GraphMutationResponse, String> {
+    remote_client(&args.urls, &args.token)?
+        .graph_put_document(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "graph")]
+async fn request_graph_delete_document(
+    args: &GraphDeleteDocumentArgs,
+) -> Result<GraphMutationResponse, String> {
+    remote_client(&args.urls, &args.token)?
+        .graph_delete_document(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "kv")]
 async fn request_kv_get(args: &KvGetArgs) -> Result<KvGetResponse, String> {
     remote_client(&args.urls, &args.token)?
@@ -4304,6 +4484,14 @@ async fn request_kv_put(args: &KvPutArgs) -> Result<KvMutationResponse, String> 
 async fn request_kv_delete(args: &KvDeleteArgs) -> Result<KvMutationResponse, String> {
     remote_client(&args.urls, &args.token)?
         .kv_delete(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_batch(args: &KvBatchArgs) -> Result<KvBatchResponse, String> {
+    remote_client(&args.urls, &args.token)?
+        .kv_batch(args.request.clone())
         .await
         .map_err(|error| error.to_string())
 }

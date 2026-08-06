@@ -168,9 +168,8 @@ impl KvCommandV1 {
         &self.request_id
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        self.validate()
-            .expect("KvCommandV1 constructors and decode preserve invariants");
+    pub fn encode(&self) -> std::result::Result<Vec<u8>, Error> {
+        self.validate()?;
         let (key, value_len) = match &self.operation {
             KvOperationV1::Put { key, value } => (key, Some(value.len())),
             KvOperationV1::Delete { key } => (key, None),
@@ -201,7 +200,7 @@ impl KvCommandV1 {
                 encoded.extend_from_slice(key);
             }
         }
-        encoded
+        Ok(encoded)
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, Error> {
@@ -304,7 +303,7 @@ pub fn encode_replicated_kv_command(command: &KvCommandV1) -> Result<Vec<u8>, Er
         ExecutionProfile::Kv,
         COMMAND_VERSION,
         command.request_id(),
-        command.encode(),
+        command.encode()?,
     )
     .and_then(|envelope| envelope.encode())
     .map_err(|error| Error::Codec(error.to_string()))
@@ -331,7 +330,7 @@ pub fn encode_replicated_kv_batch(commands: &[KvCommandV1]) -> Result<Vec<u8>, E
                 command.request_id()
             )));
         }
-        let encoded = command.encode();
+        let encoded = command.encode()?;
         body.extend_from_slice(
             &u32::try_from(encoded.len())
                 .map_err(|_| Error::Codec("KV batch member is too large".into()))?
@@ -418,7 +417,7 @@ fn decode_replicated_kv_commands(payload: &[u8]) -> Result<Vec<DecodedKvCommand>
                     .map_err(|_| Error::Codec("KV batch member length overflow".into()))?;
                 let encoded = decoder.take(length)?;
                 let command = KvCommandV1::decode(encoded)?;
-                if command.encode() != encoded {
+                if command.encode()? != encoded {
                     return Err(Error::Codec("noncanonical KV batch member".into()));
                 }
                 if !request_ids.insert(command.request_id().to_owned()) {
@@ -843,6 +842,7 @@ pub struct RedbStateMachine {
 }
 
 impl RedbStateMachine {
+    #[tracing::instrument(level = "info", skip_all, fields(epoch, config_id))]
     pub fn open(
         path: impl AsRef<Path>,
         cluster_id: impl Into<String>,
@@ -862,6 +862,7 @@ impl RedbStateMachine {
         }
         let database = Database::create(path).map_err(database_error)?;
         initialize_or_validate(&database, &cluster_id, &node_id, epoch, config_id)?;
+        tracing::info!(cluster_id, node_id, epoch, config_id, "kv state machine opened");
         Ok(Self {
             database,
             cluster_id,
@@ -872,11 +873,13 @@ impl RedbStateMachine {
     }
 
     /// Returns a copied value. No raw transaction or iterator is exposed.
+    #[tracing::instrument(skip(self), fields(key_len = key.len()))]
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         Ok(self.get_with_tip(key)?.value)
     }
 
     /// Returns a copied value and applied tip from exactly one redb read transaction.
+    #[tracing::instrument(skip(self), fields(key_len = key.len()))]
     pub fn get_with_tip(&self, key: &[u8]) -> Result<KvGetResult, Error> {
         validate_key(key)?;
         let read = self.database.begin_read().map_err(database_error)?;
@@ -1198,6 +1201,7 @@ impl RedbStateMachine {
     }
 
     /// Applies one qlog entry in exactly one redb write transaction.
+    #[tracing::instrument(skip(self, entry), fields(index = entry.index))]
     pub fn apply_entry(&self, entry: &LogEntry) -> Result<ApplyOutcome, Error> {
         self.validate_entry_identity(entry)?;
         if entry.recompute_hash() != entry.hash {
@@ -1954,7 +1958,7 @@ mod replicated_batch_tests {
         let mut forged_body = envelope.body().to_vec();
         let count_offset = BATCH_COMMAND_MAGIC.len();
         forged_body[count_offset..count_offset + 2].copy_from_slice(&1025_u16.to_be_bytes());
-        let extra = oversized.last().unwrap().encode();
+        let extra = oversized.last().unwrap().encode().unwrap();
         forged_body.extend_from_slice(&(extra.len() as u32).to_be_bytes());
         forged_body.extend_from_slice(&extra);
         let forged = ReplicatedCommandEnvelope::new(

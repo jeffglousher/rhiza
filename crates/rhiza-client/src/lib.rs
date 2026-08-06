@@ -36,12 +36,14 @@ pub mod wire {
 
     #[cfg(feature = "graph")]
     pub use rhiza_node::{
-        GraphColumnDto, GraphQueryParameterDto, GraphQueryRequest, GraphQueryResponse,
-        GraphQueryStatementDto, GraphResultValueDto,
+        GraphColumnDto, GraphDeleteDocumentRequest, GraphMutationResponse, GraphPutDocumentRequest,
+        GraphQueryParameterDto, GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto,
+        GraphResultValueDto,
     };
 
     #[cfg(feature = "kv")]
     pub use rhiza_node::{
+        KvBatchMemberRequest, KvBatchMemberResponse, KvBatchRequest, KvBatchResponse,
         KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvPutRequest,
         KvScanEntryDto, KvScanRequest, KvScanResponse,
     };
@@ -122,6 +124,24 @@ impl RhizaClient {
         .await
     }
 
+    #[cfg(feature = "graph")]
+    pub async fn graph_put_document(
+        &self,
+        request: wire::GraphPutDocumentRequest,
+    ) -> Result<wire::GraphMutationResponse, ClientError> {
+        self.json_request(rhiza_node::GRAPH_PUT_DOCUMENT_PATH, &request, true)
+            .await
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn graph_delete_document(
+        &self,
+        request: wire::GraphDeleteDocumentRequest,
+    ) -> Result<wire::GraphMutationResponse, ClientError> {
+        self.json_request(rhiza_node::GRAPH_DELETE_DOCUMENT_PATH, &request, true)
+            .await
+    }
+
     #[cfg(feature = "kv")]
     pub async fn kv_put(
         &self,
@@ -164,6 +184,15 @@ impl RhizaClient {
             read_can_hedge(request.consistency),
         )
         .await
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn kv_batch(
+        &self,
+        request: wire::KvBatchRequest,
+    ) -> Result<wire::KvBatchResponse, ClientError> {
+        self.json_request(rhiza_node::KV_BATCH_PATH, &request, true)
+            .await
     }
 
     fn build(

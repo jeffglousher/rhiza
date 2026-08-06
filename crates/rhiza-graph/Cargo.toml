@@ -11,6 +11,7 @@ description = "LadybugDB materialized state machine for rhiza graph"
 lbug = "=0.18.1"
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 tempfile.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest = "1"
