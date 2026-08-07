@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use rhiza_kv::{KvCommandV1, Error};
+use rhiza_kv::{Error, KvCommandV1};
 
 proptest! {
     #[test]

@@ -5437,9 +5437,7 @@ async fn handle_kv_batch(
                     "command exceeds {MAX_COMMAND_BYTES} bytes"
                 )));
             }
-            Err(error) => {
-                return node_error_response(NodeError::InvalidRequest(error.to_string()))
-            }
+            Err(error) => return node_error_response(NodeError::InvalidRequest(error.to_string())),
         };
         let request_id = format!("__rhiza_kv_batch_{batch_id}_{idx}");
         let deadline = tokio::time::Instant::now() + CLIENT_WRITE_WAIT_TIMEOUT;
@@ -5519,6 +5517,7 @@ async fn handle_kv_batch(
                     },
                 });
             }
+            #[cfg(any(feature = "sql", feature = "graph"))]
             Ok(WriteOperationResult::Runtime(Ok(_))) => {
                 return node_error_response(NodeError::Invariant(
                     "KV batch returned a response for another profile".into(),
@@ -5533,9 +5532,7 @@ async fn handle_kv_batch(
                 ));
             }
             Err(_) => {
-                return node_error_response(NodeError::Unavailable(
-                    "write timed out".into(),
-                ));
+                return node_error_response(NodeError::Unavailable("write timed out".into()));
             }
         }
     }
