@@ -343,7 +343,6 @@ fn local_file_backed_rejects_uncompiled_profiles_before_creating_state() {
 
     if rejected == 0 {
         // All profiles are compiled; the test cannot exercise an uncompiled case.
-        return;
     }
 }
 
