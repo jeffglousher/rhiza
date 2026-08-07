@@ -55,6 +55,8 @@ pub struct RhizaClient {
     bearer_token: String,
     http: reqwest::Client,
     policy: ClientPolicy,
+    #[cfg(feature = "tuner")]
+    tuner: Option<std::sync::Arc<rhiza_tuner::MabTuner>>,
 }
 
 impl RhizaClient {
@@ -225,6 +227,8 @@ impl RhizaClient {
             bearer_token,
             http,
             policy,
+            #[cfg(feature = "tuner")]
+            tuner: None,
         })
     }
 
@@ -248,28 +252,80 @@ impl RhizaClient {
         T: DeserializeOwned + Send + 'static,
     {
         let body = serde_json::to_vec(request).map_err(|_| ClientError::request_encoding())?;
+
+        // Use tuner to determine endpoint order and hedge delay
+        #[cfg(feature = "tuner")]
+        let (ordered_endpoints, hedge_delay_duration, correlation_id) = if let Some(tuner) =
+            &self.tuner
+        {
+            let identity = rhiza_tuner::Identity {
+                cluster_id: String::new(),
+                epoch: 0,
+                config_id: 0,
+                membership_digest: [0u8; 32],
+                recovery_generation: 0,
+            };
+            let eligible: Vec<rhiza_tuner::NodeId> = self.endpoints.to_vec();
+            let candidate_set = rhiza_tuner::CandidateSet {
+                identity: identity.clone(),
+                eligible_voters: eligible.clone(),
+                hedge_delay_allowlist: rhiza_tuner::HedgeDelayBucket::all_buckets().to_vec(),
+                static_hedge_delay_ms: 100,
+            };
+            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let result = tuner.select_action(&identity, &eligible, &candidate_set, &correlation_id);
+            let preferred = &result.output.action.first_request_target;
+            let mut ordered = self.endpoints.clone();
+            if let Some(pos) = ordered.iter().position(|e| e == preferred) {
+                let endpoint = ordered.remove(pos);
+                ordered.insert(0, endpoint);
+            }
+            let delay_ms = result
+                .output
+                .action
+                .hedge_delay
+                .as_ms()
+                .unwrap_or(self.policy.hedge_delay.as_millis() as u64);
+            (
+                ordered,
+                Duration::from_millis(delay_ms),
+                Some(correlation_id),
+            )
+        } else {
+            (self.endpoints.clone(), self.policy.hedge_delay, None)
+        };
+
+        #[cfg(not(feature = "tuner"))]
+        let (ordered_endpoints, hedge_delay_duration, _correlation_id): (
+            Vec<String>,
+            Duration,
+            Option<String>,
+        ) = (self.endpoints.clone(), self.policy.hedge_delay, None);
+
         let attempt = ClientAttempt {
             client: self.http.clone(),
             token: self.bearer_token.clone(),
             path: path.to_owned(),
             body,
-            server_fields: ServerFieldSanitizer::new(&self.endpoints, &self.bearer_token),
+            server_fields: ServerFieldSanitizer::new(&ordered_endpoints, &self.bearer_token),
             timeout: self.policy.attempt_timeout,
         };
         let mut attempts = tokio::task::JoinSet::new();
         let mut next = 0;
         let mut last_error = None;
 
-        spawn_client_attempt(&mut attempts, &self.endpoints[next], &attempt);
+        #[cfg(feature = "tuner")]
+        let start_time = tokio::time::Instant::now();
+        spawn_client_attempt(&mut attempts, &ordered_endpoints[next], &attempt);
         next += 1;
 
-        let hedge_delay = tokio::time::sleep(self.policy.hedge_delay);
+        let hedge_delay = tokio::time::sleep(hedge_delay_duration);
         let operation_deadline = tokio::time::sleep(self.policy.operation_timeout);
         tokio::pin!(hedge_delay, operation_deadline);
 
-        loop {
-            if attempts.is_empty() && next == self.endpoints.len() {
-                return Err(last_error.unwrap_or_else(ClientError::missing_endpoint));
+        let result = loop {
+            if attempts.is_empty() && next == ordered_endpoints.len() {
+                break Err(last_error.unwrap_or_else(ClientError::missing_endpoint));
             }
 
             tokio::select! {
@@ -277,37 +333,63 @@ impl RhizaClient {
                     match result.expect("a nonempty attempt set must yield a result") {
                         Ok(Ok(response)) => {
                             attempts.abort_all();
-                            return Ok(response);
+                            break Ok(response);
                         }
                         Ok(Err(error)) if !error.retryable() => {
                             attempts.abort_all();
-                            return Err(error);
+                            break Err(error);
                         }
                         Ok(Err(error)) => {
                             last_error = Some(error);
-                            if let Some(endpoint) = self.endpoints.get(next) {
+                            if let Some(endpoint) = ordered_endpoints.get(next) {
                                 spawn_client_attempt(&mut attempts, endpoint, &attempt);
                                 next += 1;
-                                hedge_delay.as_mut().reset(tokio::time::Instant::now() + self.policy.hedge_delay);
+                                hedge_delay.as_mut().reset(tokio::time::Instant::now() + hedge_delay_duration);
                             }
                         }
                         Err(_) => {
                             attempts.abort_all();
-                            return Err(ClientError::attempt_task_failed());
+                            break Err(ClientError::attempt_task_failed());
                         }
                     }
                 }
-                () = &mut hedge_delay, if hedge && next < self.endpoints.len() => {
-                    spawn_client_attempt(&mut attempts, &self.endpoints[next], &attempt);
+                () = &mut hedge_delay, if hedge && next < ordered_endpoints.len() => {
+                    spawn_client_attempt(&mut attempts, &ordered_endpoints[next], &attempt);
                     next += 1;
-                    hedge_delay.as_mut().reset(tokio::time::Instant::now() + self.policy.hedge_delay);
+                    hedge_delay.as_mut().reset(tokio::time::Instant::now() + hedge_delay_duration);
                 }
                 () = &mut operation_deadline => {
                     attempts.abort_all();
-                    return Err(last_error.unwrap_or_else(ClientError::operation_deadline));
+                    break Err(last_error.unwrap_or_else(ClientError::operation_deadline));
                 }
             }
+        };
+
+        // Record outcome to tuner
+        #[cfg(feature = "tuner")]
+        if let (Some(tuner), Some(cid)) = (&self.tuner, &correlation_id) {
+            let latency_us = start_time.elapsed().as_micros() as u64;
+            let action = rhiza_tuner::Action {
+                first_request_target: ordered_endpoints.first().cloned().unwrap_or_default(),
+                hedge_delay: rhiza_tuner::HedgeDelayBucket::Static,
+            };
+            let outcome = match &result {
+                Ok(_) => rhiza_tuner::TerminalOutcome::Success {
+                    decision_latency_us: latency_us,
+                    additional_rpcs: (next - 1) as u32,
+                    duplicate_proposer_work: next > 1,
+                    contention_or_round_escalation: false,
+                },
+                Err(error) if error.retryable() => rhiza_tuner::TerminalOutcome::Timeout,
+                Err(_) => rhiza_tuner::TerminalOutcome::Error {
+                    additional_rpcs: (next - 1) as u32,
+                    duplicate_proposer_work: next > 1,
+                },
+            };
+            tuner.record_outcome(cid, &action, &outcome);
         }
+
+        result
     }
 }
 
