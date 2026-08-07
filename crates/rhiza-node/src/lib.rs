@@ -4879,8 +4879,10 @@ async fn writer_loop(
     batch_max: usize,
     batch_window: Duration,
 ) {
+    // Hoist batch vector allocation outside the loop to reuse across iterations.
+    let mut queued = Vec::with_capacity(batch_max);
     while let Some(first) = receiver.recv().await {
-        let mut queued = Vec::with_capacity(batch_max);
+        queued.clear();
         queued.push(first);
         let deadline = tokio::time::Instant::now() + batch_window;
         while queued.len() < batch_max {
@@ -4892,7 +4894,7 @@ async fn writer_loop(
 
         let mut dispatch = Vec::with_capacity(queued.len());
         let mut members = Vec::with_capacity(queued.len());
-        for queued in queued {
+        for queued in queued.drain(..) {
             members.push(RuntimeBatchMember {
                 #[cfg(feature = "sql")]
                 request_id: queued.request_id.clone(),

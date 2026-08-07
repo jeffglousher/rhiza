@@ -1910,18 +1910,19 @@ fn ensure_open_segment(inner: &mut FileLogStoreInner, first: &LogEntry) -> Resul
 }
 
 fn seal_open_segment(inner: &mut FileLogStoreInner) -> Result<()> {
-    let Some(open) = &inner.open_segment else {
+    let Some(mut open) = inner.open_segment.take() else {
         return Ok(());
     };
-    open.file
-        .sync_data()
-        .map_err(|err| Error::Io(err.to_string()))?;
-    let entries = open.entries.clone();
-    let open_path = open.path.clone();
+    // Sync the file first — if this fails, restore the open segment.
+    if let Err(err) = open.file.sync_data() {
+        inner.open_segment = Some(open);
+        return Err(Error::Io(err.to_string()));
+    }
+    let entries = std::mem::take(&mut open.entries);
+    let open_path = &open.path;
 
     if entries.is_empty() {
-        fs::remove_file(&open_path).map_err(|err| Error::Io(err.to_string()))?;
-        inner.open_segment = None;
+        fs::remove_file(open_path).map_err(|err| Error::Io(err.to_string()))?;
         sync_directory(&inner.dir)?;
         return Ok(());
     }
@@ -1938,8 +1939,7 @@ fn seal_open_segment(inner: &mut FileLogStoreInner) -> Result<()> {
     } else {
         publish_closed_segment(&inner.dir, &entries)?;
     }
-    fs::remove_file(&open_path).map_err(|err| Error::Io(err.to_string()))?;
-    inner.open_segment = None;
+    fs::remove_file(open_path).map_err(|err| Error::Io(err.to_string()))?;
     inner.segments.push(ClosedSegment { entries });
     sync_directory(&inner.dir)
 }
