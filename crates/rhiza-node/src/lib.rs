@@ -868,13 +868,7 @@ pub enum AckMode {
     DrStrong,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadConsistency {
-    Local,
-    ReadBarrier,
-    AppliedIndex(LogIndex),
-}
+pub use rhiza_core::ReadConsistency;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FetchLogRequest {
@@ -5524,6 +5518,11 @@ async fn handle_kv_batch(
                         }
                     },
                 });
+            }
+            Ok(WriteOperationResult::Runtime(Ok(_))) => {
+                return node_error_response(NodeError::Invariant(
+                    "KV batch returned a response for another profile".into(),
+                ));
             }
             Ok(WriteOperationResult::Runtime(Err(error))) => {
                 return node_error_response(error);

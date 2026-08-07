@@ -14,10 +14,15 @@ name = "rhizadb"
 name = "graph_embedded"
 required-features = ["graph"]
 
+[[test]]
+name = "kv_embedded"
+required-features = ["kv"]
+
 [features]
 default = ["sql"]
 sql = ["dep:rhiza-sql", "rhiza-node/sql"]
 graph = ["dep:rhiza-graph", "rhiza-node/graph"]
+kv = ["dep:rhiza-kv", "rhiza-node/kv"]
 recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
 # Non-production synchronization API used only by integration tests that must
 # pause the real service activation boundary.
@@ -30,6 +35,7 @@ hyper-util.workspace = true
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 rhiza-graph = { version = "0.2.0", path = "../rhiza-graph", optional = true }
+rhiza-kv = { version = "0.1.0", path = "../rhiza-kv", optional = true }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
 rhiza-node = { version = "0.4.0", path = "../rhiza-node", default-features = false }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }

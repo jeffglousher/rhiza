@@ -23,8 +23,7 @@ const SANITIZED_UNKNOWN_SERVER_CODE: &str = "unknown_server_error";
 
 /// Feature-gated wire request and response types used by [`RhizaClient`].
 pub mod wire {
-    #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
-    pub use rhiza_node::ReadConsistency;
+    pub use rhiza_core::ReadConsistency;
 
     #[cfg(feature = "sql")]
     pub use rhiza_node::{
