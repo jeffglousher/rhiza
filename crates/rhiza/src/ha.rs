@@ -1,3 +1,46 @@
+//! High-availability node ownership and membership replacement.
+//!
+//! # Flow Overview
+//!
+//! ## Normal Node Startup
+//!
+//! ```text
+//! HaStartupConfig::new(...)
+//!     .start(HaServeConfig::new(recorder, service, transport, recorders, log_peers))
+//!     -> HaNode
+//!         .ready() -> RhizaHandle
+//!         .monitor() -> watches for failures
+//!         .shutdown() -> graceful drain
+//! ```
+//!
+//! ## Membership Replacement (Stop-and-Replace)
+//!
+//! ```text
+//! HaSuccessorPrestageConfig::new(...)
+//!     .prepare() -> PreparedHaSuccessorPrestage
+//!         .publish(...) -> PublishedHaSuccessorPrestage
+//!             .apply_page(...)  // catch-up from predecessor
+//!             .finalize(...) -> HaStartupConfig
+//!                 .with_predecessor(predecessor)
+//!                 .start(serve) -> HaSuccessorNode
+//!                     .bind_predecessor(predecessor)
+//!                     .ready() -> RhizaHandle
+//!                     .shutdown()
+//! ```
+//!
+//! # Key Types
+//!
+//! - [`HaStartupConfig`]: Configuration for a normal or successor node startup.
+//! - [`HaServeConfig`]: Bound listeners, transport, and recorder/log-peer clients.
+//! - [`HaNode`]: Running normal node owner. Call [`HaNode::ready`] then [`HaNode::monitor`].
+//! - [`HaSuccessorNode`]: Running successor node owner after membership replacement.
+//! - [`HaSuccessorPrestageConfig`]: Entry point for the successor prestage flow.
+//!
+//! # Shutdown
+//!
+//! Both [`HaNode`] and [`HaSuccessorNode`] implement the same shutdown contract:
+//! call [`HaNode::shutdown`] (not just drop) to drain and report errors.
+
 use std::{
     fmt, fs,
     future::Future,
@@ -803,6 +846,13 @@ struct HaNodeSnapshot {
     terminal_error: Option<HaNodeError>,
 }
 
+/// Running high-availability node owner.
+///
+/// Obtain from [`HaStartupConfig::start`]. Call [`Self::ready`] to wait for
+/// readiness and get a [`RhizaHandle`], then [`Self::monitor`] to watch for
+/// background failures. During planned shutdown, call [`Self::shutdown`].
+///
+/// Dropping the owner starts deadline-bounded cleanup but cannot report errors.
 pub struct HaNode {
     shutdown: tokio::sync::watch::Sender<ShutdownSignal>,
     recorder_shutdown: tokio::sync::watch::Sender<bool>,
@@ -1560,6 +1610,26 @@ fn tail_request(from: LogAnchor, max_entries: u32) -> Result<CertifiedTailReques
     Ok(CertifiedTailRequest { from, max_entries })
 }
 
+/// Configuration for starting a normal or successor HA node.
+///
+/// Build this configuration, then call [`Self::start`] with a [`HaServeConfig`]
+/// to produce a running [`HaNode`]. For membership replacement, use
+/// [`HaSuccessorPrestageConfig`] first and obtain a `HaStartupConfig` from
+/// [`PublishedHaSuccessorPrestage::finalize`].
+///
+/// # Example
+///
+/// ```text
+/// let startup = HaStartupConfig::new(
+///     node_config,
+///     archive,
+///     HaStartupMode::Rejoin,
+///     DurabilityMode::Sync,
+///     5000,  // lease duration ms
+/// );
+/// let node = startup.start(serve_config);
+/// let handle = node.ready().await?;
+/// ```
 pub struct HaStartupConfig {
     node_config: NodeConfig,
     archive: ObjectArchiveStore,

@@ -2172,6 +2172,7 @@ dependencies = [
  "rhiza-archive",
  "rhiza-core",
  "rhiza-graph",
+ "rhiza-kv",
  "rhiza-log",
  "rhiza-node",
  "rhiza-obj-store",

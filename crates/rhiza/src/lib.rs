@@ -13,7 +13,7 @@ use std::{
 
 mod ha;
 
-#[cfg(any(feature = "sql", feature = "graph"))]
+#[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
 use rhiza_node::confirm_write_durability;
 #[cfg(feature = "sql")]
 use rhiza_node::NodeService;
@@ -33,6 +33,8 @@ pub use rhiza_graph::{
     GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
     GraphValueV1,
 };
+#[cfg(feature = "kv")]
+pub use rhiza_kv::{KvCommandResultV1, KvCommandV1, KvScanResult, KvScanRow};
 pub use rhiza_node::{
     effective_cluster_id, CertifiedTailRecord, CertifiedTailRequest, CertifiedTailResponse,
     CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode, LearnerProgress,
@@ -40,6 +42,8 @@ pub use rhiza_node::{
 };
 #[cfg(feature = "graph")]
 pub use rhiza_node::{GraphMutationOutcome, GraphReadResponse};
+#[cfg(feature = "kv")]
+pub use rhiza_node::{KvMutationOutcome, KvReadResponse};
 #[cfg(feature = "sql")]
 pub use rhiza_node::{
     ReadResponse, SqlExecuteResponse, SqlQueryResponse, SqlStatementResult, WriteRequest,
@@ -503,7 +507,7 @@ struct Inner {
     runtime: Arc<NodeRuntime>,
     #[cfg(feature = "sql")]
     service: NodeService,
-    #[cfg(any(feature = "sql", feature = "graph"))]
+    #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
     execution_profile: ExecutionProfile,
     coordinator: Option<Arc<CheckpointCoordinator>>,
     operations: Arc<RwLock<()>>,
@@ -580,7 +584,7 @@ impl Rhiza {
         runtime: Arc<NodeRuntime>,
         coordinator: Option<Arc<CheckpointCoordinator>>,
     ) -> Self {
-        #[cfg(any(feature = "sql", feature = "graph"))]
+        #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
         let execution_profile = runtime.config().execution_profile();
         #[cfg(feature = "sql")]
         let service = NodeService::new(runtime.clone(), coordinator.clone());
@@ -590,7 +594,7 @@ impl Rhiza {
             runtime,
             #[cfg(feature = "sql")]
             service,
-            #[cfg(any(feature = "sql", feature = "graph"))]
+            #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
             execution_profile,
             coordinator,
             operations: Arc::new(RwLock::new(())),
@@ -871,6 +875,133 @@ impl RhizaHandle {
             .map_err(Error::Node)
     }
 
+    /// Stores a key-value pair. An exact retry with the same `request_id` replays the
+    /// original result; reuse with different bytes is a conflict.
+    #[cfg(feature = "kv")]
+    pub async fn kv_put(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        request_id: String,
+    ) -> Result<KvMutationOutcome, Error> {
+        let command = KvCommandV1::put(request_id, key, value)
+            .map_err(|error| Error::Node(NodeError::InvalidRequest(error.to_string())))?;
+        self.kv_mutate(command).await
+    }
+
+    /// Deletes a key. Returns `existed: true` if the key was present.
+    #[cfg(feature = "kv")]
+    pub async fn kv_delete(
+        &self,
+        key: Vec<u8>,
+        request_id: String,
+    ) -> Result<KvMutationOutcome, Error> {
+        let command = KvCommandV1::delete(request_id, key)
+            .map_err(|error| Error::Node(NodeError::InvalidRequest(error.to_string())))?;
+        self.kv_mutate(command).await
+    }
+
+    /// Executes a single KV mutation command. Prefer [`Self::kv_put`] or
+    /// [`Self::kv_delete`] for simple operations.
+    #[cfg(feature = "kv")]
+    pub async fn kv_mutate(
+        &self,
+        command: KvCommandV1,
+    ) -> Result<KvMutationOutcome, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        embedded_write_allowed(&inner)?;
+        let runtime = inner.runtime.clone();
+        let outcome = tokio::task::spawn_blocking(move || runtime.mutate_kv(command))
+            .await
+            .map_err(|error| Error::Worker(WorkerError::from_join(error)))??;
+        confirm_embedded_write(&inner, outcome.applied_index()).await?;
+        Ok(outcome)
+    }
+
+    /// Executes an ordered, non-atomic KV batch that may coalesce commands into fewer log entries.
+    ///
+    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
+    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
+    /// vector with the same request IDs.
+    #[cfg(feature = "kv")]
+    pub async fn kv_batch(
+        &self,
+        commands: Vec<KvCommandV1>,
+    ) -> Result<Vec<Result<KvMutationOutcome, NodeError>>, BatchWriteError> {
+        self.execute_typed_batch(
+            ExecutionProfile::Kv,
+            move |runtime| runtime.mutate_kv_batch(commands),
+            KvMutationOutcome::applied_index,
+        )
+        .await
+    }
+
+    /// Reads a single key. Returns `value: None` if the key does not exist.
+    #[cfg(feature = "kv")]
+    pub async fn kv_get(
+        &self,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<KvReadResponse, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        let runtime = inner.runtime.clone();
+        let key = key.to_vec();
+        tokio::task::spawn_blocking(move || runtime.get_kv(&key, consistency))
+            .await
+            .map_err(|error| Error::Worker(WorkerError::from_join(error)))?
+            .map_err(Error::Node)
+    }
+
+    /// Scans keys in `[start, end)` range. Pass `end: None` for unbounded.
+    /// Use `cursor` for pagination from a previous scan result.
+    #[cfg(feature = "kv")]
+    pub async fn kv_scan_range(
+        &self,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: usize,
+        cursor: Option<Vec<u8>>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        let runtime = inner.runtime.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.scan_kv_range(
+                &start,
+                end.as_deref(),
+                limit,
+                cursor.as_deref(),
+                consistency,
+            )
+        })
+        .await
+        .map_err(|error| Error::Worker(WorkerError::from_join(error)))?
+        .map_err(Error::Node)
+    }
+
+    /// Scans keys with the given prefix. Use `cursor` for pagination from a previous scan.
+    #[cfg(feature = "kv")]
+    pub async fn kv_scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: usize,
+        cursor: Option<Vec<u8>>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        let runtime = inner.runtime.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.scan_kv_prefix(&prefix, limit, cursor.as_deref(), consistency)
+        })
+        .await
+        .map_err(|error| Error::Worker(WorkerError::from_join(error)))?
+        .map_err(Error::Node)
+    }
+
     pub async fn status(&self) -> Result<NodeStatus, Error> {
         let (inner, _operation) = self.begin_operation().await?;
         let runtime = inner.runtime.clone();
@@ -896,7 +1027,7 @@ impl RhizaHandle {
         Ok((inner, operation))
     }
 
-    #[cfg(any(feature = "sql", feature = "graph"))]
+    #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
     async fn execute_typed_batch<T, F, I>(
         &self,
         profile: ExecutionProfile,
@@ -936,7 +1067,7 @@ impl RhizaHandle {
     }
 }
 
-#[cfg(any(feature = "sql", feature = "graph"))]
+#[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
 fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Error> {
     if inner.execution_profile == expected {
         Ok(())
@@ -967,7 +1098,7 @@ fn require_embedded_profile(execution_profile: ExecutionProfile) -> Result<(), E
     }
 }
 
-#[cfg(any(feature = "sql", feature = "graph"))]
+#[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
 fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
     if let Some(coordinator) = &inner.coordinator {
         coordinator.write_allowed()?;
@@ -975,7 +1106,7 @@ fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(any(feature = "sql", feature = "graph"))]
+#[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
 async fn confirm_embedded_write(
     inner: &Inner,
     applied_index: rhiza_core::LogIndex,

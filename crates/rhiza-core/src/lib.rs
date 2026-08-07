@@ -636,6 +636,16 @@ impl std::fmt::Display for ExecutionProfileParseError {
 
 impl std::error::Error for ExecutionProfileParseError {}
 
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadConsistency {
+    Local,
+    ReadBarrier,
+    AppliedIndex(LogIndex),
+}
+
 const REPLICATED_COMMAND_MAGIC: &[u8; 4] = b"QCMD";
 pub const REPLICATED_COMMAND_FORMAT_VERSION: u16 = 1;
 const REPLICATED_COMMAND_HEADER_BYTES: usize = 15;

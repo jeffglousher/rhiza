@@ -21,7 +21,7 @@ prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
-rhizadb = { path = "../crates/rhiza" }
+rhizadb = { path = "../crates/rhiza", features = ["sql", "graph", "kv"] }
 rhiza-core = { path = "../crates/rhiza-core" }
 rhiza-node = { path = "../crates/rhiza-node", features = ["recorder-postcard-rpc"] }
 rhiza-quepaxa = { path = "../crates/rhiza-quepaxa" }
@@ -50,3 +50,7 @@ path = "src/bin/rhiza-recorder-transport.rs"
 [[bin]]
 name = "rhiza-transport"
 path = "src/bin/rhiza-transport.rs"
+
+[[bin]]
+name = "rhiza-profile"
+path = "src/bin/rhiza-profile.rs"
