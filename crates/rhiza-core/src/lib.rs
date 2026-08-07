@@ -642,7 +642,6 @@ impl std::error::Error for ExecutionProfileParseError {}
 #[serde(rename_all = "snake_case")]
 pub enum ReadConsistency {
     Local,
-    #[serde(rename = "read_barrier")]
     ReadBarrier,
     AppliedIndex(LogIndex),
 }

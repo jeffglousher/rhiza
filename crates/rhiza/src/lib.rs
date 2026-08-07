@@ -875,6 +875,8 @@ impl RhizaHandle {
             .map_err(Error::Node)
     }
 
+    /// Stores a key-value pair. An exact retry with the same `request_id` replays the
+    /// original result; reuse with different bytes is a conflict.
     #[cfg(feature = "kv")]
     pub async fn kv_put(
         &self,
@@ -887,6 +889,7 @@ impl RhizaHandle {
         self.kv_mutate(command).await
     }
 
+    /// Deletes a key. Returns `existed: true` if the key was present.
     #[cfg(feature = "kv")]
     pub async fn kv_delete(
         &self,
@@ -898,6 +901,8 @@ impl RhizaHandle {
         self.kv_mutate(command).await
     }
 
+    /// Executes a single KV mutation command. Prefer [`Self::kv_put`] or
+    /// [`Self::kv_delete`] for simple operations.
     #[cfg(feature = "kv")]
     pub async fn kv_mutate(
         &self,
@@ -914,6 +919,11 @@ impl RhizaHandle {
         Ok(outcome)
     }
 
+    /// Executes an ordered, non-atomic KV batch that may coalesce commands into fewer log entries.
+    ///
+    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
+    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
+    /// vector with the same request IDs.
     #[cfg(feature = "kv")]
     pub async fn kv_batch(
         &self,
@@ -927,6 +937,7 @@ impl RhizaHandle {
         .await
     }
 
+    /// Reads a single key. Returns `value: None` if the key does not exist.
     #[cfg(feature = "kv")]
     pub async fn kv_get(
         &self,
@@ -943,6 +954,8 @@ impl RhizaHandle {
             .map_err(Error::Node)
     }
 
+    /// Scans keys in `[start, end)` range. Pass `end: None` for unbounded.
+    /// Use `cursor` for pagination from a previous scan result.
     #[cfg(feature = "kv")]
     pub async fn kv_scan_range(
         &self,
@@ -969,6 +982,7 @@ impl RhizaHandle {
         .map_err(Error::Node)
     }
 
+    /// Scans keys with the given prefix. Use `cursor` for pagination from a previous scan.
     #[cfg(feature = "kv")]
     pub async fn kv_scan_prefix(
         &self,

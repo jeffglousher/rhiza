@@ -148,3 +148,88 @@ async fn kv_profile_scan_prefix() {
 
     rhiza.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_profile_put_reports_replaced_on_update() {
+    let root = tempfile::tempdir().unwrap();
+    let config =
+        EmbeddedConfig::local_file_backed("cluster-a", root.path(), ExecutionProfile::Kv).unwrap();
+    let rhiza = Rhiza::open(config).await.unwrap();
+    let handle = rhiza.handle();
+
+    let first = handle
+        .kv_put(b"key-1".to_vec(), b"value-1".to_vec(), "put-1".into())
+        .await
+        .unwrap();
+    assert_eq!(first.result(), &KvCommandResultV1::Put { replaced: false });
+
+    let second = handle
+        .kv_put(b"key-1".to_vec(), b"value-2".to_vec(), "put-2".into())
+        .await
+        .unwrap();
+    assert_eq!(second.result(), &KvCommandResultV1::Put { replaced: true });
+
+    rhiza.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_profile_delete_reports_existed_false_for_missing_key() {
+    let root = tempfile::tempdir().unwrap();
+    let config =
+        EmbeddedConfig::local_file_backed("cluster-a", root.path(), ExecutionProfile::Kv).unwrap();
+    let rhiza = Rhiza::open(config).await.unwrap();
+    let handle = rhiza.handle();
+
+    let delete = handle
+        .kv_delete(b"missing".to_vec(), "delete-missing".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        delete.result(),
+        &KvCommandResultV1::Delete { existed: false }
+    );
+
+    rhiza.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_profile_scan_range() {
+    let root = tempfile::tempdir().unwrap();
+    let config =
+        EmbeddedConfig::local_file_backed("cluster-a", root.path(), ExecutionProfile::Kv).unwrap();
+    let rhiza = Rhiza::open(config).await.unwrap();
+    let handle = rhiza.handle();
+
+    handle
+        .kv_put(b"a".to_vec(), b"1".to_vec(), "r1".into())
+        .await
+        .unwrap();
+    handle
+        .kv_put(b"b".to_vec(), b"2".to_vec(), "r2".into())
+        .await
+        .unwrap();
+    handle
+        .kv_put(b"c".to_vec(), b"3".to_vec(), "r3".into())
+        .await
+        .unwrap();
+    handle
+        .kv_put(b"d".to_vec(), b"4".to_vec(), "r4".into())
+        .await
+        .unwrap();
+
+    let scan = handle
+        .kv_scan_range(
+            b"b".to_vec(),
+            Some(b"d".to_vec()),
+            100,
+            None,
+            ReadConsistency::Local,
+        )
+        .await
+        .unwrap();
+    assert_eq!(scan.rows().len(), 2);
+    assert_eq!(scan.rows()[0].key(), b"b");
+    assert_eq!(scan.rows()[1].key(), b"c");
+
+    rhiza.shutdown().await.unwrap();
+}
