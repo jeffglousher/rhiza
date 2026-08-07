@@ -862,7 +862,11 @@ pub struct LadybugStateMachine {
 }
 
 impl LadybugStateMachine {
-    #[tracing::instrument(level = "info", skip_all, fields(cluster_id, node_id, epoch, config_id))]
+    #[tracing::instrument(
+        level = "info",
+        skip_all,
+        fields(cluster_id, node_id, epoch, config_id)
+    )]
     pub fn open(
         path: impl AsRef<Path>,
         cluster_id: &str,
@@ -880,7 +884,13 @@ impl LadybugStateMachine {
         };
         let database = open_database(&path)?;
         initialize_or_validate(&database, &identity)?;
-        tracing::info!(cluster_id, node_id, epoch, config_id, "graph state machine opened");
+        tracing::info!(
+            cluster_id,
+            node_id,
+            epoch,
+            config_id,
+            "graph state machine opened"
+        );
         Ok(Self {
             path,
             identity,

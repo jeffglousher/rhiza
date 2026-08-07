@@ -904,10 +904,7 @@ impl RhizaHandle {
     /// Executes a single KV mutation command. Prefer [`Self::kv_put`] or
     /// [`Self::kv_delete`] for simple operations.
     #[cfg(feature = "kv")]
-    pub async fn kv_mutate(
-        &self,
-        command: KvCommandV1,
-    ) -> Result<KvMutationOutcome, Error> {
+    pub async fn kv_mutate(&self, command: KvCommandV1) -> Result<KvMutationOutcome, Error> {
         let (inner, _operation) = self.begin_operation().await?;
         require_profile(&inner, ExecutionProfile::Kv)?;
         embedded_write_allowed(&inner)?;

@@ -59,7 +59,10 @@ async fn kv_profile_rejects_idempotent_conflict() {
     let second = handle
         .kv_put(b"key-1".to_vec(), b"value-2".to_vec(), "same-req".into())
         .await;
-    assert!(second.is_err(), "reusing request_id with different payload must fail");
+    assert!(
+        second.is_err(),
+        "reusing request_id with different payload must fail"
+    );
 
     rhiza.shutdown().await.unwrap();
 }
@@ -81,7 +84,10 @@ async fn kv_profile_put_then_delete() {
         .kv_delete(b"key-1".to_vec(), "delete-1".into())
         .await
         .unwrap();
-    assert_eq!(delete.result(), &KvCommandResultV1::Delete { existed: true });
+    assert_eq!(
+        delete.result(),
+        &KvCommandResultV1::Delete { existed: true }
+    );
 
     let get = handle
         .kv_get(b"key-1", ReadConsistency::Local)
@@ -110,7 +116,10 @@ async fn kv_profile_batch_writes() {
     assert_eq!(results.len(), 3);
     for result in &results {
         let outcome = result.as_ref().unwrap();
-        assert_eq!(outcome.result(), &KvCommandResultV1::Put { replaced: false });
+        assert_eq!(
+            outcome.result(),
+            &KvCommandResultV1::Put { replaced: false }
+        );
     }
 
     let get = handle.kv_get(b"b", ReadConsistency::Local).await.unwrap();
