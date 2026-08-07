@@ -6498,7 +6498,7 @@ impl NodeConfig {
             recovery_generation: 1,
             peers,
             client_token,
-            read_consistency: ReadConsistency::Local,
+            read_consistency: ReadConsistency::ReadBarrier,
             ack_mode: AckMode::HaFirst,
             writer_batch_max: DEFAULT_WRITER_BATCH_MAX,
             writer_batch_window: DEFAULT_WRITER_BATCH_WINDOW,
@@ -11562,14 +11562,36 @@ impl NodeRuntime {
                     return Ok(LogAnchor::new(last_index, last_hash));
                 }
                 DecisionInspection::Pending => {
-                    // Slot is pending — re-check with inspect_decision_at to
-                    // catch any decision that was committed between the first
-                    // check and now.
-                    match self
-                        .consensus
-                        .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-                        .map_err(|error| self.map_consensus_error(error))?
-                    {
+                    // Slot is pending — re-check to catch any decision that
+                    // was committed between the first check and now.
+                    // Mirror the first inspection: use context_read_fence if
+                    // available to avoid missing decisions certified via that
+                    // path.
+                    let re_inspection = if context_read_fence {
+                        match self
+                            .consensus
+                            .inspect_context_read_fence_at(
+                                &self.consensus_context(),
+                                slot,
+                                last_hash,
+                            )
+                            .map_err(|error| self.map_consensus_error(error))?
+                        {
+                            CertifiedDecisionInspection::Committed(certified) => {
+                                DecisionInspection::Committed(certified.entry)
+                            }
+                            CertifiedDecisionInspection::Empty => DecisionInspection::Empty,
+                            CertifiedDecisionInspection::Pending => DecisionInspection::Pending,
+                            CertifiedDecisionInspection::Unavailable => {
+                                DecisionInspection::Unavailable
+                            }
+                        }
+                    } else {
+                        self.consensus
+                            .inspect_decision_at(&self.consensus_context(), slot, last_hash)
+                            .map_err(|error| self.map_consensus_error(error))?
+                    };
+                    match re_inspection {
                         DecisionInspection::Committed(entry) => {
                             self.persist_entry(&entry, slot, last_hash)?;
                         }
