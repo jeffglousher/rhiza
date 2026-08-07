@@ -3880,7 +3880,7 @@ impl RecorderFileStore {
 
     fn checkpoint_wal_unlocked(&self) -> Result<()> {
         let (checkpoint, next_sequence, slots, commands) = {
-            let wal = self
+            let mut wal = self
                 .wal
                 .lock()
                 .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
@@ -3895,8 +3895,8 @@ impl RecorderFileStore {
             (
                 wal.checkpoint,
                 wal.next_sequence,
-                wal.slots.clone(),
-                wal.commands.clone(),
+                std::mem::take(&mut wal.slots),
+                std::mem::take(&mut wal.commands),
             )
         };
         let next_checkpoint = WalCheckpoint {
@@ -3951,8 +3951,7 @@ impl RecorderFileStore {
         wal.last_digest = LogHash::ZERO;
         wal.frame_count = 0;
         wal.byte_count = 0;
-        wal.slots.clear();
-        wal.commands.clear();
+        // slots and commands were already taken by std::mem::take() above.
         self.recent_slots
             .lock()
             .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
