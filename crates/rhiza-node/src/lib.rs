@@ -8452,6 +8452,13 @@ impl Drop for ReadBarrierPublication {
 #[cfg(all(test, feature = "kv"))]
 type KvGroupCommitAfterExecuteHook = Arc<dyn Fn(&NodeRuntime) + Send + Sync>;
 
+const READ_BARRIER_CACHE_TTL: Duration = Duration::from_millis(1);
+
+struct CachedBarrier {
+    anchor: LogAnchor,
+    cached_at: Instant,
+}
+
 pub struct NodeRuntime {
     config: NodeConfig,
     consensus: Arc<ThreeNodeConsensus>,
@@ -8463,6 +8470,7 @@ pub struct NodeRuntime {
     #[cfg(feature = "kv")]
     kv_group_commit: KvGroupCommitQueue,
     read_barriers: ReadBarrierRounds,
+    cached_barrier: Mutex<Option<CachedBarrier>>,
     checkpointing: AtomicBool,
     operation_cancelled: Arc<AtomicBool>,
     operation_cancelled_notify: tokio::sync::Notify,
@@ -8755,6 +8763,7 @@ impl NodeRuntime {
             materializer: Mutex::new(materializer),
             commit: Mutex::new(()),
             read_barriers: ReadBarrierRounds::new(READ_BARRIER_COALESCE_WINDOW),
+            cached_barrier: Mutex::new(None),
             checkpointing: AtomicBool::new(false),
             operation_cancelled: Arc::new(AtomicBool::new(false)),
             operation_cancelled_notify: tokio::sync::Notify::new(),
@@ -9384,8 +9393,9 @@ impl NodeRuntime {
     ) -> Vec<Result<ClientWriteResponse, NodeError>> {
         let classification_mark = profile.mark();
         let mut results = vec![None; members.len()];
-        let mut pending = Vec::new();
-        let mut canonical_by_request: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut pending = Vec::with_capacity(members.len());
+        let mut canonical_by_request: HashMap<String, Vec<usize>> =
+            HashMap::with_capacity(members.len());
         let mut lookup_indices = Vec::with_capacity(members.len());
         let mut aliases = vec![None; members.len()];
         let mut blocked_by = vec![None; members.len()];
@@ -9510,7 +9520,7 @@ impl NodeRuntime {
                     break (None, Vec::new());
                 }
 
-                let mut proposed = Vec::new();
+                let mut proposed = Vec::with_capacity(attempted.len());
                 for (index, member_result) in attempted.iter().copied().zip(preparation.results) {
                     match member_result {
                         Ok(result) => proposed.push((index, result)),
@@ -9925,8 +9935,8 @@ impl NodeRuntime {
         }
 
         let mut results = vec![None; members.len()];
-        let mut pending = Vec::new();
-        let mut canonical_by_request = HashMap::new();
+        let mut pending = Vec::with_capacity(members.len());
+        let mut canonical_by_request = HashMap::with_capacity(members.len());
         let mut aliases = vec![None; members.len()];
         for (index, member) in members.iter().enumerate() {
             let QueuedOperation::Graph(command) = &member.operation else {
@@ -10113,8 +10123,8 @@ impl NodeRuntime {
         members: &[RuntimeBatchMember],
     ) -> Vec<Result<ClientWriteResponse, NodeError>> {
         let mut results = vec![None; members.len()];
-        let mut pending = Vec::new();
-        let mut canonical_by_request = HashMap::new();
+        let mut pending = Vec::with_capacity(members.len());
+        let mut canonical_by_request = HashMap::with_capacity(members.len());
         let mut aliases = vec![None; members.len()];
         let mut lookup_indices = Vec::with_capacity(members.len());
         for (index, member) in members.iter().enumerate() {
@@ -11350,6 +11360,15 @@ impl NodeRuntime {
     }
 
     fn establish_read_barrier(&self) -> Result<LogAnchor, NodeError> {
+        // Check cache first — avoids quorum RPC for repeated reads within TTL.
+        if let Ok(cache) = self.cached_barrier.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.cached_at.elapsed() < READ_BARRIER_CACHE_TTL {
+                    return Ok(cached.anchor);
+                }
+            }
+        }
+
         let participant = self.read_barriers.join().map_err(|error| match error {
             NodeError::Invariant(_) => self.latch(error),
             other => other,
@@ -11369,6 +11388,17 @@ impl NodeRuntime {
             self.commit_read_barrier_locked()
         })();
         publication.publish(result.clone());
+
+        // Cache the result for subsequent reads.
+        if let Ok(anchor) = &result {
+            if let Ok(mut cache) = self.cached_barrier.lock() {
+                *cache = Some(CachedBarrier {
+                    anchor: *anchor,
+                    cached_at: Instant::now(),
+                });
+            }
+        }
+
         result
     }
 
@@ -11526,43 +11556,71 @@ impl NodeRuntime {
                 DecisionInspection::Committed(entry) => {
                     self.persist_entry(&entry, slot, last_hash)?;
                 }
-                DecisionInspection::Empty if context_read_fence => {
-                    // Configuration may have been sealed while the read-only
-                    // quorum observation was in flight. Never return an anchor
-                    // from a configuration that is no longer write-active.
+                DecisionInspection::Empty => {
+                    // Quorum confirmed the slot is empty. This is a valid
+                    // linearization point — no committed decision exists.
+                    // Return anchor immediately without writing a Noop.
                     self.ensure_writes_active()?;
                     return Ok(LogAnchor::new(last_index, last_hash));
                 }
                 DecisionInspection::Pending => {
-                    let entry = self
-                        .consensus
-                        .propose_at(
-                            self.consensus_context(),
-                            slot,
-                            last_hash,
-                            Command::new(CommandKind::ReadBarrier, Vec::new()),
-                        )
-                        .map_err(|error| self.map_consensus_error(error))?;
-                    self.persist_entry(&entry, slot, last_hash)?;
-                    // Pending may conceal a historical phase-2 Noop whose
-                    // durable proof quorum was never installed. It cannot fence
-                    // this read, so inspect the following slot before returning.
-                }
-                DecisionInspection::Empty => {
-                    let entry = self
-                        .consensus
-                        .propose_at(
-                            self.consensus_context(),
-                            slot,
-                            last_hash,
-                            Command::new(CommandKind::ReadBarrier, Vec::new()),
-                        )
-                        .map_err(|error| self.map_consensus_error(error))?;
-                    let is_barrier =
-                        entry.entry_type == EntryType::Noop && entry.payload.is_empty();
-                    self.persist_entry(&entry, slot, last_hash)?;
-                    if is_barrier {
-                        return Ok(LogAnchor::new(entry.index, entry.hash));
+                    // Slot is pending — re-check to catch any decision that
+                    // was committed between the first check and now.
+                    // Mirror the first inspection: use context_read_fence if
+                    // available to avoid missing decisions certified via that
+                    // path.
+                    let re_inspection = if context_read_fence {
+                        match self
+                            .consensus
+                            .inspect_context_read_fence_at(
+                                &self.consensus_context(),
+                                slot,
+                                last_hash,
+                            )
+                            .map_err(|error| self.map_consensus_error(error))?
+                        {
+                            CertifiedDecisionInspection::Committed(certified) => {
+                                DecisionInspection::Committed(certified.entry)
+                            }
+                            CertifiedDecisionInspection::Empty => DecisionInspection::Empty,
+                            CertifiedDecisionInspection::Pending => DecisionInspection::Pending,
+                            CertifiedDecisionInspection::Unavailable => {
+                                DecisionInspection::Unavailable
+                            }
+                        }
+                    } else {
+                        self.consensus
+                            .inspect_decision_at(&self.consensus_context(), slot, last_hash)
+                            .map_err(|error| self.map_consensus_error(error))?
+                    };
+                    match re_inspection {
+                        DecisionInspection::Committed(entry) => {
+                            self.persist_entry(&entry, slot, last_hash)?;
+                        }
+                        DecisionInspection::Empty => {
+                            self.ensure_writes_active()?;
+                            return Ok(LogAnchor::new(last_index, last_hash));
+                        }
+                        DecisionInspection::Pending => {
+                            // Still pending — may conceal a historical phase-2
+                            // Noop whose durable proof quorum was never
+                            // installed. Write a Noop to recover.
+                            let entry = self
+                                .consensus
+                                .propose_at(
+                                    self.consensus_context(),
+                                    slot,
+                                    last_hash,
+                                    Command::new(CommandKind::ReadBarrier, Vec::new()),
+                                )
+                                .map_err(|error| self.map_consensus_error(error))?;
+                            self.persist_entry(&entry, slot, last_hash)?;
+                        }
+                        DecisionInspection::Unavailable => {
+                            return Err(NodeError::Unavailable(
+                                "decision inspection did not reach quorum".into(),
+                            ));
+                        }
                     }
                 }
                 DecisionInspection::Unavailable => {
@@ -11685,7 +11743,14 @@ impl NodeRuntime {
         }
         self.lock_materializer()?
             .apply_entry(entry)
-            .map_err(|error| self.latch(NodeError::Invariant(error)))
+            .map_err(|error| self.latch(NodeError::Invariant(error)))?;
+
+        // Invalidate cached barrier — a new entry was committed.
+        if let Ok(mut cache) = self.cached_barrier.lock() {
+            *cache = None;
+        }
+
+        Ok(None)
     }
 
     #[cfg(feature = "sql")]
@@ -11720,6 +11785,14 @@ impl NodeRuntime {
             .apply_entry(entry)
             .map_err(|error| self.latch(NodeError::Invariant(error)));
         profile.add_sql_materializer_apply(materializer_mark);
+
+        // Invalidate cached barrier — a new entry was committed.
+        if apply_result.is_ok() {
+            if let Ok(mut cache) = self.cached_barrier.lock() {
+                *cache = None;
+            }
+        }
+
         apply_result
     }
 
