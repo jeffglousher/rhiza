@@ -2021,6 +2021,8 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rhiza-core",
+ "rhiza-graph",
+ "rhiza-kv",
  "rhiza-node",
  "rhiza-quepaxa",
  "rhiza-sql",

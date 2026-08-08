@@ -23,6 +23,8 @@ rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rhizadb = { path = "../crates/rhiza", features = ["sql", "graph", "kv"] }
 rhiza-core = { path = "../crates/rhiza-core" }
+rhiza-graph = { path = "../crates/rhiza-graph" }
+rhiza-kv = { path = "../crates/rhiza-kv" }
 rhiza-node = { path = "../crates/rhiza-node", features = ["recorder-postcard-rpc"] }
 rhiza-quepaxa = { path = "../crates/rhiza-quepaxa" }
 rhiza-sql = { path = "../crates/rhiza-sql" }
