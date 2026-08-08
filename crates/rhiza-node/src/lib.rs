@@ -646,6 +646,43 @@ impl PartialEq for SqlWriteProfiler {
 
 #[cfg(feature = "sql")]
 impl Eq for SqlWriteProfiler {}
+
+/// Telemetry bridge for MAB-based auto-tuning.
+#[cfg(feature = "tuner")]
+#[derive(Clone)]
+pub struct TunerTelemetry {
+    inner: Arc<rhiza_tuner::TelemetryCollector>,
+}
+
+#[cfg(feature = "tuner")]
+impl TunerTelemetry {
+    pub fn new(collector: rhiza_tuner::TelemetryCollector) -> Self {
+        Self {
+            inner: Arc::new(collector),
+        }
+    }
+    pub fn collector(&self) -> &rhiza_tuner::TelemetryCollector {
+        &self.inner
+    }
+}
+
+#[cfg(feature = "tuner")]
+impl PartialEq for TunerTelemetry {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+#[cfg(feature = "tuner")]
+impl Eq for TunerTelemetry {}
+
+#[cfg(feature = "tuner")]
+impl fmt::Debug for TunerTelemetry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunerTelemetry").finish_non_exhaustive()
+    }
+}
+
 pub const RECORDER_STORE_COMMAND_PATH: &str = "/v2/quepaxa/recorder/store-command";
 pub const RECORDER_FETCH_COMMAND_PATH: &str = "/v2/quepaxa/recorder/fetch-command";
 pub const RECORDER_INSPECT_PROOF_PATH: &str = "/v2/quepaxa/recorder/inspect-proof";
@@ -6283,6 +6320,8 @@ pub struct NodeConfig {
     sql_write_profiler: Option<SqlWriteProfiler>,
     #[cfg(feature = "sql")]
     sql_group_commit_queue_capacity: usize,
+    #[cfg(feature = "tuner")]
+    tuner_telemetry: Option<TunerTelemetry>,
 }
 
 impl fmt::Debug for NodeConfig {
@@ -6505,6 +6544,8 @@ impl NodeConfig {
             sql_write_profiler: None,
             #[cfg(feature = "sql")]
             sql_group_commit_queue_capacity: DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY,
+            #[cfg(feature = "tuner")]
+            tuner_telemetry: None,
         })
     }
 
@@ -6525,6 +6566,12 @@ impl NodeConfig {
     #[cfg(feature = "sql")]
     pub fn with_sql_write_profiler(mut self, profiler: SqlWriteProfiler) -> Self {
         self.sql_write_profiler = Some(profiler);
+        self
+    }
+
+    #[cfg(feature = "tuner")]
+    pub fn with_tuner_telemetry(mut self, telemetry: TunerTelemetry) -> Self {
+        self.tuner_telemetry = Some(telemetry);
         self
     }
 
@@ -6705,6 +6752,27 @@ impl NodeConfig {
     #[cfg(feature = "sql")]
     pub const fn sql_group_commit_queue_capacity(&self) -> usize {
         self.sql_group_commit_queue_capacity
+    }
+
+    #[cfg(feature = "tuner")]
+    pub const fn tuner_telemetry(&self) -> Option<&TunerTelemetry> {
+        self.tuner_telemetry.as_ref()
+    }
+
+    #[cfg(feature = "tuner")]
+    pub fn tuner_identity(&self) -> rhiza_tuner::Identity {
+        rhiza_tuner::Identity {
+            cluster_id: self.cluster_id.clone(),
+            epoch: self.epoch,
+            config_id: self.configuration_state.config_id(),
+            membership_digest: *self.membership.digest().as_bytes(),
+            recovery_generation: self.recovery_generation,
+        }
+    }
+
+    #[cfg(feature = "tuner")]
+    pub fn eligible_proposers(&self) -> Vec<rhiza_tuner::NodeId> {
+        self.membership.members().to_vec()
     }
 }
 
@@ -8670,6 +8738,36 @@ impl NodeRuntime {
         )
     }
 
+    #[cfg(all(feature = "tuner", feature = "sql"))]
+    fn record_tuner_propose_outcome(&self, latency_us: u64, success: bool, timeout: bool) {
+        if let Some(telemetry) = self.config.tuner_telemetry() {
+            telemetry.collector().record_proposer_latency(
+                &self.config.node_id,
+                latency_us,
+                success,
+                timeout,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tuner", feature = "sql"))]
+    fn record_tuner_consensus_error(&self, error: &rhiza_quepaxa::Error) {
+        let is_timeout = matches!(
+            error,
+            rhiza_quepaxa::Error::RpcDeadlineExceeded
+                | rhiza_quepaxa::Error::NoQuorum
+                | rhiza_quepaxa::Error::Cancelled
+                | rhiza_quepaxa::Error::RpcCancelled
+        );
+        self.record_tuner_propose_outcome(0, false, is_timeout);
+    }
+
+    #[cfg(all(feature = "tuner", feature = "sql"))]
+    fn record_tuner_consensus_success(&self, latency: Duration) {
+        let latency_us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+        self.record_tuner_propose_outcome(latency_us, true, false);
+    }
+
     pub fn open(
         config: NodeConfig,
         consensus: Arc<ThreeNodeConsensus>,
@@ -9587,6 +9685,8 @@ impl NodeRuntime {
                 }
             };
             let consensus_mark = profile.mark();
+            #[cfg(feature = "tuner")]
+            let tuner_propose_start = std::time::Instant::now();
             let entry = self.consensus.propose_at(
                 self.consensus_context(),
                 slot,
@@ -9594,6 +9694,14 @@ impl NodeRuntime {
                 Command::new(CommandKind::Deterministic, proposal_payload.clone()),
             );
             profile.add_consensus_propose(consensus_mark);
+            #[cfg(feature = "tuner")]
+            {
+                let elapsed = tuner_propose_start.elapsed();
+                match &entry {
+                    Ok(_) => self.record_tuner_consensus_success(elapsed),
+                    Err(error) => self.record_tuner_consensus_error(error),
+                }
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
