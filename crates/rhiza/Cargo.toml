@@ -27,6 +27,8 @@ recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
 # Non-production synchronization API used only by integration tests that must
 # pause the real service activation boundary.
 test-hooks = ["rhiza-node/test-hooks"]
+# MAB-based auto-tuning for preferred proposer and hedge delay.
+tuner = ["rhiza-node/tuner"]
 
 [dependencies]
 axum.workspace = true

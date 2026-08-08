@@ -65,9 +65,7 @@ fn concurrent_reads_after_writes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.ldb");
 
-    let sm = Arc::new(
-        RedbStateMachine::open(&path, "cluster-1", "node-1", 1, 1).unwrap(),
-    );
+    let sm = Arc::new(RedbStateMachine::open(&path, "cluster-1", "node-1", 1, 1).unwrap());
 
     // Write some initial data sequentially (start at index 1 since initial applied_index is 0)
     let entries = build_entries(1, LogHash::ZERO, 100);
@@ -101,9 +99,7 @@ fn concurrent_scan_during_writes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.ldb");
 
-    let sm = Arc::new(
-        RedbStateMachine::open(&path, "cluster-1", "node-1", 1, 1).unwrap(),
-    );
+    let sm = Arc::new(RedbStateMachine::open(&path, "cluster-1", "node-1", 1, 1).unwrap());
 
     // Write initial data (start at index 1)
     let entries = build_entries(1, LogHash::ZERO, 50);
@@ -117,8 +113,7 @@ fn concurrent_scan_during_writes() {
             let key = format!("key-{i:04}");
             let value = format!("value-{i:04}");
             let command =
-                KvCommandV1::put(format!("req-{i}"), key.into_bytes(), value.into_bytes())
-                    .unwrap();
+                KvCommandV1::put(format!("req-{i}"), key.into_bytes(), value.into_bytes()).unwrap();
             let payload = replicated(&command);
             let e = entry(i, prev_hash, payload);
             sm_clone.apply_entry(&e).unwrap();
@@ -135,7 +130,10 @@ fn concurrent_scan_during_writes() {
                 let result = sm_clone.scan_range(b"key-0000", Some(b"key-0100"), 100, None);
                 let scan_result = result.unwrap();
                 let count = scan_result.rows().len();
-                assert!(count <= 100, "scan should not exceed total key count, got {count}");
+                assert!(
+                    count <= 100,
+                    "scan should not exceed total key count, got {count}"
+                );
             }
         }));
     }

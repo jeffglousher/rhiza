@@ -15,6 +15,8 @@ kv = ["dep:rhiza-kv"]
 recorder-postcard-rpc = ["dep:postcard-rpc", "dep:tracing"]
 # Non-production admission probes used by the HA ownership tests.
 test-hooks = []
+# MAB-based auto-tuning for preferred proposer and hedge delay.
+tuner = ["dep:rhiza-tuner"]
 
 [dependencies]
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
@@ -25,6 +27,7 @@ rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
+rhiza-tuner = { version = "0.1.0", path = "../rhiza-tuner", optional = true }
 axum.workspace = true
 http-body.workspace = true
 postcard.workspace = true

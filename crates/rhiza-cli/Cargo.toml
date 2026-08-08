@@ -17,6 +17,7 @@ recorder-postcard-rpc = [
     "rhiza-node/recorder-postcard-rpc",
     "rhizadb/recorder-postcard-rpc",
 ]
+tuner = ["rhiza-node/tuner", "rhiza-client/tuner", "rhizadb/tuner", "dep:rhiza-tuner"]
 
 [dependencies]
 axum.workspace = true
@@ -28,6 +29,7 @@ rhiza-node = { version = "0.4.0", path = "../rhiza-node", default-features = fal
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
+rhiza-tuner = { version = "0.1.0", path = "../rhiza-tuner", optional = true }
 rhizadb = { version = "0.4.0", path = "../rhiza", default-features = false }
 reqwest.workspace = true
 serde.workspace = true

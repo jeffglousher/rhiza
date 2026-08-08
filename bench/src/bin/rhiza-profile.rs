@@ -18,7 +18,7 @@ use rhiza_core::{
 use rhiza_graph::{encode_replicated_graph_command, GraphResultValue, LadybugStateMachine};
 use rhiza_kv::{encode_replicated_kv_command, KvCommandV1, RedbStateMachine};
 use rhiza_node::{NodeConfig, NodeRuntime, SqlWriteProfileSnapshot, SqlWriteProfiler};
-use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
+use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, RecorderRpcContext, ThreeNodeConsensus};
 #[cfg(test)]
 use rhiza_sql::decode_qwal_v3;
 use rhiza_sql::{
@@ -1762,9 +1762,9 @@ async fn write_one(
         }
         Profile::Kv => match target {
             Target::Handle(handle) => {
-                handle
-                    .put_kv(request_id, key.into_bytes(), value.into_bytes())
-                    .await
+                    handle
+                        .kv_put(key.into_bytes(), value.into_bytes(), request_id.to_string())
+                        .await
                     .map_err(|error| error.to_string())?;
             }
             Target::Runtime(runtime) => {
@@ -1825,7 +1825,7 @@ async fn write_batch(
                 .collect::<Result<Vec<_>, _>>();
             match commands {
                 Ok(commands) => {
-                    logical_batch_results(count, handle.mutate_kv_batch(commands).await)
+                    logical_batch_results(count, handle.kv_batch(commands).await)
                 }
                 Err(error) => repeated_batch_error(count, error),
             }
@@ -1995,7 +1995,7 @@ async fn get_one(target: &Target, config: &Config, key_index: u64) -> Result<(),
         Profile::Kv => {
             let result = match target {
                 Target::Handle(handle) => handle
-                    .get_kv(key.as_bytes(), consistency)
+                    .kv_get(key.as_bytes(), consistency)
                     .await
                     .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
@@ -2112,7 +2112,7 @@ async fn native_read(target: &Target, config: &Config) -> Result<(), String> {
         Profile::Kv => {
             let result = match target {
                 Target::Handle(handle) => handle
-                    .scan_kv_prefix(b"bench-key-", 16, None, consistency)
+                    .kv_scan_prefix(b"bench-key-".to_vec(), 16, None, consistency)
                     .await
                     .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
@@ -3512,6 +3512,7 @@ impl ConsensusTarget {
         let entry = self
             .consensus
             .propose_at(
+                RecorderRpcContext::default_timeout(),
                 self.next_index,
                 self.previous_hash,
                 ConsensusCommand::new(CommandKind::Deterministic, payload),

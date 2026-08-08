@@ -34,6 +34,8 @@ pub const ADMIN_STOP_PATH: &str = "/v1/admin/membership/stop";
 pub const ADMIN_INSTALL_SUCCESSOR_PATH: &str = "/v1/admin/membership/install-successor";
 pub const ADMIN_ACTIVATE_PATH: &str = "/v1/admin/membership/activate";
 pub const ADMIN_COMPACT_PATH: &str = "/v1/admin/checkpoint/compact";
+#[cfg(feature = "tuner")]
+pub const ADMIN_TUNER_METRICS_PATH: &str = "/v1/admin/tuner/metrics";
 const ADMIN_STATUS_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const ADMIN_STATUS_SNAPSHOT_MAX_IN_FLIGHT: usize = 1;
 
@@ -512,7 +514,10 @@ fn admin_router(
         .route(ADMIN_STOP_PATH, post(handle_stop))
         .route(ADMIN_INSTALL_SUCCESSOR_PATH, post(handle_install_successor))
         .route(ADMIN_ACTIVATE_PATH, post(handle_activate))
-        .route(ADMIN_COMPACT_PATH, post(handle_compact))
+        .route(ADMIN_COMPACT_PATH, post(handle_compact));
+    #[cfg(feature = "tuner")]
+    let router = router.route(ADMIN_TUNER_METRICS_PATH, get(handle_tuner_metrics));
+    let router = router
         .route_layer(middleware::from_fn_with_state(
             AdminGateState {
                 token: admin.token,
@@ -556,6 +561,33 @@ async fn handle_status(
     match status_response(&state, deadline).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => node_admin_error(error),
+    }
+}
+
+#[cfg(feature = "tuner")]
+async fn handle_tuner_metrics(
+    State(state): State<AdminRouteState>,
+    Extension(_permit): Extension<Arc<AdminPermit>>,
+) -> Response {
+    let runtime = &state.runtime;
+    match runtime.config().tuner_telemetry() {
+        Some(telemetry) => {
+            let collector = telemetry.collector();
+            let metrics = serde_json::json!({
+                "total_samples": collector.total_samples(),
+                "is_fresh": collector.is_fresh(),
+                "cold_start_gates_passed": collector.cold_start_gates_passed(),
+                "window_size": collector.window_size(),
+            });
+            Json(metrics).into_response()
+        }
+        None => {
+            let response = serde_json::json!({
+                "error": "tuner not configured",
+                "code": "tuner_not_available"
+            });
+            (StatusCode::NOT_FOUND, Json(response)).into_response()
+        }
     }
 }
 
