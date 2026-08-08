@@ -71,6 +71,27 @@ grep -Fq 'Invalid tuner metrics response' <<<"$WATCH_OUTPUT"
 # shellcheck disable=SC2329 # Invoked in the exported child-shell environment.
 curl() {
   case "$*" in
+    *membership/status*|*tuner/metrics*) printf '%s\n' '{}' ;;
+  esac
+}
+export -f curl
+run_watch
+grep -Fq 'Invalid tuner metrics response' <<<"$WATCH_OUTPUT"
+
+# shellcheck disable=SC2329 # Invoked in the exported child-shell environment.
+curl() {
+  case "$*" in
+    *membership/status*) printf '%s\n' '{}' ;;
+    *tuner/metrics*) printf '%s\n' '{"error":""}' ;;
+  esac
+}
+export -f curl
+run_watch
+grep -Fq 'Invalid tuner metrics response' <<<"$WATCH_OUTPUT"
+
+# shellcheck disable=SC2329 # Invoked in the exported child-shell environment.
+curl() {
+  case "$*" in
     *membership/status*) printf '%s\n' '{}' ;;
     *tuner/metrics*) printf '%s\n' '{"total_samples":"oops","is_fresh":true,"cold_start_gates_passed":false}' ;;
   esac

@@ -91,11 +91,18 @@ print_tuner_metrics() {
     local error total_samples is_fresh cold_start_passed
     if ! jq -e '
         type == "object" and
-        ((.error // "") | type == "string") and
-        ((.total_samples // 0) |
-          type == "number" and . >= 0 and . <= 9007199254740991 and floor == .) and
-        ((.is_fresh // false) | type == "boolean") and
-        ((.cold_start_gates_passed // false) | type == "boolean")
+        (
+          (has("error") and (.error | type == "string" and length > 0)) or
+          (
+            has("total_samples") and
+            has("is_fresh") and
+            has("cold_start_gates_passed") and
+            (.total_samples |
+              type == "number" and . >= 0 and . <= 9007199254740991 and floor == .) and
+            (.is_fresh | type == "boolean") and
+            (.cold_start_gates_passed | type == "boolean")
+          )
+        )
     ' <<<"$metrics_json" >/dev/null ||
        ! error=$(jq -r '.error // empty' <<<"$metrics_json") ||
        ! total_samples=$(jq -r '.total_samples // 0' <<<"$metrics_json") ||
