@@ -62,11 +62,12 @@ print_cluster_info() {
         return
     fi
 
-    local cluster_id=$(echo "$status_json" | jq -r '.cluster_id // "unknown"')
-    local epoch=$(echo "$status_json" | jq -r '.epoch // "unknown"')
-    local node_status=$(echo "$status_json" | jq -r '.node // "unknown"')
-    local members=$(echo "$status_json" | jq -r '.members // [] | join(", ")')
-    local profile=$(echo "$status_json" | jq -r '.execution_profile // "unknown"')
+    local cluster_id epoch node_status members profile
+    cluster_id=$(echo "$status_json" | jq -r '.cluster_id // "unknown"')
+    epoch=$(echo "$status_json" | jq -r '.epoch // "unknown"')
+    node_status=$(echo "$status_json" | jq -r '.node // "unknown"')
+    members=$(echo "$status_json" | jq -r '.members // [] | join(", ")')
+    profile=$(echo "$status_json" | jq -r '.execution_profile // "unknown"')
 
     echo -e "${CYAN}Cluster:${NC} $cluster_id"
     echo -e "${CYAN}Epoch:${NC} $epoch"
@@ -83,15 +84,17 @@ print_tuner_metrics() {
         return
     fi
 
-    local error=$(echo "$metrics_json" | jq -r '.error // empty')
+    local error
+    error=$(echo "$metrics_json" | jq -r '.error // empty')
     if [[ -n "$error" ]]; then
         echo -e "${YELLOW}⚠ Tuner not available: $error${NC}"
         return
     fi
 
-    local total_samples=$(echo "$metrics_json" | jq -r '.total_samples // 0')
-    local is_fresh=$(echo "$metrics_json" | jq -r '.is_fresh // false')
-    local cold_start_passed=$(echo "$metrics_json" | jq -r '.cold_start_gates_passed // false')
+    local total_samples is_fresh cold_start_passed
+    total_samples=$(echo "$metrics_json" | jq -r '.total_samples // 0')
+    is_fresh=$(echo "$metrics_json" | jq -r '.is_fresh // false')
+    cold_start_passed=$(echo "$metrics_json" | jq -r '.cold_start_gates_passed // false')
 
     echo -e "${BOLD}${GREEN}┌─ Telemetry Collector ────────────────────────────────────────┐${NC}"
     printf "│ %-30s %28s │\n" "Total Samples:" "$total_samples"
@@ -114,8 +117,9 @@ print_tuner_metrics() {
 
 print_recommendations() {
     local metrics_json="$1"
-    local total_samples=$(echo "$metrics_json" | jq -r '.total_samples // 0')
-    local cold_start_passed=$(echo "$metrics_json" | jq -r '.cold_start_gates_passed // false')
+    local total_samples cold_start_passed
+    total_samples=$(echo "$metrics_json" | jq -r '.total_samples // 0')
+    cold_start_passed=$(echo "$metrics_json" | jq -r '.cold_start_gates_passed // false')
 
     echo -e "${BOLD}${YELLOW}┌─ Recommendations ────────────────────────────────────────────┐${NC}"
 
