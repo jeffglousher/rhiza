@@ -59,16 +59,7 @@ pub struct MabTuner {
 
 impl MabTuner {
     pub fn new(config: TunerConfig) -> Self {
-        Self {
-            collector: TelemetryCollector::new(config.collector.clone()),
-            bandit: Mutex::new(ContextualBandit::new(config.bandit.clone())),
-            safety: SafetyBoundary::new(config.safety.clone()),
-            reward: Mutex::new(RewardPipeline::new(config.reward.clone())),
-            killswitch: KillSwitch::new(),
-            observability: Observability::new(config.observability.clone()),
-            rollout: RolloutGuard::new(),
-            config,
-        }
+        Self::with_stage(config, RolloutStage::from_features())
     }
 
     pub fn with_stage(config: TunerConfig, stage: RolloutStage) -> Self {
@@ -332,7 +323,9 @@ impl MabTuner {
     /// Reset all state (used on identity change).
     pub fn reset(&self) {
         self.collector.reset();
-        // bandit reset requires mutable access
+        if let Ok(mut bandit) = self.bandit.lock() {
+            bandit.reset();
+        }
         self.observability.clear();
     }
 
@@ -360,9 +353,11 @@ impl MabTuner {
             latency_us: None,
             duplicate_work: false,
             reward_components: None,
+            proposer_applied: apply_proposer,
+            hedge_delay_applied: apply_hedge,
+            is_shadow,
         };
         self.observability.record_action(record);
-        let _ = (apply_proposer, apply_hedge, is_shadow);
     }
 }
 

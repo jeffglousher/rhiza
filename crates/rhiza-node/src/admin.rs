@@ -577,6 +577,7 @@ async fn handle_tuner_metrics(
                 "total_samples": collector.total_samples(),
                 "is_fresh": collector.is_fresh(),
                 "cold_start_gates_passed": collector.cold_start_gates_passed(),
+                "window_size": collector.window_size(),
             });
             Json(metrics).into_response()
         }

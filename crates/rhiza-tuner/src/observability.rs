@@ -102,7 +102,7 @@ impl Observability {
             m.total_actions += 1;
             if let Some(reason) = &record.fallback_reason {
                 m.fallback_actions += 1;
-                let reason = format!("{reason:?}");
+                let reason = reason.as_str().to_owned();
                 *m.fallback_reasons.entry(reason).or_insert(0) += 1;
             } else {
                 m.tuned_actions += 1;
@@ -247,6 +247,9 @@ mod tests {
             latency_us: Some(10_000),
             duplicate_work: false,
             reward_components: None,
+            proposer_applied: true,
+            hedge_delay_applied: false,
+            is_shadow: false,
         }
     }
 

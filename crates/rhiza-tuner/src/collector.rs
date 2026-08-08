@@ -17,6 +17,8 @@ pub struct CollectorConfig {
     pub min_sample_count: u64,
     /// How often to aggregate rolling statistics.
     pub aggregation_interval: Duration,
+    /// Rolling window size for per-proposer latency samples.
+    pub window_size: usize,
 }
 
 impl Default for CollectorConfig {
@@ -25,6 +27,7 @@ impl Default for CollectorConfig {
             freshness_limit_us: 5_000_000, // 5 seconds
             min_sample_count: 100,
             aggregation_interval: Duration::from_secs(1),
+            window_size: 1000,
         }
     }
 }
@@ -66,6 +69,7 @@ pub struct TelemetryCollector {
 impl TelemetryCollector {
     pub fn new(config: CollectorConfig) -> Self {
         Self {
+            window_size: config.window_size,
             config,
             proposer_samples: RwLock::new(HashMap::new()),
             rpc_stats: RwLock::new(RpcStats::default()),
@@ -75,7 +79,6 @@ impl TelemetryCollector {
             queue_depth: RwLock::new(HashMap::new()),
             total_samples: RwLock::new(0),
             last_update: RwLock::new(Instant::now()),
-            window_size: 1000,
         }
     }
 
@@ -152,6 +155,11 @@ impl TelemetryCollector {
     /// Get the total sample count.
     pub fn total_samples(&self) -> u64 {
         self.total_samples.read().map(|c| *c).unwrap_or(0)
+    }
+
+    /// Get the configured window size.
+    pub fn window_size(&self) -> usize {
+        self.window_size
     }
 
     /// Check if telemetry is fresh enough for model use.

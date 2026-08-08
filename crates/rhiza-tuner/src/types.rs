@@ -220,6 +220,33 @@ pub enum FallbackReason {
     FreshnessExpired,
 }
 
+impl FallbackReason {
+    /// Returns a stable string representation for metrics aggregation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ModelTimeout => "model_timeout",
+            Self::ModelCrash => "model_crash",
+            Self::InvalidOutput => "invalid_output",
+            Self::StaleFeatures => "stale_features",
+            Self::StorageCorruption => "storage_corruption",
+            Self::ConfigMismatch => "config_mismatch",
+            Self::ConfidenceBelowThreshold => "confidence_below_threshold",
+            Self::GuardrailBreach => "guardrail_breach",
+            Self::KillSwitchActive => "kill_switch_active",
+            Self::ColdStart => "cold_start",
+            Self::ModelServiceLost => "model_service_lost",
+            Self::MembershipChange => "membership_change",
+            Self::FreshnessExpired => "freshness_expired",
+        }
+    }
+}
+
+impl std::fmt::Display for FallbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Terminal outcome of a request for reward computation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TerminalOutcome {
@@ -269,4 +296,10 @@ pub struct ActionRecord {
     pub latency_us: Option<u64>,
     pub duplicate_work: bool,
     pub reward_components: Option<RewardComponents>,
+    /// Whether the tuned proposer choice was applied to real traffic.
+    pub proposer_applied: bool,
+    /// Whether the tuned hedge delay was applied to real traffic.
+    pub hedge_delay_applied: bool,
+    /// Whether this action was in shadow mode (computed but not applied).
+    pub is_shadow: bool,
 }
