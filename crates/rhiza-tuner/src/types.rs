@@ -246,6 +246,7 @@ pub struct RewardComponents {
     pub work_penalty: f64,
     pub contention_penalty: f64,
     pub error_penalty: f64,
+    pub slo_penalty: f64,
     pub total: f64,
     pub censored: bool,
 }

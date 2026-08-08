@@ -290,6 +290,7 @@ mod tests {
             work_penalty: 0.0,
             contention_penalty: 0.0,
             error_penalty: 0.0,
+            slo_penalty: 0.0,
             total: -0.55,
             censored: false,
         };

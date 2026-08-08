@@ -102,7 +102,7 @@ proptest! {
         dup_work in any::<bool>(),
         contention in any::<bool>(),
     ) {
-        let pipeline = RewardPipeline::new(RewardConfig::default());
+        let mut pipeline = RewardPipeline::new(RewardConfig::default());
         let outcome = TerminalOutcome::Success {
             decision_latency_us: latency_us,
             additional_rpcs: rpcs,

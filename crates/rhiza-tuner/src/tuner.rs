@@ -51,7 +51,7 @@ pub struct MabTuner {
     collector: TelemetryCollector,
     bandit: Mutex<ContextualBandit>,
     safety: SafetyBoundary,
-    reward: RewardPipeline,
+    reward: Mutex<RewardPipeline>,
     killswitch: KillSwitch,
     observability: Observability,
     rollout: RolloutGuard,
@@ -63,7 +63,7 @@ impl MabTuner {
             collector: TelemetryCollector::new(config.collector.clone()),
             bandit: Mutex::new(ContextualBandit::new(config.bandit.clone())),
             safety: SafetyBoundary::new(config.safety.clone()),
-            reward: RewardPipeline::new(config.reward.clone()),
+            reward: Mutex::new(RewardPipeline::new(config.reward.clone())),
             killswitch: KillSwitch::new(),
             observability: Observability::new(config.observability.clone()),
             rollout: RolloutGuard::new(),
@@ -76,7 +76,7 @@ impl MabTuner {
             collector: TelemetryCollector::new(config.collector.clone()),
             bandit: Mutex::new(ContextualBandit::new(config.bandit.clone())),
             safety: SafetyBoundary::new(config.safety.clone()),
-            reward: RewardPipeline::new(config.reward.clone()),
+            reward: Mutex::new(RewardPipeline::new(config.reward.clone())),
             killswitch: KillSwitch::new(),
             observability: Observability::new(config.observability.clone()),
             rollout: RolloutGuard::with_stage(stage),
@@ -277,7 +277,11 @@ impl MabTuner {
 
     /// Record a terminal outcome and update the model.
     pub fn record_outcome(&self, correlation_id: &str, action: &Action, outcome: &TerminalOutcome) {
-        let reward = self.reward.compute(outcome);
+        let reward = if let Ok(mut reward) = self.reward.lock() {
+            reward.compute(outcome)
+        } else {
+            return;
+        };
         self.observability
             .record_outcome(correlation_id, outcome, &reward);
         // Update bandit model (only if not shadow and not killed)

@@ -35,3 +35,11 @@ harness = false
 [[bench]]
 name = "five_peer_benchmark"
 harness = false
+
+[[bench]]
+name = "reward_pipeline_benchmark"
+harness = false
+
+[[bench]]
+name = "learning_benchmark"
+harness = false
