@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317 # Exported mock bodies are invoked by child Bash processes.
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
