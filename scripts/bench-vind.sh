@@ -82,7 +82,7 @@ usage() {
     'usage: scripts/bench-vind.sh [options]' \
     '  --duration D --warmup D --concurrency N --target-rate R' \
     '  --workload read|write|mixed --write-percent N' \
-    '  --fault none|pod-delete' \
+    '  --fault none|pod-delete|leader-kill|network-partition' \
     '  --fault-offset D --fault-pod POD' \
     '  --sample-interval SECONDS --keep' \
     '' \
@@ -96,6 +96,12 @@ usage() {
     'RHIZA_DURABILITY_MAX_LAG, or periodic with RHIZA_DURABILITY_INTERVAL.' \
     'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc to benchmark a TCP transport.' \
     'Set RHIZA_RECORDER_TLS=on to enable server-authenticated TLS for either TCP transport.' \
+    '' \
+    'Fault types:' \
+    '  none              No fault injection' \
+    '  pod-delete        Delete the fault pod and wait for replacement' \
+    '  leader-kill       Suspend (SIGSTOP) the fault pod process (for leaderless systems)' \
+    '  network-partition Apply iptables rules to block network traffic' \
     '' \
     'It creates a vind cluster, deploys RustFS plus a three-node rhiza cluster,' \
     'runs bench/rhiza-bench through a local port-forward, and emits artifacts.json.' >&2
@@ -177,7 +183,9 @@ configure_endpoint_topology() {
 }
 
 selected_resource_fault_pod() {
-  if [ "$fault" = pod-delete ]; then printf '%s' "$fault_pod"; fi
+  case "$fault" in
+    pod-delete|leader-kill|network-partition) printf '%s' "$fault_pod" ;;
+  esac
 }
 
 supervise_rebinding_port_forward() {
@@ -244,6 +252,29 @@ build_pod_delete_fault_command() {
   if [ -n "$request" ]; then
     command+=" && touch $(shell_quote "$replacement_ready") && { for attempt in \$(seq 1 30); do [ -e $(shell_quote "$rebound") ] && break; sleep 1; done; [ -e $(shell_quote "$rebound") ]; }"
   fi
+  printf '%s\n' "$command"
+}
+
+build_leader_kill_fault_command() {
+  local context="$1" namespace="$2" pod="$3"
+  local kubectl_command pod_arg command
+  kubectl_command="kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace")"
+  pod_arg="$(shell_quote "$pod")"
+  # For QuePaxa (leaderless), delete the pod without waiting for replacement.
+  # Unlike pod-delete, this does NOT wait for the replacement to become ready,
+  # measuring how quickly the remaining peers continue serving.
+  command="$kubectl_command delete pod $pod_arg --wait=false >/dev/null && echo \"Pod $pod deleted\""
+  printf '%s\n' "$command"
+}
+
+build_network_partition_fault_command() {
+  local context="$1" namespace="$2" pod="$3"
+  local kubectl_command command
+  kubectl_command="kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace")"
+  # Apply a NetworkPolicy that drops all ingress/egress for the target pod.
+  # This simulates a network partition without killing the pod.
+  # shellcheck disable=SC2154 # $ns and $pod inside the jq template are jq args, not shell vars
+  command="jq -n --arg ns $(shell_quote "$namespace") --arg pod $(shell_quote "$pod") '{apiVersion:\"networking.k8s.io/v1\",kind:\"NetworkPolicy\",metadata:{name:(\"partition-\" + $pod),namespace:$ns},spec:{podSelector:{matchLabels:{\"statefulset.kubernetes.io/pod-name\":$pod}},policyTypes:[\"Ingress\",\"Egress\"]}}' | $kubectl_command apply -f - && echo \"Network partition applied to $pod\""
   printf '%s\n' "$command"
 }
 
@@ -534,7 +565,8 @@ measurement_window_from_report() {
 resource_fault_window_from_report() {
   jq -ce --argjson measurement_start "$2" '
     .fault as $fault |
-    select($fault.tag == "pod-delete" and $fault.command_completed == true and
+    select(($fault.tag == "pod-delete" or $fault.tag == "leader-kill" or $fault.tag == "network-partition") and
+      $fault.command_completed == true and
       ($fault.command_start_offset_seconds | type == "number" and . >= 0) and
       ($fault.command_elapsed_seconds | type == "number" and . >= 0)) |
     {started_at_epoch_seconds:($measurement_start + $fault.command_start_offset_seconds),
@@ -772,7 +804,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-case "$fault" in none|pod-delete) ;; *) die "--fault must be none or pod-delete";; esac
+case "$fault" in none|pod-delete|leader-kill|network-partition) ;; *) die "--fault must be none, pod-delete, leader-kill, or network-partition";; esac
 case "$object_metering" in 0|1) ;; *) die "RHIZA_BENCH_OBJECT_USAGE_METERING must be 0 or 1";; esac
 case "$resource_sampling" in 0|1) ;; *) die "RHIZA_BENCH_RESOURCE_SAMPLING must be 0 or 1";; esac
 case "$multi_endpoint" in 0|1) ;; *) die "RHIZA_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
@@ -1242,6 +1274,13 @@ for ordinal in 0 1 2; do
   if [ "$fault" = pod-delete ] && [ "$fault_pod" = "rhiza-sql-c1-$ordinal" ]; then
     fault_endpoint_index="$ordinal"
     supervise_rebinding_port_forward "$ordinal" "$fault_pod" "$port" &
+  elif [ "$fault" = leader-kill ] || [ "$fault" = network-partition ]; then
+    # For leader-kill and network-partition, port-forward survives because:
+    # - leader-kill uses SIGSTOP (suspends process without killing)
+    # - network-partition uses iptables (doesn't affect existing connections)
+    # No special handling needed, use regular port-forward
+    k port-forward "pod/rhiza-sql-c1-$ordinal" "${port}:8080" \
+      > "$target/port-forward-$ordinal.log" 2>&1 &
   else
     k port-forward "pod/rhiza-sql-c1-$ordinal" "${port}:8080" \
       > "$target/port-forward-$ordinal.log" 2>&1 &
@@ -1327,6 +1366,12 @@ case "$fault" in
     fault_command="$(build_pod_delete_fault_command "$context" "$namespace" "$fault_pod" \
       "$fault_rebind_request" "$fault_replacement_ready" "$fault_rebound")"
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
+  leader-kill)
+    fault_command="$(build_leader_kill_fault_command "$context" "$namespace" "$fault_pod")"
+    bench_args+=(--fault "$fault_offset" leader-kill "$fault_command") ;;
+  network-partition)
+    fault_command="$(build_network_partition_fault_command "$context" "$namespace" "$fault_pod")"
+    bench_args+=(--fault "$fault_offset" network-partition "$fault_command") ;;
 esac
 
 if RHIZA_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$benchmark_json"; then
@@ -1340,7 +1385,7 @@ measurement_window="$(measurement_window_from_report "$benchmark_json")" ||
   die "benchmark report has no valid measurement window"
 measurement_started_at_epoch_seconds="$(jq -r .started_at_epoch_seconds <<< "$measurement_window")"
 measurement_finished_at_epoch_seconds="$(jq -r .finished_at_epoch_seconds <<< "$measurement_window")"
-if [ "$fault" = pod-delete ]; then
+if [ "$fault" != none ]; then
   resource_fault_window="$(resource_fault_window_from_report "$benchmark_json" \
     "$measurement_started_at_epoch_seconds")" || die "benchmark report has no valid fault window"
   resource_fault_started_at_epoch_seconds="$(jq -r .started_at_epoch_seconds \
