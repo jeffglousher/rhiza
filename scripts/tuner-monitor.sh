@@ -35,7 +35,7 @@ BOLD='\033[1m'
 fetch_metrics() {
     local endpoint="$1"
     local token="$2"
-    curl -s -H "Authorization: Bearer $token" \
+    curl -sS -H "Authorization: Bearer $token" \
          -H "Accept: application/json" \
          "$endpoint/v1/admin/tuner/metrics" 2>/dev/null
 }
@@ -43,7 +43,7 @@ fetch_metrics() {
 fetch_status() {
     local endpoint="$1"
     local token="$2"
-    curl -s -H "Authorization: Bearer $token" \
+    curl -sS -H "Authorization: Bearer $token" \
          -H "Accept: application/json" \
          "$endpoint/v1/admin/membership/status" 2>/dev/null
 }
@@ -63,11 +63,15 @@ print_cluster_info() {
     fi
 
     local cluster_id epoch node_status members profile
-    cluster_id=$(echo "$status_json" | jq -r '.cluster_id // "unknown"')
-    epoch=$(echo "$status_json" | jq -r '.epoch // "unknown"')
-    node_status=$(echo "$status_json" | jq -r '.node // "unknown"')
-    members=$(echo "$status_json" | jq -r '.members // [] | join(", ")')
-    profile=$(echo "$status_json" | jq -r '.execution_profile // "unknown"')
+    if ! jq -e 'type == "object"' <<<"$status_json" >/dev/null ||
+       ! cluster_id=$(jq -r '.cluster_id // "unknown"' <<<"$status_json") ||
+       ! epoch=$(jq -r '.epoch // "unknown"' <<<"$status_json") ||
+       ! node_status=$(jq -r '.node // "unknown"' <<<"$status_json") ||
+       ! members=$(jq -r '.members // [] | join(", ")' <<<"$status_json") ||
+       ! profile=$(jq -r '.execution_profile // "unknown"' <<<"$status_json"); then
+        echo -e "${RED}✗ Invalid cluster status response${NC}"
+        return
+    fi
 
     echo -e "${CYAN}Cluster:${NC} $cluster_id"
     echo -e "${CYAN}Epoch:${NC} $epoch"
@@ -81,20 +85,29 @@ print_tuner_metrics() {
     local metrics_json="$1"
     if [[ -z "$metrics_json" ]]; then
         echo -e "${RED}✗ Cannot fetch tuner metrics${NC}"
-        return
+        return 1
     fi
 
-    local error
-    error=$(echo "$metrics_json" | jq -r '.error // empty')
+    local error total_samples is_fresh cold_start_passed
+    if ! jq -e '
+        type == "object" and
+        ((.error // "") | type == "string") and
+        ((.total_samples // 0) |
+          type == "number" and . >= 0 and . <= 9007199254740991 and floor == .) and
+        ((.is_fresh // false) | type == "boolean") and
+        ((.cold_start_gates_passed // false) | type == "boolean")
+    ' <<<"$metrics_json" >/dev/null ||
+       ! error=$(jq -r '.error // empty' <<<"$metrics_json") ||
+       ! total_samples=$(jq -r '.total_samples // 0' <<<"$metrics_json") ||
+       ! is_fresh=$(jq -r '.is_fresh // false' <<<"$metrics_json") ||
+       ! cold_start_passed=$(jq -r '.cold_start_gates_passed // false' <<<"$metrics_json"); then
+        echo -e "${RED}✗ Invalid tuner metrics response${NC}"
+        return 1
+    fi
     if [[ -n "$error" ]]; then
         echo -e "${YELLOW}⚠ Tuner not available: $error${NC}"
-        return
+        return 1
     fi
-
-    local total_samples is_fresh cold_start_passed
-    total_samples=$(echo "$metrics_json" | jq -r '.total_samples // 0')
-    is_fresh=$(echo "$metrics_json" | jq -r '.is_fresh // false')
-    cold_start_passed=$(echo "$metrics_json" | jq -r '.cold_start_gates_passed // false')
 
     echo -e "${BOLD}${GREEN}┌─ Telemetry Collector ────────────────────────────────────────┐${NC}"
     printf "│ %-30s %28s │\n" "Total Samples:" "$total_samples"
@@ -118,8 +131,11 @@ print_tuner_metrics() {
 print_recommendations() {
     local metrics_json="$1"
     local total_samples cold_start_passed
-    total_samples=$(echo "$metrics_json" | jq -r '.total_samples // 0')
-    cold_start_passed=$(echo "$metrics_json" | jq -r '.cold_start_gates_passed // false')
+    if ! total_samples=$(jq -r '.total_samples // 0' <<<"$metrics_json") ||
+       ! cold_start_passed=$(jq -r '.cold_start_gates_passed // false' <<<"$metrics_json"); then
+        echo -e "${RED}✗ Invalid tuner metrics response${NC}"
+        return
+    fi
 
     echo -e "${BOLD}${YELLOW}┌─ Recommendations ────────────────────────────────────────────┐${NC}"
 
@@ -149,18 +165,20 @@ if [[ "$WATCH_MODE" == "--watch" ]]; then
     while true; do
         tput clear
         print_header
-        STATUS=$(fetch_status "$ADMIN_ENDPOINT" "$TOKEN")
+        STATUS=$(fetch_status "$ADMIN_ENDPOINT" "$TOKEN") || STATUS=""
         print_cluster_info "$STATUS"
-        METRICS=$(fetch_metrics "$ADMIN_ENDPOINT" "$TOKEN")
-        print_tuner_metrics "$METRICS"
-        print_recommendations "$METRICS"
+        METRICS=$(fetch_metrics "$ADMIN_ENDPOINT" "$TOKEN") || METRICS=""
+        if print_tuner_metrics "$METRICS"; then
+            print_recommendations "$METRICS"
+        fi
         echo -e "${BLUE}Last updated: $(date '+%Y-%m-%d %H:%M:%S')${NC}"
         sleep 5
     done
 else
-    STATUS=$(fetch_status "$ADMIN_ENDPOINT" "$TOKEN")
+    STATUS=$(fetch_status "$ADMIN_ENDPOINT" "$TOKEN") || STATUS=""
     print_cluster_info "$STATUS"
-    METRICS=$(fetch_metrics "$ADMIN_ENDPOINT" "$TOKEN")
-    print_tuner_metrics "$METRICS"
-    print_recommendations "$METRICS"
+    METRICS=$(fetch_metrics "$ADMIN_ENDPOINT" "$TOKEN") || METRICS=""
+    if print_tuner_metrics "$METRICS"; then
+        print_recommendations "$METRICS"
+    fi
 fi

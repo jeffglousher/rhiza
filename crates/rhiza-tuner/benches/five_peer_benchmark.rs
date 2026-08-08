@@ -7,8 +7,6 @@
 //!
 //! Tuner's role: choose which endpoint is first + hedge delay
 
-use std::time::Duration;
-
 use rhiza_tuner::types::*;
 use rhiza_tuner::{MabTuner, RolloutStage, TunerConfig};
 
@@ -135,8 +133,6 @@ fn simulate_client_request(
     round: u64,
 ) -> (u64, bool, u32) {
     let mut tried = 0u32;
-    let mut elapsed = 0u64;
-
     // Try preferred first
     let (lat, timeout) = nodes[preferred].sample(round);
     tried += 1;
@@ -147,9 +143,9 @@ fn simulate_client_request(
     }
 
     // Preferred failed/timed out. Hedge to others after hedge_delay.
-    elapsed = if timeout { attempt_timeout_us } else { lat };
+    let mut elapsed = if timeout { attempt_timeout_us } else { lat };
 
-    for next in 0..N_PEERS {
+    for (next, node) in nodes.iter().enumerate() {
         if next == preferred {
             continue;
         }
@@ -157,7 +153,7 @@ fn simulate_client_request(
         // Wait for hedge delay
         elapsed += hedge_delay_us;
 
-        let (lat, timeout) = nodes[next].sample(round);
+        let (lat, timeout) = node.sample(round);
         tried += 1;
 
         if !timeout && lat < attempt_timeout_us {
@@ -177,7 +173,6 @@ fn simulate_client_request(
 // ---------------------------------------------------------------------------
 
 struct ScenarioResult {
-    label: &'static str,
     policy: String,
     rounds: usize,
     successes: usize,
@@ -207,7 +202,7 @@ impl std::fmt::Display for ScenarioResult {
 }
 
 fn run_static_scenario(
-    label: &'static str,
+    _label: &'static str,
     nodes: &[NodeResponseTime],
     preferred: usize,
     hedge_delay_us: u64,
@@ -237,7 +232,6 @@ fn run_static_scenario(
 
     latencies.sort();
     ScenarioResult {
-        label,
         policy: format!("static (peer-{preferred})"),
         rounds: N_ROUNDS,
         successes,
@@ -328,7 +322,6 @@ fn run_tuner_scenario(
 
     latencies.sort();
     ScenarioResult {
-        label,
         policy: "MAB tuner".to_string(),
         rounds: N_ROUNDS,
         successes,
@@ -596,7 +589,6 @@ fn main() {
         tuner_lats.sort();
 
         let s = ScenarioResult {
-            label: "recovery",
             policy: "static (peer-0)".into(),
             rounds: N_ROUNDS,
             successes: static_success,
@@ -607,7 +599,6 @@ fn main() {
             mean_tried: static_tried as f64 / N_ROUNDS as f64,
         };
         let t = ScenarioResult {
-            label: "recovery",
             policy: "MAB tuner".into(),
             rounds: N_ROUNDS,
             successes: tuner_success,

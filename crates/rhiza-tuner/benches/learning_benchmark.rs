@@ -6,8 +6,6 @@
 //! 3. Adaptation - how fast the tuner adapts to topology changes
 //! 4. Stability - variance in proposer selection over time
 
-use std::time::Duration;
-
 use rhiza_tuner::types::*;
 use rhiza_tuner::{MabTuner, RolloutStage, TunerConfig};
 
@@ -20,15 +18,13 @@ const WARMUP_SAMPLES: usize = 100;
 // ---------------------------------------------------------------------------
 
 struct SimulatedNode {
-    name: NodeId,
     base_latency_us: u64,
     failure_rate: f64,
 }
 
 impl SimulatedNode {
-    fn new(name: &str, base_latency_us: u64, failure_rate: f64) -> Self {
+    fn new(_name: &str, base_latency_us: u64, failure_rate: f64) -> Self {
         Self {
-            name: name.into(),
             base_latency_us,
             failure_rate,
         }
@@ -120,6 +116,7 @@ fn run_learning_scenario(
 ) -> LearningResult {
     let tuner_config = TunerConfig {
         cold_start_min_samples: WARMUP_SAMPLES as u64,
+        reward: reward_config.clone(),
         ..Default::default()
     };
     let tuner = MabTuner::with_stage(tuner_config, RolloutStage::DefaultOn);
@@ -475,6 +472,7 @@ fn run_topology_change_scenario(
 ) -> TopologyChangeResult {
     let tuner_config = TunerConfig {
         cold_start_min_samples: WARMUP_SAMPLES as u64,
+        reward: reward_config,
         ..Default::default()
     };
     let tuner = MabTuner::with_stage(tuner_config, RolloutStage::DefaultOn);
@@ -515,8 +513,6 @@ fn run_topology_change_scenario(
         } else {
             nodes_phase2
         };
-
-        let optimal_idx = if round < phase1_rounds { 0 } else { 1 };
 
         let (lat, timeout) = nodes[selected].sample(round);
         let outcome = if timeout {
