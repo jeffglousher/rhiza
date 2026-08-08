@@ -18359,11 +18359,14 @@ mod tests {
             membership.clone(),
         )
         .unwrap();
-        for slot in 1..=super::RECORDER_WAL_HARD_FRAME_LIMIT + 1 {
+        let last_slot = super::RECORDER_WAL_HARD_FRAME_LIMIT * 2 + 1;
+        let mut commands = Vec::new();
+        for slot in 1..=last_slot {
             let command = StoredCommand::new(
                 EntryType::Command,
                 format!("wal-rotate-{slot}").into_bytes(),
             );
+            commands.push((slot, command.hash(), command.clone()));
             let value = AcceptedValue::from_command("cluster", slot, 1, 1, LogHash::ZERO, &command);
             store
                 .record_proposal(RecordRequest {
@@ -18379,22 +18382,22 @@ mod tests {
                 .unwrap();
         }
         let (generation, through_sequence, frames) = store.wal_stats().unwrap();
-        assert!(generation > 1);
-        assert!(through_sequence >= super::RECORDER_WAL_HARD_FRAME_LIMIT);
+        assert!(generation > 2);
+        assert!(through_sequence >= super::RECORDER_WAL_HARD_FRAME_LIMIT * 2);
         assert_eq!(frames, 1);
         drop(store);
 
         let reopened =
             RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
                 .unwrap();
-        assert_eq!(
-            reopened
-                .load(super::RECORDER_WAL_HARD_FRAME_LIMIT + 1)
-                .unwrap()
-                .isr
-                .step(),
-            4
-        );
+        for (slot, hash, command) in commands {
+            assert_eq!(reopened.load(slot).unwrap().isr.step(), 4);
+            assert_eq!(reopened.fetch_command(hash).unwrap(), Some(command));
+        }
+        let (generation, through_sequence, frames) = reopened.wal_stats().unwrap();
+        assert_eq!(generation, 3);
+        assert_eq!(through_sequence, super::RECORDER_WAL_HARD_FRAME_LIMIT * 2);
+        assert_eq!(frames, 1);
     }
 
     proptest! {

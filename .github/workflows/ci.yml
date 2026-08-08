@@ -132,7 +132,7 @@ jobs:
       - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path bench/Cargo.toml --locked --all-targets
-      - run: bash -n scripts/bench-vind.sh scripts/tuner-monitor.sh scripts/check-tuner-monitor-static.sh scripts/check-workspace-packages.sh scripts/check-quepaxa-package.sh
+      - run: bash -n scripts/bench-vind.sh scripts/bench-rhiza-hiqlite.sh scripts/check-bench-rhiza-hiqlite-static.sh scripts/tuner-monitor.sh scripts/check-tuner-monitor-static.sh scripts/check-workspace-packages.sh scripts/check-quepaxa-package.sh
       - name: Install pinned yq
         env:
           YQ_VERSION: v4.47.2
@@ -142,6 +142,7 @@ jobs:
           echo "${YQ_SHA256}  ${RUNNER_TEMP}/yq" | sha256sum -c -
           sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
       - run: scripts/check-bench-vind-static.sh
+      - run: scripts/check-bench-rhiza-hiqlite-static.sh
       - run: scripts/check-tuner-monitor-static.sh
       - run: scripts/check-deploy.sh
       - run: scripts/check-workspace-packages.sh

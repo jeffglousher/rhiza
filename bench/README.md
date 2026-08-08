@@ -87,6 +87,41 @@ cargo run --release --manifest-path bench/Cargo.toml --bin rhiza-cost -- \
   --rustfs-storage-usd-per-gb-month 0.01
 ```
 
+## Rhiza / Hiqlite comparison program
+
+`scripts/bench-rhiza-hiqlite.sh plan` emits the versioned, machine-readable
+comparison contract. It is safe by default: it does not build images, create a
+cluster, or modify a deployment. The contract separates diagnostic, local
+durable-quorum, volume-loss, and object-authoritative durability tiers; it also
+marks Graph, persistent-KV versus cache, local versus consistent reads, and
+object-authoritative recovery as non-comparable where their semantics differ.
+
+```sh
+scripts/bench-rhiza-hiqlite.sh plan target/rhiza-hiqlite-plan.json
+```
+
+The only mutating coordinator command is explicit. It delegates the fixed
+`1,2,3 × 60,180,300` zero-PVC recovery matrix to the established Rhiza and
+Hiqlite recovery runners; it does not contain duplicate deployment logic.
+
+```sh
+scripts/bench-rhiza-hiqlite.sh run-recovery
+scripts/bench-rhiza-hiqlite.sh normalize-recovery \
+  target/rhiza-e2e/sql/RUN/recovery-matrix.jsonl \
+  target/hiqlite-recovery/RUN/summary.json target/recovery-normalized.json
+```
+
+`run-recovery` writes progress and the start event to stderr. On success its
+stdout is one completed JSON manifest with the coordinator artifact root, both
+exact source paths, and SHA-256 digests.
+
+Normalization rejects missing, duplicate, or mismatched recovery coordinates.
+It requires Hiqlite three-voter `emptyDir`/zero-PVC evidence and Rhiza zero-PVC
+plus three-old/three-new-voter cell evidence, retains source paths, and writes
+unavailable throughput/resource values as `not_measured`; it never invents them.
+Recovery normalization is implemented; a matched workload/resource coordinator
+is still pending, so no publishable performance comparison exists yet.
+
 ## vind Runner
 
 `scripts/bench-vind.sh` creates a disposable vind cluster, deploys the existing
