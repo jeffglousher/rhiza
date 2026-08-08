@@ -18,26 +18,32 @@ if grep -nF '/bin/sh' deploy/k8s/rhiza-cluster.yaml deploy/k8s/rhiza-checkpoint-
 fi
 
 client_service=deploy/k8s/rhiza-client-services.yaml
-[ "$(yq eval-all '[select(.kind == "Service")] | length' "$client_service")" = 1 ]
+[ "$(yq eval-all '[select(.kind == "Service")] | length' "$client_service")" = 3 ]
 grep -Fq 'k apply -f deploy/k8s/rhiza-client-services.yaml' scripts/e2e-vind-rustfs.sh
 grep -Fq 'k apply -f deploy/k8s/rhiza-client-services.yaml' scripts/bench-vind.sh
-yq eval -e '
-  .kind == "Service" and
-  .metadata.name == "rhiza-sql-client" and
-  (.metadata.labels | keys | sort | join(",")) ==
-    "app.kubernetes.io/component,app.kubernetes.io/name,rhiza.dev/execution-profile" and
-  .metadata.labels["app.kubernetes.io/name"] == "rhiza" and
-  .metadata.labels["app.kubernetes.io/component"] == "client" and
-  .metadata.labels["rhiza.dev/execution-profile"] == "sql" and
-  (.metadata.labels | has("rhiza.dev/config-id") | not) and
-  (.spec.selector | keys | sort | join(",")) ==
-    "app.kubernetes.io/name,rhiza.dev/execution-profile,rhiza.dev/member-role" and
-  .spec.selector["app.kubernetes.io/name"] == "rhiza" and
-  .spec.selector["rhiza.dev/execution-profile"] == "sql" and
-  .spec.selector["rhiza.dev/member-role"] == "voter" and
-  (.spec.ports | length) == 1 and .spec.ports[0].name == "client" and
-  .spec.ports[0].port == 8080 and .spec.ports[0].targetPort == "client"
-' "$client_service" >/dev/null
+for client_profile in sql graph kv; do
+  export CHECK_CLIENT_PROFILE="$client_profile"
+  export CHECK_CLIENT_NAME="rhiza-${client_profile}-client"
+  yq eval -e '
+    select(.kind == "Service" and
+      .metadata.labels["rhiza.dev/execution-profile"] ==
+        strenv(CHECK_CLIENT_PROFILE)) |
+    .metadata.name == strenv(CHECK_CLIENT_NAME) and
+    (.metadata.labels | keys | sort | join(",")) ==
+      "app.kubernetes.io/component,app.kubernetes.io/name,rhiza.dev/execution-profile" and
+    .metadata.labels["app.kubernetes.io/name"] == "rhiza" and
+    .metadata.labels["app.kubernetes.io/component"] == "client" and
+    (.metadata.labels | has("rhiza.dev/config-id") | not) and
+    (.spec.selector | keys | sort | join(",")) ==
+      "app.kubernetes.io/name,rhiza.dev/execution-profile,rhiza.dev/member-role" and
+    .spec.selector["app.kubernetes.io/name"] == "rhiza" and
+    .spec.selector["rhiza.dev/execution-profile"] ==
+      strenv(CHECK_CLIENT_PROFILE) and
+    .spec.selector["rhiza.dev/member-role"] == "voter" and
+    (.spec.ports | length) == 1 and .spec.ports[0].name == "client" and
+    .spec.ports[0].port == 8080 and .spec.ports[0].targetPort == "client"
+  ' "$client_service" >/dev/null
+done
 if grep -Eq '__[A-Z0-9_]+__|rhiza.dev/config-id' "$client_service"; then
   echo "stable client Service must not be config-rendered or config-scoped" >&2
   exit 1

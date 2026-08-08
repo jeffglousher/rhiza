@@ -25,10 +25,15 @@ jobs:
           RHIZA_PROFILE: ${{ matrix.profile }}
         run: |
           cargo_features=(--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc")
+          tuner_features=(--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc,tuner")
           cargo check --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
+          cargo check --locked -p rhiza-cli --all-targets "${tuner_features[@]}"
           dependency_tree="$RUNNER_TEMP/rhiza-${RHIZA_PROFILE}-dependencies.txt"
+          tuner_dependency_tree="$RUNNER_TEMP/rhiza-${RHIZA_PROFILE}-tuner-dependencies.txt"
           cargo tree --locked -p rhiza-cli -e normal "${cargo_features[@]}" \
             --prefix none --format '{p}' > "$dependency_tree"
+          cargo tree --locked -p rhiza-cli -e normal "${tuner_features[@]}" \
+            --prefix none --format '{p}' > "$tuner_dependency_tree"
           case "$RHIZA_PROFILE" in
             sql) forbidden=(rhiza-graph lbug rhiza-kv redb) ;;
             graph) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-kv redb) ;;
@@ -36,13 +41,17 @@ jobs:
             *) exit 64 ;;
           esac
           for dependency in "${forbidden[@]}"; do
-            if awk -v package="$dependency" '$1 == package { found=1 } END { exit !found }' "$dependency_tree"; then
-              echo "$RHIZA_PROFILE profile unexpectedly includes $dependency" >&2
-              exit 1
-            fi
+            for tree in "$dependency_tree" "$tuner_dependency_tree"; do
+              if awk -v package="$dependency" '$1 == package { found=1 } END { exit !found }' "$tree"; then
+                echo "$RHIZA_PROFILE profile unexpectedly includes $dependency" >&2
+                exit 1
+              fi
+            done
           done
           cargo clippy --locked -p rhiza-cli --all-targets "${cargo_features[@]}" -- -D warnings
+          cargo clippy --locked -p rhiza-cli --all-targets "${tuner_features[@]}" -- -D warnings
           cargo test --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
+          cargo test --locked -p rhiza-cli --all-targets "${tuner_features[@]}"
           if [ "$RHIZA_PROFILE" = graph ]; then
             cargo test --locked -p rhiza-graph
             cargo test --locked -p rhiza-node --no-default-features --features graph --test graph_runtime
@@ -114,16 +123,16 @@ jobs:
           cargo clippy --locked --all-targets \
             -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
             -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-kv -p rhiza-node -p rhizadb \
-            -p rhiza-client -p rhiza-cli -- -D warnings
+            -p rhiza-client -p rhiza-cli -p rhiza-tuner -- -D warnings
       - run: |
           cargo test --locked --all-targets \
             -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
             -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-kv -p rhiza-node -p rhizadb \
-            -p rhiza-client -p rhiza-cli
+            -p rhiza-client -p rhiza-cli -p rhiza-tuner
       - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path bench/Cargo.toml --locked --all-targets
-      - run: bash -n scripts/bench-vind.sh scripts/check-workspace-packages.sh scripts/check-quepaxa-package.sh
+      - run: bash -n scripts/bench-vind.sh scripts/tuner-monitor.sh scripts/check-tuner-monitor-static.sh scripts/check-workspace-packages.sh scripts/check-quepaxa-package.sh
       - name: Install pinned yq
         env:
           YQ_VERSION: v4.47.2
@@ -133,6 +142,7 @@ jobs:
           echo "${YQ_SHA256}  ${RUNNER_TEMP}/yq" | sha256sum -c -
           sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
       - run: scripts/check-bench-vind-static.sh
+      - run: scripts/check-tuner-monitor-static.sh
       - run: scripts/check-deploy.sh
       - run: scripts/check-workspace-packages.sh
       - run: scripts/check-quepaxa-package.sh

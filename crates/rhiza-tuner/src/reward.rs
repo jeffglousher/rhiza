@@ -42,10 +42,10 @@ impl Default for RewardConfig {
             lambda_error: 1.0,
             latency_cap_us: 1_000_000, // 1 second
             censored_penalty: -0.5,
-            slo_latency_us: 50_000,    // 50ms SLO
+            slo_latency_us: 50_000, // 50ms SLO
             slo_exponential_factor: 2.0,
             lambda_slo: 0.2,
-            latency_base_us: 1_000.0,  // 1ms base for log normalization
+            latency_base_us: 1_000.0, // 1ms base for log normalization
             time_decay_factor: 0.95,
             reward_floor: -3.0,
             reward_ceiling: 0.0,
@@ -76,14 +76,12 @@ impl RewardPipeline {
                 additional_rpcs,
                 duplicate_proposer_work,
                 contention_or_round_escalation,
-            } => {
-                self.compute_success_reward(
-                    *decision_latency_us,
-                    *additional_rpcs,
-                    *duplicate_proposer_work,
-                    *contention_or_round_escalation,
-                )
-            }
+            } => self.compute_success_reward(
+                *decision_latency_us,
+                *additional_rpcs,
+                *duplicate_proposer_work,
+                *contention_or_round_escalation,
+            ),
             TerminalOutcome::Timeout => self.compute_timeout_reward(),
             TerminalOutcome::Error {
                 additional_rpcs,
@@ -117,7 +115,8 @@ impl RewardPipeline {
             0.0
         } else {
             let log_latency = (1.0 + capped_latency as f64 / self.config.latency_base_us).ln();
-            let log_cap = (1.0 + self.config.latency_cap_us as f64 / self.config.latency_base_us).ln();
+            let log_cap =
+                (1.0 + self.config.latency_cap_us as f64 / self.config.latency_base_us).ln();
             -(log_latency / log_cap)
         };
 
@@ -149,11 +148,8 @@ impl RewardPipeline {
             0.0
         };
 
-        let total = normalized_latency
-            + slo_penalty
-            + rpc_penalty
-            + work_penalty
-            + contention_penalty;
+        let total =
+            normalized_latency + slo_penalty + rpc_penalty + work_penalty + contention_penalty;
 
         RewardComponents {
             normalized_latency,

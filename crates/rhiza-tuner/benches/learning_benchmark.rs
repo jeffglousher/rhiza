@@ -6,8 +6,6 @@
 //! 3. Adaptation - how fast the tuner adapts to topology changes
 //! 4. Stability - variance in proposer selection over time
 
-use std::time::Duration;
-
 use rhiza_tuner::types::*;
 use rhiza_tuner::{MabTuner, RolloutStage, TunerConfig};
 
@@ -20,15 +18,13 @@ const WARMUP_SAMPLES: usize = 100;
 // ---------------------------------------------------------------------------
 
 struct SimulatedNode {
-    name: NodeId,
     base_latency_us: u64,
     failure_rate: f64,
 }
 
 impl SimulatedNode {
-    fn new(name: &str, base_latency_us: u64, failure_rate: f64) -> Self {
+    fn new(_name: &str, base_latency_us: u64, failure_rate: f64) -> Self {
         Self {
-            name: name.into(),
             base_latency_us,
             failure_rate,
         }
@@ -97,7 +93,12 @@ impl std::fmt::Display for LearningResult {
         writeln!(f, "  Pipeline:         {}", self.pipeline_name)?;
         writeln!(f, "  Scenario:         {}", self.scenario)?;
         writeln!(f, "  Rounds:           {}", self.total_rounds)?;
-        writeln!(f, "  Optimal picks:    {} ({:.1}%)", self.optimal_picks, self.optimal_rate * 100.0)?;
+        writeln!(
+            f,
+            "  Optimal picks:    {} ({:.1}%)",
+            self.optimal_picks,
+            self.optimal_rate * 100.0
+        )?;
         writeln!(f, "  Convergence:      round {}", self.convergence_round)?;
         writeln!(f, "  Mean reward:      {:.4}", self.mean_reward)?;
         writeln!(f, "  Reward stddev:    {:.4}", self.reward_stddev)?;
@@ -115,6 +116,7 @@ fn run_learning_scenario(
 ) -> LearningResult {
     let tuner_config = TunerConfig {
         cold_start_min_samples: WARMUP_SAMPLES as u64,
+        reward: reward_config.clone(),
         ..Default::default()
     };
     let tuner = MabTuner::with_stage(tuner_config, RolloutStage::DefaultOn);
@@ -214,28 +216,41 @@ fn print_comparison(scenario: &str, old: &LearningResult, new: &LearningResult) 
     println!("  {scenario}");
     println!("{}", "=".repeat(70));
 
-    println!("\n  {:>20} {:>20} {:>20}", "", "Linear (old)", "Log+SLO (new)");
+    println!(
+        "\n  {:>20} {:>20} {:>20}",
+        "", "Linear (old)", "Log+SLO (new)"
+    );
     println!("  {:->20} {:->20} {:->20}", "", "", "");
 
     let row = |label: &str, ov: String, nv: String| {
         println!("  {:>20} {:>20} {:>20}", label, ov, nv);
     };
 
-    row("Optimal picks",
+    row(
+        "Optimal picks",
         format!("{} ({:.1}%)", old.optimal_picks, old.optimal_rate * 100.0),
-        format!("{} ({:.1}%)", new.optimal_picks, new.optimal_rate * 100.0));
-    row("Convergence",
+        format!("{} ({:.1}%)", new.optimal_picks, new.optimal_rate * 100.0),
+    );
+    row(
+        "Convergence",
         format!("round {}", old.convergence_round),
-        format!("round {}", new.convergence_round));
-    row("Mean reward",
+        format!("round {}", new.convergence_round),
+    );
+    row(
+        "Mean reward",
         format!("{:.4}", old.mean_reward),
-        format!("{:.4}", new.mean_reward));
-    row("Reward stddev",
+        format!("{:.4}", new.mean_reward),
+    );
+    row(
+        "Reward stddev",
         format!("{:.4}", old.reward_stddev),
-        format!("{:.4}", new.reward_stddev));
-    row("Adaptation speed",
+        format!("{:.4}", new.reward_stddev),
+    );
+    row(
+        "Adaptation speed",
         format!("{} rounds", old.adaptation_speed),
-        format!("{} rounds", new.adaptation_speed));
+        format!("{} rounds", new.adaptation_speed),
+    );
 
     // Improvement calculations
     let optimal_imp = if old.optimal_rate > 0.0 {
@@ -244,7 +259,8 @@ fn print_comparison(scenario: &str, old: &LearningResult, new: &LearningResult) 
         0.0
     };
     let convergence_imp = if old.convergence_round > 0 {
-        (old.convergence_round as f64 - new.convergence_round as f64) / old.convergence_round as f64 * 100.0
+        (old.convergence_round as f64 - new.convergence_round as f64) / old.convergence_round as f64
+            * 100.0
     } else {
         0.0
     };
@@ -252,7 +268,11 @@ fn print_comparison(scenario: &str, old: &LearningResult, new: &LearningResult) 
     println!("\n  {:>20} {:>20}", "Improvement", "");
     println!("  {:->20} {:->20}", "", "");
     row("Optimal rate", format!("{optimal_imp:+.1}%"), "".into());
-    row("Convergence speed", format!("{convergence_imp:+.1}%"), "".into());
+    row(
+        "Convergence speed",
+        format!("{convergence_imp:+.1}%"),
+        "".into(),
+    );
 }
 
 fn main() {
@@ -281,7 +301,7 @@ fn main() {
     // Scenario 1: Static optimal (peer-0 is always fastest)
     {
         let nodes = vec![
-            SimulatedNode::new("peer-0", 500, 0.0),   // optimal
+            SimulatedNode::new("peer-0", 500, 0.0), // optimal
             SimulatedNode::new("peer-1", 1000, 0.0),
             SimulatedNode::new("peer-2", 1500, 0.0),
             SimulatedNode::new("peer-3", 2000, 0.0),
@@ -296,23 +316,29 @@ fn main() {
     // Scenario 2: Degraded primary (peer-0 slow but not down)
     {
         let nodes = vec![
-            SimulatedNode::new("peer-0", 2000, 0.0),  // degraded (was 500)
-            SimulatedNode::new("peer-1", 1000, 0.0),  // now optimal
+            SimulatedNode::new("peer-0", 2000, 0.0), // degraded (was 500)
+            SimulatedNode::new("peer-1", 1000, 0.0), // now optimal
             SimulatedNode::new("peer-2", 1500, 0.0),
             SimulatedNode::new("peer-3", 2000, 0.0),
             SimulatedNode::new("peer-4", 2500, 0.0),
         ];
 
-        let old = run_learning_scenario("Linear", "Degraded primary", &nodes, 1, old_config.clone());
-        let new = run_learning_scenario("Log+SLO", "Degraded primary", &nodes, 1, new_config.clone());
-        print_comparison("2. Degraded primary (peer-0 slow, peer-1 optimal)", &old, &new);
+        let old =
+            run_learning_scenario("Linear", "Degraded primary", &nodes, 1, old_config.clone());
+        let new =
+            run_learning_scenario("Log+SLO", "Degraded primary", &nodes, 1, new_config.clone());
+        print_comparison(
+            "2. Degraded primary (peer-0 slow, peer-1 optimal)",
+            &old,
+            &new,
+        );
     }
 
     // Scenario 3: Flaky primary (peer-0 has 30% failure rate)
     {
         let nodes = vec![
-            SimulatedNode::new("peer-0", 500, 0.3),   // flaky
-            SimulatedNode::new("peer-1", 1000, 0.0),  // stable
+            SimulatedNode::new("peer-0", 500, 0.3),  // flaky
+            SimulatedNode::new("peer-1", 1000, 0.0), // stable
             SimulatedNode::new("peer-2", 1500, 0.0),
             SimulatedNode::new("peer-3", 2000, 0.0),
             SimulatedNode::new("peer-4", 2500, 0.0),
@@ -320,7 +346,11 @@ fn main() {
 
         let old = run_learning_scenario("Linear", "Flaky primary", &nodes, 1, old_config.clone());
         let new = run_learning_scenario("Log+SLO", "Flaky primary", &nodes, 1, new_config.clone());
-        print_comparison("3. Flaky primary (peer-0 30% failure, peer-1 stable)", &old, &new);
+        print_comparison(
+            "3. Flaky primary (peer-0 30% failure, peer-1 stable)",
+            &old,
+            &new,
+        );
     }
 
     // Scenario 4: Topology change mid-simulation
@@ -340,38 +370,83 @@ fn main() {
         ];
 
         let nodes_phase2 = vec![
-            SimulatedNode::new("peer-0", 2000, 0.0),  // degraded
-            SimulatedNode::new("peer-1", 500, 0.0),   // now optimal
+            SimulatedNode::new("peer-0", 2000, 0.0), // degraded
+            SimulatedNode::new("peer-1", 500, 0.0),  // now optimal
             SimulatedNode::new("peer-2", 1500, 0.0),
             SimulatedNode::new("peer-3", 2000, 0.0),
             SimulatedNode::new("peer-4", 2500, 0.0),
         ];
 
         // Run with old config
-        let old_result = run_topology_change_scenario("Linear", &nodes_phase1, &nodes_phase2, old_config.clone());
+        let old_result = run_topology_change_scenario(
+            "Linear",
+            &nodes_phase1,
+            &nodes_phase2,
+            old_config.clone(),
+        );
 
         // Run with new config
-        let new_result = run_topology_change_scenario("Log+SLO", &nodes_phase1, &nodes_phase2, new_config.clone());
+        let new_result = run_topology_change_scenario(
+            "Log+SLO",
+            &nodes_phase1,
+            &nodes_phase2,
+            new_config.clone(),
+        );
 
-        println!("\n  {:>20} {:>20} {:>20}", "", "Linear (old)", "Log+SLO (new)");
+        println!(
+            "\n  {:>20} {:>20} {:>20}",
+            "", "Linear (old)", "Log+SLO (new)"
+        );
         println!("  {:->20} {:->20} {:->20}", "", "", "");
 
         let row = |label: &str, ov: String, nv: String| {
             println!("  {:>20} {:>20} {:>20}", label, ov, nv);
         };
 
-        row("Phase1 optimal",
-            format!("{} ({:.1}%)", old_result.phase1_optimal, old_result.phase1_optimal_rate * 100.0),
-            format!("{} ({:.1}%)", new_result.phase1_optimal, new_result.phase1_optimal_rate * 100.0));
-        row("Phase2 optimal",
-            format!("{} ({:.1}%)", old_result.phase2_optimal, old_result.phase2_optimal_rate * 100.0),
-            format!("{} ({:.1}%)", new_result.phase2_optimal, new_result.phase2_optimal_rate * 100.0));
-        row("Adaptation speed",
+        row(
+            "Phase1 optimal",
+            format!(
+                "{} ({:.1}%)",
+                old_result.phase1_optimal,
+                old_result.phase1_optimal_rate * 100.0
+            ),
+            format!(
+                "{} ({:.1}%)",
+                new_result.phase1_optimal,
+                new_result.phase1_optimal_rate * 100.0
+            ),
+        );
+        row(
+            "Phase2 optimal",
+            format!(
+                "{} ({:.1}%)",
+                old_result.phase2_optimal,
+                old_result.phase2_optimal_rate * 100.0
+            ),
+            format!(
+                "{} ({:.1}%)",
+                new_result.phase2_optimal,
+                new_result.phase2_optimal_rate * 100.0
+            ),
+        );
+        row(
+            "Adaptation speed",
             format!("{} rounds", old_result.adaptation_speed),
-            format!("{} rounds", new_result.adaptation_speed));
-        row("Overall optimal",
-            format!("{} ({:.1}%)", old_result.total_optimal, old_result.total_optimal_rate * 100.0),
-            format!("{} ({:.1}%)", new_result.total_optimal, new_result.total_optimal_rate * 100.0));
+            format!("{} rounds", new_result.adaptation_speed),
+        );
+        row(
+            "Overall optimal",
+            format!(
+                "{} ({:.1}%)",
+                old_result.total_optimal,
+                old_result.total_optimal_rate * 100.0
+            ),
+            format!(
+                "{} ({:.1}%)",
+                new_result.total_optimal,
+                new_result.total_optimal_rate * 100.0
+            ),
+        );
     }
 
     println!("\n{}", "=".repeat(70));
@@ -397,6 +472,7 @@ fn run_topology_change_scenario(
 ) -> TopologyChangeResult {
     let tuner_config = TunerConfig {
         cold_start_min_samples: WARMUP_SAMPLES as u64,
+        reward: reward_config,
         ..Default::default()
     };
     let tuner = MabTuner::with_stage(tuner_config, RolloutStage::DefaultOn);
@@ -437,8 +513,6 @@ fn run_topology_change_scenario(
         } else {
             nodes_phase2
         };
-
-        let optimal_idx = if round < phase1_rounds { 0 } else { 1 };
 
         let (lat, timeout) = nodes[selected].sample(round);
         let outcome = if timeout {

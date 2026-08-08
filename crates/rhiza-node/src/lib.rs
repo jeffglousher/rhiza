@@ -657,14 +657,20 @@ pub struct TunerTelemetry {
 #[cfg(feature = "tuner")]
 impl TunerTelemetry {
     pub fn new(collector: rhiza_tuner::TelemetryCollector) -> Self {
-        Self { inner: Arc::new(collector) }
+        Self {
+            inner: Arc::new(collector),
+        }
     }
-    pub fn collector(&self) -> &rhiza_tuner::TelemetryCollector { &self.inner }
+    pub fn collector(&self) -> &rhiza_tuner::TelemetryCollector {
+        &self.inner
+    }
 }
 
 #[cfg(feature = "tuner")]
 impl PartialEq for TunerTelemetry {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.inner, &other.inner) }
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 #[cfg(feature = "tuner")]
@@ -8732,7 +8738,7 @@ impl NodeRuntime {
         )
     }
 
-    #[cfg(feature = "tuner")]
+    #[cfg(all(feature = "tuner", feature = "sql"))]
     fn record_tuner_propose_outcome(&self, latency_us: u64, success: bool, timeout: bool) {
         if let Some(telemetry) = self.config.tuner_telemetry() {
             telemetry.collector().record_proposer_latency(
@@ -8744,7 +8750,7 @@ impl NodeRuntime {
         }
     }
 
-    #[cfg(feature = "tuner")]
+    #[cfg(all(feature = "tuner", feature = "sql"))]
     fn record_tuner_consensus_error(&self, error: &rhiza_quepaxa::Error) {
         let is_timeout = matches!(
             error,
@@ -8756,7 +8762,7 @@ impl NodeRuntime {
         self.record_tuner_propose_outcome(0, false, is_timeout);
     }
 
-    #[cfg(feature = "tuner")]
+    #[cfg(all(feature = "tuner", feature = "sql"))]
     fn record_tuner_consensus_success(&self, latency: Duration) {
         let latency_us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         self.record_tuner_propose_outcome(latency_us, true, false);

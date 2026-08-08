@@ -227,7 +227,7 @@ fn bench_bandit_convergence(n_proposers: usize, n_rounds: usize) -> BanditConver
         };
         tuner.record_outcome(&cid, &result.output.action, &outcome);
 
-        let reward_pipeline = RewardPipeline::new(RewardConfig::default());
+        let mut reward_pipeline = RewardPipeline::new(RewardConfig::default());
         let reward = reward_pipeline.compute(&outcome);
         total_reward += reward.total;
     }

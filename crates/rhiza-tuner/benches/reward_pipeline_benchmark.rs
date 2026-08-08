@@ -7,10 +7,7 @@
 //! 4. Flaky node (intermittent timeouts)
 //! 5. Recovery from failure
 
-use std::time::Duration;
-
 use rhiza_tuner::types::*;
-use rhiza_tuner::{MabTuner, RolloutStage, TunerConfig};
 
 const N_ROUNDS: usize = 500;
 
@@ -166,7 +163,6 @@ struct SimulationResult {
     max_reward: f64,
     reward_stddev: f64,
     slo_violations: usize,
-    censored_count: usize,
     ema_final: f64,
     reward_stability: f64, // coefficient of variation
 }
@@ -186,111 +182,51 @@ impl std::fmt::Display for SimulationResult {
     }
 }
 
-fn run_simulation(
-    scenario_name: &'static str,
-    events: &[ScenarioEvent],
-    slo_latency_us: u64,
-) -> SimulationResult {
-    let config = TunerConfig {
-        cold_start_min_samples: 0,
-        ..Default::default()
-    };
-    let tuner = MabTuner::with_stage(config, RolloutStage::Shadow);
-
-    let mut rewards = Vec::with_capacity(events.len());
-    let mut slo_violations = 0usize;
-
-    for (i, event) in events.iter().enumerate() {
-        let outcome = if event.timeout {
-            TerminalOutcome::Timeout
-        } else if !event.success {
-            TerminalOutcome::Error {
-                additional_rpcs: event.additional_rpcs,
-                duplicate_proposer_work: event.duplicate_work,
-            }
-        } else {
-            TerminalOutcome::Success {
-                decision_latency_us: event.latency_us,
-                additional_rpcs: event.additional_rpcs,
-                duplicate_proposer_work: event.duplicate_work,
-                contention_or_round_escalation: event.contention,
-            }
-        };
-
-        // Count SLO violations
-        if event.latency_us > slo_latency_us && event.success {
-            slo_violations += 1;
-        }
-
-        // Use the tuner's reward pipeline via record_outcome
-        let action = rhiza_tuner::Action {
-            first_request_target: "node-0".into(),
-            hedge_delay: HedgeDelayBucket::Static,
-        };
-        let cid = format!("sim-{i}");
-        tuner.record_outcome(&cid, &action, &outcome);
-
-        // We need to get the reward value, so we compute it separately
-        // for reporting purposes
-        let mut pipeline = rhiza_tuner::RewardPipeline::new(rhiza_tuner::RewardConfig {
-            slo_latency_us,
-            ..Default::default()
-        });
-        let reward = pipeline.compute(&outcome);
-        rewards.push(reward.total);
-    }
-
-    let mean = rewards.iter().sum::<f64>() / rewards.len() as f64;
-    let min = rewards.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = rewards.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let variance = rewards.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rewards.len() as f64;
-    let stddev = variance.sqrt();
-    let cv = if mean.abs() > 0.001 { stddev / mean.abs() } else { 0.0 };
-
-    SimulationResult {
-        scenario: scenario_name,
-        rounds: events.len(),
-        mean_reward: mean,
-        min_reward: min,
-        max_reward: max,
-        reward_stddev: stddev,
-        slo_violations,
-        censored_count: 0,
-        ema_final: 0.0, // Will be set from tuner
-        reward_stability: cv,
-    }
-}
-
 fn print_comparison(scenario: &str, old: &SimulationResult, new: &SimulationResult) {
     println!("\n{}", "=".repeat(70));
     println!("  {scenario}");
     println!("{}", "=".repeat(70));
 
-    println!("\n  {:>20} {:>20} {:>20}", "", "Linear (old)", "Log+SLO (new)");
+    println!(
+        "\n  {:>20} {:>20} {:>20}",
+        "", "Linear (old)", "Log+SLO (new)"
+    );
     println!("  {:->20} {:->20} {:->20}", "", "", "");
 
     let row = |label: &str, ov: String, nv: String| {
         println!("  {:>20} {:>20} {:>20}", label, ov, nv);
     };
 
-    row("Mean reward",
+    row(
+        "Mean reward",
         format!("{:.4}", old.mean_reward),
-        format!("{:.4}", new.mean_reward));
-    row("Min reward",
+        format!("{:.4}", new.mean_reward),
+    );
+    row(
+        "Min reward",
         format!("{:.4}", old.min_reward),
-        format!("{:.4}", new.min_reward));
-    row("Max reward",
+        format!("{:.4}", new.min_reward),
+    );
+    row(
+        "Max reward",
         format!("{:.4}", old.max_reward),
-        format!("{:.4}", new.max_reward));
-    row("Stddev",
+        format!("{:.4}", new.max_reward),
+    );
+    row(
+        "Stddev",
         format!("{:.4}", old.reward_stddev),
-        format!("{:.4}", new.reward_stddev));
-    row("Stability (CV)",
+        format!("{:.4}", new.reward_stddev),
+    );
+    row(
+        "Stability (CV)",
         format!("{:.4}", old.reward_stability),
-        format!("{:.4}", new.reward_stability));
-    row("SLO violations",
+        format!("{:.4}", new.reward_stability),
+    );
+    row(
+        "SLO violations",
         format!("{}", old.slo_violations),
-        format!("{}", new.slo_violations));
+        format!("{}", new.slo_violations),
+    );
 
     // Improvement calculations
     let mean_imp = if old.mean_reward.abs() > 0.001 {
@@ -427,8 +363,13 @@ fn main() {
     println!("  6. Latency discrimination comparison");
     println!("{}", "=".repeat(70));
 
-    let latencies = [500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000, 75_000, 100_000];
-    println!("\n  {:>15} {:>15} {:>15} {:>15}", "Latency", "Linear", "Log+SLO", "Ratio");
+    let latencies = [
+        500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000, 75_000, 100_000,
+    ];
+    println!(
+        "\n  {:>15} {:>15} {:>15} {:>15}",
+        "Latency", "Linear", "Log+SLO", "Ratio"
+    );
     println!("  {:->15} {:->15} {:->15} {:->15}", "", "", "", "");
 
     for &lat in &latencies {
@@ -461,8 +402,10 @@ fn main() {
             0.0
         };
 
-        println!("  {:>12}µs {:>15.4} {:>15.4} {:>15.2}",
-            lat, old_reward.total, new_reward.total, ratio);
+        println!(
+            "  {:>12}µs {:>15.4} {:>15.4} {:>15.2}",
+            lat, old_reward.total, new_reward.total, ratio
+        );
     }
 
     println!("\n{}", "=".repeat(70));
@@ -510,7 +453,11 @@ fn run_simulation_with_config(
     let max = rewards.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let variance = rewards.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rewards.len() as f64;
     let stddev = variance.sqrt();
-    let cv = if mean.abs() > 0.001 { stddev / mean.abs() } else { 0.0 };
+    let cv = if mean.abs() > 0.001 {
+        stddev / mean.abs()
+    } else {
+        0.0
+    };
 
     SimulationResult {
         scenario: scenario_name,
@@ -520,7 +467,6 @@ fn run_simulation_with_config(
         max_reward: max,
         reward_stddev: stddev,
         slo_violations,
-        censored_count: 0,
         ema_final: pipeline.ema_reward(),
         reward_stability: cv,
     }

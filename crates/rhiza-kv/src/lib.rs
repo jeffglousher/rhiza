@@ -862,7 +862,13 @@ impl RedbStateMachine {
         }
         let database = Database::create(path).map_err(database_error)?;
         initialize_or_validate(&database, &cluster_id, &node_id, epoch, config_id)?;
-        tracing::info!(cluster_id, node_id, epoch, config_id, "kv state machine opened");
+        tracing::info!(
+            cluster_id,
+            node_id,
+            epoch,
+            config_id,
+            "kv state machine opened"
+        );
         Ok(Self {
             database,
             cluster_id,
