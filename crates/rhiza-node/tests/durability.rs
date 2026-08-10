@@ -2362,7 +2362,25 @@ async fn initialized_profile_checkpoint(
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new(effective_cluster_id(profile, "cluster-a").unwrap(), 1, 1, 1),
+        CheckpointIdentity::new(
+            effective_cluster_id(profile, "cluster-a").unwrap(),
+            1,
+            1,
+            NodeConfig::new_embedded(
+                "cluster-a",
+                "n1",
+                root.join("checkpoint-identity"),
+                1,
+                1,
+                ["n1", "n2", "n3"],
+            )
+            .unwrap()
+            .with_execution_profile(profile)
+            .unwrap()
+            .configuration_state()
+            .digest(),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

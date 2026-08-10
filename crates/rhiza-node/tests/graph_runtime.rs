@@ -907,7 +907,13 @@ async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new(CLUSTER_ID, 1, 1, 1),
+        CheckpointIdentity::new(
+            CLUSTER_ID,
+            1,
+            1,
+            graph_config(root).configuration_state().digest(),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive
