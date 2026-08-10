@@ -25,11 +25,16 @@ client() {
 }
 
 wait_for_recovered_quorum() {
-  local key="$1" evidence="$2" attempt ready
+  local key="$1" evidence="$2" attempt pods_json ready
   : > "$evidence"
   for attempt in $(seq 1 180); do
-    ready="$(kubectl --context "$CHAOS_K8S_CONTEXT" -n "$CHAOS_NAMESPACE" get pods -l "$selector" -o json |
-      jq '[.items[] | select(.status.phase=="Running" and any(.status.conditions[]?; .type=="Ready" and .status=="True"))] | length')"
+    if pods_json="$(kubectl --context "$CHAOS_K8S_CONTEXT" -n "$CHAOS_NAMESPACE" \
+      get pods -l "$selector" -o json 2>> "$evidence")"; then
+      ready="$(jq '[.items[] | select(.status.phase=="Running" and any(.status.conditions[]?; .type=="Ready" and .status=="True"))] | length' \
+        <<< "$pods_json")"
+    else
+      ready=unavailable
+    fi
     printf 'attempt=%s ready_voters=%s\n' "$attempt" "$ready" >> "$evidence"
     if [ "$ready" = 3 ] && client read --key "$key" --consistency read_barrier >> "$evidence" 2>&1 \
       && tail -n 1 "$evidence" | grep -q '^value=null '; then

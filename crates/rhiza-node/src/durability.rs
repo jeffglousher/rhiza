@@ -2244,9 +2244,7 @@ async fn prepare_checkpoint_external_sql_effects(
         .base()
         .snapshot()
         .map(|snapshot| snapshot.anchor().configuration_state().clone())
-        .unwrap_or_else(|| {
-            ConfigurationState::active(manifest.identity().config_id(), LogHash::ZERO)
-        });
+        .unwrap_or_else(|| checkpoint_identity_configuration(manifest.identity()));
     let mut qefx_entries = BTreeMap::new();
     for entry in suffix {
         if entry.entry_type == EntryType::Command && !entry.payload.is_empty() {
@@ -3179,7 +3177,7 @@ fn stage_restored_checkpoint(
             let initial_configuration = restored
                 .snapshot()
                 .map(|snapshot| snapshot.anchor().configuration_state().clone())
-                .unwrap_or_else(|| ConfigurationState::active(identity.config_id(), LogHash::ZERO));
+                .unwrap_or_else(|| checkpoint_identity_configuration(identity));
             let log = FileLogStore::open_with_configuration(
                 staging.join("consensus/log"),
                 identity.cluster_id(),
@@ -3248,7 +3246,7 @@ fn apply_prepared_external_sql_suffix(
     let configuration = restored
         .snapshot()
         .map(|snapshot| snapshot.anchor().configuration_state().clone())
-        .unwrap_or_else(|| ConfigurationState::active(identity.config_id(), LogHash::ZERO));
+        .unwrap_or_else(|| checkpoint_identity_configuration(identity));
     let node_id = target_node_id.ok_or_else(|| {
         DurabilityError::SnapshotVerification(
             "QEFX checkpoint restore requires a target node_id".into(),
@@ -3306,8 +3304,12 @@ fn validate_local_qlog(
         data_dir,
         identity,
         checkpoint_root,
-        ConfigurationState::active(identity.config_id(), LogHash::ZERO),
+        checkpoint_identity_configuration(identity),
     )
+}
+
+fn checkpoint_identity_configuration(identity: &CheckpointIdentity) -> ConfigurationState {
+    ConfigurationState::active(identity.config_id(), identity.config_digest())
 }
 
 fn validate_local_qlog_with_configuration(
@@ -4952,7 +4954,7 @@ mod tests {
     use super::validate_local_recovery_view;
     use super::{
         capture_expected_local_restore_state, capture_expected_qlog_state,
-        checkpoint_restore_intent_bytes,
+        checkpoint_identity_configuration, checkpoint_restore_intent_bytes,
         install_prepared_checkpoint_for_rejoin_preserving_recorder, install_test_restore_lock_gate,
         install_test_restore_lock_path_replacement_hook, mark_durable_state,
         next_sync_recovery_retry, observe_durable_tip, publisher_lease_renewal_interval,
@@ -4982,6 +4984,17 @@ mod tests {
         sync::{mpsc, Arc, Barrier, Mutex},
         time::Duration,
     };
+
+    #[test]
+    fn genesis_restore_uses_checkpoint_configuration_digest() {
+        let digest = LogHash::digest(&[b"membership"]);
+        let identity = CheckpointIdentity::new("rhiza:sql:test", 1, 7, digest, 1);
+
+        assert_eq!(
+            checkpoint_identity_configuration(&identity),
+            ConfigurationState::active(7, digest)
+        );
+    }
 
     #[test]
     fn completion_marker_names_follow_one_portable_ascii_grammar() {
@@ -5107,7 +5120,7 @@ mod tests {
             node_id,
             prepared.identity(),
             prepared.execution_profile(),
-            ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+            checkpoint_identity_configuration(prepared.identity()),
             marker,
         )
     }
@@ -5161,7 +5174,7 @@ mod tests {
         capture_expected_qlog_state(
             target,
             prepared.identity(),
-            ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+            checkpoint_identity_configuration(prepared.identity()),
         )
         .unwrap()
     }

@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
@@ -79,7 +79,10 @@ fn expected_restore_state_for_test(
         node_id,
         prepared.identity(),
         prepared.execution_profile(),
-        ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+        ConfigurationState::active(
+            prepared.identity().config_id(),
+            prepared.identity().config_digest(),
+        ),
         completion_marker_name,
     )
 }
@@ -204,7 +207,9 @@ async fn coordinator_open_rejects_tampered_segment_checksum_metadata() {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"durability-test"]),
+            runtime_config(PathBuf::from("unused"))
+                .configuration_state()
+                .digest(),
             1,
         ),
     );
@@ -2427,10 +2432,29 @@ fn checkpoint_store(root: &Path) -> ObjectArchiveStore {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"durability-test"]),
+            runtime_config(PathBuf::from("unused"))
+                .configuration_state()
+                .digest(),
             1,
         ),
     )
+}
+
+fn runtime_config(data_dir: PathBuf) -> NodeConfig {
+    NodeConfig::new(
+        "rhiza:sql:cluster-a",
+        "node-1",
+        data_dir,
+        1,
+        1,
+        [
+            PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
+            PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
+            PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
+        ],
+        "client-token",
+    )
+    .unwrap()
 }
 
 fn runtime(data_dir: impl AsRef<Path>) -> NodeRuntime {
@@ -2440,20 +2464,7 @@ fn runtime(data_dir: impl AsRef<Path>) -> NodeRuntime {
         data_dir.file_name().unwrap().to_string_lossy()
     ));
     NodeRuntime::open(
-        NodeConfig::new(
-            "rhiza:sql:cluster-a",
-            "node-1",
-            data_dir,
-            1,
-            1,
-            [
-                PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
-                PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
-                PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
-            ],
-            "client-token",
-        )
-        .unwrap(),
+        runtime_config(data_dir),
         Arc::new(
             ThreeNodeConsensus::from_recovered_tip(
                 "rhiza:sql:cluster-a",
