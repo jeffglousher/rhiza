@@ -359,7 +359,13 @@ fn checkpoint(store: &ObjStore, generation: u64) -> ObjectArchiveStore {
 }
 
 fn identity(generation: u64) -> CheckpointIdentity {
-    CheckpointIdentity::new("cluster-a", 7, 3, generation)
+    CheckpointIdentity::new(
+        "cluster-a",
+        7,
+        3,
+        LogHash::digest(&[b"archive-gc-test"]),
+        generation,
+    )
 }
 
 async fn publish(archive: &ObjectArchiveStore) {

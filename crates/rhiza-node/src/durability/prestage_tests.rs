@@ -22,7 +22,13 @@ async fn initialized_archive(root: &std::path::Path) -> ObjectArchiveStore {
             root: root.to_path_buf(),
         })
         .unwrap(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 9, 4, 7),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            9,
+            4,
+            LogHash::digest(&[b"prestage-test-config"]),
+            7,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

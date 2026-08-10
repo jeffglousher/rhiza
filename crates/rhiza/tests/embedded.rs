@@ -4,6 +4,7 @@ use std::{
 };
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+use rhiza_core::LogHash;
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
 use rhizadb::{
@@ -510,7 +511,13 @@ async fn initialized_checkpoint(root: &std::path::Path) -> ObjectArchiveStore {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

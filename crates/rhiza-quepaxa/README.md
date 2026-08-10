@@ -35,14 +35,18 @@ See `examples/local_three_node.rs` for a complete runnable example.
   Every public consensus operation accepts a caller-owned context; callers may
   choose the five-second `default_timeout` explicitly. Expiry of a mutating call
   is reported as `UnknownOutcome`, not as a safe-to-retry failure.
-- An ordinary FastPath decision returns after its phase-0 recorder quorum and
-  does not install a proof. An ordinary Phase2 decision, configuration-change
-  decision, or decision reached after a transition was observed installs its
-  proof on a recorder quorum synchronously before the proposal succeeds. If
-  that installation lacks a quorum, the proposal does not succeed.
-- Recovery may reconstruct a FastPath decision from its recorder summaries, but
-  never reconstructs a Phase2 decision from summaries alone; Phase2 recovery
-  requires a durably installed decision proof.
+- A phase-0 recorder quorum forms an ordinary FastPath decision proof after one
+  recorder round. That protocol decision point is not the public acknowledgement
+  boundary: both FastPath and Phase2 proofs are installed durably on a recorder
+  quorum on the normal success path. If installation reports an ambiguous
+  failure, the API may still acknowledge only after a bounded inspection
+  certifies the exact matching committed value. Otherwise it returns
+  `UnknownOutcome`; conflicting safety evidence remains a terminal error.
+- Recovery may reconstruct a FastPath decision from its recorder summaries.
+  This does not create an unconditional live acknowledgement shortcut; after an
+  ambiguous installer result, it can contribute only to bounded exact-value
+  reconciliation. Recovery never reconstructs a Phase2 decision from summaries
+  alone; Phase2 recovery requires a durably installed decision proof.
 - Dropping `ThreeNodeConsensus` cancels and detaches outstanding RPC workers;
   it never waits for them. A transport that ignores cancellation can leak its
   own worker and resources, but cannot block consensus destruction.

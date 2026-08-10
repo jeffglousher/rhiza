@@ -12,8 +12,13 @@ start/finish timestamps. Run every cell at least three times in rotated order;
 publish median and IQR as well as all failed attempts.
 
 The initial Hiqlite reference is release `0.14.0`, commit
-`c8316c53799c509990475ea8e2aa2ef8679e070e`, OpenRaft `0.9.24`, built from
-that exact source. Record the generated `Cargo.lock` digest. Run its
+`c8316c53799c509990475ea8e2aa2ef8679e070e`, built from that exact source.
+For every trial, generate and retain `Cargo.lock` during the first exact-source
+build, record its digest and resolved OpenRaft version, and label that value
+`openraft_version_source: generated-cargo-lock`. Exact local-reuse cells receive
+the same verified lock path and digest and re-extract the version from that
+preserved file; the coordinator requires every phase to agree with the recorded
+version and digest. Run its
 `immediate`, `immediate_async`, and configured interval WAL modes as separate
 durability leagues; never compare an interval result with Rhiza's durable-quorum
 ACK path. Rhiza provenance is the exact tested commit and dirty-state flag, not
@@ -78,10 +83,10 @@ topology, client path, and workload must be matched; and three rotated runs with
 raw provenance must agree. A recovery claim additionally requires the complete
 recovery matrix to pass.
 
-Recovery normalization is implemented now. The comparable workload/resource
-runner is pending, so there is **no publishable Rhiza-versus-Hiqlite performance
-comparison yet**. The recovery normalizer emits `not_measured` instead of
-inventing workload, CPU, or object-store metrics.
+Recovery normalization and the D1 SQL write/tail runner are implemented now.
+There is still **no published Rhiza-versus-Hiqlite result**, and comparable
+resource telemetry remains pending. The recovery normalizer emits
+`not_measured` instead of inventing workload, CPU, or object-store metrics.
 
 ## Execution and normalization
 
@@ -93,6 +98,38 @@ coordinator is deliberately safe by default:
 scripts/bench-rhiza-hiqlite.sh plan target/rhiza-hiqlite-plan.json
 scripts/bench-rhiza-hiqlite.sh run-recovery
 ```
+
+This command executes one diagnostic trial. Its normalized output is always
+marked non-publishable; a claim requires three order-rotated trials with the
+same contract and complete raw provenance. Each of its nine recovery
+coordinates is a separate, freshly created vcluster for both systems; a
+stateful nine-cell sequence is rejected.
+
+The source-freeze fingerprint covers the full tracked delta from `HEAD`
+(staged and unstaged) plus untracked source files; only `target/` artifacts are
+excluded. Hiqlite raw `recovery.jsonl` is accepted only when its `run_started`
+identity and exact `phase_summary` match that cell's `summary.json`. A path and
+SHA-256 without this semantic linkage is insufficient evidence.
+
+Every normalized recovery cell must preserve the source runner artifact path
+and SHA-256 and carry the same isolation proof:
+
+```json
+{"mode":"fresh-vcluster","process_generation_new":true,"storage_generation_new":true,"restore_env_absent":true,"prior_sentinel_absent":true,"exact_membership":true,"object_provenance_current":true,"cleanup_verified":true}
+```
+
+The coordinator builds one coordinator-tagged Rhiza image for its first cell
+and reuses it only after its local Docker ID matches exactly. It builds the
+pinned Hiqlite voter/proxy pair and generated lockfile in its first cell, then
+requires exact voter/proxy image IDs, pinned commit, and lockfile digest for
+every later reuse. Missing proof invalidates the diagnostic trial rather than
+being inferred.
+
+The coordinator freezes a canonical source fingerprint before the first cell
+and verifies it before and after every adapter: Git HEAD, the combined staged
+and unstaged binary diff from HEAD, digest-only sorted untracked paths outside
+`target`, and recursive submodule status are all part of that fingerprint.
+It records the accepted fingerprint in the completion artifact.
 
 After an explicit recovery run, normalize supplied source artifacts with:
 

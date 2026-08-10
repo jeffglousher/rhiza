@@ -129,10 +129,14 @@ jobs:
             -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
             -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-kv -p rhiza-node -p rhizadb \
             -p rhiza-client -p rhiza-cli -p rhiza-tuner
+      - run: cargo test --locked -p rhiza-quepaxa --features test-hooks
       - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path bench/Cargo.toml --locked --all-targets
-      - run: bash -n scripts/bench-vind.sh scripts/bench-rhiza-hiqlite.sh scripts/check-bench-rhiza-hiqlite-static.sh scripts/tuner-monitor.sh scripts/check-tuner-monitor-static.sh scripts/check-workspace-packages.sh scripts/check-quepaxa-package.sh
+      - run: cargo fmt --manifest-path bench/hiqlite-recovery-client/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path bench/hiqlite-recovery-client/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path bench/hiqlite-recovery-client/Cargo.toml --locked --all-targets
+      - run: bash -n scripts/bench-vind.sh scripts/bench-rhiza-hiqlite.sh scripts/bench-rhiza-hiqlite-steady.sh scripts/bench-hiqlite-steady.sh scripts/bench-power-loss-durability.sh scripts/chaos-k8s.sh scripts/chaos-vm-loss.sh scripts/check-bench-rhiza-hiqlite-static.sh scripts/check-bench-rhiza-hiqlite-steady-static.sh scripts/check-power-loss-durability-static.sh scripts/check-chaos-static.sh scripts/tuner-monitor.sh scripts/check-tuner-monitor-static.sh scripts/check-workspace-packages.sh scripts/check-quepaxa-package.sh
       - name: Install pinned yq
         env:
           YQ_VERSION: v4.47.2
@@ -143,6 +147,10 @@ jobs:
           sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
       - run: scripts/check-bench-vind-static.sh
       - run: scripts/check-bench-rhiza-hiqlite-static.sh
+      - run: scripts/check-bench-rhiza-hiqlite-steady-static.sh --fixture
+      - run: scripts/check-power-loss-durability-static.sh
+      - run: scripts/check-chaos-static.sh
+      - run: scripts/check-storage-format-compatibility.sh
       - run: scripts/check-tuner-monitor-static.sh
       - run: scripts/check-deploy.sh
       - run: scripts/check-workspace-packages.sh

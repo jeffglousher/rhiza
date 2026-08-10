@@ -9,6 +9,13 @@ trap 'rm -rf "$tmp"' EXIT
 grep -Fq 'http|tcp-postcard|tcp-postcard-rpc)' scripts/bench-vind.sh
 grep -Fq 'RHIZA_RECORDER_TLS=on' scripts/bench-vind.sh
 grep -Fq 'RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls' scripts/bench-vind.sh
+# vcluster may materialize image.tar.gz in its working directory.
+# shellcheck disable=SC2016
+grep -Fq '(cd "$target" && vcluster node load-image "$node" --image "$image")' scripts/bench-vind.sh
+[ "$(grep -Fc 'vcluster node load-image' scripts/bench-vind.sh)" -eq 1 ] || {
+  echo "every benchmark image load must run inside the target directory" >&2
+  exit 1
+}
 grep -Fq 'recorder_tls_server_name:' scripts/bench-vind.sh
 # shellcheck disable=SC2016 # Literal source check.
 grep -Fq -- '--from-file=tls.key="$recorder_tls_dir/tls.key"' scripts/bench-vind.sh

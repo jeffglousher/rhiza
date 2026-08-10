@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt, fs,
     future::Future,
@@ -21,8 +22,8 @@ use rhiza_archive::{
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::SnapshotIdentity;
 use rhiza_core::{
-    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex,
-    RecoveryAnchor, StopBinding,
+    ConfigChange, ConfigurationState, EntryType, ExecutionProfile, ExternalEffectCommand,
+    LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor, StopBinding,
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
@@ -35,18 +36,25 @@ use rhiza_kv::{
     restore_snapshot_file as restore_kv_snapshot_file, RedbStateMachine,
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore};
-use rhiza_quepaxa::Membership;
+use rhiza_quepaxa::{Membership, RecorderFileStore};
 #[cfg(feature = "sql")]
-use rhiza_sql::{restore_recovery_snapshot_file, sql_executor_fingerprint};
+use rhiza_sql::{
+    restore_recovery_snapshot_file, sql_executor_fingerprint, QwalEffectManifestV4,
+    SqliteStateMachine, VerifiedQwalEffectBundleV4,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const SYNC_COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SYNC_RECOVERY_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const SYNC_RECOVERY_RETRY_MAX: Duration = Duration::from_secs(1);
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
+pub(crate) const QEFX_RESTORE_HANDOFF_DIR: &str = "consensus/qefx-restore";
+const PENDING_QEFX_GC_FILE: &str = "consensus/pending-qefx-gc.json";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
 const SUCCESSOR_RESTORE_INTENT_FILE: &str = ".successor-restore.intent";
@@ -59,6 +67,30 @@ const SUCCESSOR_PRESTAGE_FINALIZED_FILE: &str = ".successor-prestage.finalized";
 const REPAIR_ARTIFACT_OWNER_FILE: &str = ".rhiza-recovery-owner.json";
 pub const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity.json";
 static RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn publisher_lease_renewal_interval(lease_duration_ms: u64) -> Duration {
+    (Duration::from_millis(lease_duration_ms) / 3).max(Duration::from_micros(1))
+}
+
+fn retryable_sync_archive_error(error: &rhiza_archive::Error) -> bool {
+    matches!(
+        error,
+        rhiza_archive::Error::ObjectStore(_)
+            | rhiza_archive::Error::CompareAndSwapRetriesExhausted { .. }
+            | rhiza_archive::Error::GcBarrierActive { .. }
+            | rhiza_archive::Error::GcBarrierBusy { .. }
+            | rhiza_archive::Error::GcLeaseMissing { .. }
+    )
+}
+
+fn retryable_sync_recovery_error(error: &DurabilityError) -> bool {
+    matches!(error, DurabilityError::Io(_))
+        || matches!(error, DurabilityError::Archive(error) if retryable_sync_archive_error(error))
+}
+
+fn next_sync_recovery_retry(current: Duration) -> Duration {
+    current.saturating_mul(2).min(SYNC_RECOVERY_RETRY_MAX)
+}
 
 #[cfg(test)]
 use std::sync::{mpsc, OnceLock};
@@ -370,6 +402,8 @@ impl SuccessorPrestageIdentity {
             self.cluster_id.clone(),
             self.epoch,
             self.predecessor_config_id,
+            LogHash::from_hex(&self.predecessor_membership_digest)
+                .expect("validated successor prestage membership digest"),
             self.predecessor_recovery_generation,
         )
     }
@@ -423,6 +457,18 @@ pub struct PreparedCheckpointRestore {
     execution_profile: ExecutionProfile,
     restored: RestoredCheckpoint,
     checkpoint_root: LogAnchor,
+    #[cfg(feature = "sql")]
+    external_sql_effects: Vec<PreparedCheckpointEffect>,
+}
+
+/// One QEFX suffix effect verified during remote preparation. Installers only
+/// consume these owned bytes; they never contact a recorder or archive.
+#[cfg(feature = "sql")]
+struct PreparedCheckpointEffect {
+    entry_index: LogIndex,
+    effect: VerifiedQwalEffectBundleV4,
+    manifest: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
 }
 
 /// The two local installation contracts. Fresh installation owns every
@@ -1069,13 +1115,47 @@ struct CoordinatorState {
     health: DurabilityHealth,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingQefxGc {
+    cluster_id: String,
+    epoch: u64,
+    config_id: u64,
+    config_digest: String,
+    through_slot: LogIndex,
+    checkpoint_hash: String,
+    manifest_digest: String,
+}
+
 pub struct CheckpointCoordinator {
     store: ObjectArchiveStore,
     publisher: CheckpointPublisher,
+    publisher_lease_renewal_interval: Duration,
     mode: DurabilityMode,
     state: Mutex<CoordinatorState>,
     successor_baseline_required: AtomicBool,
     publication_attempts: AtomicU64,
+    local_recorder: Mutex<Option<RecorderFileStore>>,
+}
+
+/// Marks a Sync coordinator unavailable if its post-commit durability confirmation is dropped.
+pub(crate) struct SyncDurabilityConfirmation<'a> {
+    coordinator: &'a CheckpointCoordinator,
+    armed: bool,
+}
+
+impl SyncDurabilityConfirmation<'_> {
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SyncDurabilityConfirmation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.coordinator.mark_unavailable();
+        }
+    }
 }
 
 struct RuntimeCheckpointSnapshot {
@@ -1121,6 +1201,8 @@ impl CheckpointCoordinator {
         publisher_options: CheckpointPublisherOptions,
     ) -> Result<Self, DurabilityError> {
         mode.validate()?;
+        let publisher_lease_renewal_interval =
+            publisher_lease_renewal_interval(publisher_options.lease_duration_ms());
         store
             .load_checkpoint()
             .await?
@@ -1154,6 +1236,7 @@ impl CheckpointCoordinator {
         Ok(Self {
             store,
             publisher,
+            publisher_lease_renewal_interval,
             mode,
             state: Mutex::new(CoordinatorState {
                 durable_tip,
@@ -1163,11 +1246,38 @@ impl CheckpointCoordinator {
             }),
             successor_baseline_required: AtomicBool::new(false),
             publication_attempts: AtomicU64::new(0),
+            local_recorder: Mutex::new(None),
         })
+    }
+
+    pub async fn open_with_holder_options_local_state(
+        store: ObjectArchiveStore,
+        mode: DurabilityMode,
+        holder: impl AsRef<str>,
+        publisher_options: CheckpointPublisherOptions,
+        recorder: RecorderFileStore,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, DurabilityError> {
+        let coordinator =
+            Self::open_with_holder_and_options(store, mode, holder, publisher_options).await?;
+        coordinator.attach_local_recorder(recorder)?;
+        #[cfg(feature = "sql")]
+        coordinator
+            .retry_pending_qefx_gc_at(data_dir.as_ref())
+            .await?;
+        Ok(coordinator)
     }
 
     pub const fn mode(&self) -> &DurabilityMode {
         &self.mode
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn sync_durability_confirmation(&self) -> SyncDurabilityConfirmation<'_> {
+        SyncDurabilityConfirmation {
+            coordinator: self,
+            armed: true,
+        }
     }
 
     pub fn durable_tip(&self) -> CheckpointTip {
@@ -1198,6 +1308,19 @@ impl CheckpointCoordinator {
         if index > state.durable_tip.index() && state.pending_lag.is_none() {
             state.pending_lag = Some(PendingLag::New(Instant::now()));
         }
+    }
+
+    pub fn attach_local_recorder(
+        &self,
+        recorder: RecorderFileStore,
+    ) -> Result<(), DurabilityError> {
+        let mut slot = self.local_recorder.lock().map_err(|_| {
+            DurabilityError::SnapshotVerification(
+                "local recorder attachment lock is poisoned".into(),
+            )
+        })?;
+        *slot = Some(recorder);
+        Ok(())
     }
 
     pub fn note_recovered_committed(&self, index: LogIndex) {
@@ -1411,6 +1534,8 @@ impl CheckpointCoordinator {
         runtime: &NodeRuntime,
         target_index: LogIndex,
     ) -> Result<CheckpointTip, DurabilityError> {
+        #[cfg(feature = "sql")]
+        self.retry_pending_qefx_gc(runtime).await?;
         let log_state = runtime.log_store().logical_state()?;
         let local_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
         let mut durable_tip = self.durable_tip();
@@ -1448,8 +1573,57 @@ impl CheckpointCoordinator {
                 .log_store()
                 .read_range(IndexRange::new(next, end)?)?;
             validate_local_batch(&entries, next, end, durable_tip)?;
+            #[cfg(feature = "sql")]
+            let effects = self
+                .prepare_external_sql_effect_refs(runtime, &entries)
+                .await?;
             self.publication_attempts.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "sql")]
+            let published = self
+                .publisher
+                .publish_committed_with_effects(&entries, &effects)
+                .await?;
+            #[cfg(not(feature = "sql"))]
             let published = self.publisher.publish_committed(&entries).await?;
+            #[cfg(feature = "sql")]
+            if !effects.is_empty() {
+                let certificate = self
+                    .store
+                    .checkpoint_readback_certificate(&published)
+                    .await?;
+                let configuration = runtime
+                    .configuration_state()
+                    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+                persist_pending_qefx_gc(
+                    runtime.config.data_dir(),
+                    &PendingQefxGc {
+                        cluster_id: certificate.identity().cluster_id().to_owned(),
+                        epoch: certificate.identity().epoch(),
+                        config_id: configuration.config_id(),
+                        config_digest: configuration.digest().to_hex(),
+                        through_slot: certificate.tip().index(),
+                        checkpoint_hash: certificate.tip().hash().to_hex(),
+                        manifest_digest: certificate.manifest_digest().to_hex(),
+                    },
+                )?;
+                if let Some(recorder) = self
+                    .local_recorder
+                    .lock()
+                    .map_err(|_| {
+                        DurabilityError::SnapshotVerification(
+                            "local recorder attachment lock is poisoned".into(),
+                        )
+                    })?
+                    .clone()
+                {
+                    if recorder
+                        .advance_effect_bundle_gc_anchor(&certificate, &[])
+                        .is_ok()
+                    {
+                        clear_pending_qefx_gc(runtime.config.data_dir())?;
+                    }
+                }
+            }
             durable_tip = *published.manifest().tip();
             self.mark_durable(durable_tip);
             if durable_tip.index() >= target_index {
@@ -1465,6 +1639,94 @@ impl CheckpointCoordinator {
                     })?;
         }
         Ok(durable_tip)
+    }
+
+    #[cfg(feature = "sql")]
+    async fn retry_pending_qefx_gc(&self, runtime: &NodeRuntime) -> Result<(), DurabilityError> {
+        self.retry_pending_qefx_gc_at(runtime.config.data_dir())
+            .await
+    }
+
+    #[cfg(feature = "sql")]
+    async fn retry_pending_qefx_gc_at(&self, data_dir: &Path) -> Result<(), DurabilityError> {
+        let Some(pending) = load_pending_qefx_gc(data_dir)? else {
+            return Ok(());
+        };
+        let Some(recorder) = self
+            .local_recorder
+            .lock()
+            .map_err(|_| {
+                DurabilityError::SnapshotVerification(
+                    "local recorder attachment lock is poisoned".into(),
+                )
+            })?
+            .clone()
+        else {
+            return Ok(());
+        };
+        let loaded = self
+            .store
+            .load_checkpoint()
+            .await?
+            .ok_or(DurabilityError::MissingCheckpoint)?;
+        let certificate = self.store.checkpoint_readback_certificate(&loaded).await?;
+        if certificate.identity().cluster_id() != pending.cluster_id
+            || certificate.identity().epoch() != pending.epoch
+            || certificate.identity().config_id() != pending.config_id
+            || certificate.identity().config_digest().to_hex() != pending.config_digest
+            || certificate.tip().index() != pending.through_slot
+            || certificate.tip().hash().to_hex() != pending.checkpoint_hash
+            || certificate.manifest_digest().to_hex() != pending.manifest_digest
+        {
+            return Err(DurabilityError::SnapshotVerification(
+                "pending QEFX GC evidence no longer matches the visible checkpoint".into(),
+            ));
+        }
+        if recorder
+            .advance_effect_bundle_gc_anchor(&certificate, &[])
+            .is_ok()
+        {
+            clear_pending_qefx_gc(data_dir)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "sql")]
+    async fn prepare_external_sql_effect_refs(
+        &self,
+        runtime: &NodeRuntime,
+        entries: &[LogEntry],
+    ) -> Result<Vec<rhiza_archive::CheckpointEffectRecord>, DurabilityError> {
+        if runtime.config.execution_profile != ExecutionProfile::Sqlite {
+            return Ok(Vec::new());
+        }
+        let mut effects = Vec::new();
+        for entry in entries {
+            if entry.entry_type != EntryType::Command || entry.payload.is_empty() {
+                continue;
+            }
+            ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+                DurabilityError::SnapshotVerification(format!(
+                    "committed SQLite entry is not canonical QEFX during archive publication: {error}"
+                ))
+            })?;
+            let bundle = runtime
+                .resolve_external_sql_bundle_for_archive(entry)
+                .map_err(|error| match error {
+                    crate::NodeError::Unavailable(_) | crate::NodeError::Contention(_) => {
+                        DurabilityError::Unavailable
+                    }
+                    other => DurabilityError::SnapshotVerification(format!(
+                        "committed QEFX bundle cannot be resolved for archive publication: {other}"
+                    )),
+                })?;
+            effects.push(
+                self.store
+                    .publish_verified_qefx_bundle(entry, bundle.chunks())
+                    .await?,
+            );
+        }
+        Ok(effects)
     }
 
     pub async fn checkpoint_compact(
@@ -1585,7 +1847,7 @@ impl CheckpointCoordinator {
     where
         F: Future<Output = ()> + Send,
     {
-        let cadence = match self.mode {
+        let compaction_cadence = match self.mode {
             DurabilityMode::Sync => SYNC_COMPACTION_POLL_INTERVAL,
             DurabilityMode::Bounded { max_lag } => {
                 let half = max_lag / 2;
@@ -1593,18 +1855,96 @@ impl CheckpointCoordinator {
             }
             DurabilityMode::Periodic { interval } => interval,
         };
+        let now = Instant::now();
+        let mut next_publisher_lease_renewal = now;
+        let mut heartbeat_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
+        if matches!(self.mode, DurabilityMode::Sync) {
+            let attempted_at = Instant::now();
+            match self.publisher.renew().await {
+                Ok(()) => {
+                    next_publisher_lease_renewal = attempted_at
+                        .checked_add(self.publisher_lease_renewal_interval)
+                        .unwrap_or_else(Instant::now);
+                }
+                Err(error) if retryable_sync_archive_error(&error) => {
+                    next_publisher_lease_renewal = attempted_at
+                        .checked_add(heartbeat_retry_delay)
+                        .unwrap_or_else(Instant::now);
+                    heartbeat_retry_delay = next_sync_recovery_retry(heartbeat_retry_delay);
+                }
+                Err(error) => return Err(DurabilityError::Archive(error)),
+            }
+        }
+        let mut next_compaction = Instant::now()
+            .checked_add(compaction_cadence)
+            .unwrap_or_else(Instant::now);
+        let mut recovery_retry_at = None;
+        let mut recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
         tokio::pin!(shutdown);
         loop {
+            let heartbeat_at = if matches!(self.mode, DurabilityMode::Sync) {
+                next_publisher_lease_renewal
+            } else {
+                next_compaction
+            };
+            let mut wake_at = heartbeat_at.min(next_compaction);
+            if let Some(recovery_at) = recovery_retry_at {
+                wake_at = wake_at.min(recovery_at);
+            }
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
-                () = tokio::time::sleep(cadence) => {
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {
+                    let now = Instant::now();
+                    let sync_unavailable = matches!(self.mode, DurabilityMode::Sync)
+                        && self.health() == DurabilityHealth::Unavailable;
+                    if sync_unavailable && recovery_retry_at.is_none() {
+                        recovery_retry_at = Some(now);
+                    }
+                    let recovery_due = recovery_retry_at.is_some_and(|deadline| now >= deadline);
+                    if matches!(self.mode, DurabilityMode::Sync)
+                        && (recovery_due || now >= next_publisher_lease_renewal)
+                    {
+                        let attempted_at = Instant::now();
+                        match self.publisher.renew().await {
+                            Ok(()) => {
+                                next_publisher_lease_renewal = attempted_at
+                                    .checked_add(self.publisher_lease_renewal_interval)
+                                    .unwrap_or_else(Instant::now);
+                                heartbeat_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
+                            }
+                            Err(error) if retryable_sync_archive_error(&error) => {
+                                next_publisher_lease_renewal = attempted_at
+                                    .checked_add(heartbeat_retry_delay)
+                                    .unwrap_or_else(Instant::now);
+                                heartbeat_retry_delay =
+                                    next_sync_recovery_retry(heartbeat_retry_delay);
+                            }
+                            Err(error) => return Err(DurabilityError::Archive(error)),
+                        }
+                    }
+                    if recovery_due && self.health() == DurabilityHealth::Unavailable {
+                        match self.flush_runtime(&runtime, LogIndex::MAX).await {
+                            Ok(_) => {
+                                recovery_retry_at = None;
+                                recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
+                            }
+                            Err(error) if retryable_sync_recovery_error(&error) => {
+                                recovery_retry_at = Instant::now().checked_add(recovery_retry_delay);
+                                recovery_retry_delay = next_sync_recovery_retry(recovery_retry_delay);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else if !sync_unavailable {
+                        recovery_retry_at = None;
+                        recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
+                    }
                     if !matches!(self.mode, DurabilityMode::Sync) {
                         match self.flush_runtime(&runtime, LogIndex::MAX).await {
                             Ok(_) | Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {}
                             Err(error) => return Err(error),
                         }
                     }
-                    if self.publisher.compaction_recommended().await {
+                    if now >= next_compaction && self.publisher.compaction_recommended().await {
                         match self.checkpoint_compact(&runtime).await {
                             Ok(_) => {}
                             Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
@@ -1612,6 +1952,11 @@ impl CheckpointCoordinator {
                             }
                             Err(error) => return Err(error),
                         }
+                    }
+                    if now >= next_compaction {
+                        next_compaction = Instant::now()
+                            .checked_add(compaction_cadence)
+                            .unwrap_or_else(Instant::now);
                     }
                 }
             }
@@ -1849,13 +2194,139 @@ pub async fn prepare_checkpoint_restore(
             "loaded checkpoint manifest tip does not match restored checkpoint tip".into(),
         ));
     }
+    #[cfg(feature = "sql")]
+    let external_sql_effects = prepare_checkpoint_external_sql_effects(
+        store,
+        loaded.manifest(),
+        restored.suffix(),
+        execution_profile,
+    )
+    .await?;
     let prepared = PreparedCheckpointRestore {
         identity,
         execution_profile,
         restored,
         checkpoint_root,
+        #[cfg(feature = "sql")]
+        external_sql_effects,
     };
     prepared.validate()?;
+    Ok(prepared)
+}
+
+#[cfg(feature = "sql")]
+async fn prepare_checkpoint_external_sql_effects(
+    store: &ObjectArchiveStore,
+    manifest: &rhiza_archive::CheckpointManifest,
+    suffix: &[LogEntry],
+    profile: ExecutionProfile,
+) -> Result<Vec<PreparedCheckpointEffect>, DurabilityError> {
+    let mut refs = BTreeMap::new();
+    for segment in manifest.segments() {
+        for effect in segment.effects() {
+            if refs.insert(effect.entry_index(), effect).is_some() {
+                return Err(DurabilityError::SnapshotVerification(
+                    "checkpoint has duplicate QEFX effect references".into(),
+                ));
+            }
+        }
+    }
+    if profile != ExecutionProfile::Sqlite {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(DurabilityError::SnapshotVerification(
+            "non-SQL checkpoint has QEFX effect references".into(),
+        ));
+    }
+
+    let mut configuration = manifest
+        .base()
+        .snapshot()
+        .map(|snapshot| snapshot.anchor().configuration_state().clone())
+        .unwrap_or_else(|| {
+            ConfigurationState::active(manifest.identity().config_id(), LogHash::ZERO)
+        });
+    let mut qefx_entries = BTreeMap::new();
+    for entry in suffix {
+        if entry.entry_type == EntryType::Command && !entry.payload.is_empty() {
+            let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+                DurabilityError::SnapshotVerification(format!(
+                    "checkpoint SQL suffix entry is not canonical QEFX: {error}"
+                ))
+            })?;
+            if command.intended_slot() != entry.index
+                || command.cluster_id() != entry.cluster_id
+                || command.epoch() != entry.epoch
+                || command.config_id() != entry.config_id
+                || command.config_id() != configuration.config_id()
+                || command.config_digest() != configuration.digest()
+                || command.prev_hash() != entry.prev_hash
+            {
+                return Err(DurabilityError::SnapshotVerification(
+                    "checkpoint QEFX command does not match its suffix entry".into(),
+                ));
+            }
+            if qefx_entries.insert(entry.index, command).is_some() {
+                return Err(DurabilityError::SnapshotVerification(
+                    "checkpoint suffix repeats a QEFX entry index".into(),
+                ));
+            }
+        }
+        configuration = configuration.validate_entry(entry).map_err(|error| {
+            DurabilityError::SnapshotVerification(format!(
+                "checkpoint suffix configuration transition is invalid: {error}"
+            ))
+        })?;
+    }
+    if refs.len() != qefx_entries.len() || refs.keys().copied().ne(qefx_entries.keys().copied()) {
+        return Err(DurabilityError::SnapshotVerification(
+            "checkpoint QEFX suffix entries and effect references are not bijective".into(),
+        ));
+    }
+
+    let mut total = 0usize;
+    let mut prepared = Vec::with_capacity(qefx_entries.len());
+    for (index, command) in qefx_entries {
+        let reference = refs.get(&index).expect("bijection checked above");
+        let restored = store.restore_checkpoint_effect(reference).await?;
+        if restored.manifest()
+            != command.encode().map_err(|error| {
+                DurabilityError::SnapshotVerification(format!(
+                    "checkpoint QEFX encode failed: {error}"
+                ))
+            })?
+        {
+            return Err(DurabilityError::SnapshotVerification(
+                "checkpoint QEFX manifest differs from suffix entry".into(),
+            ));
+        }
+        let effect_bytes = restored.chunks().iter().try_fold(0usize, |sum, chunk| {
+            sum.checked_add(chunk.len()).ok_or_else(|| {
+                DurabilityError::SnapshotVerification(
+                    "checkpoint QEFX aggregate byte count overflows".into(),
+                )
+            })
+        })?;
+        total = total.checked_add(effect_bytes).ok_or_else(|| {
+            DurabilityError::SnapshotVerification(
+                "checkpoint QEFX aggregate byte count overflows".into(),
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(effect_bytes);
+        for chunk in restored.chunks() {
+            bytes.extend_from_slice(chunk);
+        }
+        let effect = QwalEffectManifestV4::verify_external_bundle(&command, &bytes)
+            .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+        prepared.push(PreparedCheckpointEffect {
+            entry_index: index,
+            effect,
+            manifest: restored.manifest().to_vec(),
+            chunks: restored.chunks().to_vec(),
+        });
+    }
+    let _ = total;
     Ok(prepared)
 }
 
@@ -1926,6 +2397,8 @@ fn install_prepared_checkpoint(
     install_restored_checkpoint(
         prepared.identity(),
         prepared.restored(),
+        #[cfg(feature = "sql")]
+        &prepared.external_sql_effects,
         data_dir,
         RestoreInstallOptions {
             target_node_id: Some(target_node_id),
@@ -2224,6 +2697,8 @@ fn install_prepared_checkpoint_for_rejoin(
     install_restored_checkpoint(
         prepared.identity(),
         prepared.restored(),
+        #[cfg(feature = "sql")]
+        &prepared.external_sql_effects,
         data_dir,
         RestoreInstallOptions {
             target_node_id: Some(target_node_id),
@@ -2642,12 +3117,15 @@ struct RestoredCheckpointStaging {
 fn install_restored_checkpoint(
     identity: &CheckpointIdentity,
     restored: &RestoredCheckpoint,
+    #[cfg(feature = "sql")] external_sql_effects: &[PreparedCheckpointEffect],
     data_dir: &Path,
     options: RestoreInstallOptions<'_>,
 ) -> Result<CheckpointTip, DurabilityError> {
     let staged = stage_restored_checkpoint(
         identity,
         restored,
+        #[cfg(feature = "sql")]
+        external_sql_effects,
         data_dir,
         options.target_node_id,
         options.recovery_identity,
@@ -2671,6 +3149,7 @@ fn install_restored_checkpoint(
 fn stage_restored_checkpoint(
     identity: &CheckpointIdentity,
     restored: &RestoredCheckpoint,
+    #[cfg(feature = "sql")] external_sql_effects: &[PreparedCheckpointEffect],
     staging_parent: &Path,
     target_node_id: Option<&str>,
     recovery_identity: Option<&RecoveryArtifactIdentity>,
@@ -2682,6 +3161,18 @@ fn stage_restored_checkpoint(
     let result = (|| -> Result<(), DurabilityError> {
         if let Some(snapshot) = restored.snapshot() {
             install_profile_snapshot(identity, snapshot, &staging, target_node_id)?;
+        }
+
+        #[cfg(feature = "sql")]
+        if profile == ExecutionProfile::Sqlite && !external_sql_effects.is_empty() {
+            apply_prepared_external_sql_suffix(
+                identity,
+                restored,
+                external_sql_effects,
+                &staging,
+                target_node_id,
+            )?;
+            write_prepared_external_sql_handoff(external_sql_effects, &staging)?;
         }
 
         if restored.snapshot().is_some() || !restored.suffix().is_empty() {
@@ -2721,6 +3212,78 @@ fn stage_restored_checkpoint(
     }
     result?;
     Ok(RestoredCheckpointStaging { path: staging, tip })
+}
+
+#[cfg(feature = "sql")]
+fn write_prepared_external_sql_handoff(
+    effects: &[PreparedCheckpointEffect],
+    staging: &Path,
+) -> Result<(), DurabilityError> {
+    let root = staging.join(QEFX_RESTORE_HANDOFF_DIR);
+    fs::create_dir_all(&root)?;
+    for effect in effects {
+        let entry_dir = root.join(effect.entry_index.to_string());
+        fs::create_dir(&entry_dir)?;
+        fs::write(entry_dir.join("binding.qefx"), &effect.manifest)?;
+        for (ordinal, chunk) in effect.chunks.iter().enumerate() {
+            fs::write(entry_dir.join(format!("{ordinal:03}.qefc")), chunk)?;
+        }
+        sync_directory(&entry_dir)?;
+    }
+    sync_directory(&root)
+}
+
+#[cfg(feature = "sql")]
+fn apply_prepared_external_sql_suffix(
+    identity: &CheckpointIdentity,
+    restored: &RestoredCheckpoint,
+    effects: &[PreparedCheckpointEffect],
+    staging: &Path,
+    target_node_id: Option<&str>,
+) -> Result<(), DurabilityError> {
+    let mut by_index = effects
+        .iter()
+        .map(|effect| (effect.entry_index, &effect.effect))
+        .collect::<BTreeMap<_, _>>();
+    let configuration = restored
+        .snapshot()
+        .map(|snapshot| snapshot.anchor().configuration_state().clone())
+        .unwrap_or_else(|| ConfigurationState::active(identity.config_id(), LogHash::ZERO));
+    let node_id = target_node_id.ok_or_else(|| {
+        DurabilityError::SnapshotVerification(
+            "QEFX checkpoint restore requires a target node_id".into(),
+        )
+    })?;
+    let database = SqliteStateMachine::open_with_configuration(
+        staging.join("sqlite/db.sqlite"),
+        identity.cluster_id(),
+        node_id,
+        identity.epoch(),
+        configuration,
+    )
+    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+    for entry in restored.suffix() {
+        if entry.entry_type == EntryType::Command && !entry.payload.is_empty() {
+            let effect = by_index.remove(&entry.index).ok_or_else(|| {
+                DurabilityError::SnapshotVerification(
+                    "checkpoint QEFX suffix effect was not prepared".into(),
+                )
+            })?;
+            database
+                .apply_verified_external_effect(effect)
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+        } else {
+            database
+                .apply_entry(entry)
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+        }
+    }
+    if !by_index.is_empty() {
+        return Err(DurabilityError::SnapshotVerification(
+            "checkpoint prepared QEFX effect has no suffix entry".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_restored_suffix(
@@ -2990,6 +3553,14 @@ pub async fn prestage_successor_checkpoint(
             "successor prestage checkpoint identity changed while loading".into(),
         ));
     }
+    #[cfg(feature = "sql")]
+    let external_sql_effects = prepare_checkpoint_external_sql_effects(
+        &store,
+        loaded.manifest(),
+        restored.suffix(),
+        execution_profile,
+    )
+    .await?;
     let expected = SuccessorPrestageIdentity {
         cluster_id: identity.cluster_id().to_owned(),
         epoch: identity.epoch(),
@@ -3024,6 +3595,8 @@ pub async fn prestage_successor_checkpoint(
     let staged = stage_restored_checkpoint(
         &identity,
         &restored,
+        #[cfg(feature = "sql")]
+        &external_sql_effects,
         prestage_dir,
         Some(target_node_id),
         Some(&recovery_identity),
@@ -4062,6 +4635,58 @@ fn sync_directory(path: &Path) -> Result<(), DurabilityError> {
     Ok(())
 }
 
+fn persist_pending_qefx_gc(
+    data_dir: &Path,
+    pending: &PendingQefxGc,
+) -> Result<(), DurabilityError> {
+    let path = data_dir.join(PENDING_QEFX_GC_FILE);
+    let parent = path.parent().ok_or_else(|| {
+        DurabilityError::SnapshotVerification("pending QEFX GC path has no parent".into())
+    })?;
+    fs::create_dir_all(parent)?;
+    let bytes = serde_json::to_vec(pending)
+        .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+    let temporary = parent.join(".pending-qefx-gc.tmp");
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, &path)?;
+    sync_directory(parent)
+}
+
+fn clear_pending_qefx_gc(data_dir: &Path) -> Result<(), DurabilityError> {
+    let path = data_dir.join(PENDING_QEFX_GC_FILE);
+    if path.exists() {
+        fs::remove_file(&path)?;
+        sync_directory(path.parent().expect("pending QEFX GC path has parent"))?;
+    }
+    Ok(())
+}
+
+fn load_pending_qefx_gc(data_dir: &Path) -> Result<Option<PendingQefxGc>, DurabilityError> {
+    let path = data_dir.join(PENDING_QEFX_GC_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4096 {
+        return Err(DurabilityError::SnapshotVerification(
+            "pending QEFX GC record is unsafe".into(),
+        ));
+    }
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))
+}
+
 fn validate_local_batch(
     entries: &[rhiza_core::LogEntry],
     start: LogIndex,
@@ -4323,27 +4948,29 @@ mod prestage_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "kv")]
+    use super::validate_local_recovery_view;
     use super::{
         capture_expected_local_restore_state, capture_expected_qlog_state,
         checkpoint_restore_intent_bytes,
         install_prepared_checkpoint_for_rejoin_preserving_recorder, install_test_restore_lock_gate,
-        install_test_restore_lock_path_replacement_hook, mark_durable_state, observe_durable_tip,
-        snapshot_profile, validate_local_qlog, validate_restored_suffix,
-        write_repair_artifact_ownership, CheckpointInstallMode, CheckpointTip, CoordinatorState,
-        DurabilityError, DurabilityHealth, ExecutionProfile, ExpectedLocalRestoreState,
-        ExpectedQlogState, LogAnchor, LogHash, PendingLag, PreparedCheckpointRestore,
-        RecoveryArtifactIdentity, RepairArtifactRole, RestoreCompletionMarker,
-        SuccessorRestorePreparation, RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_COMPLETE_FILE,
-        SUCCESSOR_RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_LOCK_FILE,
+        install_test_restore_lock_path_replacement_hook, mark_durable_state,
+        next_sync_recovery_retry, observe_durable_tip, publisher_lease_renewal_interval,
+        retryable_sync_archive_error, snapshot_profile, validate_local_qlog,
+        validate_restored_suffix, write_repair_artifact_ownership, CheckpointCoordinator,
+        CheckpointInstallMode, CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth,
+        DurabilityMode, ExecutionProfile, ExpectedLocalRestoreState, ExpectedQlogState, LogAnchor,
+        LogHash, PendingLag, PreparedCheckpointRestore, RecoveryArtifactIdentity,
+        RepairArtifactRole, RestoreCompletionMarker, SuccessorRestorePreparation,
+        RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
+        SUCCESSOR_RESTORE_LOCK_FILE, SYNC_RECOVERY_RETRY_INITIAL,
     };
     use super::{install_prepared_checkpoint_to_fresh_data_dir, prepare_checkpoint_restore};
-    #[cfg(feature = "kv")]
-    use super::{validate_local_recovery_view, CheckpointCoordinator, DurabilityMode};
     #[cfg(feature = "kv")]
     use crate::KvCommandV1;
     #[cfg(any(feature = "sql", feature = "kv"))]
     use crate::{NodeConfig, NodeRuntime};
-    use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+    use rhiza_archive::{CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore};
     use rhiza_core::{ConfigurationState, EntryType, LogEntry};
     use rhiza_log::{FileLogStore, LogStore};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
@@ -4492,7 +5119,13 @@ mod tests {
                 root: root.path().join("archive"),
             })
             .unwrap(),
-            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
         );
         archive.initialize_checkpoint().await.unwrap();
         let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
@@ -4615,7 +5248,13 @@ mod tests {
                 root: root.path().join("archive"),
             })
             .unwrap(),
-            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
         );
         archive.initialize_checkpoint().await.unwrap();
         let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
@@ -4697,7 +5336,13 @@ mod tests {
                 root: root.path().join("archive"),
             })
             .unwrap(),
-            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
         );
         archive.initialize_checkpoint().await.unwrap();
         let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
@@ -5010,7 +5655,13 @@ mod tests {
         .unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             store,
-            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
         );
         archive.initialize_checkpoint().await.unwrap();
         let mut prepared = prepare_checkpoint_restore(&archive).await.unwrap();
@@ -5052,7 +5703,13 @@ mod tests {
     #[test]
     fn generic_restore_prepare_keeps_prefix_spoofed_staging_and_fails_closed() {
         let root = tempfile::tempdir().unwrap();
-        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let identity = CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"node-test-config"]),
+            1,
+        );
         let intent = super::checkpoint_restore_intent_bytes(
             &identity,
             "node-1",
@@ -5086,7 +5743,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let checkpoint = LogAnchor::new(0, LogHash::ZERO);
         let identity = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
-            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            &CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
             "node-1",
             ExecutionProfile::Sqlite,
             checkpoint,
@@ -5110,7 +5773,13 @@ mod tests {
         let spoof = root.path().join(".restore-stage-foreign");
         std::fs::create_dir(&spoof).unwrap();
         let identity = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
-            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            &CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
             "node-1",
             ExecutionProfile::Sqlite,
             LogAnchor::new(0, LogHash::ZERO),
@@ -5184,14 +5853,20 @@ mod tests {
 
         assert!(matches!(
             validate_restored_suffix(ExecutionProfile::Sqlite, &[entry]),
-            Err(DurabilityError::SnapshotVerification(message)) if message.contains("QWAL")
+            Err(DurabilityError::SnapshotVerification(message)) if message.contains("QEFX")
         ));
     }
 
     #[test]
     fn local_qlog_accepts_ahead_tip_when_checkpoint_entry_is_retained() {
         let root = tempfile::tempdir().unwrap();
-        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let identity = CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"node-test-config"]),
+            1,
+        );
         let log = FileLogStore::open(
             root.path().join("consensus/log"),
             identity.cluster_id(),
@@ -5250,7 +5925,13 @@ mod tests {
     #[test]
     fn local_qlog_treats_absent_log_as_genesis_only() {
         let root = tempfile::tempdir().unwrap();
-        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let identity = CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"node-test-config"]),
+            1,
+        );
         let genesis = rhiza_core::LogAnchor::new(0, LogHash::ZERO);
 
         assert_eq!(
@@ -5271,7 +5952,13 @@ mod tests {
         let data_dir = root.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let intent = super::checkpoint_restore_intent_bytes(
-            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            &CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
             "node-1",
             ExecutionProfile::Sqlite,
             rhiza_core::LogAnchor::new(0, LogHash::ZERO),
@@ -5315,7 +6002,13 @@ mod tests {
     #[tokio::test]
     async fn kv_compacted_rejoin_restores_missing_or_corrupt_views_without_touching_recorder() {
         let root = tempfile::tempdir().unwrap();
-        let identity = CheckpointIdentity::new("rhiza:kv:cluster-a", 1, 1, 1);
+        let identity = CheckpointIdentity::new(
+            "rhiza:kv:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"node-test-config"]),
+            1,
+        );
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             ObjStore::new(ObjStoreConfig::Local {
                 root: root.path().join("archive"),
@@ -5558,5 +6251,296 @@ mod tests {
         assert_eq!(state.durable_tip, complete);
         assert!(state.pending_lag.is_none());
         assert_eq!(state.health, DurabilityHealth::Available);
+    }
+
+    #[test]
+    fn publisher_lease_renewal_interval_is_positive_and_before_lease_expiry() {
+        for lease_duration_ms in [1, 2, 3, 5_000, 60_000] {
+            let lease_duration = Duration::from_millis(lease_duration_ms);
+            let renewal_interval = publisher_lease_renewal_interval(lease_duration_ms);
+            assert!(!renewal_interval.is_zero());
+            assert!(renewal_interval <= lease_duration / 3);
+        }
+    }
+
+    #[test]
+    fn sync_archive_retry_classifier_preserves_structural_fail_closed_errors() {
+        assert!(retryable_sync_archive_error(
+            &rhiza_archive::Error::CompareAndSwapRetriesExhausted { attempts: 16 }
+        ));
+        assert!(retryable_sync_archive_error(
+            &rhiza_archive::Error::GcBarrierActive {
+                operation_id: "gc".into(),
+            }
+        ));
+        assert!(retryable_sync_archive_error(
+            &rhiza_archive::Error::GcBarrierBusy { until_ms: 1 }
+        ));
+        assert!(retryable_sync_archive_error(
+            &rhiza_archive::Error::GcLeaseMissing {
+                lease_id: "publisher".into(),
+            }
+        ));
+        assert!(!retryable_sync_archive_error(
+            &rhiza_archive::Error::InvalidGc("corrupt control state".into())
+        ));
+        assert!(!retryable_sync_archive_error(
+            &rhiza_archive::Error::GenerationRetired {
+                generation: 1,
+                plan_hash: "plan".into(),
+            }
+        ));
+        assert!(!retryable_sync_archive_error(
+            &rhiza_archive::Error::InvalidCheckpoint("corrupt manifest".into())
+        ));
+    }
+
+    #[test]
+    fn sync_recovery_retry_backoff_is_bounded() {
+        let mut delay = SYNC_RECOVERY_RETRY_INITIAL;
+        for expected in [
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ] {
+            delay = next_sync_recovery_retry(delay);
+            assert_eq!(delay, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_sync_durability_confirmation_closes_the_write_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = CheckpointCoordinator::open(archive, DurabilityMode::Sync)
+            .await
+            .unwrap();
+        coordinator.note_committed(1);
+        drop(coordinator.sync_durability_confirmation());
+        assert_eq!(coordinator.health(), DurabilityHealth::Unavailable);
+        assert!(coordinator.write_allowed().is_err());
+
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("disarmed-archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-b",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = CheckpointCoordinator::open(archive, DurabilityMode::Sync)
+            .await
+            .unwrap();
+        coordinator.note_committed(1);
+        let mut confirmation = coordinator.sync_durability_confirmation();
+        confirmation.disarm();
+        drop(confirmation);
+        assert_eq!(coordinator.health(), DurabilityHealth::Available);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn sync_background_renews_an_expired_and_idle_publisher_lease_before_flushing() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder_and_options(
+                archive,
+                DurabilityMode::Sync,
+                "sync-lease",
+                CheckpointPublisherOptions::new(300),
+            )
+            .await
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            root.path().join("node"),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:sql:cluster-a",
+                "node-1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/node-1"),
+                    root.path().join("recorders/node-2"),
+                    root.path().join("recorders/node-3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(coordinator.clone().run_background(
+            runtime.clone(),
+            async move {
+                if !*shutdown_rx.borrow() {
+                    let _ = shutdown_rx.changed().await;
+                }
+            },
+        ));
+
+        // This is shorter than the normal 100ms Sync poll. A successful strict flush proves
+        // the background's startup renewal reacquired the expired publisher lease promptly.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+        coordinator.note_committed(committed.applied_index);
+        coordinator
+            .flush_runtime(&runtime, committed.applied_index)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(900)).await;
+
+        let committed = runtime.write("request-2", "beta", "two").unwrap();
+        coordinator.note_committed(committed.applied_index);
+        coordinator
+            .flush_runtime(&runtime, committed.applied_index)
+            .await
+            .unwrap();
+        assert!(coordinator.write_allowed().is_ok());
+        assert_eq!(coordinator.health(), DurabilityHealth::Available);
+
+        shutdown_tx.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn sync_background_recovers_an_unavailable_coordinator_after_lease_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder_and_options(
+                archive.clone(),
+                DurabilityMode::Sync,
+                "sync-recovery",
+                CheckpointPublisherOptions::new(300),
+            )
+            .await
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            root.path().join("node"),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:sql:cluster-a",
+                "node-1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/node-1"),
+                    root.path().join("recorders/node-2"),
+                    root.path().join("recorders/node-3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+        coordinator.note_committed(committed.applied_index);
+        assert!(matches!(
+            coordinator
+                .flush_runtime(&runtime, committed.applied_index)
+                .await,
+            Err(DurabilityError::Archive(_))
+        ));
+        assert_eq!(coordinator.health(), DurabilityHealth::Unavailable);
+        assert!(coordinator.write_allowed().is_err());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(coordinator.clone().run_background(
+            runtime.clone(),
+            async move {
+                if !*shutdown_rx.borrow() {
+                    let _ = shutdown_rx.changed().await;
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if coordinator.durable_tip().index() >= committed.applied_index
+                    && coordinator.health() == DurabilityHealth::Available
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(coordinator.write_allowed().is_ok());
+
+        shutdown_tx.send(true).unwrap();
+        worker.await.unwrap().unwrap();
     }
 }

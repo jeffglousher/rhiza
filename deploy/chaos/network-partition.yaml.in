@@ -1,0 +1,27 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: rhiza-__RUN_ID__-network-partition
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/part-of: rhiza-chaos
+    chaos.rhiza.io/run: __RUN_ID__
+spec:
+  action: partition
+  mode: all
+  duration: 30s
+  direction: both
+  selector:
+    namespaces: [__NAMESPACE__]
+    labelSelectors:
+      app.kubernetes.io/part-of: rhiza-chaos
+      chaos.rhiza.io/run: __RUN_ID__
+      chaos.rhiza.io/role: __ROLE__
+  target:
+    mode: all
+    selector:
+      namespaces: [__NAMESPACE__]
+      labelSelectors:
+        app.kubernetes.io/part-of: rhiza-chaos
+        chaos.rhiza.io/run: __RUN_ID__
+        chaos.rhiza.io/role: __TARGET_ROLE__

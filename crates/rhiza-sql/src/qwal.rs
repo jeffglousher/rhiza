@@ -3,7 +3,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use rhiza_core::{LogHash, LogIndex};
+use rhiza_core::{
+    ExternalEffectCommand, ExternalEffectProfile, LogHash, LogIndex, MAX_EXTERNAL_EFFECT_BYTES,
+    MAX_EXTERNAL_EFFECT_PROFILE_MANIFEST_BYTES,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -16,6 +19,9 @@ use crate::{Error, Result};
 pub const QWAL_V3_MAGIC: &[u8; 6] = b"QWAL\0\x04";
 pub const MAX_QWAL_V3_BYTES: usize = 512 * 1024;
 pub const MAX_QWAL_V3_RECEIPTS: usize = 1024;
+
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+const QWAL_EFFECT_RECEIPT_DOMAIN: &[u8] = b"rhiza:qwal-v4:receipt-result\0";
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -76,12 +82,6 @@ impl QwalEnvelopeV3 {
             &self.materializer_fingerprint,
             MAX_FINGERPRINT_BYTES,
         )?;
-        let base_file_bytes = state_file_bytes(&self.base_state, "base")?;
-        let target_file_bytes = state_file_bytes(&self.target_state, "target")?;
-        if self.base_state.page_size != self.target_state.page_size {
-            return invalid("QWAL base and target page sizes differ");
-        }
-
         if self.receipts.is_empty() || self.receipts.len() > MAX_QWAL_V3_RECEIPTS {
             return invalid(format!(
                 "QWAL receipts must contain 1..={MAX_QWAL_V3_RECEIPTS} members"
@@ -106,62 +106,12 @@ impl QwalEnvelopeV3 {
             }
         }
 
-        let page_size = u64::from(self.target_state.page_size);
-
-        let mut previous = 0;
-        let mut page_bytes = 0usize;
-        for page in &self.pages {
-            if page.page_no == 0 {
-                return invalid("QWAL page number must be one-based");
-            }
-            if page.page_no <= previous {
-                return invalid("QWAL pages must be strictly ordered without duplicates");
-            }
-            if page.after_image.len() != self.target_state.page_size as usize {
-                return invalid("QWAL after-image length does not match page size");
-            }
-            let page_end = u64::from(page.page_no)
-                .checked_mul(page_size)
-                .ok_or_else(|| Error::InvalidEntry("QWAL page offset overflows".into()))?;
-            if page_end > target_file_bytes {
-                return invalid("QWAL page lies outside the target file");
-            }
-            if page.page_no == 1 {
-                validate_sqlite_header(&page.after_image, self.target_state.page_size)?;
-                validate_header_page_count(&page.after_image, target_file_bytes, page_size)?;
-            }
-            page_bytes = page_bytes
-                .checked_add(page.after_image.len())
-                .ok_or_else(|| Error::ResourceExhausted("QWAL page bytes overflow".into()))?;
-            if page_bytes > MAX_QWAL_V3_BYTES {
-                return Err(Error::ResourceExhausted(format!(
-                    "QWAL page images exceed {MAX_QWAL_V3_BYTES} bytes"
-                )));
-            }
-            previous = page.page_no;
-        }
-
-        // Growing via set_len alone would create an attacker-sized sparse
-        // file. Every page beyond the base EOF must therefore be carried by
-        // the bounded envelope. Since pages are already strictly ordered and
-        // range checked, cardinality proves that the suffix is gap-free.
-        let base_pages = self.base_state.page_count;
-        let target_pages = self.target_state.page_count;
-        debug_assert_eq!(u64::from(base_pages) * page_size, base_file_bytes);
-        debug_assert_eq!(u64::from(target_pages) * page_size, target_file_bytes);
-        if target_pages > base_pages {
-            let first_new = self
-                .pages
-                .partition_point(|page| page.page_no <= base_pages);
-            let supplied_new_pages = u32::try_from(self.pages.len() - first_new)
-                .map_err(|_| Error::ResourceExhausted("QWAL page count overflows".into()))?;
-            let required_new_pages = target_pages - base_pages;
-            if supplied_new_pages != required_new_pages {
-                return invalid("QWAL growth must include every newly allocated page");
-            }
-        }
-
-        Ok(())
+        validate_qwal_page_effect(
+            &self.base_state,
+            &self.target_state,
+            &self.pages,
+            MAX_QWAL_V3_BYTES,
+        )
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -171,6 +121,292 @@ impl QwalEnvelopeV3 {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         decode_qwal_v3(bytes)
     }
+}
+
+/// The placement of one request result in an external effect bundle.
+///
+/// Bundle bytes begin with the concatenation of these result blobs in receipt
+/// order. `result_offset` and `result_len` name the exact slice in that prefix;
+/// the remaining bytes are the materializer-owned page effect. Result blobs
+/// are not copied into the manifest: their domain-separated digest and the
+/// digest of the complete bundle bind them to this decision.
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QwalReceiptReferenceV4 {
+    pub request_id: String,
+    pub request_digest: LogHash,
+    pub result_offset: u32,
+    pub result_len: u32,
+    pub result_digest: LogHash,
+}
+
+/// Canonically postcard-encoded page effect stored after the receipt prefix.
+///
+/// The external bundle has no untyped remainder: after all manifest-declared
+/// result slices, these exact bytes are the only permitted page-effect value.
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QwalPageEffectV4 {
+    pub pages: Vec<QwalPageV3>,
+}
+
+/// Small, canonical decision record for an externally stored SQLite effect.
+///
+/// The Recorder finalizes every referenced chunk before this manifest is
+/// proposed. A resolver must verify every chunk by index, concatenate exactly
+/// the listed chunks, then call `verify_effect_bytes` before exposing either
+/// receipt results or page data. That makes reordered, missing, and extra
+/// chunks fail before canonical state is changed; duplicate-content chunks are
+/// allowed because their position and the full bundle digest remain binding.
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QwalEffectManifestV4 {
+    // Placement and chunk commitments live only in core's QEFX envelope.
+    // This is profile-owned SQL interpretation data.
+    pub recovery_generation: u64,
+    pub base_state: StateIdentityV3,
+    pub target_state: StateIdentityV3,
+    pub materializer_fingerprint: String,
+    pub receipts: Vec<QwalReceiptReferenceV4>,
+}
+
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+impl QwalEffectManifestV4 {
+    /// Validates every property that can be checked without fetching chunks.
+    pub fn validate(&self) -> Result<()> {
+        validate_nonempty_bounded(
+            "materializer_fingerprint",
+            &self.materializer_fingerprint,
+            MAX_FINGERPRINT_BYTES,
+        )?;
+        state_file_bytes(&self.base_state, "base")?;
+        state_file_bytes(&self.target_state, "target")?;
+        if self.base_state.page_size != self.target_state.page_size {
+            return invalid("QWAL manifest base and target page sizes differ");
+        }
+        if self.receipts.is_empty() || self.receipts.len() > MAX_QWAL_V3_RECEIPTS {
+            return invalid(format!(
+                "QWAL manifest receipts must contain 1..={MAX_QWAL_V3_RECEIPTS} members"
+            ));
+        }
+        let mut request_ids = HashSet::with_capacity(self.receipts.len());
+        let mut result_end = 0u32;
+        for receipt in &self.receipts {
+            validate_nonempty_bounded("request_id", &receipt.request_id, MAX_ID_BYTES)?;
+            if !request_ids.insert(receipt.request_id.as_str()) {
+                return invalid("QWAL manifest receipt request ids must be unique");
+            }
+            if receipt.result_len == 0 || receipt.result_digest == LogHash::ZERO {
+                return invalid("QWAL manifest receipt result must be non-empty and hashed");
+            }
+            if receipt.result_offset != result_end {
+                return invalid("QWAL manifest receipt results must be contiguous and ordered");
+            }
+            result_end = result_end.checked_add(receipt.result_len).ok_or_else(|| {
+                Error::ResourceExhausted("QWAL receipt result length overflows".into())
+            })?;
+        }
+        if result_end as usize > MAX_QWAL_V3_BYTES {
+            return Err(Error::ResourceExhausted(format!(
+                "QWAL manifest receipt prefix exceeds {MAX_QWAL_V3_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let encoded = postcard::to_allocvec(self)
+            .map_err(|error| Error::InvalidEntry(format!("QWAL profile encode failed: {error}")))?;
+        if encoded.len() > MAX_EXTERNAL_EFFECT_PROFILE_MANIFEST_BYTES {
+            return Err(Error::ResourceExhausted(
+                "QWAL profile manifest exceeds core bound".into(),
+            ));
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_EXTERNAL_EFFECT_PROFILE_MANIFEST_BYTES {
+            return invalid("QWAL profile manifest is outside its byte bound");
+        }
+        let manifest: Self = postcard::from_bytes(bytes)
+            .map_err(|error| Error::InvalidEntry(format!("QWAL profile decode failed: {error}")))?;
+        manifest.validate()?;
+        if postcard::to_allocvec(&manifest).map_err(|error| {
+            Error::InvalidEntry(format!("QWAL profile re-encode failed: {error}"))
+        })? != bytes
+        {
+            return invalid("QWAL profile manifest is not canonically encoded");
+        }
+        Ok(manifest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn external_command(
+        &self,
+        cluster_id: impl Into<String>,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        intended_slot: LogIndex,
+        prev_hash: LogHash,
+        chunks: &[Vec<u8>],
+    ) -> Result<ExternalEffectCommand> {
+        ExternalEffectCommand::from_profile_bytes_and_chunks(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            intended_slot,
+            prev_hash,
+            ExternalEffectProfile::sql(self.encode()?),
+            chunks,
+        )
+        .map_err(|error| Error::InvalidEntry(format!("QEFX construction failed: {error}")))
+    }
+
+    pub fn from_external_command(command: &ExternalEffectCommand) -> Result<Self> {
+        let ExternalEffectProfile::Sql { manifest } = command.profile();
+        Self::decode(manifest)
+    }
+
+    /// Verifies whole-bundle bytes against core's canonical QEFX commitment,
+    /// then interprets the SQL-only profile payload.
+    pub fn verify_external_bundle(
+        command: &ExternalEffectCommand,
+        bytes: &[u8],
+    ) -> Result<VerifiedQwalEffectBundleV4> {
+        let manifest = Self::from_external_command(command)?;
+        if bytes.len() != command.total_effect_bytes() as usize {
+            return invalid("QEFX effect bytes do not match their committed length");
+        }
+        let mut offset = 0usize;
+        for chunk in command.chunks() {
+            let end = offset
+                .checked_add(chunk.encoded_len() as usize)
+                .ok_or_else(|| {
+                    Error::ResourceExhausted("QWAL effect chunk offset overflows".into())
+                })?;
+            let Some(bytes) = bytes.get(offset..end) else {
+                return invalid("QEFX effect bundle ends before its committed chunks");
+            };
+            if ExternalEffectCommand::chunk_digest(bytes) != chunk.digest() {
+                return invalid("QEFX effect bundle chunks are not in committed order");
+            }
+            offset = end;
+        }
+        if offset != bytes.len() {
+            return invalid("QEFX effect bundle has trailing bytes");
+        }
+        let mut receipts = Vec::with_capacity(manifest.receipts.len());
+        let mut page_effect_offset = 0usize;
+        for receipt in &manifest.receipts {
+            let end = page_effect_offset
+                .checked_add(receipt.result_len as usize)
+                .ok_or_else(|| Error::ResourceExhausted("QWAL receipt offset overflows".into()))?;
+            let result_blob = bytes.get(page_effect_offset..end).ok_or_else(|| {
+                Error::InvalidEntry("QWAL bundle ends in its receipt prefix".into())
+            })?;
+            if qwal_effect_receipt_digest(result_blob) != receipt.result_digest {
+                return invalid("QWAL receipt result does not match its manifest reference");
+            }
+            crate::validate_sql_result_blob_bounds(result_blob)
+                .map_err(|_| Error::InvalidEntry("QWAL receipt result is not canonical".into()))?;
+            receipts.push(QwalReceiptV3 {
+                request_id: receipt.request_id.clone(),
+                request_digest: receipt.request_digest,
+                result_blob: result_blob.to_vec(),
+            });
+            page_effect_offset = end;
+        }
+        let page_effect = QwalPageEffectV4::decode(
+            bytes
+                .get(page_effect_offset..)
+                .ok_or_else(|| Error::InvalidEntry("QWAL page effect offset is invalid".into()))?,
+            &manifest.base_state,
+            &manifest.target_state,
+        )?;
+        Ok(VerifiedQwalEffectBundleV4 {
+            command: command.clone(),
+            manifest,
+            receipts,
+            page_effect_offset: u32::try_from(page_effect_offset).map_err(|_| {
+                Error::ResourceExhausted("QWAL page effect offset overflows".into())
+            })?,
+            page_effect,
+        })
+    }
+}
+
+/// Fully checked, typed external effect. Production code must consume this
+/// value rather than treating the bundle suffix as raw page bytes.
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedQwalEffectBundleV4 {
+    command: ExternalEffectCommand,
+    manifest: QwalEffectManifestV4,
+    receipts: Vec<QwalReceiptV3>,
+    page_effect_offset: u32,
+    page_effect: QwalPageEffectV4,
+}
+
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+impl VerifiedQwalEffectBundleV4 {
+    pub fn command(&self) -> &ExternalEffectCommand {
+        &self.command
+    }
+    /// The immutable context that was verified with these exact bundle bytes.
+    pub fn manifest(&self) -> &QwalEffectManifestV4 {
+        &self.manifest
+    }
+
+    pub fn receipts(&self) -> &[QwalReceiptV3] {
+        &self.receipts
+    }
+
+    pub const fn page_effect_offset(&self) -> u32 {
+        self.page_effect_offset
+    }
+
+    pub fn page_effect(&self) -> &QwalPageEffectV4 {
+        &self.page_effect
+    }
+}
+
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+impl QwalPageEffectV4 {
+    pub fn encode(&self, base: &StateIdentityV3, target: &StateIdentityV3) -> Result<Vec<u8>> {
+        validate_qwal_page_effect(base, target, &self.pages, MAX_EXTERNAL_EFFECT_BYTES)?;
+        postcard::to_allocvec(self).map_err(|error| {
+            Error::InvalidEntry(format!("QWAL page effect encode failed: {error}"))
+        })
+    }
+
+    pub fn decode(bytes: &[u8], base: &StateIdentityV3, target: &StateIdentityV3) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_EXTERNAL_EFFECT_BYTES {
+            return invalid("QWAL external page effect has invalid length");
+        }
+        let effect: Self = postcard::from_bytes(bytes).map_err(|error| {
+            Error::InvalidEntry(format!("QWAL page effect decode failed: {error}"))
+        })?;
+        validate_qwal_page_effect(base, target, &effect.pages, MAX_EXTERNAL_EFFECT_BYTES)?;
+        let canonical = postcard::to_allocvec(&effect).map_err(|error| {
+            Error::InvalidEntry(format!("QWAL page effect re-encode failed: {error}"))
+        })?;
+        if canonical.as_slice() != bytes {
+            return invalid("QWAL page effect is not canonically encoded");
+        }
+        Ok(effect)
+    }
+}
+
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+pub fn qwal_effect_receipt_digest(bytes: &[u8]) -> LogHash {
+    LogHash::digest(&[QWAL_EFFECT_RECEIPT_DOMAIN, bytes])
 }
 
 pub fn encode_qwal_v3(effect: &QwalEnvelopeV3) -> Result<Vec<u8>> {
@@ -295,21 +531,59 @@ fn diff_closed_databases(
 pub(crate) fn apply_preverified_qwal_in_place(
     file: &mut File,
     effect: &QwalEnvelopeV3,
-    mut after_page_write: impl FnMut(u32) -> Result<()>,
+    after_page_write: impl FnMut(u32) -> Result<()>,
 ) -> Result<()> {
     effect.validate()?;
+    apply_preverified_qwal_page_effect_in_place(
+        file,
+        &effect.base_state,
+        &effect.target_state,
+        &effect.pages,
+        MAX_QWAL_V3_BYTES,
+        after_page_write,
+    )
+}
+
+/// Applies one intrinsically bound verified external effect. No caller-supplied
+/// manifest can reinterpret the base, target, or digest context.
+#[allow(dead_code)] // Wired into the Recorder command boundary in the next integration step.
+pub(crate) fn apply_verified_qwal_effect_in_place(
+    file: &mut File,
+    effect: &VerifiedQwalEffectBundleV4,
+    after_page_write: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    effect.manifest.validate()?;
+    apply_preverified_qwal_page_effect_in_place(
+        file,
+        &effect.manifest.base_state,
+        &effect.manifest.target_state,
+        &effect.page_effect.pages,
+        MAX_EXTERNAL_EFFECT_BYTES,
+        after_page_write,
+    )
+}
+
+fn apply_preverified_qwal_page_effect_in_place(
+    file: &mut File,
+    base_state: &StateIdentityV3,
+    target_state: &StateIdentityV3,
+    pages: &[QwalPageV3],
+    max_page_bytes: usize,
+    mut after_page_write: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    validate_qwal_page_effect(base_state, target_state, pages, max_page_bytes)?;
     let base_bytes = file.metadata().map_err(io_error)?.len();
-    if base_bytes != state_file_bytes(&effect.base_state, "base")? {
+    if base_bytes != state_file_bytes(base_state, "base")? {
         return invalid("QWAL base file size mismatch");
     }
-    if sqlite_page_size_from_file(file)? != effect.base_state.page_size {
+    if sqlite_page_size_from_file(file)? != base_state.page_size {
         return invalid("QWAL base page size mismatch");
     }
 
-    file.set_len(state_file_bytes(&effect.target_state, "target")?)
+    file.set_len(state_file_bytes(target_state, "target")?)
         .map_err(io_error)?;
-    let page_size = u64::from(effect.target_state.page_size);
-    for page in &effect.pages {
+    let page_size = u64::from(target_state.page_size);
+    for page in pages {
         let offset = u64::from(page.page_no - 1)
             .checked_mul(page_size)
             .ok_or_else(|| Error::InvalidEntry("QWAL page offset overflows".into()))?;
@@ -318,7 +592,7 @@ pub(crate) fn apply_preverified_qwal_in_place(
         after_page_write(page.page_no)?;
     }
 
-    verify_installed_pages(file, effect)
+    verify_installed_qwal_pages(file, target_state, pages)
 }
 
 #[cfg(test)]
@@ -338,18 +612,21 @@ fn verify_state_transition(base_state: &PageStateCacheV3, effect: &QwalEnvelopeV
     Ok(())
 }
 
-pub(crate) fn verify_installed_pages(file: &mut File, effect: &QwalEnvelopeV3) -> Result<()> {
-    if file.metadata().map_err(io_error)?.len() != state_file_bytes(&effect.target_state, "target")?
-    {
+fn verify_installed_qwal_pages(
+    file: &mut File,
+    target_state: &StateIdentityV3,
+    pages: &[QwalPageV3],
+) -> Result<()> {
+    if file.metadata().map_err(io_error)?.len() != state_file_bytes(target_state, "target")? {
         return invalid("QWAL target file size mismatch");
     }
-    if sqlite_page_size_from_file(file)? != effect.target_state.page_size {
+    if sqlite_page_size_from_file(file)? != target_state.page_size {
         return invalid("QWAL target page size mismatch");
     }
 
-    let page_size = u64::from(effect.target_state.page_size);
-    let mut installed = vec![0; effect.target_state.page_size as usize];
-    for page in &effect.pages {
+    let page_size = u64::from(target_state.page_size);
+    let mut installed = vec![0; target_state.page_size as usize];
+    for page in pages {
         let offset = u64::from(page.page_no - 1)
             .checked_mul(page_size)
             .ok_or_else(|| Error::InvalidEntry("QWAL page offset overflows".into()))?;
@@ -429,6 +706,69 @@ fn state_file_bytes(state: &StateIdentityV3, label: &str) -> Result<u64> {
     u64::from(state.page_size)
         .checked_mul(u64::from(state.page_count))
         .ok_or_else(|| Error::ResourceExhausted(format!("QWAL {label} file size overflows")))
+}
+
+fn validate_qwal_page_effect(
+    base_state: &StateIdentityV3,
+    target_state: &StateIdentityV3,
+    pages: &[QwalPageV3],
+    max_page_bytes: usize,
+) -> Result<()> {
+    let base_file_bytes = state_file_bytes(base_state, "base")?;
+    let target_file_bytes = state_file_bytes(target_state, "target")?;
+    if base_state.page_size != target_state.page_size {
+        return invalid("QWAL base and target page sizes differ");
+    }
+    let page_size = u64::from(target_state.page_size);
+    let mut previous = 0;
+    let mut page_bytes = 0usize;
+    for page in pages {
+        if page.page_no == 0 {
+            return invalid("QWAL page number must be one-based");
+        }
+        if page.page_no <= previous {
+            return invalid("QWAL pages must be strictly ordered without duplicates");
+        }
+        if page.after_image.len() != target_state.page_size as usize {
+            return invalid("QWAL after-image length does not match page size");
+        }
+        let page_end = u64::from(page.page_no)
+            .checked_mul(page_size)
+            .ok_or_else(|| Error::InvalidEntry("QWAL page offset overflows".into()))?;
+        if page_end > target_file_bytes {
+            return invalid("QWAL page lies outside the target file");
+        }
+        if page.page_no == 1 {
+            validate_sqlite_header(&page.after_image, target_state.page_size)?;
+            validate_header_page_count(&page.after_image, target_file_bytes, page_size)?;
+        }
+        page_bytes = page_bytes
+            .checked_add(page.after_image.len())
+            .ok_or_else(|| Error::ResourceExhausted("QWAL page bytes overflow".into()))?;
+        if page_bytes > max_page_bytes {
+            return Err(Error::ResourceExhausted(format!(
+                "QWAL page images exceed {max_page_bytes} bytes"
+            )));
+        }
+        previous = page.page_no;
+    }
+
+    // Growing via set_len alone would create an attacker-sized sparse file.
+    // Every new suffix page must be present in the typed effect.
+    let base_pages = base_state.page_count;
+    let target_pages = target_state.page_count;
+    debug_assert_eq!(u64::from(base_pages) * page_size, base_file_bytes);
+    debug_assert_eq!(u64::from(target_pages) * page_size, target_file_bytes);
+    if target_pages > base_pages {
+        let first_new = pages.partition_point(|page| page.page_no <= base_pages);
+        let supplied_new_pages = u32::try_from(pages.len() - first_new)
+            .map_err(|_| Error::ResourceExhausted("QWAL page count overflows".into()))?;
+        let required_new_pages = target_pages - base_pages;
+        if supplied_new_pages != required_new_pages {
+            return invalid("QWAL growth must include every newly allocated page");
+        }
+    }
+    Ok(())
 }
 
 fn validate_sqlite_header(page: &[u8], expected_page_size: u32) -> Result<()> {

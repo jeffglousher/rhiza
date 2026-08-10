@@ -21,8 +21,8 @@ use postcard_rpc::{
 };
 use rhiza_core::{LogHash, StoredCommand};
 use rhiza_quepaxa::{
-    DecisionProof, Error, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
-    RecordSummary, RecorderRpc,
+    DecisionProof, EffectBundleBinding, Error, Membership, ReadFenceObservation, ReadFenceRequest,
+    RecordRequest, RecordSummary, RecorderRpc,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -244,6 +244,30 @@ endpoint!(
     OpaqueRequest,
     OpaqueResponse,
     "rhiza/recorder/private/v2/fetch-command"
+);
+endpoint!(
+    StageEffectBundleChunkEndpoint,
+    OpaqueRequest,
+    OpaqueResponse,
+    "rhiza/recorder/private/v3/stage-effect-chunk"
+);
+endpoint!(
+    FinalizeStagedEffectBundleEndpoint,
+    OpaqueRequest,
+    OpaqueResponse,
+    "rhiza/recorder/private/v3/finalize-effect-bundle"
+);
+endpoint!(
+    FetchEffectBundleManifestEndpoint,
+    OpaqueRequest,
+    OpaqueResponse,
+    "rhiza/recorder/private/v3/fetch-effect-manifest"
+);
+endpoint!(
+    FetchEffectBundleChunkEndpoint,
+    OpaqueRequest,
+    OpaqueResponse,
+    "rhiza/recorder/private/v3/fetch-effect-chunk"
 );
 endpoint!(
     RecordEndpoint,
@@ -994,6 +1018,10 @@ fn operation_for_key(key: VarKey) -> Option<Operation> {
         Operation::Identity,
         Operation::StoreCommand,
         Operation::FetchCommand,
+        Operation::StageEffectBundleChunk,
+        Operation::FinalizeStagedEffectBundle,
+        Operation::FetchEffectBundleManifest,
+        Operation::FetchEffectBundleChunk,
         Operation::Record,
         Operation::InstallDecisionProof,
         Operation::InspectDecisionProof,
@@ -1009,6 +1037,10 @@ fn request_key(operation: Operation) -> postcard_rpc::Key {
         Operation::Identity => IdentityEndpoint::REQ_KEY,
         Operation::StoreCommand => StoreCommandEndpoint::REQ_KEY,
         Operation::FetchCommand => FetchCommandEndpoint::REQ_KEY,
+        Operation::StageEffectBundleChunk => StageEffectBundleChunkEndpoint::REQ_KEY,
+        Operation::FinalizeStagedEffectBundle => FinalizeStagedEffectBundleEndpoint::REQ_KEY,
+        Operation::FetchEffectBundleManifest => FetchEffectBundleManifestEndpoint::REQ_KEY,
+        Operation::FetchEffectBundleChunk => FetchEffectBundleChunkEndpoint::REQ_KEY,
         Operation::Record => RecordEndpoint::REQ_KEY,
         Operation::InstallDecisionProof => InstallDecisionProofEndpoint::REQ_KEY,
         Operation::InspectDecisionProof => InspectDecisionProofEndpoint::REQ_KEY,
@@ -1022,6 +1054,10 @@ fn response_key(operation: Operation) -> postcard_rpc::Key {
         Operation::Identity => IdentityEndpoint::RESP_KEY,
         Operation::StoreCommand => StoreCommandEndpoint::RESP_KEY,
         Operation::FetchCommand => FetchCommandEndpoint::RESP_KEY,
+        Operation::StageEffectBundleChunk => StageEffectBundleChunkEndpoint::RESP_KEY,
+        Operation::FinalizeStagedEffectBundle => FinalizeStagedEffectBundleEndpoint::RESP_KEY,
+        Operation::FetchEffectBundleManifest => FetchEffectBundleManifestEndpoint::RESP_KEY,
+        Operation::FetchEffectBundleChunk => FetchEffectBundleChunkEndpoint::RESP_KEY,
         Operation::Record => RecordEndpoint::RESP_KEY,
         Operation::InstallDecisionProof => InstallDecisionProofEndpoint::RESP_KEY,
         Operation::InspectDecisionProof => InspectDecisionProofEndpoint::RESP_KEY,
@@ -1753,6 +1789,87 @@ impl RecorderRpc for TcpPostcardRpcRecorderClient {
             false,
         )? {
             RecorderResponseBody::FetchCommand(result) => result.into_result(),
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::StageEffectBundleChunk {
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            },
+            true,
+            true,
+        )? {
+            RecorderResponseBody::StageEffectBundleChunk(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::FinalizeStagedEffectBundle {
+                binding,
+                manifest_command,
+            },
+            true,
+            true,
+        )? {
+            RecorderResponseBody::FinalizeStagedEffectBundle(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::FetchEffectBundleManifest { binding },
+            false,
+            false,
+        )? {
+            RecorderResponseBody::FetchEffectBundleManifest(result) => result.into_result(),
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::FetchEffectBundleChunk { binding, ordinal },
+            false,
+            false,
+        )? {
+            RecorderResponseBody::FetchEffectBundleChunk(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
     }

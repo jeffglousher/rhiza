@@ -725,7 +725,13 @@ async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"admin-http-test"]),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

@@ -200,7 +200,13 @@ async fn coordinator_open_rejects_tampered_segment_checksum_metadata() {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"durability-test"]),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
@@ -2003,7 +2009,7 @@ async fn restore_roundtrip_replays_normally_through_node_runtime() {
     assert_eq!(tip.hash(), second.hash);
     assert_ne!(tip.hash(), first.hash);
 
-    let restored = runtime(restored_dir);
+    let restored = runtime(&restored_dir);
     assert_eq!(restored.applied_index().unwrap(), 2);
     assert_eq!(
         restored
@@ -2128,7 +2134,7 @@ async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
     assert_eq!(restored_checkpoint.suffix().len(), 1);
     assert_eq!(restored_checkpoint.suffix()[0].index, second.applied_index);
 
-    let restored = runtime(restored_dir);
+    let restored = runtime(&restored_dir);
     assert_eq!(
         restored
             .read("alpha", ReadConsistency::Local)
@@ -2144,6 +2150,26 @@ async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
             .value
             .as_deref(),
         Some("two")
+    );
+    let recorder = RecorderFileStore::new_with_membership(
+        root.path().join("restored-handoff-recorder"),
+        "node-1",
+        "rhiza:sql:cluster-a",
+        1,
+        1,
+        restored.consensus().membership().clone(),
+    )
+    .unwrap();
+    rehydrate_recorder_after_checkpoint(
+        &restored,
+        &recorder,
+        second.applied_index,
+        &StartupIoContext::new(),
+    )
+    .unwrap();
+    assert!(
+        !restored_dir.join("consensus/qefx-restore").exists(),
+        "the verified local QEFX handoff is consumed before normal recorder rehydration"
     );
 }
 
@@ -2397,7 +2423,13 @@ fn checkpoint_store(root: &Path) -> ObjectArchiveStore {
     .unwrap();
     ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"durability-test"]),
+            1,
+        ),
     )
 }
 

@@ -111,7 +111,7 @@ scripts/bench-rhiza-hiqlite.sh normalize-recovery \
   target/hiqlite-recovery/RUN/summary.json target/recovery-normalized.json
 ```
 
-`run-recovery` writes progress and the start event to stderr. On success its
+`run-recovery` is one non-publishable diagnostic trial. It writes progress and the start event to stderr. On success its
 stdout is one completed JSON manifest with the coordinator artifact root, both
 exact source paths, and SHA-256 digests.
 
@@ -119,8 +119,14 @@ Normalization rejects missing, duplicate, or mismatched recovery coordinates.
 It requires Hiqlite three-voter `emptyDir`/zero-PVC evidence and Rhiza zero-PVC
 plus three-old/three-new-voter cell evidence, retains source paths, and writes
 unavailable throughput/resource values as `not_measured`; it never invents them.
-Recovery normalization is implemented; a matched workload/resource coordinator
-is still pending, so no publishable performance comparison exists yet.
+Hiqlite provenance records the exact reference commit, generated `Cargo.lock`
+digest, and the OpenRaft version resolved from that lock for every phase
+(`openraft_version_source: generated-cargo-lock`); no fixed OpenRaft version is
+assumed by the coordinator.
+The normalized artifact remains non-publishable until three order-rotated
+trials are aggregated. Recovery normalization and the matched D1 SQL
+write/tail coordinator are implemented. No measured comparison is published
+yet, and cross-system CPU/RSS/disk/network/fsync comparison remains pending.
 
 ## vind Runner
 
@@ -376,6 +382,12 @@ records three-run c1/c4/c16 local and read-barrier controls for SQL, KV, and
 Graph after disk space was cleared. The host was not idle and later showed an
 orphan VM/background load, so the result is diagnostic rather than publishable
 release evidence.
+
+The checked-in [SQL read-concurrency diagnostic](sql-read-concurrency-results-2026-08-10.md)
+is the local adoption gate for the bounded persistent SQLite read pool. It
+compares the same release benchmark at c1/c4/c16 against the pre-change HEAD,
+records the rejected per-query connection design, and preserves the scope and
+nonpublishable macOS/APFS limitations.
 
 The post-change KV artifact is
 `target/rhiza-bench/kv-group-commit/20260719T122120/`, built as binary SHA-256

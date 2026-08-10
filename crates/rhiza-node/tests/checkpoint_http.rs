@@ -2,6 +2,7 @@ use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use axum::Router;
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+use rhiza_core::LogHash;
 use rhiza_node::{
     node_router, node_router_with_checkpoint, CheckpointCoordinator, ClientErrorResponse,
     DurabilityHealth, DurabilityMode, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
@@ -162,7 +163,13 @@ async fn disconnected_sync_write_finishes_checkpoint_after_archive_recovers() {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"checkpoint-http-test"]),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     let coordinator = Arc::new(
@@ -791,7 +798,13 @@ async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"checkpoint-http-test"]),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

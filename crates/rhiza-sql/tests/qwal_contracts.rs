@@ -1,12 +1,12 @@
 use rhiza_core::{
     ConfigChange, ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot,
-    StopBinding,
+    StopBinding, MAX_EXTERNAL_EFFECT_BYTES,
 };
 use rhiza_sql::{
     decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
     restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, SqlBatchMember,
-    SqlCommand, SqlCommandResult, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES,
-    QWAL_V3_MAGIC,
+    SqlCommand, SqlCommandResult, SqlStatement, SqlValue, SqliteStateMachine,
+    MAX_NATIVE_WAL_CAPTURE_BYTES, MAX_SQL_EFFECT_BYTES, QWAL_V3_MAGIC,
 };
 
 fn entry(index: u64, prev_hash: LogHash, payload: &[u8]) -> LogEntry {
@@ -64,6 +64,27 @@ fn prepared_qwal(
     let effect = preparation.effect.unwrap();
     assert!(effect.starts_with(QWAL_V3_MAGIC));
     (request, effect)
+}
+
+fn prepared_external(
+    db: &SqliteStateMachine,
+    command: &SqlCommand,
+    base_index: u64,
+    base_hash: LogHash,
+) -> (Vec<u8>, rhiza_sql::PreparedExternalSqlEffect) {
+    let request = encode_sql_command(command).unwrap();
+    let preparation = db
+        .prepare_external_sql_batch_effect(
+            &[SqlBatchMember {
+                command,
+                request_payload: &request,
+            }],
+            base_index,
+            base_hash,
+        )
+        .unwrap();
+    preparation.results[0].as_ref().unwrap();
+    (request, preparation.effect.unwrap())
 }
 
 fn query(db: &SqliteStateMachine, sql: &str) -> Vec<Vec<SqlValue>> {
@@ -361,6 +382,81 @@ fn batch_preparation_rejects_1025_members_before_mutation() {
         Err(Error::InvalidCommand(_))
     ));
     assert_eq!(db.applied_tip_value().unwrap(), (0, LogHash::ZERO));
+}
+
+#[test]
+fn capacity_batch_stops_after_cumulative_result_budget_is_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bounded-results.sqlite");
+    let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let before = database.canonical_db_digest().unwrap();
+    let commands = (0..1024)
+        .map(|index| {
+            command(
+                &format!("large-result-{index}"),
+                &["SELECT printf('%0900000d', 1)"],
+            )
+        })
+        .collect::<Vec<_>>();
+    let payloads = commands
+        .iter()
+        .map(|command| encode_sql_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let members = commands
+        .iter()
+        .zip(&payloads)
+        .map(|(command, payload)| SqlBatchMember {
+            command,
+            request_payload: payload,
+        })
+        .collect::<Vec<_>>();
+
+    let prepared = database
+        .prepare_sql_batch_effect(&members, 0, LogHash::ZERO)
+        .unwrap();
+
+    assert!(prepared.effect.is_none());
+    assert_eq!(prepared.results.len(), 1024);
+    assert!(prepared
+        .results
+        .iter()
+        .all(|result| matches!(result, Err(Error::ResourceExhausted(_)))));
+    assert_eq!(database.canonical_db_digest().unwrap(), before);
+    assert_eq!(database.applied_index_value().unwrap(), 0);
+}
+
+#[test]
+fn all_invalid_external_batch_returns_aligned_errors_without_an_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("external-all-invalid.sqlite");
+    let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let before = database.canonical_db_digest().unwrap();
+    let commands = [
+        command("external-invalid-a", &["INSERT INTO absent VALUES (1)"]),
+        command("external-invalid-b", &["UPDATE absent SET value = 2"]),
+    ];
+    let payloads = commands
+        .iter()
+        .map(|command| encode_sql_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let members = commands
+        .iter()
+        .zip(&payloads)
+        .map(|(command, request_payload)| SqlBatchMember {
+            command,
+            request_payload,
+        })
+        .collect::<Vec<_>>();
+
+    let preparation = database
+        .prepare_external_sql_batch_effect(&members, 0, LogHash::ZERO)
+        .unwrap();
+
+    assert!(preparation.effect.is_none());
+    assert_eq!(preparation.results.len(), commands.len());
+    assert!(preparation.results.iter().all(Result::is_err));
+    assert_eq!(database.canonical_db_digest().unwrap(), before);
+    assert_eq!(database.applied_tip_value().unwrap(), (0, LogHash::ZERO));
 }
 
 #[test]
@@ -1077,17 +1173,10 @@ fn qwal_apply_rejects_forged_no_change_target_with_inconsistent_pages() {
         Err(Error::InvalidEntry(message)) if message.contains("target page state")
     ));
     assert_eq!(db.applied_tip_value().unwrap(), (1, setup_entry.hash));
-    assert!(matches!(
-        db.query_sql(
-            &SqlStatement {
-                sql: "SELECT value FROM forged_no_change".into(),
-                parameters: vec![],
-            },
-            1,
-            64,
-        ),
-        Err(Error::InvalidEntry(message)) if message.contains("pending")
-    ));
+    assert_eq!(
+        query(&db, "SELECT value FROM forged_no_change"),
+        [[SqlValue::Text("before".into())]]
+    );
     drop(db);
     let reopened = SqliteStateMachine::open_existing(&path).unwrap();
     assert_eq!(
@@ -1126,8 +1215,157 @@ fn pure_noop_commit_survives_reopen_and_replay_but_rejects_a_different_hash() {
 }
 
 #[test]
+fn external_sql_create_index_and_bulk_update_replay_exactly_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let proposer_path = dir.path().join("external-proposer.sqlite");
+    let follower_path = dir.path().join("external-follower.sqlite");
+    let proposer = SqliteStateMachine::open(&proposer_path, "cluster-a", "node-1", 1, 1).unwrap();
+    let follower = SqliteStateMachine::open(&follower_path, "cluster-a", "node-2", 1, 1).unwrap();
+    let create = command(
+        "external-create-index",
+        &[
+            "CREATE TABLE external_items(id INTEGER PRIMARY KEY, value BLOB NOT NULL)",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 2048) INSERT INTO external_items SELECT x, zeroblob(1024) FROM n",
+            "CREATE INDEX external_items_value ON external_items(value)",
+        ],
+    );
+    let (_, prepared) = prepared_external(&proposer, &create, 0, LogHash::ZERO);
+    assert!(prepared.total_effect_bytes() > MAX_SQL_EFFECT_BYTES);
+    assert!(prepared.total_effect_bytes() <= MAX_EXTERNAL_EFFECT_BYTES);
+    assert!(prepared
+        .build_command(LogHash::digest(&[b"wrong-config"]), 1, LogHash::ZERO)
+        .is_err());
+    assert!(prepared
+        .build_command(LogHash::ZERO, 2, LogHash::ZERO)
+        .is_err());
+    assert!(prepared
+        .build_command(LogHash::ZERO, 1, LogHash::digest(&[b"wrong-prev"]))
+        .is_err());
+    let external_command = prepared
+        .build_command(LogHash::ZERO, 1, LogHash::ZERO)
+        .unwrap();
+    let verified = prepared.verify(&external_command).unwrap();
+    let proposer_outcome = proposer.apply_verified_external_effect(&verified).unwrap();
+    let follower_outcome = follower.apply_verified_external_effect(&verified).unwrap();
+    assert_eq!(follower_outcome.progress(), proposer_outcome.progress());
+    assert_eq!(
+        proposer.canonical_db_digest().unwrap(),
+        follower.canonical_db_digest().unwrap()
+    );
+
+    let update = command(
+        "external-bulk-update",
+        &["UPDATE external_items SET value = randomblob(1024)"],
+    );
+    let (_, prepared) = prepared_external(
+        &proposer,
+        &update,
+        1,
+        proposer_outcome.progress().applied_hash(),
+    );
+    assert!(prepared.total_effect_bytes() > MAX_SQL_EFFECT_BYTES);
+    let external_command = prepared
+        .build_command(LogHash::ZERO, 2, proposer_outcome.progress().applied_hash())
+        .unwrap();
+    let verified = prepared.verify(&external_command).unwrap();
+    proposer.apply_verified_external_effect(&verified).unwrap();
+    follower.apply_verified_external_effect(&verified).unwrap();
+    assert_eq!(
+        proposer.canonical_db_digest().unwrap(),
+        follower.canonical_db_digest().unwrap()
+    );
+    proposer.close_for_handoff().unwrap();
+    follower.close_for_handoff().unwrap();
+    let proposer = SqliteStateMachine::open_existing(&proposer_path).unwrap();
+    let follower = SqliteStateMachine::open_existing(&follower_path).unwrap();
+    assert_eq!(
+        query(&proposer, "SELECT count(*) FROM external_items"),
+        [[SqlValue::Integer(2048)]]
+    );
+    assert_eq!(
+        proposer.canonical_db_digest().unwrap(),
+        follower.canonical_db_digest().unwrap()
+    );
+    assert_eq!(proposer.applied_index_value().unwrap(), 2);
+    assert_eq!(follower.applied_index_value().unwrap(), 2);
+}
+
+#[test]
+fn external_sql_effect_above_64_mib_fails_without_canonical_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("external-too-large.sqlite");
+    let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let before = database.canonical_db_digest().unwrap();
+    let oversized = command(
+        "external-too-large",
+        &[
+            "CREATE TABLE oversized_external(id INTEGER PRIMARY KEY, value BLOB NOT NULL)",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 17000) INSERT INTO oversized_external SELECT x, zeroblob(4096) FROM n",
+        ],
+    );
+    let request = encode_sql_command(&oversized).unwrap();
+
+    assert!(matches!(
+        database.prepare_external_sql_batch_effect(
+            &[SqlBatchMember { command: &oversized, request_payload: &request }],
+            0,
+            LogHash::ZERO,
+        ),
+        Err(Error::ResourceExhausted(message)) if message.contains("changed page images") || message.contains("external SQL effect")
+    ));
+    assert_eq!(database.canonical_db_digest().unwrap(), before);
+    assert_eq!(database.applied_index_value().unwrap(), 0);
+    assert_eq!(database.get_value("still-readable").unwrap(), None);
+}
+
+#[test]
+fn external_multi_receipt_apply_and_duplicate_return_no_single_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("external-multi.sqlite");
+    let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let commands = [
+        command("external-multi-a", &["SELECT 1"]),
+        command("external-multi-b", &["SELECT 2"]),
+    ];
+    let payloads = commands
+        .iter()
+        .map(|command| encode_sql_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let members = commands
+        .iter()
+        .zip(&payloads)
+        .map(|(command, payload)| SqlBatchMember {
+            command,
+            request_payload: payload,
+        })
+        .collect::<Vec<_>>();
+    let preparation = database
+        .prepare_external_sql_batch_effect(&members, 0, LogHash::ZERO)
+        .unwrap();
+    assert!(preparation.results.iter().all(Result::is_ok));
+    let prepared = preparation.effect.unwrap();
+    let command = prepared
+        .build_command(LogHash::ZERO, 1, LogHash::ZERO)
+        .unwrap();
+    let verified = prepared.verify(&command).unwrap();
+
+    assert!(database
+        .apply_verified_external_effect(&verified)
+        .unwrap()
+        .sql_result()
+        .is_none());
+    assert!(database
+        .apply_verified_external_effect(&verified)
+        .unwrap()
+        .sql_result()
+        .is_none());
+    assert_eq!(database.applied_index_value().unwrap(), 1);
+}
+
+#[test]
 fn qwal_prepare_rejects_an_effect_larger_than_the_inline_limit() {
     assert_eq!(MAX_SQL_EFFECT_BYTES, 512 * 1024);
+    assert_eq!(MAX_NATIVE_WAL_CAPTURE_BYTES, 8 * 1024 * 1024);
     let dir = tempfile::tempdir().unwrap();
     let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
         .unwrap();

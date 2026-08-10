@@ -12,8 +12,8 @@ use std::{
 
 use rhiza_core::{LogHash, StoredCommand};
 use rhiza_quepaxa::{
-    DecisionProof, Error, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
-    RecordSummary, RecorderRpc, RejectReason,
+    DecisionProof, EffectBundleBinding, Error, Membership, ReadFenceObservation, ReadFenceRequest,
+    RecordRequest, RecordSummary, RecorderRpc, RejectReason,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -280,6 +280,23 @@ pub(crate) enum RecorderRequestBody {
         config_digest: LogHash,
         command_hash: LogHash,
     },
+    StageEffectBundleChunk {
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    },
+    FinalizeStagedEffectBundle {
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    },
+    FetchEffectBundleManifest {
+        binding: EffectBundleBinding,
+    },
+    FetchEffectBundleChunk {
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    },
     Record(RecordRequest),
     InstallDecisionProof {
         proof: DecisionProof,
@@ -306,6 +323,10 @@ pub(crate) enum RecorderResponseBody {
     Identity(RpcResult<String>),
     StoreCommand(RpcResult<()>),
     FetchCommand(RpcResult<Option<StoredCommand>>),
+    StageEffectBundleChunk(RpcResult<()>),
+    FinalizeStagedEffectBundle(RpcResult<()>),
+    FetchEffectBundleManifest(RpcResult<Option<StoredCommand>>),
+    FetchEffectBundleChunk(RpcResult<Option<Vec<u8>>>),
     Record(RpcResult<RecordSummary>),
     InstallDecisionProof(RpcResult<()>),
     InspectDecisionProof(RpcResult<Option<DecisionProof>>),
@@ -1093,6 +1114,10 @@ enum Operation {
     Identity,
     StoreCommand,
     FetchCommand,
+    StageEffectBundleChunk,
+    FinalizeStagedEffectBundle,
+    FetchEffectBundleManifest,
+    FetchEffectBundleChunk,
     Record,
     InstallDecisionProof,
     InspectDecisionProof,
@@ -1104,7 +1129,11 @@ impl Operation {
     const fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::StoreCommand | Self::Record | Self::InstallDecisionProof
+            Self::StoreCommand
+                | Self::StageEffectBundleChunk
+                | Self::FinalizeStagedEffectBundle
+                | Self::Record
+                | Self::InstallDecisionProof
         )
     }
 
@@ -1122,6 +1151,14 @@ fn response_operation(request: &RecorderRequestBody) -> Operation {
         RecorderRequestBody::Identity => Operation::Identity,
         RecorderRequestBody::StoreCommand { .. } => Operation::StoreCommand,
         RecorderRequestBody::FetchCommand { .. } => Operation::FetchCommand,
+        RecorderRequestBody::StageEffectBundleChunk { .. } => Operation::StageEffectBundleChunk,
+        RecorderRequestBody::FinalizeStagedEffectBundle { .. } => {
+            Operation::FinalizeStagedEffectBundle
+        }
+        RecorderRequestBody::FetchEffectBundleManifest { .. } => {
+            Operation::FetchEffectBundleManifest
+        }
+        RecorderRequestBody::FetchEffectBundleChunk { .. } => Operation::FetchEffectBundleChunk,
         RecorderRequestBody::Record(_) => Operation::Record,
         RecorderRequestBody::InstallDecisionProof { .. } => Operation::InstallDecisionProof,
         RecorderRequestBody::InspectDecisionProof { .. } => Operation::InspectDecisionProof,
@@ -1180,6 +1217,30 @@ fn dispatch<R: RecorderRpc>(
                 command_hash,
             )))
         }
+        RecorderRequestBody::StageEffectBundleChunk {
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        } => RecorderResponseBody::StageEffectBundleChunk(RpcResult::from_result(
+            recorder.stage_effect_bundle_chunk(context, binding, manifest_command, ordinal, chunk),
+        )),
+        RecorderRequestBody::FinalizeStagedEffectBundle {
+            binding,
+            manifest_command,
+        } => RecorderResponseBody::FinalizeStagedEffectBundle(RpcResult::from_result(
+            recorder.finalize_staged_effect_bundle(context, binding, manifest_command),
+        )),
+        RecorderRequestBody::FetchEffectBundleManifest { binding } => {
+            RecorderResponseBody::FetchEffectBundleManifest(RpcResult::from_result(
+                recorder.fetch_effect_bundle_manifest(context, binding),
+            ))
+        }
+        RecorderRequestBody::FetchEffectBundleChunk { binding, ordinal } => {
+            RecorderResponseBody::FetchEffectBundleChunk(RpcResult::from_result(
+                recorder.fetch_effect_bundle_chunk(context, binding, ordinal),
+            ))
+        }
         RecorderRequestBody::Record(request) => {
             let result = if !valid_recorder_record(&request)
                 || !authenticated_proposer_admitted(
@@ -1228,6 +1289,18 @@ fn overloaded_response(operation: Operation) -> RecorderResponseBody {
         Operation::Identity => RecorderResponseBody::Identity(RpcResult::Overloaded),
         Operation::StoreCommand => RecorderResponseBody::StoreCommand(RpcResult::Overloaded),
         Operation::FetchCommand => RecorderResponseBody::FetchCommand(RpcResult::Overloaded),
+        Operation::StageEffectBundleChunk => {
+            RecorderResponseBody::StageEffectBundleChunk(RpcResult::Overloaded)
+        }
+        Operation::FinalizeStagedEffectBundle => {
+            RecorderResponseBody::FinalizeStagedEffectBundle(RpcResult::Overloaded)
+        }
+        Operation::FetchEffectBundleManifest => {
+            RecorderResponseBody::FetchEffectBundleManifest(RpcResult::Overloaded)
+        }
+        Operation::FetchEffectBundleChunk => {
+            RecorderResponseBody::FetchEffectBundleChunk(RpcResult::Overloaded)
+        }
         Operation::Record => RecorderResponseBody::Record(RpcResult::Overloaded),
         Operation::InstallDecisionProof => {
             RecorderResponseBody::InstallDecisionProof(RpcResult::Overloaded)
@@ -1250,6 +1323,18 @@ fn error_response(operation: Operation, error: Error) -> RecorderResponseBody {
         Operation::Identity => RecorderResponseBody::Identity(RpcResult::Error(error)),
         Operation::StoreCommand => RecorderResponseBody::StoreCommand(RpcResult::Error(error)),
         Operation::FetchCommand => RecorderResponseBody::FetchCommand(RpcResult::Error(error)),
+        Operation::StageEffectBundleChunk => {
+            RecorderResponseBody::StageEffectBundleChunk(RpcResult::Error(error))
+        }
+        Operation::FinalizeStagedEffectBundle => {
+            RecorderResponseBody::FinalizeStagedEffectBundle(RpcResult::Error(error))
+        }
+        Operation::FetchEffectBundleManifest => {
+            RecorderResponseBody::FetchEffectBundleManifest(RpcResult::Error(error))
+        }
+        Operation::FetchEffectBundleChunk => {
+            RecorderResponseBody::FetchEffectBundleChunk(RpcResult::Error(error))
+        }
         Operation::Record => RecorderResponseBody::Record(RpcResult::Error(error)),
         Operation::InstallDecisionProof => {
             RecorderResponseBody::InstallDecisionProof(RpcResult::Error(error))
@@ -2251,6 +2336,22 @@ fn response_matches(operation: Operation, response: &RecorderResponseBody) -> bo
                 Operation::FetchCommand,
                 RecorderResponseBody::FetchCommand(_)
             )
+            | (
+                Operation::StageEffectBundleChunk,
+                RecorderResponseBody::StageEffectBundleChunk(_)
+            )
+            | (
+                Operation::FinalizeStagedEffectBundle,
+                RecorderResponseBody::FinalizeStagedEffectBundle(_)
+            )
+            | (
+                Operation::FetchEffectBundleManifest,
+                RecorderResponseBody::FetchEffectBundleManifest(_)
+            )
+            | (
+                Operation::FetchEffectBundleChunk,
+                RecorderResponseBody::FetchEffectBundleChunk(_)
+            )
             | (Operation::Record, RecorderResponseBody::Record(_))
             | (
                 Operation::InstallDecisionProof,
@@ -2326,6 +2427,87 @@ impl RecorderRpc for TcpPostcardRecorderClient {
         };
         match self.exchange(context, request, false, false)? {
             RecorderResponseBody::FetchCommand(result) => result.into_result(),
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::StageEffectBundleChunk {
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            },
+            false,
+            true,
+        )? {
+            RecorderResponseBody::StageEffectBundleChunk(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::FinalizeStagedEffectBundle {
+                binding,
+                manifest_command,
+            },
+            false,
+            true,
+        )? {
+            RecorderResponseBody::FinalizeStagedEffectBundle(result) => {
+                result.into_result().map_err(preserve_mutation_outcome)
+            }
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::FetchEffectBundleManifest { binding },
+            false,
+            false,
+        )? {
+            RecorderResponseBody::FetchEffectBundleManifest(result) => result.into_result(),
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        match self.exchange(
+            context,
+            RecorderRequestBody::FetchEffectBundleChunk { binding, ordinal },
+            false,
+            false,
+        )? {
+            RecorderResponseBody::FetchEffectBundleChunk(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
     }

@@ -1,0 +1,14 @@
+clusterScoped: true
+
+controllerManager:
+  enableFilterNamespace: true
+
+chaosDaemon:
+  runtime: containerd
+  socketPath: /run/containerd/containerd.sock
+
+dashboard:
+  create: false
+
+dnsServer:
+  create: false

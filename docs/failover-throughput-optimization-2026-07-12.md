@@ -35,10 +35,16 @@ was injected.
   request body and `request_id`.
 - A recorder validates the piggybacked command against the complete accepted
   value, persists it, and only then acknowledges ISR progress.
-- An ordinary SQL/KV FastPath decision returns after one phase-0 recorder
-  quorum; it does not wait for a second quorum to install the decision proof.
-  `ConfigChange` decisions still install the proof on a quorum before return.
-  A slow minority is not on either response critical path.
+- In the implementation measured by this historical note, an ordinary SQL/KV
+  FastPath returned after one phase-0 recorder quorum and only configuration
+  changes synchronously installed a proof quorum. That acknowledgement contract
+  was superseded by `bcd14d4` (`fix(quepaxa): durably fence fast path decisions`):
+  the current runtime forms the FastPath proof after phase 0, then durably
+  installs it on a recorder quorum on the normal success path. An ambiguous
+  installer result is acknowledged only if bounded inspection certifies the
+  exact matching committed value. These figures must not be presented as
+  measurements of the current FastPath acknowledgement path. Quorum-early
+  completion still excludes a slow minority when a quorum is available.
 - A microbatch is one consensus entry and one SQLite transaction. Each member
   keeps an independent persistent idempotency record and SQL result, including
   `RETURNING` rows.

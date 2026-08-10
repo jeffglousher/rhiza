@@ -8,7 +8,7 @@ use std::{
 };
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_core::{EntryType, StoredCommand};
+use rhiza_core::{EntryType, LogHash, StoredCommand};
 use rhiza_node::HttpRecorderClient;
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{Membership, RecordSummary, RecorderFileStore, RecorderRpc};
@@ -29,7 +29,13 @@ fn archive(root: &Path) -> ObjectArchiveStore {
             root: root.to_path_buf(),
         })
         .unwrap(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     )
 }
 

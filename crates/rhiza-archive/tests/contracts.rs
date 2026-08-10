@@ -99,7 +99,13 @@ async fn empty_checkpoint_initialization_is_idempotent_and_identity_bound() {
 
     let wrong = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("cluster-a", 9, 1, 4),
+        CheckpointIdentity::new(
+            "cluster-a",
+            9,
+            1,
+            LogHash::digest(&[b"archive-contract-test"]),
+            4,
+        ),
     );
     let wrong_manifest = wrong.initialize_checkpoint().await.unwrap();
     store
@@ -667,7 +673,13 @@ async fn recovery_generation_roll_preserves_snapshot_and_exact_suffix() {
         )
         .await
         .unwrap();
-    let target_identity = CheckpointIdentity::new("cluster-a", 7, 3, 5);
+    let target_identity = CheckpointIdentity::new(
+        "cluster-a",
+        7,
+        3,
+        LogHash::digest(&[b"archive-contract-test"]),
+        5,
+    );
     let target = ObjectArchiveStore::new_checkpoint_for_single_process(store, target_identity);
 
     source.roll_recovery_generation(&target).await.unwrap();
@@ -1112,7 +1124,13 @@ fn local_checkpoint(
 }
 
 fn checkpoint_identity() -> CheckpointIdentity {
-    CheckpointIdentity::new("cluster-a", 7, 3, 4)
+    CheckpointIdentity::new(
+        "cluster-a",
+        7,
+        3,
+        LogHash::digest(&[b"archive-contract-test"]),
+        4,
+    )
 }
 
 fn entries(start: u64, end: u64, prev_hash: LogHash) -> Vec<LogEntry> {

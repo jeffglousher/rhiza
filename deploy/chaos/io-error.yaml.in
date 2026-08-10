@@ -1,0 +1,20 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: rhiza-__RUN_ID__-io-error
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/part-of: rhiza-chaos
+    chaos.rhiza.io/run: __RUN_ID__
+spec:
+  action: fault
+  mode: one
+  duration: 30s
+  selector:
+    namespaces: [__NAMESPACE__]
+    labelSelectors:
+      app.kubernetes.io/part-of: rhiza-chaos
+      chaos.rhiza.io/run: __RUN_ID__
+      chaos.rhiza.io/role: __ROLE__
+  volumePath: __VOLUME_PATH__
+  errno: 5

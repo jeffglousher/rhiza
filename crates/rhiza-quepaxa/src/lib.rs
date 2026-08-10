@@ -15,7 +15,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{hash_map, BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{hash_map, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -27,12 +27,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rhiza_archive::CheckpointReadbackCertificate;
 use rhiza_core::canonical_membership_digest;
 
 pub use rhiza_core::{
-    ClusterId, Command, CommandKind, ConfigChange, ConfigId, EntryType, Epoch, LogEntry, LogHash,
-    LogIndex, NodeId, StoredCommand,
+    ClusterId, Command, CommandKind, ConfigChange, ConfigId, EntryType, Epoch, ExternalEffectChunk,
+    ExternalEffectCommand, LogEntry, LogHash, LogIndex, NodeId, StoredCommand,
 };
+
+mod anchored_fs;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Slot = u64;
@@ -720,6 +723,13 @@ pub const DEFAULT_RECORDER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 // remaining limits follow directly from the on-disk envelopes: seven membership entries,
 // two durable slot snapshots, and at most one oversized WAL frame past the soft limit.
 const MAX_REPLICATED_COMMAND_BYTES: usize = 512 * 1024;
+/// Large SQL effects are deliberately not replicated as `StoredCommand`s.
+/// Their immutable data lives in the Recorder effect-bundle namespace and a
+/// small manifest is what will eventually be replicated by the SQL layer.
+pub const MAX_EFFECT_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EFFECT_BUNDLE_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_EFFECT_BUNDLE_CHUNKS: usize = 256;
+pub const DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COMMAND_CACHE_BYTES: usize = 4 + 2 + 1 + 8 + MAX_REPLICATED_COMMAND_BYTES + 32;
 const MAX_CONFIGURATION_BYTES: usize = 512 * 1024;
 const MAX_RECORDER_STATE_BYTES: usize = 1024 * 1024;
@@ -766,6 +776,13 @@ pub enum Error {
         limit: usize,
     },
     CommandUnavailable,
+    EffectBundleConflict,
+    EffectBundleInvalid(String),
+    EffectBundleQuotaExceeded {
+        actual: u64,
+        limit: u64,
+    },
+    EffectBundleUnavailable,
     Cancelled,
     /// The caller cancelled an RPC before a recorder acknowledged it.
     RpcCancelled,
@@ -807,6 +824,13 @@ impl fmt::Display for Error {
                 )
             }
             Self::CommandUnavailable => write!(f, "QuePaxa command bytes unavailable"),
+            Self::EffectBundleConflict => write!(f, "Recorder effect bundle conflicts with existing durable data"),
+            Self::EffectBundleInvalid(message) => write!(f, "Recorder effect bundle is invalid: {message}"),
+            Self::EffectBundleQuotaExceeded { actual, limit } => write!(
+                f,
+                "Recorder effect-bundle store needs {actual} bytes but its {limit}-byte quota is exhausted"
+            ),
+            Self::EffectBundleUnavailable => write!(f, "Recorder effect bundle bytes unavailable"),
             Self::Cancelled => write!(f, "QuePaxa proposal cancelled"),
             Self::RpcCancelled => write!(f, "QuePaxa recorder RPC cancelled"),
             Self::RpcDeadlineExceeded => write!(f, "QuePaxa recorder RPC deadline elapsed"),
@@ -938,7 +962,7 @@ impl Membership {
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect();
+            .collect::<Vec<_>>();
         if members.len() != member_count {
             return Err(Error::DuplicateRecorderIdentity);
         }
@@ -1906,6 +1930,7 @@ pub struct RecorderFileStore {
     wal: Arc<Mutex<RecorderWal>>,
     seal_fault: Arc<Mutex<Option<SealFaultPoint>>>,
     _root_lock: Arc<fs::File>,
+    effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
     sync: Arc<Mutex<()>>,
 }
 
@@ -1947,6 +1972,432 @@ struct RecorderWal {
     commands: HashMap<LogHash, StoredCommand>,
     file: Option<fs::File>,
     failed: bool,
+}
+
+// The persisted manifest is the canonical QEFX command itself.  Keep this
+// read bound identical to the command decoder's bound so an accepted command
+// can always be recovered and an oversized command is rejected before any
+// effect chunk is written.
+const MAX_EFFECT_BUNDLE_MANIFEST_BYTES: usize = rhiza_core::MAX_EXTERNAL_EFFECT_COMMAND_BYTES;
+const EFFECT_CHUNK_PREFIX: &str = "effect-chunk-";
+const EFFECT_BUNDLE_PREFIX: &str = "effect-bundle-";
+const EFFECT_BUNDLE_GC_ANCHOR_FILE: &str = ".effect-bundle-gc-anchor.rec";
+const EFFECT_BUNDLE_GC_ANCHOR_MAGIC: &[u8; 4] = b"QEGC";
+const EFFECT_BUNDLE_GC_ANCHOR_VERSION: u16 = 1;
+const MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES: usize = 4 * 1024;
+const STORAGE_GENERATION_FILE: &str = ".rhiza-storage-generation";
+const STORAGE_GENERATION_FINGERPRINT: &[u8] = b"rhiza:recorder:storage-generation:clean-v1\n";
+
+#[cfg(test)]
+struct RecorderPostPreflightHook {
+    root: PathBuf,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static RECORDER_POST_PREFLIGHT_HOOK: std::sync::OnceLock<Mutex<Option<RecorderPostPreflightHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn pause_after_recorder_anchor_open(root: &Path) {
+    let hook = RECORDER_POST_PREFLIGHT_HOOK.get_or_init(|| Mutex::new(None));
+    let selected = {
+        let mut hook = lock_unpoison(hook);
+        if hook
+            .as_ref()
+            .is_some_and(|candidate| candidate.root == root)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = selected {
+        let _ = hook.entered.send(());
+        let _ = hook.release.recv();
+    }
+}
+
+/// The consensus context an immutable SQL page-effect is allowed to serve.
+///
+/// The binding makes an otherwise reusable content-addressed blob specific to
+/// exactly one proposed log position and its small QWAL manifest command.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct EffectBundleBinding {
+    pub cluster_id: ClusterId,
+    pub epoch: Epoch,
+    pub config_id: ConfigId,
+    pub config_digest: LogHash,
+    pub intended_slot: Slot,
+    pub prev_hash: LogHash,
+    pub manifest_command_hash: LogHash,
+    pub effect_digest: LogHash,
+}
+
+/// Stable filename key for a finalized QEFX manifest.
+///
+/// Chunks are content-addressed by their own digest and may intentionally be
+/// shared. A manifest is instead bound to one exact consensus position, so
+/// naming it by `effect_digest` alone would make equal bytes at two slots
+/// collide. Length-prefix the only variable-width field to keep this encoding
+/// unambiguous without depending on a serializer's wire-version policy.
+fn effect_bundle_binding_digest(binding: &EffectBundleBinding) -> LogHash {
+    let cluster_len = u64::try_from(binding.cluster_id.len())
+        .expect("cluster identifier length fits u64")
+        .to_be_bytes();
+    let epoch = binding.epoch.to_be_bytes();
+    let config_id = binding.config_id.to_be_bytes();
+    let intended_slot = binding.intended_slot.to_be_bytes();
+    LogHash::digest(&[
+        b"rhiza.qefx.effect-bundle-binding.v1\0",
+        &cluster_len,
+        binding.cluster_id.as_bytes(),
+        &epoch,
+        &config_id,
+        binding.config_digest.as_bytes(),
+        &intended_slot,
+        binding.prev_hash.as_bytes(),
+        binding.manifest_command_hash.as_bytes(),
+        binding.effect_digest.as_bytes(),
+    ])
+}
+
+/// A protected QEFX registration. Pins cover work that is active/inflight as
+/// well as successor or reconfiguration hand-off work, whose chunks may not
+/// yet be reachable from a finalized manifest.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct EffectBundleGcPin {
+    pub binding: EffectBundleBinding,
+    pub manifest_command: StoredCommand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct EffectBundleGcOutcome {
+    pub previous_anchor: Option<Slot>,
+    pub current_anchor: Slot,
+    pub removed_manifests: usize,
+    pub removed_chunks: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EffectBundleGcAnchor {
+    cluster_id: ClusterId,
+    epoch: Epoch,
+    through_slot: Slot,
+    tip_hash: LogHash,
+    manifest_digest: LogHash,
+}
+
+#[derive(Default)]
+struct EffectBundleGcProtected {
+    bindings: HashSet<LogHash>,
+    chunks: HashSet<LogHash>,
+}
+
+/// An immutable, ordered set of content-addressed effect chunks.
+///
+/// This type is intentionally separate from [`StoredCommand`]. Its eventual
+/// consensus representation is a bounded manifest; the bytes themselves are
+/// finalized through the Recorder effect-bundle namespace first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecorderEffectBundle {
+    binding: EffectBundleBinding,
+    chunks: Vec<Vec<u8>>,
+    chunk_hashes: Vec<LogHash>,
+    chunk_lengths: Vec<u32>,
+    total_len: usize,
+}
+
+/// Exact small command that commits the large bundle's ordered chunk sequence.
+/// A Recorder may acknowledge finalization only when this command's hash is
+/// the binding's `manifest_command_hash`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectBundleFinalizeRequest {
+    pub bundle: RecorderEffectBundle,
+    pub manifest_command: StoredCommand,
+}
+
+impl RecorderEffectBundle {
+    pub fn effect_digest_for_chunks(chunks: &[Vec<u8>]) -> Result<LogHash> {
+        validate_effect_chunks(chunks)?;
+        let hashes = chunks
+            .iter()
+            .map(|chunk| effect_chunk_digest(chunk))
+            .collect::<Vec<_>>();
+        let lengths = chunks
+            .iter()
+            .map(|chunk| u32::try_from(chunk.len()).expect("effect chunk limit fits u32"))
+            .collect::<Vec<_>>();
+        Ok(effect_digest(
+            &hashes,
+            &lengths,
+            chunks.iter().map(Vec::len).sum(),
+        ))
+    }
+
+    pub fn new(binding: EffectBundleBinding, chunks: Vec<Vec<u8>>) -> Result<Self> {
+        validate_effect_chunks(&chunks)?;
+        let chunk_hashes = chunks
+            .iter()
+            .map(|chunk| effect_chunk_digest(chunk))
+            .collect::<Vec<_>>();
+        let chunk_lengths = chunks
+            .iter()
+            .map(|chunk| u32::try_from(chunk.len()).expect("effect chunk limit fits u32"))
+            .collect::<Vec<_>>();
+        let total_len = chunks.iter().map(Vec::len).sum::<usize>();
+        let effect_digest = effect_digest(&chunk_hashes, &chunk_lengths, total_len);
+        if effect_digest != binding.effect_digest {
+            return Err(Error::EffectBundleInvalid(
+                "full effect digest does not match its binding".into(),
+            ));
+        }
+        Ok(Self {
+            binding,
+            chunks,
+            chunk_hashes,
+            chunk_lengths,
+            total_len,
+        })
+    }
+
+    pub fn binding(&self) -> &EffectBundleBinding {
+        &self.binding
+    }
+
+    pub fn chunk_hashes(&self) -> &[LogHash] {
+        &self.chunk_hashes
+    }
+
+    pub const fn total_len(&self) -> usize {
+        self.total_len
+    }
+
+    pub fn chunks(&self) -> &[Vec<u8>] {
+        &self.chunks
+    }
+}
+
+impl EffectBundleFinalizeRequest {
+    pub fn new(bundle: RecorderEffectBundle, manifest_command: StoredCommand) -> Result<Self> {
+        let qefx = ExternalEffectCommand::decode(&manifest_command.payload).map_err(|error| {
+            Error::EffectBundleInvalid(format!("manifest command is not canonical QEFX: {error}"))
+        })?;
+        let expected_chunks = bundle
+            .chunk_hashes
+            .iter()
+            .zip(&bundle.chunk_lengths)
+            .map(|(digest, encoded_len)| ExternalEffectChunk::new(*digest, *encoded_len))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::EffectBundleInvalid(error.to_string()))?;
+        if manifest_command.entry_type != EntryType::Command
+            || manifest_command.hash() != bundle.binding.manifest_command_hash
+            || qefx.cluster_id() != bundle.binding.cluster_id
+            || qefx.epoch() != bundle.binding.epoch
+            || qefx.config_id() != bundle.binding.config_id
+            || qefx.config_digest() != bundle.binding.config_digest
+            || qefx.intended_slot() != bundle.binding.intended_slot
+            || qefx.prev_hash() != bundle.binding.prev_hash
+            || qefx.effect_digest_value() != bundle.binding.effect_digest
+            || qefx.chunks() != expected_chunks
+        {
+            return Err(Error::EffectBundleInvalid(
+                "manifest command does not exactly commit this effect bundle".into(),
+            ));
+        }
+        Ok(Self {
+            bundle,
+            manifest_command,
+        })
+    }
+}
+
+fn verified_effect_bundle_command(
+    binding: &EffectBundleBinding,
+    manifest_command: &StoredCommand,
+) -> Result<ExternalEffectCommand> {
+    let qefx = ExternalEffectCommand::decode(&manifest_command.payload).map_err(|error| {
+        Error::EffectBundleInvalid(format!("manifest command is not canonical QEFX: {error}"))
+    })?;
+    if manifest_command.entry_type != EntryType::Command
+        || manifest_command.hash() != binding.manifest_command_hash
+        || qefx.cluster_id() != binding.cluster_id
+        || qefx.epoch() != binding.epoch
+        || qefx.config_id() != binding.config_id
+        || qefx.config_digest() != binding.config_digest
+        || qefx.intended_slot() != binding.intended_slot
+        || qefx.prev_hash() != binding.prev_hash
+        || qefx.effect_digest_value() != binding.effect_digest
+    {
+        return Err(Error::EffectBundleInvalid(
+            "manifest command does not exactly commit this effect bundle".into(),
+        ));
+    }
+    Ok(qefx)
+}
+
+fn validate_effect_chunks(chunks: &[Vec<u8>]) -> Result<()> {
+    if chunks.is_empty() {
+        return Err(Error::EffectBundleInvalid("bundle has no chunks".into()));
+    }
+    if chunks.len() > MAX_EFFECT_BUNDLE_CHUNKS {
+        return Err(Error::EffectBundleInvalid(format!(
+            "bundle has {} chunks; limit is {MAX_EFFECT_BUNDLE_CHUNKS}",
+            chunks.len()
+        )));
+    }
+    let mut total = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.is_empty() || chunk.len() > MAX_EFFECT_BUNDLE_CHUNK_BYTES {
+            return Err(Error::EffectBundleInvalid(format!(
+                "chunk {index} has {} bytes; each chunk must be 1..={MAX_EFFECT_BUNDLE_CHUNK_BYTES} bytes",
+                chunk.len()
+            )));
+        }
+        total = total
+            .checked_add(chunk.len())
+            .ok_or_else(|| Error::EffectBundleInvalid("bundle length overflow".into()))?;
+    }
+    if total > MAX_EFFECT_BUNDLE_BYTES {
+        return Err(Error::EffectBundleInvalid(format!(
+            "bundle has {total} bytes; limit is {MAX_EFFECT_BUNDLE_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn effect_chunk_digest(chunk: &[u8]) -> LogHash {
+    ExternalEffectCommand::chunk_digest(chunk)
+}
+
+fn effect_digest(chunk_hashes: &[LogHash], chunk_lengths: &[u32], total_len: usize) -> LogHash {
+    let chunks = chunk_hashes
+        .iter()
+        .zip(chunk_lengths)
+        .map(|(digest, length)| ExternalEffectChunk::new(*digest, *length))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("validated effect chunks fit the core envelope");
+    let (actual_len, digest) = ExternalEffectCommand::effect_digest(&chunks)
+        .expect("validated effect chunks fit the core envelope");
+    assert_eq!(actual_len as usize, total_len);
+    digest
+}
+
+fn encode_effect_bundle_gc_anchor(anchor: &EffectBundleGcAnchor) -> Result<Vec<u8>> {
+    let cluster = anchor.cluster_id.as_bytes();
+    let cluster_len = u16::try_from(cluster.len())
+        .map_err(|_| Error::EffectBundleInvalid("GC anchor cluster id is too long".into()))?;
+    let mut out = Vec::with_capacity(4 + 2 + 2 + cluster.len() + 8 * 2 + 32 * 2);
+    out.extend_from_slice(EFFECT_BUNDLE_GC_ANCHOR_MAGIC);
+    out.extend_from_slice(&EFFECT_BUNDLE_GC_ANCHOR_VERSION.to_be_bytes());
+    out.extend_from_slice(&cluster_len.to_be_bytes());
+    out.extend_from_slice(cluster);
+    out.extend_from_slice(&anchor.epoch.to_be_bytes());
+    out.extend_from_slice(&anchor.through_slot.to_be_bytes());
+    out.extend_from_slice(anchor.tip_hash.as_bytes());
+    out.extend_from_slice(anchor.manifest_digest.as_bytes());
+    Ok(out)
+}
+
+fn decode_effect_bundle_gc_anchor(bytes: &[u8]) -> Result<EffectBundleGcAnchor> {
+    let minimum = 4 + 2 + 2 + 8 + 8 + 32 + 32;
+    if bytes.len() < minimum || &bytes[..4] != EFFECT_BUNDLE_GC_ANCHOR_MAGIC {
+        return Err(Error::EffectBundleInvalid(
+            "invalid effect GC anchor".into(),
+        ));
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != EFFECT_BUNDLE_GC_ANCHOR_VERSION {
+        return Err(Error::EffectBundleInvalid(
+            "unsupported effect GC anchor version".into(),
+        ));
+    }
+    let cluster_len = usize::from(u16::from_be_bytes([bytes[6], bytes[7]]));
+    let expected = minimum
+        .checked_add(cluster_len)
+        .ok_or_else(|| Error::EffectBundleInvalid("effect GC anchor length overflow".into()))?;
+    if bytes.len() != expected {
+        return Err(Error::EffectBundleInvalid(
+            "invalid effect GC anchor length".into(),
+        ));
+    }
+    let mut cursor = 8;
+    let cluster_end = cursor + cluster_len;
+    let cluster_id = std::str::from_utf8(&bytes[cursor..cluster_end])
+        .map_err(|_| Error::EffectBundleInvalid("invalid effect GC anchor cluster id".into()))?
+        .to_owned();
+    cursor = cluster_end;
+    let read_u64 = |bytes: &[u8], cursor: &mut usize| {
+        let end = *cursor + 8;
+        let value = u64::from_be_bytes(bytes[*cursor..end].try_into().expect("bounded anchor"));
+        *cursor = end;
+        value
+    };
+    let epoch = read_u64(bytes, &mut cursor);
+    let through_slot = read_u64(bytes, &mut cursor);
+    let tip_hash = LogHash::from_bytes(
+        bytes[cursor..cursor + 32]
+            .try_into()
+            .expect("bounded anchor"),
+    );
+    cursor += 32;
+    let manifest_digest = LogHash::from_bytes(
+        bytes[cursor..cursor + 32]
+            .try_into()
+            .expect("bounded anchor"),
+    );
+    Ok(EffectBundleGcAnchor {
+        cluster_id,
+        epoch,
+        through_slot,
+        tip_hash,
+        manifest_digest,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EffectBundleManifest {
+    binding: EffectBundleBinding,
+    chunk_hashes: Vec<LogHash>,
+    chunk_lengths: Vec<u32>,
+    total_len: usize,
+}
+
+fn encode_effect_bundle(command: &StoredCommand) -> Result<Vec<u8>> {
+    ExternalEffectCommand::decode(&command.payload)
+        .map_err(|error| Error::EffectBundleInvalid(format!("invalid QEFX command: {error}")))?;
+    Ok(command.payload.clone())
+}
+
+fn decode_effect_bundle(bytes: &[u8]) -> Result<EffectBundleManifest> {
+    let command = ExternalEffectCommand::decode(bytes).map_err(|error| {
+        Error::EffectBundleInvalid(format!("invalid persisted QEFX command: {error}"))
+    })?;
+    let stored = StoredCommand::new(EntryType::Command, bytes.to_vec());
+    Ok(EffectBundleManifest {
+        binding: EffectBundleBinding {
+            cluster_id: command.cluster_id().into(),
+            epoch: command.epoch(),
+            config_id: command.config_id(),
+            config_digest: command.config_digest(),
+            intended_slot: command.intended_slot(),
+            prev_hash: command.prev_hash(),
+            manifest_command_hash: stored.hash(),
+            effect_digest: command.effect_digest_value(),
+        },
+        chunk_hashes: command
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.digest())
+            .collect(),
+        chunk_lengths: command
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.encoded_len())
+            .collect(),
+        total_len: command.total_effect_bytes() as usize,
+    })
 }
 
 impl Default for RecorderWal {
@@ -2014,7 +2465,8 @@ pub trait RecorderRpc: Send + Sync {
     /// Installs a verified decision proof durably.
     ///
     /// An `Ok(())` must mean the proof survives recorder recovery; ordinary
-    /// Phase2 acknowledgements rely on a quorum of these durable successes.
+    /// FastPath and Phase2 acknowledgements rely on a quorum of these durable
+    /// successes.
     fn install_decision_proof(
         &self,
         _context: &RecorderRpcContext,
@@ -2059,6 +2511,11 @@ pub trait RecorderRpc: Send + Sync {
     }
 
     #[allow(clippy::too_many_arguments)] // mirrors the durable recorder identity tuple
+    /// Stores the exact command bytes durably under their verified content hash.
+    ///
+    /// An `Ok(())` must mean the same `(command_hash, command)` survives recorder
+    /// recovery. Repeating the same pair must be idempotent, while a mismatched
+    /// hash or different bytes under an existing hash must fail closed.
     fn store_command_for(
         &self,
         context: &RecorderRpcContext,
@@ -2100,6 +2557,48 @@ pub trait RecorderRpc: Send + Sync {
         );
         Err(Error::TypedRecordRequired)
     }
+
+    /// Durably stages one bounded QEFX effect chunk. This is not a final ACK:
+    /// callers must receive a subsequent `finalize_staged_effect_bundle` ACK
+    /// before considering the effect available for proposal.
+    fn stage_effect_bundle_chunk(
+        &self,
+        _context: &RecorderRpcContext,
+        _binding: EffectBundleBinding,
+        _manifest_command: StoredCommand,
+        _ordinal: u16,
+        _chunk: Vec<u8>,
+    ) -> Result<()> {
+        Err(Error::TypedRecordRequired)
+    }
+
+    /// Makes previously staged chunks reachable only after full QEFX
+    /// verification and durable manifest installation.
+    fn finalize_staged_effect_bundle(
+        &self,
+        _context: &RecorderRpcContext,
+        _binding: EffectBundleBinding,
+        _manifest_command: StoredCommand,
+    ) -> Result<()> {
+        Err(Error::TypedRecordRequired)
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        _context: &RecorderRpcContext,
+        _binding: EffectBundleBinding,
+    ) -> Result<Option<StoredCommand>> {
+        Err(Error::TypedRecordRequired)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        _context: &RecorderRpcContext,
+        _binding: EffectBundleBinding,
+        _ordinal: u16,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(Error::TypedRecordRequired)
+    }
 }
 
 impl RecorderFileStore {
@@ -2138,7 +2637,7 @@ impl RecorderFileStore {
             .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
             .slots
             .contains_key(&slot);
-        if !exists_in_wal && !self.path(slot).exists() {
+        if !exists_in_wal && !self.effect_root_anchor.exists(&Self::slot_name(slot))? {
             return Ok(None);
         }
         let state = self.load_unlocked(slot, configuration.config_digest)?;
@@ -2217,9 +2716,10 @@ impl RecorderFileStore {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| Error::Io(error.to_string()))?;
         if entries.is_empty()
-            || entries
-                .iter()
-                .all(|entry| entry.file_name() == ".recorder.lock")
+            || entries.iter().all(|entry| {
+                entry.file_name() == ".recorder.lock"
+                    || entry.file_name() == STORAGE_GENERATION_FILE
+            })
         {
             return Ok(RecorderPreflight::Missing);
         }
@@ -2314,8 +2814,9 @@ impl RecorderFileStore {
         config_id: ConfigId,
     ) -> Result<Self> {
         let root = root.into();
-        let existing_format = current_recorder_layout(&root)?;
-        let (store, _) = Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
+        let (store, existing_format) =
+            Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
+        store.effect_root_anchor.verify_path(&store.root)?;
         if current_recorder_layout(&store.root)? != existing_format {
             return Err(Error::Decode(
                 "recorder layout changed while opening".into(),
@@ -2338,7 +2839,9 @@ impl RecorderFileStore {
         if recorder_id.is_empty() {
             return Err(Error::EmptyRecorderIdentity);
         }
-        prepare_fresh_recorder_root(&root)?;
+        let effect_root_anchor = Arc::new(prepare_fresh_recorder_root(&root)?);
+        ensure_storage_generation(&effect_root_anchor)?;
+        effect_root_anchor.verify_path(&root)?;
         if current_recorder_layout(&root)? {
             return Self::open_existing_root(
                 root,
@@ -2346,9 +2849,10 @@ impl RecorderFileStore {
                 cluster_id.into(),
                 epoch,
                 config_id,
+                effect_root_anchor,
             );
         }
-        let root_lock = open_or_create_fresh_root_lock(&root)?;
+        let root_lock = effect_root_anchor.open_lock_or_create()?;
         if current_recorder_layout(&root)? {
             return Err(Error::Decode(
                 "recorder layout changed while opening".into(),
@@ -2379,6 +2883,7 @@ impl RecorderFileStore {
                 wal: Arc::new(Mutex::new(RecorderWal::default())),
                 seal_fault: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
+                effect_root_anchor,
                 sync: Arc::new(Mutex::new(())),
             },
             false,
@@ -2391,7 +2896,10 @@ impl RecorderFileStore {
         cluster_id: ClusterId,
         epoch: Epoch,
         config_id: ConfigId,
+        effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
     ) -> Result<(Self, bool)> {
+        ensure_storage_generation(&effect_root_anchor)?;
+        effect_root_anchor.verify_path(&root)?;
         let root_metadata = match fs::symlink_metadata(&root) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2407,8 +2915,7 @@ impl RecorderFileStore {
         if recorder_id.is_empty() {
             return Err(Error::EmptyRecorderIdentity);
         }
-        let root_lock_path = root.join(".recorder.lock");
-        let root_lock = open_existing_root_lock(&root_lock_path)?;
+        let root_lock = effect_root_anchor.open_lock()?;
         match root_lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
@@ -2434,6 +2941,7 @@ impl RecorderFileStore {
                 wal: Arc::new(Mutex::new(RecorderWal::default())),
                 seal_fault: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
+                effect_root_anchor,
                 sync: Arc::new(Mutex::new(())),
             },
             true,
@@ -2504,7 +3012,18 @@ impl RecorderFileStore {
         }
         let existing_format = preflight != RecorderPreflight::Missing;
         let (mut store, _) = if existing_format {
-            Self::open_existing_root(root, recorder_id, cluster_id, epoch, config_id)?
+            let effect_root_anchor = Arc::new(anchored_fs::AnchoredDir::open(&root)?);
+            let opened = Self::open_existing_root(
+                root,
+                recorder_id,
+                cluster_id,
+                epoch,
+                config_id,
+                effect_root_anchor,
+            )?;
+            #[cfg(test)]
+            pause_after_recorder_anchor_open(&opened.0.root);
+            opened
         } else {
             Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?
         };
@@ -2521,13 +3040,13 @@ impl RecorderFileStore {
             ));
         }
         store.recover_configuration_head_intent()?;
-        let configured = match read_regular_file_bounded(
-            &store.configuration_path(),
+        let configured = match store.effect_root_anchor.read_optional(
+            Self::CONFIGURATION_FILE,
             MAX_CONFIGURATION_BYTES,
             "configuration.rec",
-        ) {
-            Ok(bytes) => decode_configuration_state(&bytes)?,
-            Err(Error::Decode(message)) if message == "recorder is missing configuration.rec" => {
+        )? {
+            Some(bytes) => decode_configuration_state(&bytes)?,
+            None => {
                 let configured =
                     ConfigurationState::initial(config_id, membership.digest(), Some(membership));
                 store.commit_configuration_head_unlocked(
@@ -2536,7 +3055,6 @@ impl RecorderFileStore {
                 )?;
                 configured
             }
-            Err(error) => return Err(error),
         };
         if configured
             .membership
@@ -3047,14 +3565,15 @@ impl RecorderFileStore {
     }
 
     fn stage_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
-        let path = self.command_path(command_hash);
-        if path.exists() {
+        let name = Self::command_name(command_hash);
+        if self.effect_root_anchor.exists(&name)? {
             return match self.fetch_command_cache_unlocked(command_hash)? {
                 Some(existing) if existing == *command => Ok(()),
                 _ => Err(Error::CommandHashMismatch),
             };
         }
-        atomic_replace(&path, &encode_stored_command(command))?;
+        self.effect_root_anchor
+            .atomic_write(&name, &encode_stored_command(command))?;
         Ok(())
     }
 
@@ -3064,6 +3583,620 @@ impl RecorderFileStore {
             .lock()
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
         self.fetch_command_unlocked(command_hash)
+    }
+
+    /// Durably finalizes one immutable SQL effect bundle before its small
+    /// manifest can be proposed. This is deliberately a local foundation: no
+    /// production proposal path calls it until the manifest/resolver protocol
+    /// is wired end-to-end.
+    pub fn finalize_effect_bundle(&self, request: &EffectBundleFinalizeRequest) -> Result<()> {
+        self.finalize_effect_bundle_with_quota(request, DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES)
+    }
+
+    /// Same as [`Self::finalize_effect_bundle`], with an explicit bounded
+    /// admission quota for tests and future operator configuration.
+    pub fn finalize_effect_bundle_with_quota(
+        &self,
+        request: &EffectBundleFinalizeRequest,
+        quota_bytes: u64,
+    ) -> Result<()> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        let bundle = &request.bundle;
+        EffectBundleFinalizeRequest::new(bundle.clone(), request.manifest_command.clone())?;
+        self.validate_effect_bundle_binding(&bundle.binding)?;
+        validate_effect_chunks(&bundle.chunks)?;
+        if effect_digest(
+            &bundle.chunk_hashes,
+            &bundle.chunk_lengths,
+            bundle.total_len,
+        ) != bundle.binding.effect_digest
+        {
+            return Err(Error::EffectBundleInvalid(
+                "full effect digest changed after construction".into(),
+            ));
+        }
+        let anchor = &self.effect_root_anchor;
+        let manifest_name = self.effect_bundle_name(&bundle.binding);
+        if anchor
+            .read_optional(
+                &manifest_name,
+                MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+                "effect bundle manifest",
+            )?
+            .is_some()
+        {
+            let existing = self.load_effect_bundle_unlocked(&bundle.binding)?;
+            return if existing == *bundle {
+                Ok(())
+            } else {
+                Err(Error::EffectBundleConflict)
+            };
+        }
+
+        let mut missing_bytes = 0u64;
+        for (chunk, hash) in bundle.chunks.iter().zip(&bundle.chunk_hashes) {
+            let name = self.effect_chunk_name(*hash);
+            if let Some(existing) =
+                anchor.read_optional(&name, MAX_EFFECT_BUNDLE_CHUNK_BYTES, "effect chunk")?
+            {
+                if existing != *chunk || effect_chunk_digest(&existing) != *hash {
+                    return Err(Error::EffectBundleConflict);
+                }
+            } else {
+                missing_bytes = missing_bytes
+                    .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                        Error::EffectBundleInvalid("chunk length cannot fit u64".into())
+                    })?)
+                    .ok_or_else(|| {
+                        Error::EffectBundleInvalid("quota accounting overflow".into())
+                    })?;
+            }
+        }
+        let actual = self
+            .effect_chunk_usage_unlocked()?
+            .checked_add(missing_bytes)
+            .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
+        if actual > quota_bytes {
+            return Err(Error::EffectBundleQuotaExceeded {
+                actual,
+                limit: quota_bytes,
+            });
+        }
+
+        // Chunks become durable before the manifest makes them reachable. A
+        // crash before the final manifest leaves only harmless, unreachable
+        // CAS data; a successful acknowledgement has both data and directory
+        // entries fsynced.
+        for (chunk, hash) in bundle.chunks.iter().zip(&bundle.chunk_hashes) {
+            let name = self.effect_chunk_name(*hash);
+            if anchor
+                .read_optional(&name, MAX_EFFECT_BUNDLE_CHUNK_BYTES, "effect chunk")?
+                .is_none()
+            {
+                anchor.atomic_write(&name, chunk)?;
+            }
+        }
+        anchor.sync()?;
+        anchor.atomic_write(
+            &manifest_name,
+            &encode_effect_bundle(&request.manifest_command)?,
+        )?;
+        anchor.sync()?;
+        Ok(())
+    }
+
+    /// Persists one bounded chunk for an exact QEFX command. Staged chunks are
+    /// deliberately unreachable until [`Self::finalize_staged_effect_bundle`]
+    /// has verified the complete ordered bundle and durably installed its
+    /// manifest.
+    pub fn stage_effect_bundle_chunk(
+        &self,
+        binding: &EffectBundleBinding,
+        manifest_command: &StoredCommand,
+        ordinal: u16,
+        chunk: &[u8],
+    ) -> Result<()> {
+        let qefx = verified_effect_bundle_command(binding, manifest_command)?;
+        let expected = qefx.chunks().get(usize::from(ordinal)).ok_or_else(|| {
+            Error::EffectBundleInvalid("effect chunk ordinal is out of range".into())
+        })?;
+        if expected.encoded_len() as usize != chunk.len()
+            || expected.digest() != effect_chunk_digest(chunk)
+        {
+            return Err(Error::EffectBundleInvalid(
+                "effect chunk does not match the QEFX commitment".into(),
+            ));
+        }
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        self.validate_effect_bundle_binding(binding)?;
+        let name = self.effect_chunk_name(expected.digest());
+        if let Some(existing) = self.effect_root_anchor.read_optional(
+            &name,
+            MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+            "effect chunk",
+        )? {
+            if existing != chunk {
+                return Err(Error::EffectBundleConflict);
+            }
+            return Ok(());
+        }
+        self.effect_root_anchor.atomic_write(&name, chunk)?;
+        self.effect_root_anchor.sync()
+    }
+
+    /// Finalizes an exact QEFX bundle from its previously staged chunks.
+    pub fn finalize_staged_effect_bundle(
+        &self,
+        binding: &EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> Result<()> {
+        let qefx = verified_effect_bundle_command(binding, &manifest_command)?;
+        let chunks = {
+            let _guard = self
+                .sync
+                .lock()
+                .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+            self.recover_intent()?;
+            self.effect_root_anchor.verify_path(&self.root)?;
+            self.validate_effect_bundle_binding(binding)?;
+            qefx.chunks()
+                .iter()
+                .map(|expected| {
+                    let chunk = self.effect_root_anchor.read(
+                        &self.effect_chunk_name(expected.digest()),
+                        MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                        "effect chunk",
+                    )?;
+                    if chunk.len() != expected.encoded_len() as usize
+                        || effect_chunk_digest(&chunk) != expected.digest()
+                    {
+                        return Err(Error::EffectBundleInvalid(
+                            "staged effect chunk does not match QEFX".into(),
+                        ));
+                    }
+                    Ok(chunk)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let bundle = RecorderEffectBundle::new(binding.clone(), chunks)?;
+        self.finalize_effect_bundle(&EffectBundleFinalizeRequest::new(bundle, manifest_command)?)
+    }
+
+    /// Returns only the bounded QEFX command for a finalized bundle.
+    pub fn fetch_effect_bundle_manifest(
+        &self,
+        binding: &EffectBundleBinding,
+    ) -> Result<Option<StoredCommand>> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        self.validate_effect_bundle_binding(binding)?;
+        let Some(bytes) = self.effect_root_anchor.read_optional(
+            &self.effect_bundle_name(binding),
+            MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+            "effect bundle manifest",
+        )?
+        else {
+            return Ok(None);
+        };
+        let command = StoredCommand::new(EntryType::Command, bytes);
+        verified_effect_bundle_command(binding, &command)?;
+        Ok(Some(command))
+    }
+
+    /// Reads exactly one bounded finalized chunk, preserving QEFX ordering.
+    pub fn fetch_effect_bundle_chunk(
+        &self,
+        binding: &EffectBundleBinding,
+        ordinal: u16,
+    ) -> Result<Option<Vec<u8>>> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        self.validate_effect_bundle_binding(binding)?;
+        let Some(bytes) = self.effect_root_anchor.read_optional(
+            &self.effect_bundle_name(binding),
+            MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+            "effect bundle manifest",
+        )?
+        else {
+            return Ok(None);
+        };
+        let command = StoredCommand::new(EntryType::Command, bytes);
+        let qefx = verified_effect_bundle_command(binding, &command)?;
+        let expected = qefx.chunks().get(usize::from(ordinal)).ok_or_else(|| {
+            Error::EffectBundleInvalid("effect chunk ordinal is out of range".into())
+        })?;
+        let chunk = self.effect_root_anchor.read(
+            &self.effect_chunk_name(expected.digest()),
+            MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+            "effect chunk",
+        )?;
+        if chunk.len() != expected.encoded_len() as usize
+            || effect_chunk_digest(&chunk) != expected.digest()
+        {
+            return Err(Error::EffectBundleInvalid(
+                "effect chunk digest mismatch".into(),
+            ));
+        }
+        Ok(Some(chunk))
+    }
+
+    /// Loads and re-verifies a finalized effect bundle. Missing, truncated,
+    /// reordered, or corrupted chunks fail before a caller can mutate SQLite.
+    pub fn load_effect_bundle(
+        &self,
+        binding: &EffectBundleBinding,
+    ) -> Result<Option<RecorderEffectBundle>> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        self.validate_effect_bundle_binding(binding)?;
+        let name = self.effect_bundle_name(binding);
+        if self
+            .effect_root_anchor
+            .read_optional(
+                &name,
+                MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+                "effect bundle manifest",
+            )?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.load_effect_bundle_unlocked(binding).map(Some)
+    }
+
+    /// Persists a monotonic, archive-readback-certified GC anchor and then
+    /// removes only finalized manifests at or below that anchor. The anchor is
+    /// fsynced before any deletion, so a crash yields either the old complete
+    /// set or a valid superset of the new swept set; it never creates a hole
+    /// below an unpersisted certificate.
+    pub fn advance_effect_bundle_gc_anchor(
+        &self,
+        certificate: &CheckpointReadbackCertificate,
+        protected_pins: &[EffectBundleGcPin],
+    ) -> Result<EffectBundleGcOutcome> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        self.validate_effect_bundle_gc_certificate(certificate)?;
+        let protected = self.effect_bundle_gc_protected(protected_pins)?;
+        let previous = self.load_effect_bundle_gc_anchor_unlocked()?;
+        let identity = certificate.identity();
+        let tip = certificate.tip();
+        if let Some(previous) = &previous {
+            if previous.cluster_id != identity.cluster_id() || previous.epoch != identity.epoch() {
+                return Err(Error::EffectBundleInvalid(
+                    "effect GC anchor cluster or epoch does not match this certificate".into(),
+                ));
+            }
+            if tip.index() < previous.through_slot {
+                return Err(Error::EffectBundleInvalid(
+                    "effect GC anchor cannot move backwards".into(),
+                ));
+            }
+            if tip.index() == previous.through_slot
+                && (previous.tip_hash != tip.hash()
+                    || previous.manifest_digest != certificate.manifest_digest())
+            {
+                return Err(Error::EffectBundleInvalid(
+                    "effect GC anchor retry has different checkpoint evidence".into(),
+                ));
+            }
+        }
+
+        if previous.as_ref().is_none_or(|anchor| {
+            anchor.through_slot != tip.index()
+                || anchor.tip_hash != tip.hash()
+                || anchor.manifest_digest != certificate.manifest_digest()
+        }) {
+            self.effect_root_anchor.atomic_write(
+                EFFECT_BUNDLE_GC_ANCHOR_FILE,
+                &encode_effect_bundle_gc_anchor(&EffectBundleGcAnchor {
+                    cluster_id: identity.cluster_id().into(),
+                    epoch: identity.epoch(),
+                    through_slot: tip.index(),
+                    tip_hash: tip.hash(),
+                    manifest_digest: certificate.manifest_digest(),
+                })?,
+            )?;
+            self.effect_root_anchor.sync()?;
+        }
+
+        let removed_manifests =
+            self.sweep_effect_bundle_manifests_unlocked(tip.index(), &protected)?;
+        let removed_chunks = self.reap_unreachable_effect_chunks_unlocked(&protected)?;
+        Ok(EffectBundleGcOutcome {
+            previous_anchor: previous.map(|anchor| anchor.through_slot),
+            current_anchor: tip.index(),
+            removed_manifests,
+            removed_chunks,
+        })
+    }
+
+    pub fn effect_bundle_gc_anchor(&self) -> Result<Option<Slot>> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        Ok(self
+            .load_effect_bundle_gc_anchor_unlocked()?
+            .map(|anchor| anchor.through_slot))
+    }
+
+    fn validate_effect_bundle_gc_certificate(
+        &self,
+        certificate: &CheckpointReadbackCertificate,
+    ) -> Result<()> {
+        let configuration = self.configuration_state()?;
+        let identity = certificate.identity();
+        let tip = certificate.tip();
+        if identity.cluster_id() != self.cluster_id
+            || identity.epoch() != self.epoch
+            || identity.config_id() != configuration.config_id
+            || identity.config_digest() != configuration.config_digest
+            || tip.index() == 0
+            || tip.hash() == LogHash::ZERO
+            || certificate.manifest_digest() == LogHash::ZERO
+        {
+            return Err(Error::EffectBundleInvalid(
+                "effect GC certificate is not a certified checkpoint for this recorder".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn effect_bundle_gc_protected(
+        &self,
+        pins: &[EffectBundleGcPin],
+    ) -> Result<EffectBundleGcProtected> {
+        let mut protected = EffectBundleGcProtected::default();
+        for pin in pins {
+            let qefx = verified_effect_bundle_command(&pin.binding, &pin.manifest_command)?;
+            if pin.binding.cluster_id != self.cluster_id || pin.binding.epoch != self.epoch {
+                return Err(Error::EffectBundleInvalid(
+                    "effect GC pin belongs to a foreign cluster or epoch".into(),
+                ));
+            }
+            protected
+                .bindings
+                .insert(effect_bundle_binding_digest(&pin.binding));
+            protected
+                .chunks
+                .extend(qefx.chunks().iter().map(ExternalEffectChunk::digest));
+        }
+        Ok(protected)
+    }
+
+    fn load_effect_bundle_gc_anchor_unlocked(&self) -> Result<Option<EffectBundleGcAnchor>> {
+        self.effect_root_anchor
+            .read_optional(
+                EFFECT_BUNDLE_GC_ANCHOR_FILE,
+                MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES,
+                "effect GC anchor",
+            )?
+            .map(|bytes| decode_effect_bundle_gc_anchor(&bytes))
+            .transpose()
+    }
+
+    fn sweep_effect_bundle_manifests_unlocked(
+        &self,
+        through_slot: Slot,
+        protected: &EffectBundleGcProtected,
+    ) -> Result<usize> {
+        let mut removed = 0;
+        for name in self.effect_root_anchor.list()? {
+            if !name.starts_with(EFFECT_BUNDLE_PREFIX) {
+                continue;
+            }
+            if !self.is_effect_bundle_name(&name) {
+                return Err(Error::EffectBundleInvalid(
+                    "invalid effect bundle name".into(),
+                ));
+            }
+            let bytes = self.effect_root_anchor.read(
+                &name,
+                MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+                "effect bundle manifest",
+            )?;
+            let manifest = decode_effect_bundle(&bytes)?;
+            let binding_digest = effect_bundle_binding_digest(&manifest.binding);
+            if self.effect_bundle_name(&manifest.binding) != name {
+                return Err(Error::EffectBundleInvalid(
+                    "effect bundle filename/binding mismatch".into(),
+                ));
+            }
+            if manifest.binding.intended_slot <= through_slot
+                && !protected.bindings.contains(&binding_digest)
+            {
+                self.effect_root_anchor.remove(&name)?;
+                removed += 1;
+            }
+        }
+        self.effect_root_anchor.sync()?;
+        Ok(removed)
+    }
+
+    fn validate_effect_bundle_binding(&self, binding: &EffectBundleBinding) -> Result<()> {
+        let configuration = self.configuration_state()?;
+        if binding.cluster_id != self.cluster_id
+            || binding.epoch != self.epoch
+            || binding.config_id != configuration.config_id
+            || binding.config_digest != configuration.config_digest
+        {
+            return Err(Error::EffectBundleInvalid(
+                "binding does not match this recorder identity".into(),
+            ));
+        }
+        if binding.intended_slot == 0 || binding.effect_digest == LogHash::ZERO {
+            return Err(Error::EffectBundleInvalid(
+                "binding has an invalid intended slot or effect digest".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_effect_bundle_unlocked(
+        &self,
+        expected: &EffectBundleBinding,
+    ) -> Result<RecorderEffectBundle> {
+        let name = self.effect_bundle_name(expected);
+        let bytes = self.effect_root_anchor.read(
+            &name,
+            MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+            "effect bundle manifest",
+        )?;
+        let manifest = decode_effect_bundle(&bytes)?;
+        if manifest.binding != *expected {
+            return Err(Error::EffectBundleConflict);
+        }
+        let mut chunks = Vec::with_capacity(manifest.chunk_hashes.len());
+        for hash in &manifest.chunk_hashes {
+            let chunk = self
+                .effect_root_anchor
+                .read(
+                    &self.effect_chunk_name(*hash),
+                    MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                    "effect chunk",
+                )
+                .map_err(|_| Error::EffectBundleUnavailable)?;
+            if effect_chunk_digest(&chunk) != *hash {
+                return Err(Error::EffectBundleInvalid("chunk digest mismatch".into()));
+            }
+            chunks.push(chunk);
+        }
+        let bundle = RecorderEffectBundle::new(manifest.binding, chunks)?;
+        if bundle.chunk_hashes != manifest.chunk_hashes
+            || bundle.chunk_lengths != manifest.chunk_lengths
+            || bundle.total_len != manifest.total_len
+        {
+            return Err(Error::EffectBundleInvalid(
+                "manifest chunk order or total length mismatch".into(),
+            ));
+        }
+        Ok(bundle)
+    }
+
+    fn effect_chunk_name(&self, hash: LogHash) -> String {
+        format!("{EFFECT_CHUNK_PREFIX}{}.qefc", hash.to_hex())
+    }
+
+    fn effect_bundle_name(&self, binding: &EffectBundleBinding) -> String {
+        format!(
+            "{EFFECT_BUNDLE_PREFIX}{}.qefb",
+            effect_bundle_binding_digest(binding).to_hex()
+        )
+    }
+
+    fn effect_chunk_usage_unlocked(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for name in self.effect_root_anchor.list()? {
+            if !name.starts_with(EFFECT_CHUNK_PREFIX) {
+                continue;
+            }
+            if !self.is_effect_chunk_name(&name) {
+                return Err(Error::EffectBundleInvalid(
+                    "invalid effect chunk name".into(),
+                ));
+            }
+            let chunk = self.effect_root_anchor.read(
+                &name,
+                MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                "effect chunk",
+            )?;
+            total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
+        }
+        Ok(total)
+    }
+
+    fn reap_unreachable_effect_chunks_unlocked(
+        &self,
+        protected: &EffectBundleGcProtected,
+    ) -> Result<usize> {
+        let mut reachable = protected.chunks.clone();
+        let names = self.effect_root_anchor.list()?;
+        for name in &names {
+            if !name.starts_with(EFFECT_BUNDLE_PREFIX) {
+                continue;
+            }
+            if !self.is_effect_bundle_name(name) {
+                return Err(Error::EffectBundleInvalid(
+                    "invalid effect bundle name".into(),
+                ));
+            }
+            let bytes = self.effect_root_anchor.read(
+                name,
+                MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+                "effect bundle manifest",
+            )?;
+            let manifest = decode_effect_bundle(&bytes)?;
+            if self.effect_bundle_name(&manifest.binding) != *name {
+                return Err(Error::EffectBundleInvalid(
+                    "effect bundle filename/binding mismatch".into(),
+                ));
+            }
+            reachable.extend(manifest.chunk_hashes);
+        }
+        let mut removed = 0;
+        for name in names {
+            if !name.starts_with(EFFECT_CHUNK_PREFIX) {
+                continue;
+            }
+            let Some(hash) = self.effect_chunk_hash_from_name(&name) else {
+                return Err(Error::EffectBundleInvalid(
+                    "invalid effect chunk name".into(),
+                ));
+            };
+            if !reachable.contains(&hash) {
+                self.effect_root_anchor.remove(&name)?;
+                removed += 1;
+            }
+        }
+        self.effect_root_anchor.sync()?;
+        Ok(removed)
+    }
+
+    fn is_effect_chunk_name(&self, name: &str) -> bool {
+        self.effect_chunk_hash_from_name(name).is_some()
+    }
+
+    fn effect_chunk_hash_from_name(&self, name: &str) -> Option<LogHash> {
+        name.strip_prefix(EFFECT_CHUNK_PREFIX)
+            .and_then(|value| value.strip_suffix(".qefc"))
+            .and_then(LogHash::from_hex)
+    }
+
+    fn is_effect_bundle_name(&self, name: &str) -> bool {
+        name.strip_prefix(EFFECT_BUNDLE_PREFIX)
+            .and_then(|value| value.strip_suffix(".qefb"))
+            .and_then(LogHash::from_hex)
+            .is_some()
     }
 
     fn load_unlocked(&self, slot: Slot, config_digest: LogHash) -> Result<RecorderSlotState> {
@@ -3084,10 +4217,14 @@ impl RecorderFileStore {
             return Ok(state);
         }
         drop(wal);
-        let path = self.path(slot);
-        let bytes = match read_regular_file_bounded(&path, MAX_RECORDER_STATE_BYTES, "slot cache") {
-            Ok(bytes) => bytes,
-            Err(Error::Decode(message)) if message == "recorder is missing slot cache" => {
+        let slot_name = Self::slot_name(slot);
+        let bytes = match self.effect_root_anchor.read_optional(
+            &slot_name,
+            MAX_RECORDER_STATE_BYTES,
+            "slot cache",
+        )? {
+            Some(bytes) => bytes,
+            None => {
                 return Ok(RecorderSlotState::new_with_digest(
                     slot,
                     self.cluster_id.clone(),
@@ -3096,7 +4233,6 @@ impl RecorderFileStore {
                     config_digest,
                 ));
             }
-            Err(error) => return Err(error),
         };
         let state = decode_recorder_state(&bytes)?;
         if state.slot != slot
@@ -3112,22 +4248,22 @@ impl RecorderFileStore {
 
     fn open_or_initialize_recorded_head(&self, existing_format: bool) -> Result<()> {
         let configuration = self.configuration_state()?;
-        let (head, recent_slots, wal_checkpoint) = match read_regular_file_bounded(
-            &self.recorded_head_path(),
+        let (head, recent_slots, wal_checkpoint) = match self.effect_root_anchor.read_optional(
+            Self::RECORDED_HEAD_FILE,
             MAX_RECORDED_HEAD_BYTES,
             "recorded-head.rec",
-        ) {
-            Ok(bytes) => {
+        )? {
+            Some(bytes) => {
                 decode_recorded_head(&bytes, &self.cluster_id, self.epoch, &configuration)?
             }
-            Err(Error::Decode(message)) if message == "recorder is missing recorded-head.rec" => {
+            None => {
                 if existing_format {
                     return Err(noncurrent_recorder_layout_error());
                 }
                 let head = RecordedHeadProvenance::Empty;
                 let wal_checkpoint = WalCheckpoint::default();
-                atomic_write(
-                    &self.recorded_head_path(),
+                self.effect_root_anchor.atomic_write(
+                    Self::RECORDED_HEAD_FILE,
                     &encode_recorded_head(
                         &self.cluster_id,
                         self.epoch,
@@ -3139,26 +4275,16 @@ impl RecorderFileStore {
                 )?;
                 (head, Vec::new(), wal_checkpoint)
             }
-            Err(error) => return Err(error),
         };
         self.install_recorded_head(&configuration, head, recent_slots, wal_checkpoint)
     }
 
     fn open_or_replay_wal(&self) -> Result<()> {
-        let path = self.wal_path();
-        let created = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(Error::Io(error.to_string())),
-        };
-        if created {
-            self.sync_root()?;
-        }
-        let bytes = read_regular_file_bounded(&path, MAX_RECORDER_WAL_BYTES, "recorder.wal")?;
+        self.effect_root_anchor
+            .create_empty_if_missing(Self::WAL_FILE)?;
+        let bytes =
+            self.effect_root_anchor
+                .read(Self::WAL_FILE, MAX_RECORDER_WAL_BYTES, "recorder.wal")?;
         let checkpoint = self.wal_checkpoint()?;
         let mut replayed = RecorderWal {
             checkpoint,
@@ -3258,20 +4384,10 @@ impl RecorderFileStore {
             offset = end;
         }
         if offset != bytes.len() {
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|error| Error::Io(error.to_string()))?;
-            file.set_len(offset as u64)
-                .and_then(|_| sync_wal_metadata(&file))
-                .map_err(|error| Error::Io(error.to_string()))?;
+            self.effect_root_anchor
+                .truncate(Self::WAL_FILE, offset as u64)?;
         }
-        replayed.file = Some(
-            fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .map_err(|error| Error::Io(error.to_string()))?,
-        );
+        replayed.file = Some(self.effect_root_anchor.open_append(Self::WAL_FILE)?);
         replayed.byte_count = offset as u64;
         *self
             .wal
@@ -3311,13 +4427,15 @@ impl RecorderFileStore {
             for value in recorder_state_values(&state) {
                 self.validate_value_unlocked(snapshot.slot, value)?;
             }
-            let path = self.path(snapshot.slot);
-            if read_regular_file_bounded(&path, MAX_RECORDER_STATE_BYTES, "slot cache")
-                .ok()
+            let name = Self::slot_name(snapshot.slot);
+            if self
+                .effect_root_anchor
+                .read_optional(&name, MAX_RECORDER_STATE_BYTES, "slot cache")?
                 .as_deref()
                 != Some(snapshot.bytes.as_slice())
             {
-                atomic_replace(&path, &snapshot.bytes)?;
+                self.effect_root_anchor
+                    .atomic_write(&name, &snapshot.bytes)?;
                 recovered_cache = true;
             }
         }
@@ -3401,10 +4519,19 @@ impl RecorderFileStore {
     fn fetch_command_cache_unlocked(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
         #[cfg(test)]
         COMMAND_FILE_READS.with(|reads| reads.set(reads.get() + 1));
-        match read_existing_command_cache(&self.root, command_hash) {
-            Err(Error::CommandUnavailable) => Ok(None),
-            result => result.map(Some),
+        let Some(bytes) = self.effect_root_anchor.read_optional(
+            &Self::command_name(command_hash),
+            MAX_COMMAND_CACHE_BYTES,
+            "command cache entry",
+        )?
+        else {
+            return Ok(None);
+        };
+        let command = decode_stored_command(&bytes)?;
+        if command.hash() != command_hash {
+            return Err(Error::CommandHashMismatch);
         }
+        Ok(Some(command))
     }
 
     fn validate_value_unlocked(&self, slot: Slot, value: &AcceptedValue) -> Result<()> {
@@ -3618,34 +4745,24 @@ impl RecorderFileStore {
         }
     }
 
-    fn path(&self, slot: Slot) -> PathBuf {
-        self.root.join(format!("slot-{slot:020}.rec"))
+    fn slot_name(slot: Slot) -> String {
+        format!("slot-{slot:020}.rec")
     }
 
+    fn command_name(command_hash: LogHash) -> String {
+        format!("command-{}.cmd", command_hash.to_hex())
+    }
+
+    #[cfg(test)]
     fn command_path(&self, command_hash: LogHash) -> PathBuf {
-        self.root
-            .join(format!("command-{}.cmd", command_hash.to_hex()))
+        self.root.join(Self::command_name(command_hash))
     }
 
-    fn configuration_path(&self) -> PathBuf {
-        self.root.join("configuration.rec")
-    }
-
-    fn intent_path(&self) -> PathBuf {
-        self.root.join("configuration.intent")
-    }
-
-    fn configuration_head_intent_path(&self) -> PathBuf {
-        self.root.join("configuration-head.intent")
-    }
-
-    fn recorded_head_path(&self) -> PathBuf {
-        self.root.join("recorded-head.rec")
-    }
-
-    fn wal_path(&self) -> PathBuf {
-        self.root.join("recorder.wal")
-    }
+    const CONFIGURATION_FILE: &'static str = "configuration.rec";
+    const TRANSITION_INTENT_FILE: &'static str = "configuration.intent";
+    const CONFIGURATION_HEAD_INTENT_FILE: &'static str = "configuration-head.intent";
+    const RECORDED_HEAD_FILE: &'static str = "recorded-head.rec";
+    const WAL_FILE: &'static str = "recorder.wal";
 
     fn head_after_slot_state(
         &self,
@@ -3670,11 +4787,10 @@ impl RecorderFileStore {
 
     fn recover_intent(&self) -> Result<()> {
         self.recover_configuration_head_intent()?;
-        let path = self.intent_path();
-        let Some(intent_bytes) = read_preflight_intent(
-            &self.root,
-            "configuration.intent",
+        let Some(intent_bytes) = self.effect_root_anchor.read_optional(
+            Self::TRANSITION_INTENT_FILE,
             MAX_TRANSITION_INTENT_BYTES,
+            Self::TRANSITION_INTENT_FILE,
         )?
         else {
             return Ok(());
@@ -3683,10 +4799,12 @@ impl RecorderFileStore {
         let configuration = decode_configuration_state(&configuration_bytes)?;
         let slot_state = decode_recorder_state(&slot_bytes)?;
         let head = self.head_after_slot_state(&configuration, &slot_state)?;
-        atomic_write(&self.path(slot), &slot_bytes)?;
-        atomic_write(&self.configuration_path(), &configuration_bytes)?;
-        atomic_write(
-            &self.recorded_head_path(),
+        self.effect_root_anchor
+            .atomic_write(&Self::slot_name(slot), &slot_bytes)?;
+        self.effect_root_anchor
+            .atomic_write(Self::CONFIGURATION_FILE, &configuration_bytes)?;
+        self.effect_root_anchor.atomic_write(
+            Self::RECORDED_HEAD_FILE,
             &encode_recorded_head(
                 &self.cluster_id,
                 self.epoch,
@@ -3696,10 +4814,8 @@ impl RecorderFileStore {
                 self.wal_checkpoint()?,
             )?,
         )?;
-        fs::remove_file(path).map_err(|err| Error::Io(err.to_string()))?;
-        fs::File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| Error::Io(err.to_string()))?;
+        self.effect_root_anchor
+            .remove(Self::TRANSITION_INTENT_FILE)?;
         *self
             .configuration
             .lock()
@@ -3716,20 +4832,21 @@ impl RecorderFileStore {
     }
 
     fn recover_configuration_head_intent(&self) -> Result<()> {
-        let path = self.configuration_head_intent_path();
-        let Some(intent_bytes) = read_preflight_intent(
-            &self.root,
-            "configuration-head.intent",
+        let Some(intent_bytes) = self.effect_root_anchor.read_optional(
+            Self::CONFIGURATION_HEAD_INTENT_FILE,
             MAX_CONFIGURATION_HEAD_INTENT_BYTES,
+            Self::CONFIGURATION_HEAD_INTENT_FILE,
         )?
         else {
             return Ok(());
         };
         let (configuration_bytes, head_bytes) = decode_configuration_head_intent(&intent_bytes)?;
-        atomic_write(&self.configuration_path(), configuration_bytes)?;
-        atomic_write(&self.recorded_head_path(), head_bytes)?;
-        fs::remove_file(path).map_err(|err| Error::Io(err.to_string()))?;
-        self.sync_root()
+        self.effect_root_anchor
+            .atomic_write(Self::CONFIGURATION_FILE, configuration_bytes)?;
+        self.effect_root_anchor
+            .atomic_write(Self::RECORDED_HEAD_FILE, head_bytes)?;
+        self.effect_root_anchor
+            .remove(Self::CONFIGURATION_HEAD_INTENT_FILE)
     }
 
     fn commit_configuration_head_unlocked(
@@ -3746,18 +4863,19 @@ impl RecorderFileStore {
             &[],
             self.wal_checkpoint()?,
         )?;
-        atomic_write(
-            &self.configuration_head_intent_path(),
+        self.effect_root_anchor.atomic_write(
+            Self::CONFIGURATION_HEAD_INTENT_FILE,
             &encode_configuration_head_intent(&configuration_bytes, &head_bytes),
         )?;
         self.fail_seal_at(SealFaultPoint::AfterHeadIntent)?;
-        atomic_write(&self.configuration_path(), &configuration_bytes)?;
+        self.effect_root_anchor
+            .atomic_write(Self::CONFIGURATION_FILE, &configuration_bytes)?;
         self.fail_seal_at(SealFaultPoint::AfterHeadConfiguration)?;
-        atomic_write(&self.recorded_head_path(), &head_bytes)?;
+        self.effect_root_anchor
+            .atomic_write(Self::RECORDED_HEAD_FILE, &head_bytes)?;
         self.fail_seal_at(SealFaultPoint::AfterHead)?;
-        fs::remove_file(self.configuration_head_intent_path())
-            .map_err(|err| Error::Io(err.to_string()))?;
-        self.sync_root()
+        self.effect_root_anchor
+            .remove(Self::CONFIGURATION_HEAD_INTENT_FILE)
     }
 
     fn persist_state_transition_unlocked(
@@ -3907,10 +5025,12 @@ impl RecorderFileStore {
             through_sequence: next_sequence - 1,
         };
         for (hash, command) in &commands {
-            atomic_replace(&self.command_path(*hash), &encode_stored_command(command))?;
+            self.effect_root_anchor
+                .atomic_write(&Self::command_name(*hash), &encode_stored_command(command))?;
         }
         for (slot, bytes) in &slots {
-            atomic_replace(&self.path(*slot), bytes)?;
+            self.effect_root_anchor
+                .atomic_write(&Self::slot_name(*slot), bytes)?;
         }
         let configuration = self.configuration_state()?;
         let head = self
@@ -3918,12 +5038,12 @@ impl RecorderFileStore {
             .lock()
             .map_err(|_| Error::Io("recorder head lock poisoned".into()))?
             .clone();
-        atomic_replace(
-            &self.configuration_path(),
+        self.effect_root_anchor.atomic_write(
+            Self::CONFIGURATION_FILE,
             &encode_configuration_state(&configuration)?,
         )?;
-        atomic_write(
-            &self.recorded_head_path(),
+        self.effect_root_anchor.atomic_write(
+            Self::RECORDED_HEAD_FILE,
             &encode_recorded_head(
                 &self.cluster_id,
                 self.epoch,
@@ -3933,15 +5053,11 @@ impl RecorderFileStore {
                 next_checkpoint,
             )?,
         )?;
-        let truncate_result = fs::OpenOptions::new()
-            .write(true)
-            .open(self.wal_path())
-            .and_then(|file| file.set_len(0).and_then(|_| sync_wal_metadata(&file)));
-        if let Err(error) = truncate_result {
+        if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
             if let Ok(mut wal) = self.wal.lock() {
                 wal.failed = true;
             }
-            return Err(Error::Io(error.to_string()));
+            return Err(error);
         }
         let mut wal = self
             .wal
@@ -3960,12 +5076,7 @@ impl RecorderFileStore {
     }
 
     fn sync_root(&self) -> Result<()> {
-        fs::File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| Error::Io(err.to_string()))?;
-        #[cfg(test)]
-        record_directory_sync();
-        Ok(())
+        self.effect_root_anchor.sync()
     }
 
     fn commit_transition_unlocked(
@@ -3984,20 +5095,21 @@ impl RecorderFileStore {
             &[],
             self.wal_checkpoint()?,
         )?;
-        atomic_write(
-            &self.intent_path(),
+        self.effect_root_anchor.atomic_write(
+            Self::TRANSITION_INTENT_FILE,
             &encode_transition_intent(slot_state.slot(), &slot_bytes, &configuration_bytes)?,
         )?;
         self.fail_seal_at(SealFaultPoint::AfterIntent)?;
-        atomic_write(&self.path(slot_state.slot()), &slot_bytes)?;
+        self.effect_root_anchor
+            .atomic_write(&Self::slot_name(slot_state.slot()), &slot_bytes)?;
         self.fail_seal_at(SealFaultPoint::AfterSlot)?;
-        atomic_write(&self.configuration_path(), &configuration_bytes)?;
+        self.effect_root_anchor
+            .atomic_write(Self::CONFIGURATION_FILE, &configuration_bytes)?;
         self.fail_seal_at(SealFaultPoint::AfterConfiguration)?;
-        atomic_write(&self.recorded_head_path(), &head_bytes)?;
-        fs::remove_file(self.intent_path()).map_err(|err| Error::Io(err.to_string()))?;
-        fs::File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| Error::Io(err.to_string()))?;
+        self.effect_root_anchor
+            .atomic_write(Self::RECORDED_HEAD_FILE, &head_bytes)?;
+        self.effect_root_anchor
+            .remove(Self::TRANSITION_INTENT_FILE)?;
         *self
             .configuration
             .lock()
@@ -4219,6 +5331,96 @@ fn take_record_worker_panic_after_pop(worker_identity: usize) -> bool {
     true
 }
 
+#[cfg(all(test, feature = "test-hooks"))]
+struct RecordReplySentHook {
+    worker_identity: usize,
+    group_cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+static RECORD_REPLY_SENT_HOOKS: std::sync::OnceLock<Mutex<Vec<RecordReplySentHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-hooks"))]
+struct RecordReplySentHookGuard {
+    worker_identity: usize,
+    group_cancellation: Arc<AtomicBool>,
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+impl Drop for RecordReplySentHookGuard {
+    fn drop(&mut self) {
+        let hooks = RECORD_REPLY_SENT_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+        lock_unpoison(hooks).retain(|hook| {
+            hook.worker_identity != self.worker_identity
+                || !Arc::ptr_eq(&hook.group_cancellation, &self.group_cancellation)
+        });
+    }
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+fn pause_after_next_record_reply_sent(
+    worker: &Arc<RecordWorkerState>,
+    group_cancellation: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+) -> RecordReplySentHookGuard {
+    let worker_identity = Arc::as_ptr(worker) as usize;
+    let hooks = RECORD_REPLY_SENT_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut hooks = lock_unpoison(hooks);
+    assert!(
+        !hooks.iter().any(|hook| {
+            hook.worker_identity == worker_identity
+                && Arc::ptr_eq(&hook.group_cancellation, &group_cancellation)
+        }),
+        "only one post-reply hook may be armed per record worker group"
+    );
+    hooks.push(RecordReplySentHook {
+        worker_identity,
+        group_cancellation: Arc::clone(&group_cancellation),
+        entered,
+        release,
+    });
+    RecordReplySentHookGuard {
+        worker_identity,
+        group_cancellation,
+    }
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+fn pause_after_record_reply_sent(
+    worker_identity: usize,
+    group_cancellation: Option<Arc<AtomicBool>>,
+) {
+    let Some(group_cancellation) = group_cancellation else {
+        return;
+    };
+    let hooks = RECORD_REPLY_SENT_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+    let hook = {
+        let mut hooks = lock_unpoison(hooks);
+        hooks
+            .iter()
+            .position(|hook| {
+                hook.worker_identity == worker_identity
+                    && Arc::ptr_eq(&hook.group_cancellation, &group_cancellation)
+            })
+            .map(|index| hooks.swap_remove(index))
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.entered.send(()).unwrap();
+    let (released, condition) = &*hook.release;
+    let mut released = lock_unpoison(released);
+    while !*released {
+        released = condition
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
 impl RecordWorker {
     fn spawn(
         recorder_id: NodeId,
@@ -4419,7 +5621,11 @@ impl QueuedRecordJob {
                 Err(Error::Rejected(RejectReason::InvalidRequest))
             }
         });
+        #[cfg(all(test, feature = "test-hooks"))]
+        let group_cancellation = self.completion.group().map(RpcCallGroup::token);
         let _ = self.job.result.send((self.job.index, reply));
+        #[cfg(all(test, feature = "test-hooks"))]
+        pause_after_record_reply_sent(_worker_identity, group_cancellation);
         #[cfg(feature = "test-hooks")]
         self.test_event(_worker_identity, TestWorkerEvent::ReplySent);
         #[cfg(feature = "test-hooks")]
@@ -4649,6 +5855,55 @@ enum ControlJob {
         command_hash: LogHash,
         result: std::sync::mpsc::SyncSender<(usize, Result<Option<StoredCommand>>)>,
     },
+    StageEffectBundleChunk {
+        index: usize,
+        context: RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+        result: std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+    },
+    FinalizeStagedEffectBundle {
+        index: usize,
+        context: RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        result: std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+    },
+    /// One logical effect fetch owns one reply stream and one cancellation
+    /// group for both the manifest and every chunk.  Keeping those reads in
+    /// the same group prevents a slow recorder from consuming the drain
+    /// reserve between otherwise healthy fetch stages.
+    FetchEffectBundle {
+        index: usize,
+        context: RecorderRpcContext,
+        binding: EffectBundleBinding,
+        kind: EffectFetchKind,
+        result: std::sync::mpsc::SyncSender<(usize, EffectFetchReply)>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum EffectFetchKind {
+    Manifest,
+    Chunk { ordinal: u16 },
+}
+
+enum EffectFetchReply {
+    Manifest(Result<Option<StoredCommand>>),
+    Chunk {
+        ordinal: u16,
+        result: Result<Option<Vec<u8>>>,
+    },
+}
+
+struct EffectFetchContext<'a> {
+    budget: &'a ControlCallBudget,
+    group: &'a ControlCallGroup,
+    sender: &'a std::sync::mpsc::SyncSender<(usize, EffectFetchReply)>,
+    receiver: &'a std::sync::mpsc::Receiver<(usize, EffectFetchReply)>,
+    binding: &'a EffectBundleBinding,
 }
 
 /// Whether an admitted recorder RPC can have durably changed recorder state.
@@ -4666,11 +5921,15 @@ enum RecorderRpcOperation {
 impl ControlJob {
     fn operation(&self) -> RecorderRpcOperation {
         match self {
-            Self::InstallProof { .. } | Self::StoreCommand { .. } => RecorderRpcOperation::Mutating,
+            Self::InstallProof { .. }
+            | Self::StoreCommand { .. }
+            | Self::StageEffectBundleChunk { .. }
+            | Self::FinalizeStagedEffectBundle { .. } => RecorderRpcOperation::Mutating,
             Self::InspectProof { .. }
             | Self::InspectSummary { .. }
             | Self::ObserveReadFence { .. }
-            | Self::FetchCommand { .. } => RecorderRpcOperation::ReadOnly,
+            | Self::FetchCommand { .. }
+            | Self::FetchEffectBundle { .. } => RecorderRpcOperation::ReadOnly,
         }
     }
 
@@ -4681,7 +5940,10 @@ impl ControlJob {
             | Self::InspectSummary { context, .. }
             | Self::ObserveReadFence { context, .. }
             | Self::StoreCommand { context, .. }
-            | Self::FetchCommand { context, .. } => context,
+            | Self::FetchCommand { context, .. }
+            | Self::StageEffectBundleChunk { context, .. }
+            | Self::FinalizeStagedEffectBundle { context, .. }
+            | Self::FetchEffectBundle { context, .. } => context,
         };
         *context = context.with_cancellation(cancellation);
     }
@@ -4779,12 +6041,68 @@ impl ControlJob {
                 });
                 let _ = result.send((index, reply));
             }
+            Self::StageEffectBundleChunk {
+                index,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+                result,
+            } => {
+                let reply = recorder_rpc(RecorderRpcOperation::Mutating, || {
+                    recorder.stage_effect_bundle_chunk(
+                        &context,
+                        binding,
+                        manifest_command,
+                        ordinal,
+                        chunk,
+                    )
+                });
+                let _ = result.send((index, reply));
+            }
+            Self::FinalizeStagedEffectBundle {
+                index,
+                context,
+                binding,
+                manifest_command,
+                result,
+            } => {
+                let reply = recorder_rpc(RecorderRpcOperation::Mutating, || {
+                    recorder.finalize_staged_effect_bundle(&context, binding, manifest_command)
+                });
+                let _ = result.send((index, reply));
+            }
+            Self::FetchEffectBundle {
+                index,
+                context,
+                binding,
+                kind,
+                result,
+            } => {
+                let reply = match kind {
+                    EffectFetchKind::Manifest => EffectFetchReply::Manifest(recorder_rpc(
+                        RecorderRpcOperation::ReadOnly,
+                        || recorder.fetch_effect_bundle_manifest(&context, binding),
+                    )),
+                    EffectFetchKind::Chunk { ordinal } => EffectFetchReply::Chunk {
+                        ordinal,
+                        result: recorder_rpc(RecorderRpcOperation::ReadOnly, || {
+                            recorder.fetch_effect_bundle_chunk(&context, binding, ordinal)
+                        }),
+                    },
+                };
+                let _ = result.send((index, reply));
+            }
         }
     }
 
     fn fail(self, error: Error) {
         match self {
-            Self::InstallProof { index, result, .. } | Self::StoreCommand { index, result, .. } => {
+            Self::InstallProof { index, result, .. }
+            | Self::StoreCommand { index, result, .. }
+            | Self::StageEffectBundleChunk { index, result, .. }
+            | Self::FinalizeStagedEffectBundle { index, result, .. } => {
                 let _ = result.send((index, Err(error)));
             }
             Self::InspectProof { index, result, .. } => {
@@ -4798,6 +6116,21 @@ impl ControlJob {
             }
             Self::FetchCommand { index, result, .. } => {
                 let _ = result.send((index, Err(error)));
+            }
+            Self::FetchEffectBundle {
+                index,
+                kind,
+                result,
+                ..
+            } => {
+                let reply = match kind {
+                    EffectFetchKind::Manifest => EffectFetchReply::Manifest(Err(error)),
+                    EffectFetchKind::Chunk { ordinal } => EffectFetchReply::Chunk {
+                        ordinal,
+                        result: Err(error),
+                    },
+                };
+                let _ = result.send((index, reply));
             }
         }
     }
@@ -6528,6 +7861,253 @@ impl ThreeNodeConsensus {
         self.store_command_on_quorum_with_budget(&budget, &mutation_started, command_hash, &command)
     }
 
+    /// Stages every bounded chunk and then installs the exact QEFX manifest on
+    /// a recorder quorum. A successful return is therefore a durable quorum
+    /// acknowledgement, suitable as the precondition to proposing the small
+    /// QEFX command. This deliberately does not invoke any SQL producer.
+    pub fn finalize_effect_bundle_on_quorum(
+        &self,
+        context: &RecorderRpcContext,
+        request: &EffectBundleFinalizeRequest,
+    ) -> Result<()> {
+        EffectBundleFinalizeRequest::new(request.bundle.clone(), request.manifest_command.clone())?;
+        let mutation_started = AtomicBool::new(false);
+        let budget = ControlCallBudget::new(context)
+            .map_err(|error| Self::store_context_error(error, &mutation_started))?;
+        for (ordinal, chunk) in request.bundle.chunks().iter().enumerate() {
+            let ordinal = u16::try_from(ordinal).map_err(|_| {
+                Error::EffectBundleInvalid("effect chunk ordinal exceeds wire limit".into())
+            })?;
+            self.mutation_on_quorum_with_budget(
+                &budget,
+                &mutation_started,
+                |index, context, result| ControlJob::StageEffectBundleChunk {
+                    index,
+                    context,
+                    binding: request.bundle.binding.clone(),
+                    manifest_command: request.manifest_command.clone(),
+                    ordinal,
+                    chunk: chunk.clone(),
+                    result,
+                },
+            )?;
+        }
+        self.mutation_on_quorum_with_budget(&budget, &mutation_started, |index, context, result| {
+            ControlJob::FinalizeStagedEffectBundle {
+                index,
+                context,
+                binding: request.bundle.binding.clone(),
+                manifest_command: request.manifest_command.clone(),
+                result,
+            }
+        })
+    }
+
+    /// Resolves a previously quorum-finalized QEFX bundle from any available
+    /// recorder, verifying the exact command hash, binding, chunk order and
+    /// digest before returning bytes to an executor.
+    pub fn resolve_effect_bundle_from_quorum(
+        &self,
+        context: &RecorderRpcContext,
+        binding: &EffectBundleBinding,
+        manifest_command: &StoredCommand,
+    ) -> Result<Option<RecorderEffectBundle>> {
+        let qefx = verified_effect_bundle_command(binding, manifest_command)?;
+        let budget = ControlCallBudget::new(context)?;
+        let group = ControlCallGroup::new();
+        #[cfg(feature = "test-hooks")]
+        group.attach_test_root_probe(&budget.caller);
+        let capacity = self
+            .read_fence_workers
+            .len()
+            .saturating_mul(qefx.chunks().len().saturating_add(1))
+            .max(1);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        let fetch = EffectFetchContext {
+            budget: &budget,
+            group: &group,
+            sender: &sender,
+            receiver: &receiver,
+            binding,
+        };
+        let outcome = (|| {
+            self.fetch_effect_manifest_in_group(&fetch, manifest_command)?;
+            let mut chunks = Vec::with_capacity(qefx.chunks().len());
+            for (ordinal, expected) in qefx.chunks().iter().enumerate() {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    Error::EffectBundleInvalid("effect chunk ordinal exceeds wire limit".into())
+                })?;
+                chunks.push(self.fetch_effect_chunk_in_group(&fetch, ordinal, expected)?);
+            }
+            RecorderEffectBundle::new(binding.clone(), chunks).map(Some)
+        })();
+        drop(sender);
+        // This is deliberately the only cancellation/drain point for the
+        // entire bundle.  In particular, never drain after the manifest: a
+        // non-cooperative recorder must not spend the caller's reserve before
+        // healthy peers can supply the chunks.  A fully verified read has no
+        // mutation uncertainty, so it may detach a stuck backend immediately
+        // rather than making the healthy result wait for D. Quarantine closes
+        // that worker's generation and fences all future reuse; its owned
+        // thread releases the final attachment when it eventually returns.
+        if outcome.is_ok() {
+            group.cancel_and_prune();
+            for worker in group.drain_to_deadline(Instant::now() + CONTEXT_POLL_INTERVAL) {
+                worker.quarantine();
+            }
+        } else {
+            group.cancel_and_prune();
+            for worker in group.drain_to_deadline(budget.deadline) {
+                worker.quarantine();
+            }
+        }
+        outcome
+    }
+
+    fn dispatch_effect_fetch(
+        &self,
+        fetch: &EffectFetchContext<'_>,
+        kind: EffectFetchKind,
+    ) -> Result<usize> {
+        let mut admitted = 0;
+        for (index, worker) in self.read_fence_workers.iter().enumerate() {
+            fetch.budget.check_admission()?;
+            if matches!(
+                worker.dispatch_group(
+                    ControlJob::FetchEffectBundle {
+                        index,
+                        context: fetch.budget.child_context(fetch.group),
+                        binding: fetch.binding.clone(),
+                        kind,
+                        result: fetch.sender.clone(),
+                    },
+                    fetch.group,
+                ),
+                ControlDispatch::Accepted
+            ) {
+                admitted += 1;
+            }
+        }
+        Ok(admitted)
+    }
+
+    fn fetch_effect_manifest_in_group(
+        &self,
+        fetch: &EffectFetchContext<'_>,
+        expected: &StoredCommand,
+    ) -> Result<()> {
+        let mut outstanding = self.dispatch_effect_fetch(fetch, EffectFetchKind::Manifest)?;
+        if outstanding == 0 {
+            return Err(Error::EffectBundleUnavailable);
+        }
+        let mut malformed = None;
+        while outstanding != 0 {
+            fetch.budget.check_admission()?;
+            let remaining = fetch
+                .budget
+                .work_deadline
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(malformed.unwrap_or(Error::EffectBundleUnavailable));
+            }
+            match fetch
+                .receiver
+                .recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL))
+            {
+                Ok((_, EffectFetchReply::Manifest(Ok(Some(command))))) if command == *expected => {
+                    return Ok(());
+                }
+                Ok((index, EffectFetchReply::Manifest(Ok(Some(_))))) => {
+                    outstanding -= 1;
+                    self.read_fence_workers[index].state.quarantine();
+                    malformed.get_or_insert_with(|| {
+                        Error::EffectBundleInvalid(
+                            "recorder returned a different QEFX manifest".into(),
+                        )
+                    });
+                }
+                Ok((_, EffectFetchReply::Manifest(Ok(None) | Err(_)))) => outstanding -= 1,
+                // Late responses from an earlier phase cannot exist yet, but
+                // retaining this arm makes the shared stream robust if a
+                // recorder replies after its work was superseded.
+                Ok((_, EffectFetchReply::Chunk { .. })) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Err(malformed.unwrap_or(Error::EffectBundleUnavailable))
+    }
+
+    fn fetch_effect_chunk_in_group(
+        &self,
+        fetch: &EffectFetchContext<'_>,
+        ordinal: u16,
+        expected: &ExternalEffectChunk,
+    ) -> Result<Vec<u8>> {
+        let mut outstanding =
+            self.dispatch_effect_fetch(fetch, EffectFetchKind::Chunk { ordinal })?;
+        if outstanding == 0 {
+            return Err(Error::EffectBundleUnavailable);
+        }
+        let mut malformed = None;
+        while outstanding != 0 {
+            fetch.budget.check_admission()?;
+            let remaining = fetch
+                .budget
+                .work_deadline
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(malformed.unwrap_or(Error::EffectBundleUnavailable));
+            }
+            match fetch
+                .receiver
+                .recv_timeout(remaining.min(CONTEXT_POLL_INTERVAL))
+            {
+                Ok((
+                    _,
+                    EffectFetchReply::Chunk {
+                        ordinal: reply_ordinal,
+                        result: Ok(Some(chunk)),
+                    },
+                )) if reply_ordinal == ordinal
+                    && chunk.len() == expected.encoded_len() as usize
+                    && effect_chunk_digest(&chunk) == expected.digest() =>
+                {
+                    return Ok(chunk);
+                }
+                Ok((
+                    index,
+                    EffectFetchReply::Chunk {
+                        ordinal: reply_ordinal,
+                        result: Ok(Some(_)),
+                    },
+                )) if reply_ordinal == ordinal => {
+                    outstanding -= 1;
+                    self.read_fence_workers[index].state.quarantine();
+                    malformed.get_or_insert_with(|| {
+                        Error::EffectBundleInvalid(
+                            "recorder returned a corrupt effect chunk".into(),
+                        )
+                    });
+                }
+                Ok((
+                    _,
+                    EffectFetchReply::Chunk {
+                        ordinal: reply_ordinal,
+                        result: Ok(None) | Err(_),
+                    },
+                )) if reply_ordinal == ordinal => outstanding -= 1,
+                // A manifest reply left in the shared stream, or an old
+                // chunk reply, belongs to an earlier stage and must never be
+                // counted as this ordinal's response.
+                Ok((_, EffectFetchReply::Manifest(_) | EffectFetchReply::Chunk { .. })) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Err(malformed.unwrap_or(Error::EffectBundleUnavailable))
+    }
+
     fn propose_next(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry> {
         let mut tip = self
             .sequential_tip
@@ -7006,6 +8586,12 @@ impl ThreeNodeConsensus {
         Ok(DriveOutcome::Progress(progress))
     }
 
+    /// Completes Rhiza's public acknowledgement contract after QuePaxa has
+    /// formed a decision proof. A FastPath proof is formed after one phase-0
+    /// recorder round, but the normal public success path still requires the
+    /// same durable proof-quorum installation used by Phase2. An ambiguous
+    /// installer result is acknowledged only after exact committed-value
+    /// reconciliation below.
     fn finish_decision_with_context(
         &self,
         proof: DecisionProof,
@@ -7295,8 +8881,6 @@ impl ThreeNodeConsensus {
             }
             if let Some(error) = safety_error.clone() {
                 frozen = Some(Err(error));
-            } else if observed_unknown {
-                frozen = Some(Err(Error::UnknownOutcome));
             } else if installed >= quorum {
                 frozen = Some(Ok(()));
             } else if received == accepted_count {
@@ -7346,17 +8930,21 @@ impl ThreeNodeConsensus {
         if let Some(error) = safety_error {
             return Err(error);
         }
-        if received < accepted_count || observed_unknown || !timed_out.is_empty() {
-            return Err(Error::UnknownOutcome);
-        }
-        if let Err(error) = budget.check_admission() {
-            return Err(Self::store_context_error(error, mutation_started));
-        }
+        // Exact durable/idempotent installs from distinct admitted workers are
+        // sufficient post-decision evidence.  An earlier ambiguous delivery
+        // cannot erase that quorum; it remains UnknownOutcome only when no
+        // exact quorum is subsequently observed.
         if installed >= quorum {
             return Ok(());
         }
         if let Some(error) = typed_error {
             return Err(error);
+        }
+        if received < accepted_count || observed_unknown || !timed_out.is_empty() {
+            return Err(Error::UnknownOutcome);
+        }
+        if let Err(error) = budget.check_admission() {
+            return Err(Self::store_context_error(error, mutation_started));
         }
         match frozen {
             Some(result) => result,
@@ -7475,7 +9063,6 @@ impl ThreeNodeConsensus {
                 }
                 Err(Error::UnknownOutcome) => {
                     observed_unknown = true;
-                    frozen = Some(Err(Error::UnknownOutcome));
                 }
                 Err(error) if Self::is_record_safety_error(&error) => {
                     safety_error.get_or_insert(error);
@@ -7484,11 +9071,7 @@ impl ThreeNodeConsensus {
                     typed_errors[index] = Some(error);
                 }
                 Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {
-                    observed_unknown = mutation_started.load(Ordering::Acquire);
-                    frozen = Some(Err(Self::store_context_error(
-                        Error::RpcCancelled,
-                        mutation_started,
-                    )));
+                    observed_unknown |= mutation_started.load(Ordering::Acquire);
                 }
                 Err(Error::ProposeFailed) => worker_failed = true,
                 Err(_) => {}
@@ -7516,11 +9099,23 @@ impl ThreeNodeConsensus {
             });
         }
 
-        // Quorum freezes the public result, not the lifecycle of its admitted
-        // workers. Reclaim jobs that have not begun, but leave a running
-        // mutation under its child W until the original caller D.
-        group.prune_pending();
-        let timed_out = group.drain_to_deadline(budget.deadline);
+        let exact_quorum = matches!(&frozen, Some(Ok(replies)) if replies.len() >= quorum);
+        // Record requests are immutable and idempotent for this exact proposer
+        // operation. Once distinct current voters have returned an exact
+        // quorum, cancel the minority hedge and spend only the reserved drain
+        // budget reclaiming it; an ambiguous minority cannot erase the quorum.
+        // Without that quorum, keep the original caller deadline and preserve
+        // every admitted mutation ambiguity as UnknownOutcome.
+        let drain_deadline = if exact_quorum {
+            group.cancel_and_prune();
+            Instant::now()
+                .checked_add(CONTROL_DRAIN_RESERVE)
+                .map_or(budget.deadline, |deadline| deadline.min(budget.deadline))
+        } else {
+            group.prune_pending();
+            budget.deadline
+        };
+        let timed_out = group.drain_to_deadline(drain_deadline);
         if !timed_out.is_empty() {
             group.cancel();
             group.prune_pending();
@@ -7549,6 +9144,9 @@ impl ThreeNodeConsensus {
         }
         if let Some(error) = safety_error {
             return Err(error);
+        }
+        if exact_quorum {
+            return frozen.expect("exact record quorum freezes a result");
         }
         if observed_unknown || !timed_out.is_empty() || accepted_completed < accepted {
             return Err(Error::UnknownOutcome);
@@ -8531,15 +10129,18 @@ impl ThreeNodeConsensus {
         }
     }
 
-    /// Stores command bytes under one caller-captured deadline.  Every
+    /// Runs a typed durable mutation under one caller-captured deadline. Every
     /// admitted mutation is group-owned so a terminal result is not returned
     /// until it has either finished by D or its worker was quarantined.
-    fn store_command_on_quorum_with_budget(
+    fn mutation_on_quorum_with_budget(
         &self,
         budget: &ControlCallBudget,
         mutation_started: &AtomicBool,
-        command_hash: LogHash,
-        command: &StoredCommand,
+        make_job: impl Fn(
+            usize,
+            RecorderRpcContext,
+            std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+        ) -> ControlJob,
     ) -> Result<()> {
         check_operation_context(&budget.caller, mutation_started)?;
         let quorum = quorum_size(self.control_workers.len());
@@ -8557,17 +10158,7 @@ impl ThreeNodeConsensus {
                 break;
             }
             let dispatch = worker.dispatch_mutating_group(
-                ControlJob::StoreCommand {
-                    index,
-                    context: budget.child_context(&group),
-                    cluster_id: self.cluster_id.clone(),
-                    epoch: self.epoch,
-                    config_id: self.config_id,
-                    config_digest: self.config_digest,
-                    command_hash,
-                    command: command.clone(),
-                    result: sender.clone(),
-                },
+                make_job(index, budget.child_context(&group), sender.clone()),
                 &group,
                 mutation_started,
             );
@@ -8664,8 +10255,6 @@ impl ThreeNodeConsensus {
             }
             if let Some(error) = safety_error.clone() {
                 frozen = Some(Err(error));
-            } else if observed_unknown {
-                frozen = Some(Err(Error::UnknownOutcome));
             } else if stored >= quorum {
                 frozen = Some(Ok(()));
             } else if received == accepted_count {
@@ -8711,13 +10300,14 @@ impl ThreeNodeConsensus {
         if let Some(error) = safety_error {
             return Err(error);
         }
-        if received < accepted_count {
-            return Err(Error::UnknownOutcome);
+        // StoreCommand verifies the supplied content hash and persists the
+        // same content-addressed bytes durably and idempotently at its bound
+        // worker.  Thus distinct exact ACKs establish this content-registration
+        // quorum even if another admitted delivery is unknown.
+        if stored >= quorum {
+            return Ok(());
         }
-        if observed_unknown {
-            return Err(Error::UnknownOutcome);
-        }
-        if !timed_out.is_empty() {
+        if received < accepted_count || observed_unknown || !timed_out.is_empty() {
             return Err(Error::UnknownOutcome);
         }
         if let Err(error) = budget.check_admission() {
@@ -8731,6 +10321,28 @@ impl ThreeNodeConsensus {
             }
             None => Err(Error::NoQuorum),
         }
+    }
+
+    fn store_command_on_quorum_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
+        command_hash: LogHash,
+        command: &StoredCommand,
+    ) -> Result<()> {
+        self.mutation_on_quorum_with_budget(budget, mutation_started, |index, context, result| {
+            ControlJob::StoreCommand {
+                index,
+                context,
+                cluster_id: self.cluster_id.clone(),
+                epoch: self.epoch,
+                config_id: self.config_id,
+                config_digest: self.config_digest,
+                command_hash,
+                command: command.clone(),
+                result,
+            }
+        })
     }
 
     fn fetch_verified_value(
@@ -9092,7 +10704,7 @@ impl RecorderRpc for RecorderFileStore {
             .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
             .slots
             .contains_key(&slot);
-        if !exists_in_wal && !self.path(slot).exists() {
+        if !exists_in_wal && !self.effect_root_anchor.exists(&Self::slot_name(slot))? {
             return Ok(None);
         }
         let state = self.load_unlocked(slot, configuration.config_digest)?;
@@ -9141,7 +10753,10 @@ impl RecorderRpc for RecorderFileStore {
             .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
             .slots
             .contains_key(&request.slot);
-        let exact_exists = exists_in_wal || self.path(request.slot).exists();
+        let exact_exists = exists_in_wal
+            || self
+                .effect_root_anchor
+                .exists(&Self::slot_name(request.slot))?;
         let summary = if exact_exists {
             let state = self.load_unlocked(request.slot, configuration.config_digest)?;
             Some(Box::new(record_summary(
@@ -9211,6 +10826,47 @@ impl RecorderRpc for RecorderFileStore {
                 command_hash,
             })?
             .command)
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> Result<()> {
+        context.check()?;
+        self.stage_effect_bundle_chunk(&binding, &manifest_command, ordinal, &chunk)
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> Result<()> {
+        context.check()?;
+        self.finalize_staged_effect_bundle(&binding, manifest_command)
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> Result<Option<StoredCommand>> {
+        context.check()?;
+        self.fetch_effect_bundle_manifest(&binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> Result<Option<Vec<u8>>> {
+        context.check()?;
+        self.fetch_effect_bundle_chunk(&binding, ordinal)
     }
 }
 
@@ -9939,8 +11595,6 @@ fn decode_stored_command(bytes: &[u8]) -> Result<StoredCommand> {
     Ok(StoredCommand::new(entry_type, payload))
 }
 
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 #[cfg(test)]
 std::thread_local! {
     static SYNC_COUNTS: std::cell::Cell<(usize, usize)> = const {
@@ -9981,6 +11635,7 @@ fn sync_wal_append(file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn sync_wal_metadata(file: &fs::File) -> io::Result<()> {
     file.sync_all()?;
     #[cfg(test)]
@@ -10273,7 +11928,7 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File> {
         .map_err(|error| Error::Io(error.to_string()))
 }
 
-fn prepare_fresh_recorder_root(root: &Path) -> Result<()> {
+fn prepare_fresh_recorder_root(root: &Path) -> Result<anchored_fs::AnchoredDir> {
     if let Some(parent) = root
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -10285,7 +11940,36 @@ fn prepare_fresh_recorder_root(root: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(Error::Io(error.to_string())),
     }
-    ensure_real_directory(root, "recorder root")
+    anchored_fs::AnchoredDir::open(root)
+}
+
+/// Clean-install-only recorder generation gate. A nonempty root without this
+/// exact immutable marker is legacy or partially initialized and must be
+/// reset by the operator before any lock, WAL, or effect-store mutation.
+fn ensure_storage_generation(root: &anchored_fs::AnchoredDir) -> Result<()> {
+    match root.read_optional(
+        STORAGE_GENERATION_FILE,
+        STORAGE_GENERATION_FINGERPRINT.len(),
+        STORAGE_GENERATION_FILE,
+    )? {
+        Some(bytes) if bytes == STORAGE_GENERATION_FINGERPRINT => return Ok(()),
+        Some(_) => {
+            return Err(Error::Decode(
+                "recorder storage generation mismatch; reset required".into(),
+            ))
+        }
+        None => {}
+    }
+    let has_durable = root
+        .list()?
+        .into_iter()
+        .any(|name| name != ".recorder.lock");
+    if has_durable {
+        return Err(Error::Decode(
+            "recorder storage generation missing; reset required".into(),
+        ));
+    }
+    root.atomic_write(STORAGE_GENERATION_FILE, STORAGE_GENERATION_FINGERPRINT)
 }
 
 fn create_real_directory_if_missing(path: &Path) -> Result<()> {
@@ -10316,78 +12000,6 @@ fn ensure_real_directory(path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn open_or_create_fresh_root_lock(root: &Path) -> Result<fs::File> {
-    let path = root.join(".recorder.lock");
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    options.custom_flags(O_NOFOLLOW_FLAG);
-    match options.open(&path) {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            open_existing_root_lock(&path)
-        }
-        Err(error) => Err(Error::Io(error.to_string())),
-    }
-}
-
-fn open_existing_root_lock(path: &Path) -> Result<fs::File> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(Error::Decode("recorder root lock does not exist".into()));
-        }
-        Err(error) => return Err(Error::Io(error.to_string())),
-    };
-    if before.file_type().is_symlink() || !before.is_file() {
-        return Err(Error::Decode(
-            "recorder root lock must be an existing regular file".into(),
-        ));
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    options.custom_flags(O_NOFOLLOW_FLAG);
-    let file = options
-        .open(path)
-        .map_err(|error| Error::Io(error.to_string()))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| Error::Io(error.to_string()))?;
-    let after = fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
-    if after.file_type().is_symlink()
-        || !after.is_file()
-        || !opened.is_file()
-        || !same_opened_file(&before, &opened)
-        || !same_opened_file(&opened, &after)
-        || before.len() != opened.len()
-        || opened.len() != after.len()
-    {
-        return Err(Error::Decode(
-            "recorder root lock changed before open".into(),
-        ));
-    }
-    Ok(file)
-}
-
 #[cfg(unix)]
 fn same_opened_file(opened: &fs::Metadata, linked: &fs::Metadata) -> bool {
     opened.dev() == linked.dev() && opened.ino() == linked.ino()
@@ -10416,9 +12028,9 @@ fn current_recorder_layout(root: &Path) -> Result<bool> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| Error::Io(error.to_string()))?;
     if entries.is_empty()
-        || entries
-            .iter()
-            .all(|entry| entry.file_name() == ".recorder.lock")
+        || entries.iter().all(|entry| {
+            entry.file_name() == ".recorder.lock" || entry.file_name() == STORAGE_GENERATION_FILE
+        })
     {
         return Ok(false);
     }
@@ -10910,57 +12522,6 @@ fn decode_recorded_head(
     Ok((provenance, recent_slots, wal_checkpoint))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    atomic_replace(path, bytes)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Io("atomic write path has no parent".into()))?;
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|err| Error::Io(err.to_string()))?;
-    #[cfg(test)]
-    record_directory_sync();
-    Ok(())
-}
-
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Io("atomic write path has no parent".into()))?;
-    fs::create_dir_all(parent).map_err(|err| Error::Io(err.to_string()))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| Error::Io("atomic write path has no file name".into()))?
-        .to_string_lossy();
-    let (temp_path, mut file) = loop {
-        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => break (temp_path, file),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(Error::Io(err.to_string())),
-        }
-    };
-    let result = (|| -> io::Result<()> {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        #[cfg(test)]
-        record_file_sync();
-        drop(file);
-        fs::rename(&temp_path, path)?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Error::Io(err.to_string()));
-    }
-    Ok(())
-}
-
 fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());
 }
@@ -11131,21 +12692,25 @@ impl Consensus for SingleNodeConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_next_fetch_group_token, command_file_reads, count_control_budget_constructors_for,
-        decode_configuration_state, decode_recorder_state, decode_wal_frame, encode_stored_command,
-        encode_wal_frame, force_next_control_group_drain_timeout, last_file_sync_kind,
-        pause_after_next_fetch_dispatch, pause_after_next_summary_dispatch,
-        pause_after_next_summary_provisional_none, record_budget_identity_for,
-        reset_command_file_reads, reset_sync_counts, sync_counts, sync_wal_append,
-        sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
+        anchored_fs, capture_next_fetch_group_token, command_file_reads,
+        count_control_budget_constructors_for, current_recorder_layout, decode_configuration_state,
+        decode_recorder_state, decode_wal_frame, encode_stored_command, encode_wal_frame,
+        ensure_storage_generation, force_next_control_group_drain_timeout, last_file_sync_kind,
+        lock_unpoison, pause_after_next_fetch_dispatch, pause_after_next_summary_dispatch,
+        pause_after_next_summary_provisional_none, prepare_fresh_recorder_root,
+        record_budget_identity_for, reset_command_file_reads, reset_sync_counts, sync_counts,
+        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
         CertifiedDecisionInspection, ClusterId, ConfigChange, ConfigId, ConfigurationState,
         Consensus, ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob,
         ControlJobCancellation, ControlWorker, DecisionInspection, DecisionProof, DriveOutcome,
-        Epoch, Error, FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority,
-        ProposerProgress, ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState,
-        RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderPreflight,
-        RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState, RecorderSummary,
-        RejectReason, SealFaultPoint, SingleNodeConsensus, Slot, ThreeNodeConsensus,
+        EffectBundleBinding, EffectBundleFinalizeRequest, Epoch, Error, ExternalEffectCommand,
+        FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
+        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
+        RecordedHeadProvenance, RecorderEffectBundle, RecorderFileStore, RecorderPostPreflightHook,
+        RecorderPreflight, RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState,
+        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, Slot,
+        ThreeNodeConsensus, RECORDER_POST_PREFLIGHT_HOOK, STORAGE_GENERATION_FILE,
+        STORAGE_GENERATION_FINGERPRINT,
     };
     #[cfg(feature = "test-hooks")]
     use super::{
@@ -11154,7 +12719,9 @@ mod tests {
         TestProbeRegistrationError,
     };
     use proptest::prelude::*;
-    use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
+    use rhiza_core::{
+        Command, CommandKind, EntryType, ExternalEffectProfile, LogHash, StoredCommand,
+    };
     #[cfg(feature = "test-hooks")]
     use std::sync::Barrier;
     use std::{
@@ -12159,7 +13726,151 @@ mod tests {
     }
 
     #[test]
-    fn record_quorum_waits_through_root_deadline_then_quarantines_a_noncooperative_hedge() {
+    fn exact_record_quorum_survives_an_earlier_unknown_outcome() {
+        let (record_tx, record_rx) = mpsc::sync_channel(1);
+        let (control_tx, _control_rx) = mpsc::sync_channel(1);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(ContextRecordingRecorder {
+                    recorder_id: "n1",
+                    record_contexts: record_tx,
+                    control_contexts: control_tx,
+                    record_error: Some(Error::UnknownOutcome),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n2",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n3",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let mutation_started = AtomicBool::new(false);
+
+        let replies = consensus
+            .record_broadcast_with_context(
+                record_requests(&consensus, 1),
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                &mutation_started,
+            )
+            .unwrap();
+
+        assert!(record_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.recorder_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["n2", "n3"])
+        );
+        assert!(mutation_started.load(Ordering::Acquire));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn record_no_quorum_preserves_unknown_over_a_definite_failure_in_every_position() {
+        for exact_position in 0..3 {
+            for unknown_position in 0..3 {
+                if exact_position == unknown_position {
+                    continue;
+                }
+                let (record_tx, _record_rx) = mpsc::sync_channel(3);
+                let (control_tx, _control_rx) = mpsc::sync_channel(3);
+                let recorders = ["n1", "n2", "n3"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, recorder_id)| {
+                        let recorder: Box<dyn RecorderRpc> = if position == exact_position {
+                            Box::new(SlotRecorder {
+                                recorder_id,
+                                reject_slot: None,
+                                observed: None,
+                            })
+                        } else {
+                            Box::new(ContextRecordingRecorder {
+                                recorder_id,
+                                record_contexts: record_tx.clone(),
+                                control_contexts: control_tx.clone(),
+                                record_error: Some(if position == unknown_position {
+                                    Error::UnknownOutcome
+                                } else {
+                                    Error::ProposeFailed
+                                }),
+                            })
+                        };
+                        (recorder_id.into(), recorder)
+                    })
+                    .collect();
+                let consensus =
+                    ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                        .unwrap();
+                assert_eq!(
+                    consensus.record_broadcast_with_context(
+                        record_requests(&consensus, 1),
+                        RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &AtomicBool::new(false),
+                    ),
+                    Err(Error::UnknownOutcome)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn record_one_exact_and_two_definite_failures_is_retryable_in_every_position() {
+        for exact_position in 0..3 {
+            let (record_tx, _record_rx) = mpsc::sync_channel(3);
+            let (control_tx, _control_rx) = mpsc::sync_channel(3);
+            let recorders = ["n1", "n2", "n3"]
+                .into_iter()
+                .enumerate()
+                .map(|(position, recorder_id)| {
+                    let recorder: Box<dyn RecorderRpc> = if position == exact_position {
+                        Box::new(SlotRecorder {
+                            recorder_id,
+                            reject_slot: None,
+                            observed: None,
+                        })
+                    } else {
+                        Box::new(ContextRecordingRecorder {
+                            recorder_id,
+                            record_contexts: record_tx.clone(),
+                            control_contexts: control_tx.clone(),
+                            record_error: Some(Error::ProposeFailed),
+                        })
+                    };
+                    (recorder_id.into(), recorder)
+                })
+                .collect();
+            let consensus =
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap();
+            assert_eq!(
+                consensus.record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                    &AtomicBool::new(false),
+                ),
+                Err(Error::ProposeFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn record_quorum_returns_within_drain_reserve_and_quarantines_a_noncooperative_hedge() {
         let (n1_started_tx, n1_started_rx) = mpsc::sync_channel(1);
         let (n2_started_tx, n2_started_rx) = mpsc::sync_channel(1);
         let (n3_started_tx, n3_started_rx) = mpsc::sync_channel(1);
@@ -12226,15 +13937,11 @@ mod tests {
         assert_eq!(n3_started_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
         n1_release_tx.send(()).unwrap();
         n2_release_tx.send(()).unwrap();
-        assert_eq!(
-            done_rx.recv_timeout(Duration::from_millis(30)),
-            Err(mpsc::RecvTimeoutError::Timeout),
-            "a two-reply quorum must not escape while an admitted mutating hedge is running"
-        );
-        assert_eq!(
-            done_rx.recv_timeout(Duration::from_secs(1)),
-            Ok((Err(Error::UnknownOutcome), true))
-        );
+        let (result, mutation_started) = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("an exact quorum must not wait through the root deadline");
+        assert!(matches!(result, Ok(ref replies) if replies.len() == 2));
+        assert!(mutation_started);
 
         let blocked = &consensus.record_workers[2].state;
         assert!(blocked.quarantined.load(Ordering::Acquire));
@@ -12266,6 +13973,113 @@ mod tests {
         caller_guard.finish();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
         assert_eq!(blocked.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn ready_safety_error_beats_exact_record_quorum_while_completion_is_delayed() {
+        let event_timeout = Duration::from_secs(2);
+        let success_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _success_gate = GateRelease::new(Arc::clone(&success_gate));
+        let post_send_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _post_send_gate = GateRelease::new(Arc::clone(&post_send_gate));
+        let (n1_seen_tx, n1_seen_rx) = mpsc::sync_channel(1);
+        let (n2_seen_tx, n2_seen_rx) = mpsc::sync_channel(1);
+        let (group_tx, group_rx) = mpsc::sync_channel(1);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(GatedContextRecorder {
+                    recorder_id: "n1",
+                    contexts: n1_seen_tx,
+                    release: Arc::clone(&success_gate),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(GatedContextRecorder {
+                    recorder_id: "n2",
+                    contexts: n2_seen_tx,
+                    release: Arc::clone(&success_gate),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(CancellationSafetyRecorder {
+                    group_cancellation: group_tx,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let probe = Arc::new(TestControlOperationProbe::default());
+        let registration = consensus
+            .install_test_record_operation_probe(1, Arc::clone(&probe))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                done_tx
+                    .send(consensus.record_broadcast_with_context(
+                        record_requests(&consensus, 1),
+                        RecorderRpcContext::with_timeout(event_timeout),
+                        &AtomicBool::new(false),
+                    ))
+                    .unwrap();
+            })
+        };
+        assert!(n1_seen_rx.recv_timeout(event_timeout).is_ok());
+        assert!(n2_seen_rx.recv_timeout(event_timeout).is_ok());
+        let group_cancellation = group_rx.recv_timeout(event_timeout).unwrap();
+        let (post_send_tx, post_send_rx) = mpsc::sync_channel(1);
+        let _post_send_hook = super::pause_after_next_record_reply_sent(
+            &consensus.record_workers[2].state,
+            group_cancellation,
+            post_send_tx,
+            Arc::clone(&post_send_gate),
+        );
+
+        release_gate(&success_gate);
+        assert_eq!(post_send_rx.recv_timeout(event_timeout), Ok(()));
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(500)),
+            Ok(Err(Error::ChainConflict {
+                slot: 1,
+                expected_prev_hash: LogHash::ZERO,
+                actual_prev_hash: LogHash::ZERO,
+            }))
+        );
+        assert!(consensus.record_workers[2]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        assert!(consensus.record_workers[..2]
+            .iter()
+            .all(|worker| !worker.state.quarantined.load(Ordering::Acquire)));
+        assert_eq!(probe.quarantine_count(), 1);
+        assert_eq!(probe.outstanding(), 1);
+        assert!(!probe.wait_for_quiescence(Duration::ZERO));
+
+        release_gate(&post_send_gate);
+        caller.join().unwrap();
+        assert!(probe.wait_for_quiescence(event_timeout));
+        assert_eq!(probe.outstanding(), 0);
+        assert!(probe.worker_transitions().iter().all(|transition| {
+            transition.live_leases == 0 && transition.enqueued == transition.completion_dropped
+        }));
+        assert!(probe.worker_transitions().iter().any(|transition| {
+            transition.worker_identity == Arc::as_ptr(&consensus.record_workers[2].state) as usize
+                && transition.reply_sent == 1
+                && transition.completion_dropped == 1
+        }));
+        drop(registration);
+        assert_eq!(
+            consensus.test_record_operation_probe_registration_count(),
+            0
+        );
+        assert!(consensus.finish_pending_rpcs(event_timeout));
     }
 
     #[test]
@@ -12518,7 +14332,7 @@ mod tests {
     }
 
     #[test]
-    fn record_worker_exit_after_pop_without_reply_is_unknown_and_quarantined() {
+    fn record_worker_exit_after_pop_preserves_exact_quorum_and_quarantines_worker() {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let _release = GateRelease::new(Arc::clone(&release));
         let recorders = vec![
@@ -12574,9 +14388,14 @@ mod tests {
         };
         assert_eq!(popped_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
         release_gate(&release);
-        assert_eq!(caller.1.join().unwrap(), Err(Error::UnknownOutcome));
+        let replies = caller.1.join().unwrap().unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| reply.recorder_id != "n1"));
         assert!(mutation_started.load(Ordering::Acquire));
-        let quarantine_deadline = Instant::now() + Duration::from_secs(1);
+        // This observes a worker thread, so use the suite's hang-sized budget rather than the
+        // RPC's one-second semantic deadline. A loaded test host may not schedule the worker
+        // before that RPC deadline even though the resolver remains correct.
+        let quarantine_deadline = Instant::now() + Duration::from_secs(10);
         while !caller
             .0
             .record_workers
@@ -12584,7 +14403,7 @@ mod tests {
             .any(|worker| worker.state.quarantined.load(Ordering::Acquire))
             && Instant::now() < quarantine_deadline
         {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         let quarantined: Vec<_> = caller
             .0
@@ -12869,6 +14688,38 @@ mod tests {
         recorder_id: &'static str,
         contexts: mpsc::SyncSender<Instant>,
         release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    #[cfg(feature = "test-hooks")]
+    struct CancellationSafetyRecorder {
+        group_cancellation: mpsc::SyncSender<Arc<AtomicBool>>,
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl RecorderRpc for CancellationSafetyRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> super::Result<RecordSummary> {
+            self.group_cancellation
+                .send(
+                    context
+                        .cancellations
+                        .last()
+                        .cloned()
+                        .expect("record worker context carries its group cancellation"),
+                )
+                .unwrap();
+            while !context.is_cancelled() {
+                thread::yield_now();
+            }
+            Err(Error::ChainConflict {
+                slot: request.slot,
+                expected_prev_hash: LogHash::ZERO,
+                actual_prev_hash: LogHash::ZERO,
+            })
+        }
     }
 
     impl RecorderRpc for GatedContextRecorder {
@@ -13221,11 +15072,447 @@ mod tests {
         }
     }
 
+    /// Deliberately does not inspect cancellation while gated.  It models a
+    /// transport stuck below Rhiza's cancellation boundary, which is the case
+    /// the effect-fetch group must contain without starving healthy peers.
+    struct ScriptedEffectFetchRecorder {
+        manifest: super::Result<Option<StoredCommand>>,
+        chunks: Vec<super::Result<Option<Vec<u8>>>>,
+        manifest_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        manifest_started: Option<mpsc::SyncSender<()>>,
+        chunk_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+    }
+
+    impl RecorderRpc for ScriptedEffectFetchRecorder {
+        fn fetch_effect_bundle_manifest(
+            &self,
+            _context: &RecorderRpcContext,
+            _binding: EffectBundleBinding,
+        ) -> super::Result<Option<StoredCommand>> {
+            if let Some(started) = &self.manifest_started {
+                let _ = started.send(());
+            }
+            if let Some(gate) = &self.manifest_gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.manifest.clone()
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            _context: &RecorderRpcContext,
+            _binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> super::Result<Option<Vec<u8>>> {
+            if let Some(gate) = &self.chunk_gate {
+                let (released, condition) = &**gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            self.chunks
+                .get(ordinal as usize)
+                .cloned()
+                .unwrap_or(Ok(None))
+        }
+    }
+
+    fn effect_fetch_fixture() -> (Membership, RecorderEffectBundle, StoredCommand) {
+        effect_fetch_fixture_with_chunks(vec![
+            b"first-effect-chunk".to_vec(),
+            b"second-effect-chunk".to_vec(),
+        ])
+    }
+
+    fn effect_fetch_fixture_with_chunks(
+        chunks: Vec<Vec<u8>>,
+    ) -> (Membership, RecorderEffectBundle, StoredCommand) {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let qefx = ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "effect-fetch-cluster",
+            1,
+            1,
+            membership.digest(),
+            9,
+            LogHash::digest(&[b"effect-fetch-prev"]),
+            ExternalEffectProfile::sql(vec![0x5a]),
+            &chunks,
+        )
+        .unwrap();
+        let manifest = StoredCommand::new(EntryType::Command, qefx.encode().unwrap());
+        let binding = EffectBundleBinding {
+            cluster_id: qefx.cluster_id().into(),
+            epoch: qefx.epoch(),
+            config_id: qefx.config_id(),
+            config_digest: qefx.config_digest(),
+            intended_slot: qefx.intended_slot(),
+            prev_hash: qefx.prev_hash(),
+            manifest_command_hash: manifest.hash(),
+            effect_digest: qefx.effect_digest_value(),
+        };
+        let bundle = RecorderEffectBundle::new(binding, chunks).unwrap();
+        EffectBundleFinalizeRequest::new(bundle.clone(), manifest.clone()).unwrap();
+        (membership, bundle, manifest)
+    }
+
+    fn effect_fetch_consensus(recorders: [ScriptedEffectFetchRecorder; 3]) -> ThreeNodeConsensus {
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "effect-fetch-cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(recorders)
+                .map(|(id, recorder)| (id.into(), Box::new(recorder) as Box<dyn RecorderRpc>))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn effect_fetch_healthy_peers_finish_before_a_slow_manifest_is_drained() {
+        let _blocking = lock_blocking_control_tests();
+        let (_membership, bundle, manifest) =
+            effect_fetch_fixture_with_chunks(vec![b"single-effect-chunk".to_vec()]);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&gate));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let valid = || -> Vec<super::Result<Option<Vec<u8>>>> {
+            bundle
+                .chunks()
+                .iter()
+                .cloned()
+                .map(|chunk| Ok(Some(chunk)))
+                .collect()
+        };
+        let consensus = Arc::new(effect_fetch_consensus([
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: Some(Arc::clone(&gate)),
+                manifest_started: Some(started_tx),
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+        ]));
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let binding = bundle.binding().clone();
+            let caller_manifest = manifest.clone();
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.resolve_effect_bundle_from_quorum(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &binding,
+                        &caller_manifest,
+                    ))
+                    .unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let healthy_deadline = Instant::now() + Duration::from_millis(250);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(Some(bundle.clone()))
+        );
+        assert!(
+            Instant::now() < healthy_deadline,
+            "a verified healthy effect bundle must not wait for the slow read's caller deadline"
+        );
+        caller.join().unwrap();
+        assert!(consensus.read_fence_workers[0]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        release_gate(&gate);
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        // The detached worker's late reply belongs only to the old group's
+        // private receiver.  A fresh fetch must obtain a clean bundle from
+        // the surviving pair without inherited replies or queued work.
+        assert_eq!(
+            consensus.resolve_effect_bundle_from_quorum(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                bundle.binding(),
+                &manifest,
+            ),
+            Ok(Some(bundle))
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn effect_fetch_quarantines_corrupt_source_but_uses_valid_hedge() {
+        let _blocking = lock_blocking_control_tests();
+        // One chunk isolates corrupt-source quarantine from later-ordinal scheduling. Multi-chunk
+        // sequencing is covered separately by the healthy/loss/cancellation fetch tests.
+        let (_membership, bundle, manifest) =
+            effect_fetch_fixture_with_chunks(vec![b"effect-fetch-chunk".to_vec()]);
+        let valid_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&valid_gate));
+        let valid = || -> Vec<super::Result<Option<Vec<u8>>>> {
+            bundle
+                .chunks()
+                .iter()
+                .cloned()
+                .map(|chunk| Ok(Some(chunk)))
+                .collect()
+        };
+        let mut corrupt = valid();
+        corrupt[0] = Ok(Some(b"corrupt-effect-chunk".to_vec()));
+        let consensus = effect_fetch_consensus([
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(None),
+                chunks: vec![Ok(None)],
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: corrupt,
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                // The healthy hedge intentionally has only the chunk. This makes the corrupt
+                // source the sole manifest source, so its chunk response must be observed and
+                // quarantined before the gated healthy chunk can complete the fetch.
+                manifest: Ok(None),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: Some(Arc::clone(&valid_gate)),
+            },
+        ]);
+        let consensus = Arc::new(consensus);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let binding = bundle.binding().clone();
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.resolve_effect_bundle_from_quorum(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &binding,
+                        &manifest,
+                    ))
+                    .unwrap();
+            })
+        };
+        let quarantine_deadline = Instant::now() + Duration::from_secs(10);
+        while !consensus.read_fence_workers[1]
+            .state
+            .quarantined
+            .load(Ordering::Acquire)
+        {
+            assert!(Instant::now() < quarantine_deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        release_gate(&valid_gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(Some(bundle))
+        );
+        caller.join().unwrap();
+        assert!(consensus.read_fence_workers[1]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn effect_fetch_all_bad_sources_return_typed_safety_error() {
+        let _blocking = lock_blocking_control_tests();
+        let (_membership, bundle, manifest) = effect_fetch_fixture();
+        let valid = || -> Vec<super::Result<Option<Vec<u8>>>> {
+            bundle
+                .chunks()
+                .iter()
+                .cloned()
+                .map(|chunk| Ok(Some(chunk)))
+                .collect()
+        };
+        let mut corrupt = valid();
+        corrupt[0] = Ok(Some(b"corrupt-effect-chunk".to_vec()));
+        let missing = bundle.chunks().iter().map(|_| Ok(None)).collect();
+        let consensus = effect_fetch_consensus([
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(None),
+                chunks: missing,
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: corrupt,
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: bundle.chunks().iter().map(|_| Ok(None)).collect(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+        ]);
+        assert!(matches!(
+            consensus.resolve_effect_bundle_from_quorum(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                bundle.binding(),
+                &manifest,
+            ),
+            Err(Error::EffectBundleInvalid(_))
+        ));
+        assert!(consensus.read_fence_workers[1]
+            .state
+            .quarantined
+            .load(Ordering::Acquire));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn effect_fetch_survives_one_recorder_loss() {
+        let _blocking = lock_blocking_control_tests();
+        let (_membership, bundle, manifest) = effect_fetch_fixture();
+        let valid = || -> Vec<super::Result<Option<Vec<u8>>>> {
+            bundle
+                .chunks()
+                .iter()
+                .cloned()
+                .map(|chunk| Ok(Some(chunk)))
+                .collect()
+        };
+        let consensus = effect_fetch_consensus([
+            ScriptedEffectFetchRecorder {
+                manifest: Err(Error::Io("lost recorder".into())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+        ]);
+        assert_eq!(
+            consensus.resolve_effect_bundle_from_quorum(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                bundle.binding(),
+                &manifest,
+            ),
+            Ok(Some(bundle))
+        );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn effect_fetch_cancellation_prunes_queued_chunks_and_drains_after_release() {
+        let _blocking = lock_blocking_control_tests();
+        let (_membership, bundle, manifest) = effect_fetch_fixture();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&gate));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let missing = || bundle.chunks().iter().map(|_| Ok(None)).collect();
+        let consensus = Arc::new(effect_fetch_consensus([
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: missing(),
+                manifest_gate: Some(Arc::clone(&gate)),
+                manifest_started: Some(started_tx),
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(None),
+                chunks: missing(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(None),
+                chunks: missing(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+        ]));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = RecorderRpcContext::with_timeout_and_cancellation(
+            Duration::from_secs(1),
+            Arc::clone(&cancellation),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let binding = bundle.binding().clone();
+            let caller_manifest = manifest.clone();
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.resolve_effect_bundle_from_quorum(
+                        &context,
+                        &binding,
+                        &caller_manifest,
+                    ))
+                    .unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(true, Ordering::Release);
+        release_gate(&gate);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::RpcCancelled)
+        );
+        caller.join().unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert!(consensus
+            .read_fence_workers
+            .iter()
+            .all(ControlWorker::is_idle));
+    }
+
     struct ScriptedCommandStoreRecorder {
         recorder_id: &'static str,
         entered: mpsc::SyncSender<&'static str>,
         gate: Option<Arc<(Mutex<bool>, Condvar)>>,
         reply: super::Result<()>,
+        stored: Mutex<Vec<(LogHash, StoredCommand)>>,
     }
 
     impl RecorderRpc for ScriptedCommandStoreRecorder {
@@ -13236,8 +15523,8 @@ mod tests {
             _epoch: u64,
             _config_id: u64,
             _config_digest: LogHash,
-            _command_hash: LogHash,
-            _command: StoredCommand,
+            command_hash: LogHash,
+            command: StoredCommand,
         ) -> super::Result<()> {
             self.entered.send(self.recorder_id).unwrap();
             if let Some(gate) = &self.gate {
@@ -13247,7 +15534,21 @@ mod tests {
                     released = condition.wait(released).unwrap();
                 }
             }
-            self.reply.clone()
+            self.reply.clone()?;
+            if command.hash() != command_hash {
+                return Err(Error::CommandHashMismatch);
+            }
+            let mut stored = self.stored.lock().unwrap();
+            match stored.iter().find(|(hash, _)| *hash == command_hash) {
+                Some((_, existing_command)) if *existing_command != command => {
+                    Err(Error::CommandHashMismatch)
+                }
+                Some(_) => Ok(()),
+                None => {
+                    stored.push((command_hash, command));
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -18131,6 +20432,112 @@ mod tests {
         assert_eq!(directory_files(parent.path()), parent_before);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn post_preflight_root_swap_keeps_all_durable_io_and_lock_on_the_anchor() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("recorder");
+        let retained = parent.path().join("retained-recorder");
+        let staged = parent.path().join("replacement-recorder");
+        let external = parent.path().join("external-target");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        drop(
+            RecorderFileStore::new_with_membership(
+                &root,
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        );
+        std::fs::write(&external, b"external-bytes").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        *lock_unpoison(RECORDER_POST_PREFLIGHT_HOOK.get_or_init(|| Mutex::new(None))) =
+            Some(RecorderPostPreflightHook {
+                root: root.clone(),
+                entered: entered_tx,
+                release: release_rx,
+            });
+        let open_root = root.clone();
+        let open_membership = membership.clone();
+        let opener = thread::spawn(move || {
+            RecorderFileStore::open_existing_with_membership(
+                open_root,
+                "n1",
+                "cluster",
+                1,
+                1,
+                open_membership,
+            )
+        });
+        entered_rx.recv().unwrap();
+
+        std::fs::create_dir(&staged).unwrap();
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            std::fs::copy(entry.path(), staged.join(entry.file_name())).unwrap();
+        }
+        std::fs::rename(&root, &retained).unwrap();
+        std::fs::rename(&staged, &root).unwrap();
+        symlink(&external, root.join("external-target-link")).unwrap();
+        let replacement_before = directory_files(&root);
+        let external_before = std::fs::read(&external).unwrap();
+        release_tx.send(()).unwrap();
+        let store = opener.join().unwrap().unwrap();
+
+        let command = StoredCommand::new(EntryType::Command, b"anchored-after-swap".to_vec());
+        store
+            .store_command(command.hash(), command.clone())
+            .unwrap();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: None,
+            })
+            .unwrap();
+        store.checkpoint_wal_unlocked().unwrap();
+        let configuration = store.configuration_state().unwrap();
+        let head = store.recorded_head.lock().unwrap().clone();
+        store
+            .commit_configuration_head_unlocked(&configuration, &head)
+            .unwrap();
+        store
+            .commit_transition_unlocked(
+                &RecorderSlotState::new_with_digest(9, "cluster", 1, 1, membership.digest()),
+                &configuration,
+            )
+            .unwrap();
+
+        assert_eq!(directory_files(&root), replacement_before);
+        assert_eq!(std::fs::read(&external).unwrap(), external_before);
+        assert!(retained.join("slot-00000000000000000009.rec").exists());
+        assert!(matches!(
+            RecorderFileStore::open_existing_with_membership(
+                &retained,
+                "n1-second",
+                "cluster",
+                1,
+                1,
+                membership,
+            ),
+            Err(Error::RecorderRootLocked(path)) if path == retained
+        ));
+    }
+
     #[test]
     fn existing_open_never_recreates_a_deleted_or_replaced_recoverable_recorder_root() {
         let parent = tempfile::tempdir().unwrap();
@@ -18243,6 +20650,35 @@ mod tests {
             .join(".recorder.lock")
             .exists());
         assert_eq!(directory_files(target.path()), before);
+    }
+
+    #[test]
+    fn storage_generation_marker_is_exact_and_marker_only_root_is_fresh() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("recorder");
+        let anchor = prepare_fresh_recorder_root(&root).unwrap();
+        ensure_storage_generation(&anchor).unwrap();
+        assert_eq!(
+            std::fs::read(root.join(STORAGE_GENERATION_FILE)).unwrap(),
+            STORAGE_GENERATION_FINGERPRINT
+        );
+        assert!(!current_recorder_layout(&root).unwrap());
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        RecorderFileStore::new_with_membership(&root, "n1", "cluster", 1, 1, membership).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_generation_marker_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"untouched").unwrap();
+        symlink(outside.path(), root.path().join(STORAGE_GENERATION_FILE)).unwrap();
+        let anchor = anchored_fs::AnchoredDir::open(root.path()).unwrap();
+        assert!(ensure_storage_generation(&anchor).is_err());
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"untouched");
     }
 
     #[test]
@@ -18954,7 +21390,7 @@ mod tests {
     }
 
     #[test]
-    fn install_proof_missing_admitted_reply_after_worker_exit_is_unknown() {
+    fn install_proof_exact_quorum_survives_missing_admitted_reply_after_worker_exit() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(2);
         let fast = Arc::new((Mutex::new(false), Condvar::new()));
@@ -19009,10 +21445,7 @@ mod tests {
         release_gate(&fast);
         assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         release_gate(&pause);
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(Error::UnknownOutcome))
-        );
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
         caller.join().unwrap();
         assert!(consensus.control_workers[2].is_idle());
         let queue = &consensus.control_workers[2].state.queue;
@@ -19056,7 +21489,7 @@ mod tests {
     }
 
     #[test]
-    fn install_proof_drain_miss_quarantines_before_unknown_and_survivors_recover() {
+    fn install_proof_exact_quorum_survives_a_quarantined_drain_miss() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(3);
         let slow = Arc::new((Mutex::new(false), Condvar::new()));
@@ -19118,10 +21551,7 @@ mod tests {
         );
         release_gate(&fast);
         ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(Error::UnknownOutcome))
-        );
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
         assert!(consensus.control_workers[0]
             .state
             .quarantined
@@ -19342,7 +21772,7 @@ mod tests {
     }
 
     #[test]
-    fn install_proof_late_unknown_overrides_frozen_quorum_success() {
+    fn install_proof_unknown_reply_before_exact_quorum_does_not_freeze() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(3);
         let fast = Arc::new((Mutex::new(false), Condvar::new()));
@@ -19391,13 +21821,10 @@ mod tests {
         for _ in 0..3 {
             entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         }
-        release_gate(&fast);
-        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         release_gate(&late);
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(Error::UnknownOutcome))
-        );
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&fast);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
@@ -19616,7 +22043,7 @@ mod tests {
                 Err(Error::UnknownOutcome),
                 Err(Error::ProposeFailed),
             ],
-            Err(Error::UnknownOutcome),
+            Err(Error::TypedProofInstallRequired),
         );
     }
 
@@ -19726,6 +22153,7 @@ mod tests {
                         entered: entered_tx.clone(),
                         gate: Some(gate),
                         reply,
+                        stored: Mutex::new(Vec::new()),
                     }) as Box<dyn RecorderRpc>
                 };
                 let consensus = Arc::new(
@@ -19852,6 +22280,7 @@ mod tests {
                     entered: entered_tx.clone(),
                     gate: Some(gate),
                     reply,
+                    stored: Mutex::new(Vec::new()),
                 }) as Box<dyn RecorderRpc>
             };
             let consensus = Arc::new(
@@ -19934,6 +22363,7 @@ mod tests {
                 entered: entered_tx.clone(),
                 gate,
                 reply: Ok(()),
+                stored: Mutex::new(Vec::new()),
             }) as Box<dyn RecorderRpc>
         };
         let consensus = Arc::new(
@@ -19976,7 +22406,7 @@ mod tests {
     }
 
     #[test]
-    fn store_command_missing_admitted_reply_after_worker_exit_is_unknown() {
+    fn store_command_exact_quorum_survives_missing_admitted_reply_after_worker_exit() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(2);
         let fast = Arc::new((Mutex::new(false), Condvar::new()));
@@ -19989,6 +22419,7 @@ mod tests {
                 entered: entered_tx.clone(),
                 gate: Some(Arc::clone(&fast)),
                 reply: Ok(()),
+                stored: Mutex::new(Vec::new()),
             }) as Box<dyn RecorderRpc>
         };
         let consensus = Arc::new(
@@ -20033,10 +22464,7 @@ mod tests {
         release_gate(&fast);
         assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         release_gate(&pause);
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(Error::UnknownOutcome))
-        );
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
         caller.join().unwrap();
         assert!(consensus.control_workers[2].is_idle());
         let queue = &consensus.control_workers[2].state.queue;
@@ -20087,7 +22515,7 @@ mod tests {
     }
 
     #[test]
-    fn store_command_late_unknown_overrides_frozen_quorum_success() {
+    fn store_command_unknown_reply_before_exact_quorum_does_not_freeze() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(3);
         let fast = Arc::new((Mutex::new(false), Condvar::new()));
@@ -20100,6 +22528,7 @@ mod tests {
                 entered: entered_tx.clone(),
                 gate,
                 reply,
+                stored: Mutex::new(Vec::new()),
             }) as Box<dyn RecorderRpc>
         };
         let consensus = Arc::new(
@@ -20136,13 +22565,10 @@ mod tests {
         for _ in 0..3 {
             entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         }
-        release_gate(&fast);
-        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         release_gate(&late);
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(Error::UnknownOutcome))
-        );
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_gate(&fast);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
         caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
@@ -20215,6 +22641,7 @@ mod tests {
                         entered: entered_tx.clone(),
                         gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
                         reply: Ok(()),
+                        stored: Mutex::new(Vec::new()),
                     }) as Box<dyn RecorderRpc>,
                 )
             })
@@ -20276,6 +22703,7 @@ mod tests {
                         entered: entered_tx.clone(),
                         gate: (recorder_id == "n1").then(|| Arc::clone(&worker_gate)),
                         reply: Ok(()),
+                        stored: Mutex::new(Vec::new()),
                     }) as Box<dyn RecorderRpc>,
                 )
             })
@@ -20351,6 +22779,7 @@ mod tests {
                         entered: entered_tx.clone(),
                         gate: None,
                         reply: Ok(()),
+                        stored: Mutex::new(Vec::new()),
                     }) as Box<dyn RecorderRpc>,
                 )
             })
@@ -20370,7 +22799,7 @@ mod tests {
     }
 
     #[test]
-    fn store_command_drain_miss_quarantines_before_unknown_and_survivors_recover() {
+    fn store_command_exact_quorum_survives_drain_miss_and_quarantines_worker() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(3);
         let slow = Arc::new((Mutex::new(false), Condvar::new()));
@@ -20383,6 +22812,7 @@ mod tests {
                 entered: entered_tx.clone(),
                 gate,
                 reply: Ok(()),
+                stored: Mutex::new(Vec::new()),
             }) as Box<dyn RecorderRpc>
         };
         let consensus = Arc::new(
@@ -20428,10 +22858,7 @@ mod tests {
         );
         release_gate(&fast);
         ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(Error::UnknownOutcome))
-        );
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
         assert!(consensus.control_workers[0]
             .state
             .quarantined
@@ -21390,7 +23817,10 @@ mod tests {
                 "record broadcast was not admitted"
             );
             assert_eq!(record.pending(), 0);
-            assert_eq!(record.cancel_count(), 0);
+            assert!(
+                record.cancel_count() > 0,
+                "each exact record quorum must cancel its cooperative minority hedge"
+            );
             assert_eq!(record.quarantine_count(), 0);
             assert!(
                 control.dispatch_count() > 0,
