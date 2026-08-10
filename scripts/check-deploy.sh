@@ -1460,6 +1460,23 @@ grep -Fq 'canonical_cluster_id="rhiza:${profile}:${logical_cluster_id}"' \
 grep -Fq 'export RHIZA_CLUSTER_ID="$logical_cluster_id"' scripts/e2e-vind-rustfs.sh
 # shellcheck disable=SC2016
 grep -Fq 'name="rhiza-${profile}-c${id}"' scripts/e2e-vind-rustfs.sh
+grep -Fq 'RHIZA_CHAOS_RUN_ID must be a DNS label' scripts/e2e-vind-rustfs.sh
+grep -Fq '.spec.template.metadata.labels["app.kubernetes.io/part-of"] = "rhiza-chaos"' \
+  scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+rustfs_chaos_label_line="$(grep -nF 'inject_chaos_labels "$target/rustfs.yaml" object-store' \
+  scripts/e2e-vind-rustfs.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+rustfs_apply_line="$(grep -nF 'k apply -f "$target/rustfs.yaml"' \
+  scripts/e2e-vind-rustfs.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+voter_chaos_label_line="$(grep -nF 'inject_chaos_labels "$target/config-c1.yaml" voter' \
+  scripts/e2e-vind-rustfs.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+voter_create_line="$(grep -nF 'k create -f "$target/config-c1.yaml"' \
+  scripts/e2e-vind-rustfs.sh | cut -d: -f1)"
+[ -n "$rustfs_chaos_label_line" ] && [ "$rustfs_chaos_label_line" -lt "$rustfs_apply_line" ]
+[ -n "$voter_chaos_label_line" ] && [ "$voter_chaos_label_line" -lt "$voter_create_line" ]
 grep -Fq "recorder_tcp_addr:(\$name + \"-\" + (\$n|tostring) + \".\" + \$name + \":8082\")" \
   scripts/e2e-vind-rustfs.sh
 grep -Fq "recorder_tls_server_name:(\$name + \"-\" + (\$n|tostring) + \".\" + \$name)" \

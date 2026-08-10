@@ -48,6 +48,7 @@ fresh_cell_isolation=null
 marker=/var/lib/rhiza/emptydir-marker
 marker_helper_container=e2e-marker
 marker_helper_image="${RHIZA_MARKER_HELPER_IMAGE:-busybox:1.36.1}"
+chaos_run_id="${RHIZA_CHAOS_RUN_ID:-}"
 diagnostic_secrets=()
 
 die() { echo "$*" >&2; exit 1; }
@@ -64,6 +65,9 @@ case "$skip_build" in 0|1) ;; *) die "RHIZA_VIND_SKIP_BUILD must be 0 or 1";; es
 case "$direct_cluster" in 0|1) ;; *) die "RHIZA_VIND_DIRECT_CLUSTER must be 0 or 1";; esac
 case "$skip_image_load" in 0|1) ;; *) die "RHIZA_VIND_SKIP_IMAGE_LOAD must be 0 or 1";; esac
 case "$marker_helper_image" in '') die "RHIZA_MARKER_HELPER_IMAGE must not be empty";; esac
+if [ -n "$chaos_run_id" ] && ! [[ "$chaos_run_id" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  die "RHIZA_CHAOS_RUN_ID must be a DNS label"
+fi
 case "$recovery_matrix" in 0|1) ;; *) die "RHIZA_E2E_RECOVERY_MATRIX must be 0 or 1";; esac
 case "$recovery_matrix_only" in 0|1) ;; *) die "RHIZA_E2E_RECOVERY_MATRIX_ONLY must be 0 or 1";; esac
 case "$recovery_require_fresh_vcluster" in 0|1) ;; *) die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER must be 0 or 1";; esac
@@ -428,8 +432,22 @@ k create secret generic rhiza-auth \
   --from-literal=admin-token="$admin_token" \
   --from-literal=tail-token="$tail_token" >/dev/null
 
+inject_chaos_labels() {
+  [ -n "$chaos_run_id" ] || return 0
+  export CHAOS_RUN_ID="$chaos_run_id" CHAOS_ROLE="$2"
+  yq eval --inplace '
+    with(select(.kind == strenv(CHAOS_KIND));
+      .spec.template.metadata.labels["app.kubernetes.io/part-of"] = "rhiza-chaos" |
+      .spec.template.metadata.labels["chaos.rhiza.io/run"] = strenv(CHAOS_RUN_ID) |
+      .spec.template.metadata.labels["chaos.rhiza.io/role"] = strenv(CHAOS_ROLE)
+    )
+  ' "$1"
+}
+
 sed -e "s|__RUSTFS_IMAGE__|$rustfs_image|g" -e "s|__AWS_CLI_IMAGE__|$aws_image|g" \
   deploy/k8s/rustfs-e2e.yaml > "$target/rustfs.yaml"
+export CHAOS_KIND=Deployment
+inject_chaos_labels "$target/rustfs.yaml" object-store
 yq eval '.' "$target/rustfs.yaml" >/dev/null
 k apply -f "$target/rustfs.yaml" >/dev/null
 k rollout status deployment/rustfs --timeout=240s >/dev/null
@@ -481,6 +499,8 @@ echo "== initialize object checkpoint and bootstrap config 1 =="
 scripts/k8s-object-job.sh 1 "$target/config-c1.json" init-checkpoint >/dev/null
 RHIZA_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
   1 3 "$target/config-c1.json" "$target/config-c1.yaml"
+export CHAOS_KIND=StatefulSet
+inject_chaos_labels "$target/config-c1.yaml" voter
 inject_marker_helper "$target/config-c1.yaml"
 k create -f "$target/config-c1.yaml" >/dev/null
 "$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c1" 3 1

@@ -17,6 +17,9 @@ grep -Fq -- 'CHAOS_AUTHORIZED_CONTEXT' scripts/chaos-k8s.sh
 grep -Fq -- '--include-crds' scripts/chaos-k8s.sh
 grep -Fq -- 'CHAOS_INSTALL_MANIFEST_OUT' scripts/chaos-k8s.sh
 grep -Fq -- 'CHAOS_EXPECTED_SYSTEMS' scripts/chaos-k8s.sh
+grep -Fq -- 'wait_for_recovered_quorum' scripts/chaos-rhiza-workload-hook.sh
+grep -Fq -- 'ready_voters' scripts/chaos-rhiza-workload-hook.sh
+grep -Fq -- 'read_barrier' scripts/chaos-rhiza-workload-hook.sh
 grep -Fq -- 'apply --server-side --field-manager=rhiza-chaos' scripts/chaos-k8s.sh
 yq -e '.clusterScoped == true and .controllerManager.enableFilterNamespace == true and .dashboard.create == false and .dnsServer.create == false and .chaosDaemon.runtime == "containerd" and .chaosDaemon.socketPath == "/run/containerd/containerd.sock"' deploy/chaos/values-shared-gke.yaml >/dev/null
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT

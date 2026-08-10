@@ -24,6 +24,22 @@ client() {
   kubectl --context "$CHAOS_K8S_CONTEXT" -n "$CHAOS_NAMESPACE" exec "$pod" -- rhiza "$@" --url http://127.0.0.1:8080
 }
 
+wait_for_recovered_quorum() {
+  local key="$1" evidence="$2" attempt ready
+  : > "$evidence"
+  for attempt in $(seq 1 180); do
+    ready="$(kubectl --context "$CHAOS_K8S_CONTEXT" -n "$CHAOS_NAMESPACE" get pods -l "$selector" -o json |
+      jq '[.items[] | select(.status.phase=="Running" and any(.status.conditions[]?; .type=="Ready" and .status=="True"))] | length')"
+    printf 'attempt=%s ready_voters=%s\n' "$attempt" "$ready" >> "$evidence"
+    if [ "$ready" = 3 ] && client read --key "$key" --consistency read_barrier >> "$evidence" 2>&1 \
+      && tail -n 1 "$evidence" | grep -q '^value=null '; then
+      return 0
+    fi
+    sleep 1
+  done
+  die 'three-voter read-barrier convergence did not recover after fault removal'
+}
+
 if [ "$phase" = prepare ]; then
   id="$CHAOS_RUN_ID-$cutpoint-$(date -u +%Y%m%d%H%M%S)-$$"
   key="chaos-$id"
@@ -33,6 +49,7 @@ if [ "$phase" = prepare ]; then
     grep -q '^value=null ' "$raw" || die 'fresh pre-ack key was unexpectedly present'
     durable=false
   else
+    wait_for_recovered_quorum "$key" "$output_dir/rhiza-post-ack-recovery.raw"
     client write --request-id "$id" --key "$key" --value "$value" > "$raw"
     grep -q '^applied_index=' "$raw" || die 'write returned no acknowledgement'
     durable=true
