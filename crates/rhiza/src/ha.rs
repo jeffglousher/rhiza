@@ -91,9 +91,9 @@ use rhiza_node::{
     RecorderPostcardRpcTlsServerConfig,
 };
 use rhiza_quepaxa::{
-    AcceptedValue, DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest,
-    RecordRequest, RecordSummary, RecorderFileStore, RecorderPreflight, RecorderRpc,
-    ThreeNodeConsensus,
+    AcceptedValue, DecisionProof, EffectBundleBinding, Membership, ReadFenceObservation,
+    ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore, RecorderPreflight,
+    RecorderRpc, ThreeNodeConsensus,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt as _;
@@ -6429,6 +6429,57 @@ impl RecorderRpc for HaRecorder {
         )
     }
 
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.require_active()?;
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.require_active()?;
+        RecorderRpc::finalize_staged_effect_bundle(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+        )
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.recorder, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.recorder, context, binding, ordinal)
+    }
+
     fn record(
         &self,
         context: &rhiza_quepaxa::RecorderRpcContext,
@@ -9632,6 +9683,62 @@ mod tests {
                     .unwrap(),
             ],
         )
+    }
+
+    #[test]
+    fn ha_recorder_forwards_external_effect_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let (recorder, _) = test_http_recorder(root.path());
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let chunks = vec![b"ha-effect".to_vec()];
+        let qefx = rhiza_core::ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "cluster-a",
+            1,
+            1,
+            membership.digest(),
+            1,
+            LogHash::ZERO,
+            rhiza_core::ExternalEffectProfile::sql(vec![1]),
+            &chunks,
+        )
+        .unwrap();
+        let manifest = StoredCommand::new(rhiza_core::EntryType::Command, qefx.encode().unwrap());
+        let binding = EffectBundleBinding {
+            cluster_id: qefx.cluster_id().into(),
+            epoch: qefx.epoch(),
+            config_id: qefx.config_id(),
+            config_digest: qefx.config_digest(),
+            intended_slot: qefx.intended_slot(),
+            prev_hash: qefx.prev_hash(),
+            manifest_command_hash: manifest.hash(),
+            effect_digest: qefx.effect_digest_value(),
+        };
+        let context = rhiza_quepaxa::RecorderRpcContext::default_timeout();
+        RecorderRpc::stage_effect_bundle_chunk(
+            &recorder,
+            &context,
+            binding.clone(),
+            manifest.clone(),
+            0,
+            chunks[0].clone(),
+        )
+        .unwrap();
+        RecorderRpc::finalize_staged_effect_bundle(
+            &recorder,
+            &context,
+            binding.clone(),
+            manifest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            RecorderRpc::fetch_effect_bundle_manifest(&recorder, &context, binding.clone(),)
+                .unwrap(),
+            Some(manifest)
+        );
+        assert_eq!(
+            RecorderRpc::fetch_effect_bundle_chunk(&recorder, &context, binding, 0).unwrap(),
+            Some(chunks[0].clone())
+        );
     }
 
     fn test_recorder_tls_material() -> (String, String) {

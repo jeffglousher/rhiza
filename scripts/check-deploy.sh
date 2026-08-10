@@ -1460,6 +1460,10 @@ grep -Fq 'canonical_cluster_id="rhiza:${profile}:${logical_cluster_id}"' \
 grep -Fq 'export RHIZA_CLUSTER_ID="$logical_cluster_id"' scripts/e2e-vind-rustfs.sh
 # shellcheck disable=SC2016
 grep -Fq 'name="rhiza-${profile}-c${id}"' scripts/e2e-vind-rustfs.sh
+grep -Fq "recorder_tcp_addr:(\$name + \"-\" + (\$n|tostring) + \".\" + \$name + \":8082\")" \
+  scripts/e2e-vind-rustfs.sh
+grep -Fq "recorder_tls_server_name:(\$name + \"-\" + (\$n|tostring) + \".\" + \$name)" \
+  scripts/e2e-vind-rustfs.sh
 if grep -Eq 'rhiza-c[0-9]' scripts/e2e-vind-rustfs.sh; then
   echo "vind E2E retained an unscoped rhiza-cN resource name" >&2
   exit 1

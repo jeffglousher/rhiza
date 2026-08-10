@@ -442,13 +442,19 @@ fresh_assert_prebootstrap_absence
 
 make_bundle() {
   id="$1" output="$2" name="rhiza-${profile}-c${id}"
-  jq -n --argjson id "$id" --argjson tokens "$peer_tokens" --arg name "$name" '
+  jq -n --argjson id "$id" --argjson tokens "$peer_tokens" --arg name "$name" \
+    --arg recorder_transport "${RHIZA_RECORDER_TRANSPORT:-http}" \
+    --arg recorder_tls "${RHIZA_RECORDER_TLS:-off}" '
     {config_id:$id, members:[range(3) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://" + $name + "-" + ($n|tostring) + "." + $name + ":8081"),
       log_url:("http://" + $name + "-" + ($n|tostring) + "." + $name + ":8080"),
       token:$tokens[$n]
-    }]}
+    } + (if $recorder_transport != "http" then {
+      recorder_tcp_addr:($name + "-" + ($n|tostring) + "." + $name + ":8082")
+    } else {} end) + (if $recorder_tls == "on" then {
+      recorder_tls_server_name:($name + "-" + ($n|tostring) + "." + $name)
+    } else {} end)]}
   ' > "$output"
   chmod 600 "$output"
 }
