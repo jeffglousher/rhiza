@@ -31,9 +31,9 @@ use rhiza_node::{
 use rhiza_node::{GraphCommandV1, GraphValueV1};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
-    install_test_control_operation_probe, DecisionProof, Membership, ReadFenceObservation,
-    ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
-    RecorderRpcContext, TestControlOperationProbe, ThreeNodeConsensus,
+    install_test_control_operation_probe, DecisionProof, EffectBundleBinding, Membership,
+    ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
+    RecorderRpc, RecorderRpcContext, TestControlOperationProbe, ThreeNodeConsensus,
 };
 use rhiza_sql::SqliteStateMachine;
 
@@ -1017,6 +1017,55 @@ impl RecorderRpc for BlockingRehydrateRecorder {
     ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
         self.recorder
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: rhiza_core::StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: rhiza_core::StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::finalize_staged_effect_bundle(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+        )
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.recorder, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.recorder, context, binding, ordinal)
     }
 }
 

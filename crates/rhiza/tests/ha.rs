@@ -275,7 +275,9 @@ fn archive(root: &Path) -> ObjectArchiveStore {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
             1,
         ),
     )
@@ -611,7 +613,9 @@ async fn finalized_successor_restart_handles_empty_target_archive_before_activat
             "rhiza:sql:cluster-a",
             1,
             2,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -1393,7 +1397,9 @@ async fn fresh_live_successor_rejoins_the_active_target_checkpoint_without_prede
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -1404,7 +1410,9 @@ async fn fresh_live_successor_rejoins_the_active_target_checkpoint_without_prede
             "rhiza:sql:cluster-a",
             1,
             2,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );

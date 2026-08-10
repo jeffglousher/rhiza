@@ -12399,7 +12399,10 @@ impl NodeRuntime {
         let bundle = self
             .consensus
             .resolve_effect_bundle_from_quorum(
-                &self.consensus_context(),
+                // Archive publication is part of shutdown/recovery cleanup
+                // and must remain able to perform bounded read-only QEFX
+                // resolution after ordinary operation admission is closed.
+                &RecorderRpcContext::with_timeout(DEFAULT_RECORDER_RPC_TIMEOUT),
                 &binding,
                 &manifest_command,
             )

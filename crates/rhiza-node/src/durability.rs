@@ -1676,14 +1676,16 @@ impl CheckpointCoordinator {
             .await?
             .ok_or(DurabilityError::MissingCheckpoint)?;
         let certificate = self.store.checkpoint_readback_certificate(&loaded).await?;
-        if certificate.identity().cluster_id() != pending.cluster_id
+        let identity_mismatch = certificate.identity().cluster_id() != pending.cluster_id
             || certificate.identity().epoch() != pending.epoch
             || certificate.identity().config_id() != pending.config_id
-            || certificate.identity().config_digest().to_hex() != pending.config_digest
-            || certificate.tip().index() != pending.through_slot
-            || certificate.tip().hash().to_hex() != pending.checkpoint_hash
-            || certificate.manifest_digest().to_hex() != pending.manifest_digest
-        {
+            || certificate.identity().config_digest().to_hex() != pending.config_digest;
+        let visible_tip = certificate.tip().index();
+        let rollback = visible_tip < pending.through_slot;
+        let same_tip_conflict = visible_tip == pending.through_slot
+            && (certificate.tip().hash().to_hex() != pending.checkpoint_hash
+                || certificate.manifest_digest().to_hex() != pending.manifest_digest);
+        if identity_mismatch || rollback || same_tip_conflict {
             return Err(DurabilityError::SnapshotVerification(
                 "pending QEFX GC evidence no longer matches the visible checkpoint".into(),
             ));
