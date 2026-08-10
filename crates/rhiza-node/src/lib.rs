@@ -686,6 +686,11 @@ impl fmt::Debug for TunerTelemetry {
 
 pub const RECORDER_STORE_COMMAND_PATH: &str = "/v2/quepaxa/recorder/store-command";
 pub const RECORDER_FETCH_COMMAND_PATH: &str = "/v2/quepaxa/recorder/fetch-command";
+pub const RECORDER_STAGE_EFFECT_CHUNK_PATH: &str = "/v3/quepaxa/recorder/stage-effect-chunk";
+pub const RECORDER_FINALIZE_EFFECT_BUNDLE_PATH: &str =
+    "/v3/quepaxa/recorder/finalize-effect-bundle";
+pub const RECORDER_FETCH_EFFECT_MANIFEST_PATH: &str = "/v3/quepaxa/recorder/fetch-effect-manifest";
+pub const RECORDER_FETCH_EFFECT_CHUNK_PATH: &str = "/v3/quepaxa/recorder/fetch-effect-chunk";
 pub const RECORDER_INSPECT_PROOF_PATH: &str = "/v2/quepaxa/recorder/inspect-proof";
 pub const RECORDER_INSPECT_RECORD_PATH: &str = "/v2/quepaxa/recorder/inspect-record";
 pub const RECORDER_READ_FENCE_PATH: &str = "/v3/quepaxa/recorder/read-fence";
@@ -2146,6 +2151,31 @@ struct FetchCommandV2 {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct StageEffectChunkV3 {
+    binding: EffectBundleBinding,
+    manifest_command: StoredCommand,
+    ordinal: u16,
+    chunk: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct FinalizeEffectBundleV3 {
+    binding: EffectBundleBinding,
+    manifest_command: StoredCommand,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct FetchEffectManifestV3 {
+    binding: EffectBundleBinding,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct FetchEffectChunkV3 {
+    binding: EffectBundleBinding,
+    ordinal: u16,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct InspectProofV2 {
     slot: u64,
 }
@@ -2719,6 +2749,71 @@ impl RecorderRpc for HttpRecorderClient {
                 config_digest,
                 command_hash,
             },
+            false,
+        )
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.post_v2(
+            context,
+            RECORDER_STAGE_EFFECT_CHUNK_PATH,
+            StageEffectChunkV3 {
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            },
+            true,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.post_v2(
+            context,
+            RECORDER_FINALIZE_EFFECT_BUNDLE_PATH,
+            FinalizeEffectBundleV3 {
+                binding,
+                manifest_command,
+            },
+            true,
+        )
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        self.post_v2(
+            context,
+            RECORDER_FETCH_EFFECT_MANIFEST_PATH,
+            FetchEffectManifestV3 { binding },
+            false,
+        )
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        self.post_v2(
+            context,
+            RECORDER_FETCH_EFFECT_CHUNK_PATH,
+            FetchEffectChunkV3 { binding, ordinal },
             false,
         )
     }
@@ -4234,6 +4329,22 @@ where
             post(handle_recorder_fetch_command::<R>),
         )
         .route(
+            RECORDER_STAGE_EFFECT_CHUNK_PATH,
+            post(handle_recorder_stage_effect_chunk::<R>),
+        )
+        .route(
+            RECORDER_FINALIZE_EFFECT_BUNDLE_PATH,
+            post(handle_recorder_finalize_effect_bundle::<R>),
+        )
+        .route(
+            RECORDER_FETCH_EFFECT_MANIFEST_PATH,
+            post(handle_recorder_fetch_effect_manifest::<R>),
+        )
+        .route(
+            RECORDER_FETCH_EFFECT_CHUNK_PATH,
+            post(handle_recorder_fetch_effect_chunk::<R>),
+        )
+        .route(
             RECORDER_INSPECT_PROOF_PATH,
             post(handle_recorder_inspect_proof::<R>),
         )
@@ -4446,6 +4557,155 @@ where
                 body.config_digest,
                 body.command_hash,
             )
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_stage_effect_chunk<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request = match decode_recorder_json::<StageEffectChunkV3, _>(&state, &headers, body).await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.version != RECORDER_WIRE_VERSION
+        || !valid_recorder_command(&request.body.manifest_command)
+    {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("invalid recorder effect request".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_mutation_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let body = request.body;
+            recorder.stage_effect_bundle_chunk(
+                &context,
+                body.binding,
+                body.manifest_command,
+                body.ordinal,
+                body.chunk,
+            )
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_finalize_effect_bundle<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request =
+        match decode_recorder_json::<FinalizeEffectBundleV3, _>(&state, &headers, body).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    if request.version != RECORDER_WIRE_VERSION
+        || !valid_recorder_command(&request.body.manifest_command)
+    {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("invalid recorder effect request".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_mutation_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let body = request.body;
+            recorder.finalize_staged_effect_bundle(&context, body.binding, body.manifest_command)
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_fetch_effect_manifest<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request =
+        match decode_recorder_json::<FetchEffectManifestV3, _>(&state, &headers, body).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    if request.version != RECORDER_WIRE_VERSION {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            recorder.fetch_effect_bundle_manifest(&context, request.body.binding)
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_fetch_effect_chunk<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request = match decode_recorder_json::<FetchEffectChunkV3, _>(&state, &headers, body).await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.version != RECORDER_WIRE_VERSION {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let body = request.body;
+            recorder.fetch_effect_bundle_chunk(&context, body.binding, body.ordinal)
         })
         .await,
     )
@@ -17184,6 +17444,91 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.unwrap(), "node-1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_round_trips_external_effect_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "node-1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                recorder_router(
+                    store,
+                    vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()],
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let chunks = vec![b"http-effect-bundle".to_vec()];
+        let command = ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "cluster",
+            1,
+            1,
+            membership.digest(),
+            1,
+            LogHash::ZERO,
+            rhiza_core::ExternalEffectProfile::sql(vec![1]),
+            &chunks,
+        )
+        .unwrap();
+        let manifest_command = StoredCommand::new(EntryType::Command, command.encode().unwrap());
+        let binding = rhiza_quepaxa::EffectBundleBinding {
+            cluster_id: command.cluster_id().into(),
+            epoch: command.epoch(),
+            config_id: command.config_id(),
+            config_digest: command.config_digest(),
+            intended_slot: command.intended_slot(),
+            prev_hash: command.prev_hash(),
+            manifest_command_hash: manifest_command.hash(),
+            effect_digest: command.effect_digest_value(),
+        };
+        let bundle =
+            rhiza_quepaxa::RecorderEffectBundle::new(binding.clone(), chunks.clone()).unwrap();
+        let request =
+            rhiza_quepaxa::EffectBundleFinalizeRequest::new(bundle, manifest_command.clone())
+                .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            let client =
+                HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2")
+                    .unwrap();
+            let context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5));
+            client.stage_effect_bundle_chunk(
+                &context,
+                binding.clone(),
+                manifest_command.clone(),
+                0,
+                chunks[0].clone(),
+            )?;
+            client.finalize_staged_effect_bundle(
+                &context,
+                binding.clone(),
+                manifest_command.clone(),
+            )?;
+            let fetched_manifest =
+                client.fetch_effect_bundle_manifest(&context, binding.clone())?;
+            let fetched_chunk = client.fetch_effect_bundle_chunk(&context, binding, 0)?;
+            Ok::<_, rhiza_quepaxa::Error>((fetched_manifest, fetched_chunk))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, Some(request.manifest_command));
+        assert_eq!(result.1, Some(b"http-effect-bundle".to_vec()));
         server.abort();
     }
 
