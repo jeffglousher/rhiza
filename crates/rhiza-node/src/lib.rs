@@ -43,10 +43,11 @@ use axum::{
 use http_body::Frame;
 #[cfg(feature = "sql")]
 use rhiza_archive::SnapshotRecord;
+#[cfg(feature = "sql")]
+use rhiza_core::ExternalEffectCommand;
 use rhiza_core::{
     Command, CommandKind, ConfigChange, ConfigurationState, EntryType, ErrorClassification,
-    ExecutionProfile, ExternalEffectCommand, LogAnchor, LogEntry, LogHash, LogIndex,
-    RecoveryAnchor, StoredCommand,
+    ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor, StoredCommand,
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
@@ -68,10 +69,12 @@ use rhiza_log::{FileLogStore, IndexRange, LogStore};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
     CertifiedDecisionInspection, DecisionInspection, DecisionProof, EffectBundleBinding,
-    EffectBundleFinalizeRequest, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
-    RecordSummary, RecorderEffectBundle, RecorderFileStore, RecorderRpc, RecorderRpcContext,
-    RejectReason, ThreeNodeConsensus, DEFAULT_RECORDER_RPC_TIMEOUT,
+    Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary,
+    RecorderFileStore, RecorderRpc, RecorderRpcContext, RejectReason, ThreeNodeConsensus,
+    DEFAULT_RECORDER_RPC_TIMEOUT,
 };
+#[cfg(feature = "sql")]
+use rhiza_quepaxa::{EffectBundleFinalizeRequest, RecorderEffectBundle};
 #[cfg(feature = "sql")]
 use rhiza_sql::{
     encode_put_request, encode_sql_command, restore_snapshot_file, QwalEffectManifestV4,
@@ -18667,23 +18670,23 @@ fn reconcile_local_storage(
 }
 
 fn apply_reconciled_entry(
-    config: &NodeConfig,
-    consensus: &ThreeNodeConsensus,
+    _config: &NodeConfig,
+    _consensus: &ThreeNodeConsensus,
     materializer: &Materializer,
-    configuration: Option<&ConfigurationState>,
+    _configuration: Option<&ConfigurationState>,
     entry: &LogEntry,
-    context: &RecorderRpcContext,
+    _context: &RecorderRpcContext,
 ) -> Result<(), NodeError> {
     #[cfg(feature = "sql")]
-    if config.execution_profile() == ExecutionProfile::Sqlite
+    if _config.execution_profile() == ExecutionProfile::Sqlite
         && entry.entry_type == EntryType::Command
         && !entry.payload.is_empty()
     {
-        let configuration = configuration.ok_or_else(|| {
+        let configuration = _configuration.ok_or_else(|| {
             NodeError::Reconciliation("SQL materializer omitted its configuration state".into())
         })?;
         let verified =
-            resolve_external_sql_effect_from_consensus(consensus, configuration, entry, context)?;
+            resolve_external_sql_effect_from_consensus(_consensus, configuration, entry, _context)?;
         return materializer
             .apply_verified_external_sql_effect(&verified)
             .map(|_| ())
@@ -18879,7 +18882,7 @@ fn recover_startup_decisions(
 #[allow(clippy::too_many_arguments)] // Startup recovery needs the explicit consensus resolver.
 fn persist_startup_entry(
     config: &NodeConfig,
-    consensus: &ThreeNodeConsensus,
+    _consensus: &ThreeNodeConsensus,
     log_store: &FileLogStore,
     materializer: &Materializer,
     entry: &LogEntry,
@@ -18904,7 +18907,7 @@ fn persist_startup_entry(
         && !entry.payload.is_empty()
     {
         Some(resolve_external_sql_effect_from_consensus(
-            consensus,
+            _consensus,
             &configuration_state,
             entry,
             &startup.recorder_context(),

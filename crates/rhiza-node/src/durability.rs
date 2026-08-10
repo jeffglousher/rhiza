@@ -1,7 +1,8 @@
+#[cfg(feature = "sql")]
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
-    collections::BTreeMap,
     error::Error,
     fmt, fs,
     future::Future,
@@ -22,9 +23,11 @@ use rhiza_archive::{
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::SnapshotIdentity;
 use rhiza_core::{
-    ConfigChange, ConfigurationState, EntryType, ExecutionProfile, ExternalEffectCommand,
-    LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor, StopBinding,
+    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex,
+    RecoveryAnchor, StopBinding,
 };
+#[cfg(feature = "sql")]
+use rhiza_core::{EntryType, ExternalEffectCommand};
 #[cfg(feature = "graph")]
 use rhiza_graph::{
     decode_snapshot as decode_graph_snapshot, encode_snapshot as encode_graph_snapshot,
@@ -53,7 +56,9 @@ const SYNC_RECOVERY_RETRY_MAX: Duration = Duration::from_secs(1);
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
+#[cfg(feature = "sql")]
 pub(crate) const QEFX_RESTORE_HANDOFF_DIR: &str = "consensus/qefx-restore";
+#[cfg(feature = "sql")]
 const PENDING_QEFX_GC_FILE: &str = "consensus/pending-qefx-gc.json";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
@@ -1117,6 +1122,7 @@ struct CoordinatorState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "sql")]
 struct PendingQefxGc {
     cluster_id: String,
     epoch: u64,
@@ -1256,14 +1262,14 @@ impl CheckpointCoordinator {
         holder: impl AsRef<str>,
         publisher_options: CheckpointPublisherOptions,
         recorder: RecorderFileStore,
-        data_dir: impl AsRef<Path>,
+        _data_dir: impl AsRef<Path>,
     ) -> Result<Self, DurabilityError> {
         let coordinator =
             Self::open_with_holder_and_options(store, mode, holder, publisher_options).await?;
         coordinator.attach_local_recorder(recorder)?;
         #[cfg(feature = "sql")]
         coordinator
-            .retry_pending_qefx_gc_at(data_dir.as_ref())
+            .retry_pending_qefx_gc_at(_data_dir.as_ref())
             .await?;
         Ok(coordinator)
     }
@@ -4637,6 +4643,7 @@ fn sync_directory(path: &Path) -> Result<(), DurabilityError> {
     Ok(())
 }
 
+#[cfg(feature = "sql")]
 fn persist_pending_qefx_gc(
     data_dir: &Path,
     pending: &PendingQefxGc,
@@ -4662,6 +4669,7 @@ fn persist_pending_qefx_gc(
     sync_directory(parent)
 }
 
+#[cfg(feature = "sql")]
 fn clear_pending_qefx_gc(data_dir: &Path) -> Result<(), DurabilityError> {
     let path = data_dir.join(PENDING_QEFX_GC_FILE);
     if path.exists() {
@@ -4671,6 +4679,7 @@ fn clear_pending_qefx_gc(data_dir: &Path) -> Result<(), DurabilityError> {
     Ok(())
 }
 
+#[cfg(feature = "sql")]
 fn load_pending_qefx_gc(data_dir: &Path) -> Result<Option<PendingQefxGc>, DurabilityError> {
     let path = data_dir.join(PENDING_QEFX_GC_FILE);
     let metadata = match fs::symlink_metadata(&path) {

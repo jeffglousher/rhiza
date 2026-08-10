@@ -7229,7 +7229,7 @@ impl ControlWorker {
 
     #[cfg(test)]
     fn dispatch(&self, job: ControlJob) -> ControlDispatch {
-        Self::dispatch_inner(&self.state, job, None, None, None)
+        Self::dispatch_inner(&self.state, job, None, None, None, true)
     }
 
     #[cfg(test)]
@@ -7238,11 +7238,23 @@ impl ControlWorker {
         job: ControlJob,
         cancellation: Arc<AtomicBool>,
     ) -> ControlDispatch {
-        Self::dispatch_inner(&self.state, job, Some(cancellation), None, None)
+        Self::dispatch_inner(&self.state, job, Some(cancellation), None, None, true)
     }
 
     fn dispatch_group(&self, job: ControlJob, group: &ControlCallGroup) -> ControlDispatch {
-        Self::dispatch_inner(&self.state, job, None, Some(group), None)
+        Self::dispatch_inner(&self.state, job, None, Some(group), None, true)
+    }
+
+    fn dispatch_read_group_retryable(
+        &self,
+        job: ControlJob,
+        group: &ControlCallGroup,
+    ) -> ControlDispatch {
+        // The caller retains saturated workers as retry candidates. Do not
+        // inject a synthetic rejection into the shared response stream for a
+        // job that was never admitted; repeated phase retries could otherwise
+        // fill the bounded channel before the caller can drain it.
+        Self::dispatch_inner(&self.state, job, None, Some(group), None, false)
     }
 
     /// Marks the caller's mutation certainty while the queue is still locked,
@@ -7253,7 +7265,14 @@ impl ControlWorker {
         group: &ControlCallGroup,
         mutation_started: &AtomicBool,
     ) -> ControlDispatch {
-        Self::dispatch_inner(&self.state, job, None, Some(group), Some(mutation_started))
+        Self::dispatch_inner(
+            &self.state,
+            job,
+            None,
+            Some(group),
+            Some(mutation_started),
+            true,
+        )
     }
 
     fn dispatch_inner(
@@ -7262,6 +7281,7 @@ impl ControlWorker {
         cancelled: Option<Arc<AtomicBool>>,
         group: Option<&ControlCallGroup>,
         mutation_started: Option<&AtomicBool>,
+        reply_on_rejection: bool,
     ) -> ControlDispatch {
         let mut queued_job = Some(QueuedControlJob {
             job,
@@ -7314,7 +7334,10 @@ impl ControlWorker {
             }
         }
         if let Some(error) = error {
-            queued_job.unwrap().fail(error);
+            let queued_job = queued_job.unwrap();
+            if reply_on_rejection {
+                queued_job.fail(error);
+            }
         }
         outcome
     }
@@ -7968,24 +7991,41 @@ impl ThreeNodeConsensus {
         &self,
         fetch: &EffectFetchContext<'_>,
         kind: EffectFetchKind,
+        dispatched: &mut [bool],
     ) -> Result<usize> {
+        if dispatched.len() != self.read_fence_workers.len() {
+            return Err(Error::EffectBundleInvalid(
+                "effect fetch dispatch state does not match Recorder membership".into(),
+            ));
+        }
         let mut admitted = 0;
         for (index, worker) in self.read_fence_workers.iter().enumerate() {
+            if dispatched[index] {
+                continue;
+            }
             fetch.budget.check_admission()?;
-            if matches!(
-                worker.dispatch_group(
-                    ControlJob::FetchEffectBundle {
-                        index,
-                        context: fetch.budget.child_context(fetch.group),
-                        binding: fetch.binding.clone(),
-                        kind,
-                        result: fetch.sender.clone(),
-                    },
-                    fetch.group,
-                ),
-                ControlDispatch::Accepted
+            match worker.dispatch_read_group_retryable(
+                ControlJob::FetchEffectBundle {
+                    index,
+                    context: fetch.budget.child_context(fetch.group),
+                    binding: fetch.binding.clone(),
+                    kind,
+                    result: fetch.sender.clone(),
+                },
+                fetch.group,
             ) {
-                admitted += 1;
+                ControlDispatch::Accepted => {
+                    dispatched[index] = true;
+                    admitted += 1;
+                }
+                ControlDispatch::Saturated => {
+                    // A reply from the preceding manifest/chunk phase can be
+                    // visible before that worker has dropped its queue lease.
+                    // Keep this source eligible and retry it within the same
+                    // caller budget instead of falsely concluding that only
+                    // a missing hedge was available.
+                }
+                ControlDispatch::Failed => dispatched[index] = true,
             }
         }
         Ok(admitted)
@@ -7996,12 +8036,22 @@ impl ThreeNodeConsensus {
         fetch: &EffectFetchContext<'_>,
         expected: &StoredCommand,
     ) -> Result<()> {
-        let mut outstanding = self.dispatch_effect_fetch(fetch, EffectFetchKind::Manifest)?;
-        if outstanding == 0 {
-            return Err(Error::EffectBundleUnavailable);
-        }
+        let mut dispatched = vec![false; self.read_fence_workers.len()];
+        let mut outstanding = 0usize;
         let mut malformed = None;
-        while outstanding != 0 {
+        loop {
+            outstanding = outstanding
+                .checked_add(self.dispatch_effect_fetch(
+                    fetch,
+                    EffectFetchKind::Manifest,
+                    &mut dispatched,
+                )?)
+                .ok_or_else(|| {
+                    Error::EffectBundleInvalid("effect manifest dispatch count overflow".into())
+                })?;
+            if outstanding == 0 && dispatched.iter().all(|complete| *complete) {
+                break;
+            }
             fetch.budget.check_admission()?;
             let remaining = fetch
                 .budget
@@ -8044,13 +8094,22 @@ impl ThreeNodeConsensus {
         ordinal: u16,
         expected: &ExternalEffectChunk,
     ) -> Result<Vec<u8>> {
-        let mut outstanding =
-            self.dispatch_effect_fetch(fetch, EffectFetchKind::Chunk { ordinal })?;
-        if outstanding == 0 {
-            return Err(Error::EffectBundleUnavailable);
-        }
+        let mut dispatched = vec![false; self.read_fence_workers.len()];
+        let mut outstanding = 0usize;
         let mut malformed = None;
-        while outstanding != 0 {
+        loop {
+            outstanding = outstanding
+                .checked_add(self.dispatch_effect_fetch(
+                    fetch,
+                    EffectFetchKind::Chunk { ordinal },
+                    &mut dispatched,
+                )?)
+                .ok_or_else(|| {
+                    Error::EffectBundleInvalid("effect chunk dispatch count overflow".into())
+                })?;
+            if outstanding == 0 && dispatched.iter().all(|complete| *complete) {
+                break;
+            }
             fetch.budget.check_admission()?;
             let remaining = fetch
                 .budget
@@ -15257,6 +15316,109 @@ mod tests {
             ),
             Ok(Some(bundle))
         );
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn effect_fetch_retries_sources_saturated_by_the_preceding_phase() {
+        let _blocking = lock_blocking_control_tests();
+        let (_membership, bundle, manifest) =
+            effect_fetch_fixture_with_chunks(vec![b"single-effect-chunk".to_vec()]);
+        let valid = || -> Vec<super::Result<Option<Vec<u8>>>> {
+            bundle
+                .chunks()
+                .iter()
+                .cloned()
+                .map(|chunk| Ok(Some(chunk)))
+                .collect()
+        };
+        let consensus = Arc::new(effect_fetch_consensus([
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(None),
+                chunks: vec![Ok(None)],
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+            ScriptedEffectFetchRecorder {
+                manifest: Ok(Some(manifest.clone())),
+                chunks: valid(),
+                manifest_gate: None,
+                manifest_started: None,
+                chunk_gate: None,
+            },
+        ]));
+
+        // Occupy both healthy workers and fill each one-entry queue. The
+        // resolver initially reaches only the missing hedge. Once the prior
+        // work drains it must retry the saturated healthy sources rather than
+        // returning a false EffectBundleUnavailable.
+        let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease::new(Arc::clone(&pause));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let (dummy_tx, _dummy_rx) = mpsc::sync_channel(4);
+        for index in 1..=2 {
+            consensus.read_fence_workers[index]
+                .pause_after_next_pop(entered_tx.clone(), Arc::clone(&pause));
+            assert_eq!(
+                consensus.read_fence_workers[index].dispatch(
+                    super::ControlJob::FetchEffectBundle {
+                        index,
+                        context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        binding: bundle.binding().clone(),
+                        kind: super::EffectFetchKind::Manifest,
+                        result: dummy_tx.clone(),
+                    }
+                ),
+                super::ControlDispatch::Accepted
+            );
+        }
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for index in 1..=2 {
+            assert_eq!(
+                consensus.read_fence_workers[index].dispatch(
+                    super::ControlJob::FetchEffectBundle {
+                        index,
+                        context: RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        binding: bundle.binding().clone(),
+                        kind: super::EffectFetchKind::Manifest,
+                        result: dummy_tx.clone(),
+                    }
+                ),
+                super::ControlDispatch::Accepted
+            );
+        }
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            let binding = bundle.binding().clone();
+            let caller_manifest = manifest.clone();
+            thread::spawn(move || {
+                result_tx
+                    .send(consensus.resolve_effect_bundle_from_quorum(
+                        &RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                        &binding,
+                        &caller_manifest,
+                    ))
+                    .unwrap();
+            })
+        };
+        assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_gate(&pause);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(Some(bundle))
+        );
+        caller.join().unwrap();
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
@@ -23121,6 +23283,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             ),
             ControlDispatch::Accepted
         );

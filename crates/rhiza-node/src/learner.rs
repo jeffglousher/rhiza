@@ -619,6 +619,7 @@ pub struct LearnerStore {
     config: TailReaderConfig,
     log: FileLogStore,
     materializer: Materializer,
+    #[cfg(feature = "sql")]
     consensus: Option<Arc<ThreeNodeConsensus>>,
     apply_lock: Mutex<()>,
 }
@@ -703,7 +704,7 @@ impl LearnerStore {
     fn open_inner(
         data_dir: PathBuf,
         config: TailReaderConfig,
-        consensus: Option<Arc<ThreeNodeConsensus>>,
+        _consensus: Option<Arc<ThreeNodeConsensus>>,
     ) -> Result<Self, LearnerStoreError> {
         let prestage = inspect_successor_prestage(
             &data_dir,
@@ -756,7 +757,8 @@ impl LearnerStore {
             config,
             log,
             materializer,
-            consensus,
+            #[cfg(feature = "sql")]
+            consensus: _consensus,
             apply_lock: Mutex::new(()),
         };
         store.reconcile()?;
@@ -934,13 +936,13 @@ impl LearnerStore {
 
     fn preflight_entry(
         &self,
-        configuration: &ConfigurationState,
-        entry: &LogEntry,
+        _configuration: &ConfigurationState,
+        _entry: &LogEntry,
     ) -> Result<(), LearnerStoreError> {
         #[cfg(feature = "sql")]
         if self.prestage.identity().execution_profile() == ExecutionProfile::Sqlite
-            && entry.entry_type == rhiza_core::EntryType::Command
-            && !entry.payload.is_empty()
+            && _entry.entry_type == rhiza_core::EntryType::Command
+            && !_entry.payload.is_empty()
         {
             let consensus = self.consensus.as_ref().ok_or_else(|| {
                 LearnerStoreError::Unavailable(
@@ -949,8 +951,8 @@ impl LearnerStore {
             })?;
             resolve_external_sql_effect_from_consensus(
                 consensus,
-                configuration,
-                entry,
+                _configuration,
+                _entry,
                 &RecorderRpcContext::default_timeout(),
             )
             .map_err(map_effect_resolution_error)?;
@@ -960,7 +962,7 @@ impl LearnerStore {
 
     fn apply_entry(
         &self,
-        configuration: &ConfigurationState,
+        _configuration: &ConfigurationState,
         entry: &LogEntry,
     ) -> Result<(), LearnerStoreError> {
         #[cfg(feature = "sql")]
@@ -975,7 +977,7 @@ impl LearnerStore {
             })?;
             let effect = resolve_external_sql_effect_from_consensus(
                 consensus,
-                configuration,
+                _configuration,
                 entry,
                 &RecorderRpcContext::default_timeout(),
             )
