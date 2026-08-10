@@ -1222,15 +1222,29 @@ fn dispatch<R: RecorderRpc>(
             manifest_command,
             ordinal,
             chunk,
-        } => RecorderResponseBody::StageEffectBundleChunk(RpcResult::from_result(
-            recorder.stage_effect_bundle_chunk(context, binding, manifest_command, ordinal, chunk),
-        )),
+        } => {
+            let result = recorder.stage_effect_bundle_chunk(
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            );
+            if let Err(error) = &result {
+                eprintln!("recorder effect chunk stage rejected: {error}");
+            }
+            RecorderResponseBody::StageEffectBundleChunk(RpcResult::from_result(result))
+        }
         RecorderRequestBody::FinalizeStagedEffectBundle {
             binding,
             manifest_command,
-        } => RecorderResponseBody::FinalizeStagedEffectBundle(RpcResult::from_result(
-            recorder.finalize_staged_effect_bundle(context, binding, manifest_command),
-        )),
+        } => {
+            let result = recorder.finalize_staged_effect_bundle(context, binding, manifest_command);
+            if let Err(error) = &result {
+                eprintln!("recorder effect bundle finalize rejected: {error}");
+            }
+            RecorderResponseBody::FinalizeStagedEffectBundle(RpcResult::from_result(result))
+        }
         RecorderRequestBody::FetchEffectBundleManifest { binding } => {
             RecorderResponseBody::FetchEffectBundleManifest(RpcResult::from_result(
                 recorder.fetch_effect_bundle_manifest(context, binding),
