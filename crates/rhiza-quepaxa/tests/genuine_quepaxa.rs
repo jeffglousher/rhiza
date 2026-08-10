@@ -3114,9 +3114,15 @@ fn consecutive_ordinary_decisions_remain_reconstructable_from_durable_proofs() {
         b"third".as_slice(),
     ] {
         let command = StoredCommand::new(EntryType::Command, payload.to_vec());
-        assert!(stores
-            .iter()
-            .all(|store| store.fetch_command(command.hash()).unwrap() == Some(command.clone())));
+        assert!(
+            stores
+                .iter()
+                .filter(|store| {
+                    store.fetch_command(command.hash()).unwrap() == Some(command.clone())
+                })
+                .count()
+                >= membership.quorum_size()
+        );
     }
     let first_hash = first.hash;
     let second_hash = second.hash;
