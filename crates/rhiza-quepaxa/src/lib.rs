@@ -13788,6 +13788,7 @@ mod tests {
     fn exact_record_quorum_survives_an_earlier_unknown_outcome() {
         let (record_tx, record_rx) = mpsc::sync_channel(1);
         let (control_tx, _control_rx) = mpsc::sync_channel(1);
+        let exact_release = Arc::new((Mutex::new(false), Condvar::new()));
         let recorders = vec![
             (
                 "n1".into(),
@@ -13800,18 +13801,16 @@ mod tests {
             ),
             (
                 "n2".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedRecordRecorder {
                     recorder_id: "n2",
-                    reject_slot: None,
-                    observed: None,
+                    release: Arc::clone(&exact_release),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
                 "n3".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedRecordRecorder {
                     recorder_id: "n3",
-                    reject_slot: None,
-                    observed: None,
+                    release: Arc::clone(&exact_release),
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
@@ -13819,15 +13818,21 @@ mod tests {
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
         let mutation_started = AtomicBool::new(false);
 
-        let replies = consensus
-            .record_broadcast_with_context(
-                record_requests(&consensus, 1),
-                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
-                &mutation_started,
-            )
-            .unwrap();
+        let replies = thread::scope(|scope| {
+            let proposal = scope.spawn(|| {
+                consensus.record_broadcast_with_context(
+                    record_requests(&consensus, 1),
+                    RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                    &mutation_started,
+                )
+            });
+            assert!(record_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+            let (released, condition) = &*exact_release;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+            proposal.join().unwrap().unwrap()
+        });
 
-        assert!(record_rx.recv_timeout(Duration::from_secs(1)).is_ok());
         assert_eq!(
             replies
                 .iter()
