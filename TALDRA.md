@@ -43,19 +43,16 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
   the unsupported platform path type-checks (upstream tip omitted the import).
 
 
-## Next fork patch (planned)
+## Fork patches (caller-owned drive)
 
-**Caller-owned / actor-owned drive seam (ADR-0005 exit condition 1):**
+**Caller-owned QuePaxa drive (ADR-0005 exit condition 1) — landed:**
 
-- Keep `RecorderRpc` as the transport-independent recorder contract.
-- Add a caller-driven propose/drive path that does **not** spawn
-  `RecordWorker` / `ControlWorker` / read-fence OS threads per cluster.
-- Dispatch record / install / inspect RPCs on the calling thread (or through a
-  Taldra-owned shared bounded I/O pool later), returning
-  `UnknownOutcome` on deadline/cancel after mutation may have started.
-- Preserve file-backed recorder durability and proof-install semantics.
-- `ThreeNodeConsensus` worker runtime remains available for Rhiza-native
-  tests; Taldra lab will migrate off it after the seam lands and the pin bumps.
+- `CallerOwnedConsensus` proposes/drives without spawning `RecordWorker` /
+  `ControlWorker` OS threads.
+- Record / install / fetch / inspect RPCs run synchronously on the calling
+  thread via `RecorderRpc`, with quorum early-stop and
+  `UnknownOutcome` after mutation-started cancel/deadline.
+- `ThreeNodeConsensus` worker runtime remains for Rhiza-native tests; Taldra
+  should pin this revision and migrate labs onto `CallerOwnedConsensus`.
 
-Until that patch merges, Taldra comparative labs may use `ThreeNodeConsensus`
-only as a temporary harness (documented in ADR-0015).
+Public type: `CallerOwnedConsensus` (no RecordWorker/ControlWorker OS threads).
