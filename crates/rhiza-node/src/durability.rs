@@ -6465,7 +6465,7 @@ mod tests {
 
     #[cfg(feature = "sql")]
     #[tokio::test]
-    async fn sync_background_renews_an_expired_and_idle_publisher_lease_before_flushing() {
+    async fn sync_flush_renews_an_expired_and_idle_publisher_lease_before_mutation() {
         let root = tempfile::tempdir().unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             ObjStore::new(ObjStoreConfig::Local {
@@ -6481,16 +6481,14 @@ mod tests {
             ),
         );
         archive.initialize_checkpoint().await.unwrap();
-        let coordinator = Arc::new(
-            CheckpointCoordinator::open_with_holder_and_options(
-                archive,
-                DurabilityMode::Sync,
-                "sync-lease",
-                CheckpointPublisherOptions::new(300),
-            )
-            .await
-            .unwrap(),
-        );
+        let coordinator = CheckpointCoordinator::open_with_holder_and_options(
+            archive,
+            DurabilityMode::Sync,
+            "sync-lease",
+            CheckpointPublisherOptions::new(300),
+        )
+        .await
+        .unwrap();
         let config = NodeConfig::new_embedded(
             "cluster-a",
             "node-1",
@@ -6516,32 +6514,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
 
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let worker = tokio::spawn(coordinator.clone().run_background(
-            runtime.clone(),
-            async move {
-                if !*shutdown_rx.borrow() {
-                    let _ = shutdown_rx.changed().await;
-                }
-            },
-        ));
-
-        // This is shorter than the normal 100ms Sync poll. A successful strict flush proves
-        // the background's startup renewal reacquired the expired publisher lease promptly.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let committed = runtime.write("request-1", "alpha", "one").unwrap();
-        coordinator.note_committed(committed.applied_index);
-        coordinator
-            .flush_runtime(&runtime, committed.applied_index)
-            .await
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(900)).await;
-
-        let committed = runtime.write("request-2", "beta", "two").unwrap();
         coordinator.note_committed(committed.applied_index);
         coordinator
             .flush_runtime(&runtime, committed.applied_index)
@@ -6549,14 +6525,11 @@ mod tests {
             .unwrap();
         assert!(coordinator.write_allowed().is_ok());
         assert_eq!(coordinator.health(), DurabilityHealth::Available);
-
-        shutdown_tx.send(true).unwrap();
-        worker.await.unwrap().unwrap();
     }
 
     #[cfg(feature = "sql")]
     #[tokio::test]
-    async fn sync_background_recovers_an_unavailable_coordinator_after_lease_expiry() {
+    async fn sync_background_recovers_an_unavailable_coordinator_after_transient_failure() {
         let root = tempfile::tempdir().unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             ObjStore::new(ObjStoreConfig::Local {
@@ -6609,15 +6582,9 @@ mod tests {
         );
         let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
 
-        tokio::time::sleep(Duration::from_millis(600)).await;
         let committed = runtime.write("request-1", "alpha", "one").unwrap();
         coordinator.note_committed(committed.applied_index);
-        assert!(matches!(
-            coordinator
-                .flush_runtime(&runtime, committed.applied_index)
-                .await,
-            Err(DurabilityError::Archive(_))
-        ));
+        drop(coordinator.sync_durability_confirmation());
         assert_eq!(coordinator.health(), DurabilityHealth::Unavailable);
         assert!(coordinator.write_allowed().is_err());
 

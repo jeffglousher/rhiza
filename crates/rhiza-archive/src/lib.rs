@@ -1312,6 +1312,7 @@ impl CheckpointPublisher {
             self.renew().await?;
             return Ok(self.cached_checkpoint().await);
         }
+        self.renew().await?;
 
         let (result, receiver) = tokio::sync::oneshot::channel();
         {
@@ -1341,6 +1342,7 @@ impl CheckpointPublisher {
         effects: &[CheckpointEffectRecord],
     ) -> Result<LoadedCheckpointManifest> {
         let _operation = self.operation.lock().await;
+        self.renew().await?;
         let loaded = self.state.lock().await.loaded.clone();
         let published = self
             .store
@@ -1363,6 +1365,7 @@ impl CheckpointPublisher {
         snapshot_bytes: &[u8],
     ) -> Result<LoadedCheckpointManifest> {
         let _operation = self.operation.lock().await;
+        self.renew().await?;
         let loaded = self.state.lock().await.loaded.clone();
         let published = self
             .store
@@ -1387,6 +1390,7 @@ impl CheckpointPublisher {
         snapshot_bytes: &[u8],
     ) -> Result<LoadedCheckpointManifest> {
         let _operation = self.operation.lock().await;
+        self.renew().await?;
         let loaded = self.state.lock().await.loaded.clone();
         let published = self
             .store
