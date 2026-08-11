@@ -24116,6 +24116,7 @@ mod tests {
     fn saturated_recorder_keeps_quorum_reachable_when_another_worker_fails() {
         let (started_tx, started_rx) = mpsc::sync_channel(2);
         let (_release_tx, release_rx) = mpsc::sync_channel(0);
+        let exact_release = Arc::new((Mutex::new(false), Condvar::new()));
         let recorders = vec![
             (
                 "n1".into(),
@@ -24134,24 +24135,25 @@ mod tests {
             ),
             (
                 "n3".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedRecordRecorder {
                     recorder_id: "n3",
-                    reject_slot: None,
-                    observed: None,
+                    release: Arc::clone(&exact_release),
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
         let consensus =
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-        assert_eq!(
-            consensus
-                .record_broadcast(record_requests(&consensus, 1))
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let first = thread::scope(|scope| {
+            let proposal =
+                scope.spawn(|| consensus.record_broadcast(record_requests(&consensus, 1)));
+            assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+            let (released, condition) = &*exact_release;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+            proposal.join().unwrap().unwrap()
+        });
+        assert_eq!(first.len(), 2);
         assert_eq!(
             consensus
                 .record_broadcast(record_requests(&consensus, 2))
