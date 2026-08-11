@@ -38,3 +38,6 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
   `rhiza-archive` / `object_store` / `aws-lc-sys`. Enable `archive-gc` only when
   checkpoint GC APIs are required. Taldra's dual-engine pin uses
   `default-features = false` and does not enable `archive-gc`.
+
+- Windows / non-unix64 `anchored_fs` stub: import `crate::{Error, Result}` so
+  the unsupported platform path type-checks (upstream tip omitted the import).

@@ -504,6 +504,15 @@ pub(crate) struct AnchoredDir;
         target_pointer_width = "64"
     )
 )))]
+use crate::{Error, Result};
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "64"
+    )
+)))]
 impl AnchoredDir {
     pub(crate) fn open(_path: &std::path::Path) -> Result<Self> {
         unsupported()
