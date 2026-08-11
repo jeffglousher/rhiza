@@ -6,7 +6,9 @@ die() { printf 'chaos-rhiza-hook: %s\n' "$*" >&2; exit 1; }
 [ $# = 3 ] || die 'expected PHASE CUTPOINT OUTPUT_DIR'
 phase="$1"; cutpoint="$2"; output_dir="$3"
 case "$phase:$cutpoint" in prepare:pre-ack|verify:pre-ack|prepare:post-ack|verify:post-ack) ;; *) die 'invalid boundary' ;; esac
-[ -n "${CHAOS_K8S_CONTEXT:-}" ] && [ -n "${CHAOS_NAMESPACE:-}" ] && [ -n "${CHAOS_RUN_ID:-}" ] || die 'missing exact cluster scope'
+if [ -z "${CHAOS_K8S_CONTEXT:-}" ] || [ -z "${CHAOS_NAMESPACE:-}" ] || [ -z "${CHAOS_RUN_ID:-}" ]; then
+  die 'missing exact cluster scope'
+fi
 [ "$(kubectl config current-context)" = "$CHAOS_K8S_CONTEXT" ] || die 'current context changed'
 
 state="$output_dir/.rhiza-$cutpoint-state.json"

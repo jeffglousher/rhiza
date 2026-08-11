@@ -13,7 +13,14 @@ controller SIGKILLs the attested QEMU_BINARY process; hooks must reuse the
 exact QEMU_DISK path.
 EOF
 }
-require_hook() { local n="$1" p="${!1:-}" canonical; [ -n "$p" ] && [ -x "$p" ] && [[ "$p" = /* ]] || die "$n must be an executable absolute path"; canonical="$(readlink -f "$p")"; [ "$canonical" = "$p" ] || die "$n must not be symlinked"; }
+require_hook() {
+  local n="$1" p="${!1:-}" canonical
+  if [ -z "$p" ] || [ ! -x "$p" ] || [[ "$p" != /* ]]; then
+    die "$n must be an executable absolute path"
+  fi
+  canonical="$(readlink -f "$p")"
+  [ "$canonical" = "$p" ] || die "$n must not be symlinked"
+}
 plan() { jq -n '{schema_version:1,kind:"qemu-vm-loss-plan",physical_power_loss:false,fault:"external-controller-sigkill-qemu",ack_boundaries:["pre-ack","post-ack"]}'; }
 run() {
   [ $# = 2 ] || { usage >&2; exit 2; }
@@ -21,8 +28,12 @@ run() {
   case "$cutpoint" in pre-ack|post-ack) ;; *) die 'cutpoint must be pre-ack or post-ack' ;; esac
   [ "$(uname -s)" = Linux ] || die 'live VM-loss execution is Linux-only'
   [ "${QEMU_VM_LOSS_OPT_IN:-}" = I_UNDERSTAND_DISPOSABLE_VM_LOSS ] || die 'exact disposable-VM opt-in is required'
-  [ -n "${QEMU_DISK:-}" ] && [ -f "$QEMU_DISK" ] && [[ "$QEMU_DISK" = /* ]] && [ "$(readlink -f "$QEMU_DISK")" = "$QEMU_DISK" ] || die 'QEMU_DISK must be a canonical absolute regular file'
-  [ -n "${QEMU_BINARY:-}" ] && [ -x "$QEMU_BINARY" ] && [[ "$QEMU_BINARY" = /* ]] && [ "$(readlink -f "$QEMU_BINARY")" = "$QEMU_BINARY" ] || die 'QEMU_BINARY must be a canonical executable path'
+  if [ -z "${QEMU_DISK:-}" ] || [ ! -f "$QEMU_DISK" ] || [[ "$QEMU_DISK" != /* ]] || [ "$(readlink -f "$QEMU_DISK")" != "$QEMU_DISK" ]; then
+    die 'QEMU_DISK must be a canonical absolute regular file'
+  fi
+  if [ -z "${QEMU_BINARY:-}" ] || [ ! -x "$QEMU_BINARY" ] || [[ "$QEMU_BINARY" != /* ]] || [ "$(readlink -f "$QEMU_BINARY")" != "$QEMU_BINARY" ]; then
+    die 'QEMU_BINARY must be a canonical executable path'
+  fi
   [ ! -e "$dir" ] || die 'output directory must not exist'; mkdir -p "$dir"; started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   require_hook QEMU_VM_LAUNCH_HOOK; require_hook QEMU_VM_REBOOT_HOOK; require_hook QEMU_VM_VERIFY_HOOK
   before="$(sha256_file "$QEMU_DISK")"; QEMU_VM_LAUNCH_HOOK "$QEMU_DISK" "$cutpoint" "$dir" > "$dir/launch.json"

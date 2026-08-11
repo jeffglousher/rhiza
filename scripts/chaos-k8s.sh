@@ -102,7 +102,9 @@ wait_for_injection() {
 }
 cleanup_active_fault() { [ -z "${CHAOS_APPLIED_RENDERED:-}" ] || kubectl delete -f "$CHAOS_APPLIED_RENDERED" --wait=true >/dev/null 2>&1 || true; }
 bind_workload_hook() {
-  [ -n "${CHAOS_WORKLOAD_HOOK:-}" ] && [ -x "$CHAOS_WORKLOAD_HOOK" ] && [[ "$CHAOS_WORKLOAD_HOOK" = /* ]] || die 'CHAOS_WORKLOAD_HOOK must be an executable absolute path'
+  if [ -z "${CHAOS_WORKLOAD_HOOK:-}" ] || [ ! -x "$CHAOS_WORKLOAD_HOOK" ] || [[ "$CHAOS_WORKLOAD_HOOK" != /* ]]; then
+    die 'CHAOS_WORKLOAD_HOOK must be an executable absolute path'
+  fi
   CHAOS_WORKLOAD_HOOK_CANONICAL="$(readlink -f "$CHAOS_WORKLOAD_HOOK")"
   [ "$CHAOS_WORKLOAD_HOOK_CANONICAL" = "$CHAOS_WORKLOAD_HOOK" ] || die 'CHAOS_WORKLOAD_HOOK must not be symlinked'
   CHAOS_WORKLOAD_HOOK_SHA256="$(sha256_file "$CHAOS_WORKLOAD_HOOK")"
@@ -135,7 +137,9 @@ manifest() {
 }
 plan() { jq -n --slurpfile lock "$lock" '{schema_version:1,kind:"chaos-plan",physical_power_loss:false,chaos_mesh:$lock[0],scenarios:["pod-kill","network-partition","io-error"],ack_boundaries:["pre-ack","post-ack"]}'; }
 install() {
-  [ $# = 1 ] && [ -r "$1" ] || die 'install needs one readable digest-pinned values file'
+  if [ $# != 1 ] || [ ! -r "$1" ]; then
+    die 'install needs one readable digest-pinned values file'
+  fi
   require_disposable_context; require_locked_chart
   command -v helm >/dev/null || die 'helm is required'
   local tmp chart
