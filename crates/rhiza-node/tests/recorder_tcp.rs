@@ -817,10 +817,9 @@ async fn tcp_recorders_durably_install_an_ordinary_proof_quorum() {
                     1,
                 )
                 .unwrap();
-                let summary = inspector
-                    .inspect_record_summary(&context(), 1)
-                    .unwrap()
-                    .unwrap();
+                let Some(summary) = inspector.inspect_record_summary(&context(), 1).unwrap() else {
+                    return false;
+                };
                 summary.decided.as_ref() == Some(&proof)
                     && summary.step == 4
                     && summary.first_current.as_ref() == Some(proof.proposal())
