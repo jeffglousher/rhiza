@@ -719,6 +719,16 @@ async fn serve(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
 }
 
 async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
+    let config = NodeConfig::new(
+        "rhiza:sql:cluster-a",
+        "node-1",
+        root.join("identity-only"),
+        1,
+        1,
+        peers(),
+        "client-token",
+    )
+    .unwrap();
     let store = ObjStore::new(ObjStoreConfig::Local {
         root: root.to_path_buf(),
     })
@@ -729,7 +739,7 @@ async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"admin-http-test"]),
+            config.log_initial_configuration().digest(),
             1,
         ),
     );

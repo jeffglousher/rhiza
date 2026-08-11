@@ -57,6 +57,8 @@ const SYNC_RECOVERY_RETRY_MAX: Duration = Duration::from_secs(1);
 const ONLINE_QEFX_GC_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(feature = "sql")]
 const ONLINE_QEFX_GC_REMOVAL_BUDGET: usize = 1;
+#[cfg(feature = "sql")]
+const MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES: usize = 128 * 1024 * 1024;
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
@@ -2383,6 +2385,11 @@ async fn prepare_checkpoint_external_sql_effects(
         ));
     }
 
+    // Reject the complete declared effect set before the first object read.
+    // Per-bundle QEFX limits are not an aggregate restore-memory bound: a
+    // valid suffix can reference many independently valid 64 MiB bundles.
+    let expected_total = checkpoint_qefx_aggregate_bytes(qefx_entries.values())?;
+
     let mut total = 0usize;
     let mut prepared = Vec::with_capacity(qefx_entries.len());
     for (index, command) in qefx_entries {
@@ -2424,8 +2431,37 @@ async fn prepare_checkpoint_external_sql_effects(
             chunks: restored.chunks().to_vec(),
         });
     }
-    let _ = total;
+    if total != expected_total {
+        return Err(DurabilityError::SnapshotVerification(
+            "checkpoint QEFX restored bytes differ from the declared aggregate".into(),
+        ));
+    }
     Ok(prepared)
+}
+
+#[cfg(feature = "sql")]
+fn checkpoint_qefx_aggregate_bytes<'a>(
+    commands: impl IntoIterator<Item = &'a ExternalEffectCommand>,
+) -> Result<usize, DurabilityError> {
+    commands.into_iter().try_fold(0usize, |sum, command| {
+        let bytes = usize::try_from(command.total_effect_bytes()).map_err(|_| {
+            DurabilityError::SnapshotVerification(
+                "checkpoint QEFX aggregate byte count overflows".into(),
+            )
+        })?;
+        let total = sum.checked_add(bytes).ok_or_else(|| {
+            DurabilityError::SnapshotVerification(
+                "checkpoint QEFX aggregate byte count overflows".into(),
+            )
+        })?;
+        if total > MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES {
+            return Err(DurabilityError::SnapshotVerification(format!(
+                "checkpoint QEFX aggregate bytes exceed limit {}: {total}",
+                MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES
+            )));
+        }
+        Ok(total)
+    })
 }
 
 /// Synchronously installs a prepared checkpoint into a fresh node directory.
@@ -5093,6 +5129,8 @@ mod tests {
         SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
         SUCCESSOR_RESTORE_LOCK_FILE, SYNC_RECOVERY_RETRY_INITIAL,
     };
+    #[cfg(feature = "sql")]
+    use super::{checkpoint_qefx_aggregate_bytes, MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES};
     use super::{install_prepared_checkpoint_to_fresh_data_dir, prepare_checkpoint_restore};
     #[cfg(feature = "kv")]
     use crate::KvCommandV1;
@@ -5100,9 +5138,13 @@ mod tests {
     use crate::{NodeConfig, NodeRuntime};
     use rhiza_archive::{CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore};
     use rhiza_core::{ConfigurationState, EntryType, LogEntry};
+    #[cfg(feature = "sql")]
+    use rhiza_core::{ExternalEffectChunk, ExternalEffectCommand, ExternalEffectProfile};
     use rhiza_log::{FileLogStore, LogStore};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
     use rhiza_quepaxa::ThreeNodeConsensus;
+    #[cfg(feature = "sql")]
+    use rhiza_sql::{encode_put_request, SqliteStateMachine};
     use std::{
         collections::BTreeMap,
         fs,
@@ -5120,6 +5162,202 @@ mod tests {
             checkpoint_identity_configuration(&identity),
             ConfigurationState::active(7, digest)
         );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn checkpoint_qefx_aggregate_is_rejected_before_bundle_reads() {
+        let chunk = ExternalEffectChunk::new(
+            LogHash::digest(&[b"checkpoint-aggregate-chunk"]),
+            256 * 1024,
+        )
+        .unwrap();
+        let command = ExternalEffectCommand::new(
+            "rhiza:sql:test",
+            1,
+            1,
+            LogHash::digest(&[b"checkpoint-aggregate-config"]),
+            1,
+            LogHash::ZERO,
+            ExternalEffectProfile::sql(vec![1]),
+            vec![chunk; 256],
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_qefx_aggregate_bytes([&command, &command]).unwrap(),
+            MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES
+        );
+        assert!(matches!(
+            checkpoint_qefx_aggregate_bytes([&command, &command, &command]),
+            Err(DurabilityError::SnapshotVerification(message))
+                if message.contains("aggregate bytes exceed limit")
+        ));
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn legacy_1211_qefx_refs_append_and_prepare_restore() {
+        const LEGACY_REFS: usize = 1_211;
+        const FOLLOWUP_REFS: usize = 32;
+
+        let root = tempfile::tempdir().unwrap();
+        let identity = CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"legacy-qefx-config"]),
+            1,
+        );
+        let object_store = ObjStore::new(ObjStoreConfig::Local {
+            root: root.path().join("archive"),
+        })
+        .unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            object_store.clone(),
+            identity.clone(),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+
+        let database = SqliteStateMachine::open(
+            root.path().join("effect.sqlite"),
+            identity.cluster_id(),
+            "node-1",
+            1,
+            1,
+        )
+        .unwrap();
+        let request = encode_put_request("legacy-effect", "key", "value").unwrap();
+        let template = database
+            .prepare_external_put_effect(
+                "legacy-effect",
+                "key",
+                "value",
+                &request,
+                0,
+                LogHash::ZERO,
+            )
+            .unwrap();
+        let profile = template.manifest().clone();
+        let chunks = template.chunks().to_vec();
+
+        let total_refs = LEGACY_REFS + FOLLOWUP_REFS;
+        let mut entries = Vec::with_capacity(total_refs);
+        let mut effects = Vec::with_capacity(total_refs);
+        let mut commands = Vec::with_capacity(total_refs);
+        let mut previous_hash = LogHash::ZERO;
+        for index in 1..=u64::try_from(total_refs).unwrap() {
+            let command = profile
+                .external_command(
+                    identity.cluster_id(),
+                    identity.epoch(),
+                    identity.config_id(),
+                    identity.config_digest(),
+                    index,
+                    previous_hash,
+                    &chunks,
+                )
+                .unwrap();
+            let payload = command.encode().unwrap();
+            let hash = LogEntry::calculate_hash(
+                identity.cluster_id(),
+                index,
+                identity.epoch(),
+                identity.config_id(),
+                EntryType::Command,
+                previous_hash,
+                &payload,
+            );
+            let entry = LogEntry {
+                cluster_id: identity.cluster_id().to_owned(),
+                epoch: identity.epoch(),
+                config_id: identity.config_id(),
+                index,
+                entry_type: EntryType::Command,
+                payload,
+                prev_hash: previous_hash,
+                hash,
+            };
+            effects.push(
+                archive
+                    .publish_verified_qefx_bundle(&entry, &chunks)
+                    .await
+                    .unwrap(),
+            );
+            commands.push(command);
+            entries.push(entry);
+            previous_hash = hash;
+        }
+
+        for (entry_batch, effect_batch) in entries[..LEGACY_REFS]
+            .chunks(32)
+            .zip(effects[..LEGACY_REFS].chunks(32))
+        {
+            archive
+                .publish_committed_with_effects(entry_batch, effect_batch)
+                .await
+                .unwrap();
+        }
+
+        let loaded = archive.load_checkpoint().await.unwrap().unwrap();
+        let mut legacy = serde_json::to_value(loaded.manifest()).unwrap();
+        for effect in legacy["segments"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|segment| segment["effects"].as_array_mut().unwrap())
+        {
+            let index = effect["entry_index"].as_u64().unwrap();
+            let command = &commands[usize::try_from(index - 1).unwrap()];
+            let prefix = effect["manifest_object_key"]
+                .as_str()
+                .unwrap()
+                .strip_suffix("/binding.qefx")
+                .unwrap();
+            effect["chunk_object_keys"] = serde_json::json!(command
+                .chunks()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, chunk)| format!(
+                    "{prefix}/chunks/{ordinal:03}-{}.qefc",
+                    chunk.digest().to_hex()
+                ))
+                .collect::<Vec<_>>());
+            effect["chunk_sha256"] = serde_json::json!(chunks
+                .iter()
+                .map(|chunk| LogHash::digest(&[chunk]).to_hex())
+                .collect::<Vec<_>>());
+            effect["chunk_size_bytes"] = serde_json::json!(chunks
+                .iter()
+                .map(|chunk| chunk.len() as u64)
+                .collect::<Vec<_>>());
+        }
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(legacy_bytes.len() > 900 * 1024);
+        assert!(legacy_bytes.len() < 2 * 1024 * 1024);
+        object_store
+            .update(
+                &archive.checkpoint_manifest_key().unwrap(),
+                &legacy_bytes,
+                loaded.version().clone(),
+            )
+            .await
+            .unwrap();
+
+        let published = archive
+            .publish_committed_with_effects(&entries[LEGACY_REFS..], &effects[LEGACY_REFS..])
+            .await
+            .unwrap();
+        assert_eq!(published.manifest().tip().index(), total_refs as u64);
+        let current_bytes = object_store
+            .get(&archive.checkpoint_manifest_key().unwrap())
+            .await
+            .unwrap();
+        assert!(current_bytes.len() < 2 * 1024 * 1024);
+
+        let prepared = prepare_checkpoint_restore(&archive).await.unwrap();
+        assert_eq!(prepared.restored().suffix().len(), total_refs);
+        assert_eq!(prepared.external_sql_effects.len(), total_refs);
+        assert_eq!(prepared.checkpoint_root().index(), total_refs as u64);
     }
 
     #[test]
@@ -6602,6 +6840,15 @@ mod tests {
     #[tokio::test]
     async fn sync_flush_renews_an_expired_and_idle_publisher_lease_before_mutation() {
         let root = tempfile::tempdir().unwrap();
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            root.path().join("node"),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             ObjStore::new(ObjStoreConfig::Local {
                 root: root.path().join("archive"),
@@ -6611,7 +6858,7 @@ mod tests {
                 "rhiza:sql:cluster-a",
                 1,
                 1,
-                LogHash::digest(&[b"node-test-config"]),
+                config.log_initial_configuration().digest(),
                 1,
             ),
         );
@@ -6623,15 +6870,6 @@ mod tests {
             CheckpointPublisherOptions::new(300),
         )
         .await
-        .unwrap();
-        let config = NodeConfig::new_embedded(
-            "cluster-a",
-            "node-1",
-            root.path().join("node"),
-            1,
-            1,
-            ["node-1", "node-2", "node-3"],
-        )
         .unwrap();
         let consensus = Arc::new(
             ThreeNodeConsensus::from_recovered_tip(
@@ -6666,6 +6904,15 @@ mod tests {
     #[tokio::test]
     async fn sync_background_recovers_an_unavailable_coordinator_after_transient_failure() {
         let root = tempfile::tempdir().unwrap();
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            root.path().join("node"),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             ObjStore::new(ObjStoreConfig::Local {
                 root: root.path().join("archive"),
@@ -6675,7 +6922,7 @@ mod tests {
                 "rhiza:sql:cluster-a",
                 1,
                 1,
-                LogHash::digest(&[b"node-test-config"]),
+                config.log_initial_configuration().digest(),
                 1,
             ),
         );
@@ -6690,15 +6937,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let config = NodeConfig::new_embedded(
-            "cluster-a",
-            "node-1",
-            root.path().join("node"),
-            1,
-            1,
-            ["node-1", "node-2", "node-3"],
-        )
-        .unwrap();
         let consensus = Arc::new(
             ThreeNodeConsensus::from_recovered_tip(
                 "rhiza:sql:cluster-a",
@@ -6754,6 +6992,15 @@ mod tests {
     #[tokio::test]
     async fn periodic_background_retries_transient_unavailability_without_new_writes() {
         let root = tempfile::tempdir().unwrap();
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            root.path().join("node"),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             ObjStore::new(ObjStoreConfig::Local {
                 root: root.path().join("archive"),
@@ -6763,7 +7010,7 @@ mod tests {
                 "rhiza:sql:cluster-a",
                 1,
                 1,
-                LogHash::digest(&[b"node-test-config"]),
+                config.log_initial_configuration().digest(),
                 1,
             ),
         );
@@ -6780,15 +7027,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let config = NodeConfig::new_embedded(
-            "cluster-a",
-            "node-1",
-            root.path().join("node"),
-            1,
-            1,
-            ["node-1", "node-2", "node-3"],
-        )
-        .unwrap();
         let consensus = Arc::new(
             ThreeNodeConsensus::from_recovered_tip(
                 "rhiza:sql:cluster-a",

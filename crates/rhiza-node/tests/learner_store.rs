@@ -21,6 +21,7 @@ const PREDECESSOR_CONFIG_ID: u64 = 4;
 const RECOVERY_GENERATION: u64 = 7;
 
 async fn initialized_archive(root: &Path) -> ObjectArchiveStore {
+    let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         ObjStore::new(ObjStoreConfig::Local {
             root: root.to_path_buf(),
@@ -30,7 +31,7 @@ async fn initialized_archive(root: &Path) -> ObjectArchiveStore {
             CLUSTER_ID,
             EPOCH,
             PREDECESSOR_CONFIG_ID,
-            LogHash::digest(&[b"learner-store-test-config"]),
+            predecessor.digest(),
             RECOVERY_GENERATION,
         ),
     );

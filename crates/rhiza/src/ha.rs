@@ -9191,25 +9191,25 @@ mod tests {
     }
 
     fn actual_child_test_archive(root: &std::path::Path) -> ObjectArchiveStore {
-        actual_child_test_archive_for_cluster(root, "rhiza:sql:cluster-a")
+        let config = actual_child_test_node_config(&root.join("identity-only"));
+        actual_child_test_archive_for_cluster(
+            root,
+            config.cluster_id(),
+            config.log_initial_configuration().digest(),
+        )
     }
 
     fn actual_child_test_archive_for_cluster(
         root: &std::path::Path,
         cluster_id: impl Into<String>,
+        config_digest: LogHash,
     ) -> ObjectArchiveStore {
         ObjectArchiveStore::new_checkpoint_for_single_process(
             rhiza_obj_store::ObjStore::new(rhiza_obj_store::ObjStoreConfig::Local {
                 root: root.to_path_buf(),
             })
             .unwrap(),
-            CheckpointIdentity::new(
-                cluster_id,
-                1,
-                1,
-                rhiza_core::LogHash::digest(&[b"ha-test-config"]),
-                1,
-            ),
+            CheckpointIdentity::new(cluster_id, 1, 1, config_digest, 1),
         )
     }
 
@@ -9298,6 +9298,7 @@ mod tests {
         let archive = actual_child_test_archive_for_cluster(
             &root.join("archive"),
             config.cluster_id().to_owned(),
+            config.log_initial_configuration().digest(),
         );
         archive.initialize_checkpoint().await.unwrap();
 
@@ -14734,24 +14735,18 @@ mod tests {
                         root: root_path.join("archive"),
                     })
                     .expect("archive store must open");
+                let predecessor = Membership::new(["node-1", "node-2", "node-3"])
+                    .expect("predecessor membership must be valid");
+                let successor = Membership::new(["node-4", "node-5", "node-6"])
+                    .expect("successor membership must be valid");
                 let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                     store.clone(),
-                    CheckpointIdentity::new(
-                        "rhiza:sql:cluster-a",
-                        1,
-                        1,
-                        LogHash::digest(&[b"ha-test-config"]),
-                        1,
-                    ),
+                    CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, predecessor.digest(), 1),
                 );
                 source_archive
                     .initialize_checkpoint()
                     .await
                     .expect("source checkpoint must initialize");
-                let predecessor = Membership::new(["node-1", "node-2", "node-3"])
-                    .expect("predecessor membership must be valid");
-                let successor = Membership::new(["node-4", "node-5", "node-6"])
-                    .expect("successor membership must be valid");
                 let source_recorders = predecessor
                     .members()
                     .iter()
@@ -14826,13 +14821,7 @@ mod tests {
                 drop(source);
                 let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                     store,
-                    CheckpointIdentity::new(
-                        "rhiza:sql:cluster-a",
-                        1,
-                        2,
-                        LogHash::digest(&[b"ha-test-config"]),
-                        1,
-                    ),
+                    CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, successor.digest(), 1),
                 );
                 let peers = successor
                     .members()
