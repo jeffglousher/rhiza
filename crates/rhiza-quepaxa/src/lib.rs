@@ -1931,6 +1931,7 @@ pub struct RecorderFileStore {
     seal_fault: Arc<Mutex<Option<SealFaultPoint>>>,
     _root_lock: Arc<fs::File>,
     effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
+    staged_effect_pins: Arc<Mutex<HashMap<LogHash, EffectBundleGcPin>>>,
     sync: Arc<Mutex<()>>,
 }
 
@@ -2884,6 +2885,7 @@ impl RecorderFileStore {
                 seal_fault: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
+                staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
                 sync: Arc::new(Mutex::new(())),
             },
             false,
@@ -2942,6 +2944,7 @@ impl RecorderFileStore {
                 seal_fault: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
+                staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
                 sync: Arc::new(Mutex::new(())),
             },
             true,
@@ -3632,6 +3635,7 @@ impl RecorderFileStore {
         {
             let existing = self.load_effect_bundle_unlocked(&bundle.binding)?;
             return if existing == *bundle {
+                self.clear_staged_effect_pin(&bundle.binding)?;
                 Ok(())
             } else {
                 Err(Error::EffectBundleConflict)
@@ -3687,6 +3691,7 @@ impl RecorderFileStore {
             &encode_effect_bundle(&request.manifest_command)?,
         )?;
         anchor.sync()?;
+        self.clear_staged_effect_pin(&bundle.binding)?;
         Ok(())
     }
 
@@ -3719,6 +3724,16 @@ impl RecorderFileStore {
         self.recover_intent()?;
         self.effect_root_anchor.verify_path(&self.root)?;
         self.validate_effect_bundle_binding(binding)?;
+        self.staged_effect_pins
+            .lock()
+            .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
+            .insert(
+                effect_bundle_binding_digest(binding),
+                EffectBundleGcPin {
+                    binding: binding.clone(),
+                    manifest_command: manifest_command.clone(),
+                },
+            );
         let name = self.effect_chunk_name(expected.digest());
         if let Some(existing) = self.effect_root_anchor.read_optional(
             &name,
@@ -3882,10 +3897,19 @@ impl RecorderFileStore {
         self.recover_intent()?;
         self.effect_root_anchor.verify_path(&self.root)?;
         self.validate_effect_bundle_gc_certificate(certificate)?;
-        let protected = self.effect_bundle_gc_protected(protected_pins)?;
-        let previous = self.load_effect_bundle_gc_anchor_unlocked()?;
         let identity = certificate.identity();
         let tip = certificate.tip();
+        let mut all_pins = protected_pins.to_vec();
+        all_pins.extend(
+            self.staged_effect_pins
+                .lock()
+                .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
+                .values()
+                .filter(|pin| pin.binding.intended_slot > tip.index())
+                .cloned(),
+        );
+        let protected = self.effect_bundle_gc_protected(&all_pins)?;
+        let previous = self.load_effect_bundle_gc_anchor_unlocked()?;
         if let Some(previous) = &previous {
             if previous.cluster_id != identity.cluster_id() || previous.epoch != identity.epoch() {
                 return Err(Error::EffectBundleInvalid(
@@ -4001,6 +4025,14 @@ impl RecorderFileStore {
             )?
             .map(|bytes| decode_effect_bundle_gc_anchor(&bytes))
             .transpose()
+    }
+
+    fn clear_staged_effect_pin(&self, binding: &EffectBundleBinding) -> Result<()> {
+        self.staged_effect_pins
+            .lock()
+            .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
+            .remove(&effect_bundle_binding_digest(binding));
+        Ok(())
     }
 
     fn sweep_effect_bundle_manifests_unlocked(

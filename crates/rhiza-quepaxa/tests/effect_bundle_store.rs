@@ -507,6 +507,41 @@ fn certified_gc_persists_monotonically_and_preserves_newer_effects_after_reopen(
 }
 
 #[test]
+fn certified_gc_does_not_reap_chunks_between_stage_and_finalize() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let (bundle, request) = sql_qefx(&membership, vec![b"inflight-stage".to_vec()], 81);
+    store
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        )
+        .unwrap();
+
+    let certificate = gc_certificate(
+        root.path(),
+        CLUSTER_ID,
+        CONFIG_ID,
+        membership.digest(),
+        80,
+        1,
+    );
+    store
+        .advance_effect_bundle_gc_anchor(&certificate, &[])
+        .unwrap();
+
+    store
+        .finalize_staged_effect_bundle(bundle.binding(), request.manifest_command.clone())
+        .unwrap();
+    assert_eq!(
+        store.load_effect_bundle(bundle.binding()).unwrap(),
+        Some(bundle)
+    );
+}
+
+#[test]
 fn certified_gc_rejects_uncertified_rollback_and_foreign_identity() {
     let root = tempfile::tempdir().unwrap();
     let (store, membership) = open_store(root.path());
