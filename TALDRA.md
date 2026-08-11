@@ -45,14 +45,12 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
 
 ## Fork patches (caller-owned drive)
 
-**Caller-owned QuePaxa drive (ADR-0005 exit condition 1) — landed:**
+**Caller-owned QuePaxa drive (ADR-0005 exit condition 1) -- landed:**
 
-- `CallerOwnedConsensus` proposes/drives without spawning `RecordWorker` /
-  `ControlWorker` OS threads.
+- Public type: `CallerOwnedConsensus` (no `RecordWorker` / `ControlWorker` OS
+  threads).
 - Record / install / fetch / inspect RPCs run synchronously on the calling
-  thread via `RecorderRpc`, with quorum early-stop and
-  `UnknownOutcome` after mutation-started cancel/deadline.
+  thread via `RecorderRpc`, with quorum early-stop and `UnknownOutcome` after
+  mutation-started cancel/deadline.
 - `ThreeNodeConsensus` worker runtime remains for Rhiza-native tests; Taldra
   should pin this revision and migrate labs onto `CallerOwnedConsensus`.
-
-Public type: `CallerOwnedConsensus` (no RecordWorker/ControlWorker OS threads).
