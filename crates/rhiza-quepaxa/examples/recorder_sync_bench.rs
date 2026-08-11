@@ -25,9 +25,7 @@ const WAL_SOFT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 const WAL_PREFIX_LEN: usize = 4 + 2 + 8;
 const WAL_DIGEST_LEN: usize = 32;
 const WAL_CHAIN_FIELDS_LEN: usize = 8 + 8 + 32;
-// The production WAL checkpoints after 1,024 frames. Keeping every invocation below that
-// boundary isolates the steady append + durability barrier that the default benchmark is for.
-const MAX_TOTAL_OPERATIONS: usize = 1_000;
+const TWO_ROTATION_OPERATIONS: usize = WAL_HARD_FRAME_LIMIT * 2 + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -115,14 +113,13 @@ impl Config {
             if warmup_explicit && config.warmup != 0 {
                 return Err("--checkpoint-diagnostic requires --warmup 0".into());
             }
-            if operations_explicit && config.operations != WAL_HARD_FRAME_LIMIT + 1 {
+            if operations_explicit && config.operations != TWO_ROTATION_OPERATIONS {
                 return Err(format!(
-                    "--checkpoint-diagnostic requires --operations {}",
-                    WAL_HARD_FRAME_LIMIT + 1
+                    "--checkpoint-diagnostic requires --operations {TWO_ROTATION_OPERATIONS}"
                 ));
             }
             config.warmup = 0;
-            config.operations = WAL_HARD_FRAME_LIMIT + 1;
+            config.operations = TWO_ROTATION_OPERATIONS;
         }
         if config.operations == 0 {
             return Err("--operations must be greater than zero".into());
@@ -134,16 +131,17 @@ impl Config {
         }
         if config.payload_bytes > MAX_PAYLOAD_BYTES {
             return Err(format!(
-                "--payload-bytes must not exceed {MAX_PAYLOAD_BYTES}; this keeps the run below the WAL byte checkpoint boundary"
+                "--payload-bytes must not exceed {MAX_PAYLOAD_BYTES}"
             ));
         }
         let total = config
             .warmup
             .checked_add(config.operations)
             .ok_or_else(|| "warmup + operations overflowed".to_owned())?;
-        if !config.checkpoint_diagnostic && total > MAX_TOTAL_OPERATIONS {
+        if total > usize::from(u16::MAX) {
             return Err(format!(
-                "warmup + operations must not exceed {MAX_TOTAL_OPERATIONS}; this keeps the run before the WAL checkpoint boundary"
+                "warmup + operations must not exceed {}; payload markers are u16",
+                u16::MAX
             ));
         }
         Ok(config)
@@ -159,9 +157,10 @@ fn parse_usize(flag: &str, value: Option<String>) -> Result<usize, String> {
 
 fn usage() -> String {
     format!(
-        "usage: recorder_sync_bench [--operations N] [--warmup N] [--payload-bytes N] [--label NAME] [--root PATH] [--keep] [--command-mode inline|pre-stored] [--checkpoint-diagnostic]\n\n  --payload-bytes N\n      exact equal command payload size; at least 2 bytes identify each operation\n  --command-mode inline|pre-stored\n      inline is the default and includes distinct inline command persistence in each timed record;\n      pre-stored stores every distinct command before timing and omits it from timed requests\n  --checkpoint-diagnostic\n      forces --warmup 0 --operations {}; operation {} crosses the 1,024-frame boundary,\n      must perform exactly one checkpoint before appending the generation-2 frame, and\n      must reopen through the production decoder",
+        "usage: recorder_sync_bench [--operations N] [--warmup N] [--payload-bytes N] [--label NAME] [--root PATH] [--keep] [--command-mode inline|pre-stored] [--checkpoint-diagnostic]\n\n  --payload-bytes N\n      exact equal command payload size; at least 2 bytes identify each operation\n  --command-mode inline|pre-stored\n      inline is the default and includes distinct inline command persistence in each timed record;\n      pre-stored stores every distinct command before timing and omits it from timed requests\n  --checkpoint-diagnostic\n      forces --warmup 0 --operations {}; operations {} and {} cross two 1,024-frame boundaries,\n      must perform exactly two checkpoints before generation-2 and generation-3 frames, and\n      must reopen through the production decoder",
+        TWO_ROTATION_OPERATIONS,
         WAL_HARD_FRAME_LIMIT + 1,
-        WAL_HARD_FRAME_LIMIT + 1,
+        TWO_ROTATION_OPERATIONS,
     )
 }
 
@@ -314,7 +313,7 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
 
     let started = Instant::now();
     let mut latencies = Vec::with_capacity(config.operations);
-    let mut boundary_operations = Vec::with_capacity(3);
+    let mut boundary_operations = Vec::with_capacity(6);
     let mut errors = 0usize;
     for (index, request) in measured_requests.into_iter().enumerate() {
         let operation = config.warmup + index + 1;
@@ -326,7 +325,10 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
         } else {
             errors += 1;
         }
-        if (WAL_HARD_FRAME_LIMIT - 1..=WAL_HARD_FRAME_LIMIT + 1).contains(&operation) {
+        if [WAL_HARD_FRAME_LIMIT, WAL_HARD_FRAME_LIMIT * 2]
+            .into_iter()
+            .any(|boundary| (boundary - 1..=boundary + 1).contains(&operation))
+        {
             boundary_operations.push(OperationObservation {
                 operation,
                 call_elapsed_ns,
@@ -347,12 +349,16 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
     let wal = observe_reopenable_wal(root, expected_membership, total)?;
     let diagnostic_passed = checkpoint_diagnostic_passed(&wal);
     let checkpoint_events = if config.checkpoint_diagnostic && diagnostic_passed {
-        Some(CheckpointEvent {
-            operation: WAL_HARD_FRAME_LIMIT + 1,
-            generation: wal.checkpoint_generation,
-        })
-        .into_iter()
-        .collect()
+        vec![
+            CheckpointEvent {
+                operation: WAL_HARD_FRAME_LIMIT + 1,
+                generation: 2,
+            },
+            CheckpointEvent {
+                operation: TWO_ROTATION_OPERATIONS,
+                generation: 3,
+            },
+        ]
     } else {
         Vec::new()
     };
@@ -406,7 +412,7 @@ fn prepare_operations(
         .map(|operation| {
             let mut payload = vec![0x5a; payload_bytes];
             let marker = u16::try_from(operation)
-                .expect("benchmark operation count is capped at 1,025")
+                .expect("benchmark operation count is capped at u16::MAX")
                 .to_be_bytes();
             payload[..marker.len()].copy_from_slice(&marker);
             let command = StoredCommand::new(EntryType::Command, payload);
@@ -446,13 +452,13 @@ fn percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
 }
 
 fn checkpoint_diagnostic_passed(wal: &WalObservation) -> bool {
-    wal.checkpoints_observed == 1
-        && wal.checkpoint_generation == 2
-        && wal.checkpoint_through_sequence == WAL_HARD_FRAME_LIMIT as u64
+    wal.checkpoints_observed == 2
+        && wal.checkpoint_generation == 3
+        && wal.checkpoint_through_sequence == (WAL_HARD_FRAME_LIMIT * 2) as u64
         && wal.frames == 1
-        && wal.generations == [2]
-        && wal.first_sequence == Some((WAL_HARD_FRAME_LIMIT + 1) as u64)
-        && wal.last_sequence == Some((WAL_HARD_FRAME_LIMIT + 1) as u64)
+        && wal.generations == [3]
+        && wal.first_sequence == Some(TWO_ROTATION_OPERATIONS as u64)
+        && wal.last_sequence == Some(TWO_ROTATION_OPERATIONS as u64)
 }
 
 fn observe_reopenable_wal(
@@ -718,7 +724,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.operations, WAL_HARD_FRAME_LIMIT + 1);
+        assert_eq!(config.operations, TWO_ROTATION_OPERATIONS);
         assert_eq!(config.warmup, 0);
         assert_eq!(config.command_mode, CommandMode::PreStored);
         assert!(config.checkpoint_diagnostic);
@@ -742,8 +748,8 @@ mod tests {
 
         assert!(help.contains("inline is the default"));
         assert!(help.contains("pre-stored stores every distinct command before timing"));
-        assert!(help.contains("forces --warmup 0 --operations 1025"));
-        assert!(help.contains("checkpoint before appending the generation-2 frame"));
+        assert!(help.contains("forces --warmup 0 --operations 2049"));
+        assert!(help.contains("two checkpoints before generation-2 and generation-3 frames"));
         assert!(help.contains("reopen through the production decoder"));
     }
 
@@ -764,6 +770,35 @@ mod tests {
         assert!(report.checkpoint_events.is_empty());
         assert_eq!(report.wal.checkpoint_generation, 1);
         assert_eq!(report.wal.checkpoint_through_sequence, 0);
+    }
+
+    #[test]
+    fn checkpoint_diagnostic_gates_two_rotation_boundaries() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("two-rotation-diagnostic");
+        let config = Config {
+            operations: TWO_ROTATION_OPERATIONS,
+            warmup: 0,
+            payload_bytes: 2,
+            command_mode: CommandMode::PreStored,
+            checkpoint_diagnostic: true,
+            ..Config::default()
+        };
+
+        let (report, failed) = run_at_root(&config, &root).unwrap();
+
+        assert!(!failed);
+        assert_eq!(report.checkpoint_events.len(), 2);
+        assert_eq!(report.wal.checkpoints_observed, 2);
+        assert_eq!(report.wal.checkpoint_generation, 3);
+        assert_eq!(report.wal.checkpoint_through_sequence, 2_048);
+        assert!(report
+            .checkpoint_boundary_operations
+            .iter()
+            .any(
+                |observation| observation.operation == TWO_ROTATION_OPERATIONS
+                    && observation.checkpoint_observed
+            ));
     }
 
     #[test]
@@ -824,15 +859,16 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_runs_that_cross_the_checkpoint_boundary() {
-        let error = Config::parse_from(
+    fn parser_allows_runs_that_cross_the_checkpoint_boundary() {
+        let config = Config::parse_from(
             ["--operations", "901", "--warmup", "100"]
                 .into_iter()
                 .map(String::from),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("WAL checkpoint boundary"));
+        assert_eq!(config.operations, 901);
+        assert_eq!(config.warmup, 100);
     }
 
     #[test]

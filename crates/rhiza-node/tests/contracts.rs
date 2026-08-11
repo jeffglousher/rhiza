@@ -9,7 +9,7 @@ use std::{
 
 use rhiza_core::{
     Command, CommandKind, ConfigChange, ConfigurationState, EntryType, LogEntry, LogHash,
-    StoredCommand,
+    StoredCommand, EXTERNAL_EFFECT_COMMAND_MAGIC,
 };
 use rhiza_log::{FileLogStore, LogStore};
 use rhiza_node::{
@@ -25,11 +25,12 @@ use rhiza_node::{
     VERSION_HEADER,
 };
 use rhiza_quepaxa::{
-    CertifiedDecisionInspection, DecisionProof, FixedMembership, IsrState, Membership,
-    ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary, RecorderFileStore,
-    RecorderRpc, ThreeNodeConsensus,
+    CertifiedDecisionInspection, DecisionProof, EffectBundleBinding, EffectBundleFinalizeRequest,
+    FixedMembership, IsrState, Membership, ReadFenceRequest, ReadFenceSlotState, RecordRequest,
+    RecordSummary, RecorderEffectBundle, RecorderFileStore, RecorderRpc, RecorderRpcContext,
+    ThreeNodeConsensus,
 };
-use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, QWAL_V3_MAGIC};
+use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine};
 
 fn test_config_digest() -> LogHash {
     FixedMembership::new(["node-1", "node-2", "node-3"])
@@ -453,7 +454,7 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V3_MAGIC));
+        .starts_with(EXTERNAL_EFFECT_COMMAND_MAGIC));
     assert_eq!(
         runtime
             .query_sql(
@@ -525,7 +526,7 @@ fn sql_batch_reprepares_all_members_after_a_foreign_slot_winner() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V3_MAGIC));
+        .starts_with(EXTERNAL_EFFECT_COMMAND_MAGIC));
 }
 
 #[test]
@@ -636,15 +637,17 @@ fn startup_replays_qlog_ahead_of_sqlite() {
         1,
     )
     .unwrap();
-    let entry = first_qwal_put_entry(
-        &dir.path().join("prepared-qwal"),
+    let consensus = consensus(dir.path());
+    let entry = first_qefx_put_entry(
+        &dir.path().join("prepared-qefx"),
+        &consensus,
         "request-1",
         "alpha",
         "from-qlog",
     );
     log.append(&entry).unwrap();
 
-    let runtime = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
+    let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
 
     assert_eq!(runtime.applied_index().unwrap(), 1);
     assert_eq!(
@@ -662,8 +665,9 @@ fn startup_recovers_quorum_decision_without_qlog_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     let config = node_config(dir.path());
     let decided_consensus = consensus(dir.path());
-    let prepared = first_qwal_put_entry(
-        &dir.path().join("prepared-qwal"),
+    let prepared = first_qefx_put_entry(
+        &dir.path().join("prepared-qefx"),
+        &decided_consensus,
         "request-1",
         "alpha",
         "recovered",
@@ -688,7 +692,7 @@ fn startup_recovers_quorum_decision_without_qlog_exactly_once() {
 }
 
 #[test]
-fn startup_rejects_non_qwal_sql_decision_before_mutating_qlog() {
+fn startup_rejects_non_qefx_sql_decision_before_mutating_qlog() {
     let dir = tempfile::tempdir().unwrap();
     let decided_consensus = consensus(dir.path());
     decided_consensus
@@ -705,7 +709,7 @@ fn startup_rejects_non_qwal_sql_decision_before_mutating_qlog() {
 
     assert!(matches!(
         NodeRuntime::open(node_config(dir.path()), decided_consensus, &[]),
-        Err(NodeError::Invariant(message)) if message.contains("QWAL")
+        Err(NodeError::Invariant(message)) if message.contains("QEFX")
     ));
     let log = FileLogStore::open_with_configuration(
         dir.path().join("consensus/log"),
@@ -719,7 +723,7 @@ fn startup_rejects_non_qwal_sql_decision_before_mutating_qlog() {
 }
 
 #[test]
-fn startup_rejects_non_qwal_peer_winner_before_mutating_qlog() {
+fn startup_rejects_non_qefx_peer_winner_before_mutating_qlog() {
     let dir = tempfile::tempdir().unwrap();
     let decided_consensus = consensus(dir.path());
     let decided = decided_consensus
@@ -737,7 +741,7 @@ fn startup_rejects_non_qwal_peer_winner_before_mutating_qlog() {
 
     assert!(matches!(
         NodeRuntime::open(node_config(dir.path()), decided_consensus, &[&peer]),
-        Err(NodeError::Invariant(message)) if message.contains("QWAL")
+        Err(NodeError::Invariant(message)) if message.contains("QEFX")
     ));
     let log = FileLogStore::open_with_configuration(
         dir.path().join("consensus/log"),
@@ -805,8 +809,9 @@ fn startup_replays_qlog_config_change_ahead_of_sqlite_sidecar() {
 fn startup_accepts_peer_candidate_only_when_consensus_committed_exact_entry() {
     let dir = tempfile::tempdir().unwrap();
     let decided_consensus = consensus(dir.path());
-    let prepared = first_qwal_put_entry(
-        &dir.path().join("prepared-qwal"),
+    let prepared = first_qefx_put_entry(
+        &dir.path().join("prepared-qefx"),
+        &decided_consensus,
         "request-candidate",
         "alpha",
         "verified",
@@ -1100,6 +1105,50 @@ impl RecorderRpc for TypedOnlyRecorder {
         command_hash: LogHash,
     ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
         self.0.fetch_command(command_hash)
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.0,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::finalize_staged_effect_bundle(&self.0, context, binding, manifest_command)
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.0, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.0, context, binding, ordinal)
     }
 
     fn record(
@@ -1862,6 +1911,50 @@ impl RecorderRpc for FenceFaultRecorder {
         )
     }
 
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.inner,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::finalize_staged_effect_bundle(&self.inner, context, binding, manifest_command)
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+    }
+
     fn record(
         &self,
         context: &rhiza_quepaxa::RecorderRpcContext,
@@ -2160,6 +2253,50 @@ impl RecorderRpc for ProofDroppingRecorder {
         self.0.fetch_command(command_hash)
     }
 
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.0,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::finalize_staged_effect_bundle(&self.0, context, binding, manifest_command)
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.0, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.0, context, binding, ordinal)
+    }
+
     fn record(
         &self,
         _context: &rhiza_quepaxa::RecorderRpcContext,
@@ -2429,7 +2566,7 @@ async fn sql_http_replays_fts5_write_and_read_barrier_exposes_match_results() {
 }
 
 #[test]
-fn sql_batch_commits_one_qwal_entry_and_replays_results() {
+fn sql_batch_commits_one_qefx_entry_and_replays_results() {
     let dir = tempfile::tempdir().unwrap();
     let runtime =
         Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
@@ -2467,7 +2604,7 @@ fn sql_batch_commits_one_qwal_entry_and_replays_results() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V3_MAGIC));
+        .starts_with(EXTERNAL_EFFECT_COMMAND_MAGIC));
     assert_eq!(first.results.len(), 1);
     assert_eq!(second.results.len(), 1);
     assert_ne!(first.results[0].returning, second.results[0].returning);
@@ -2495,7 +2632,7 @@ fn sql_batch_commits_one_qwal_entry_and_replays_results() {
 }
 
 #[test]
-fn four_member_sql_batch_commits_one_exact_base_qwal_entry() {
+fn four_member_sql_batch_commits_one_exact_base_qefx_entry() {
     let dir = tempfile::tempdir().unwrap();
     let runtime =
         Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
@@ -2543,7 +2680,7 @@ fn four_member_sql_batch_commits_one_exact_base_qwal_entry() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V3_MAGIC));
+        .starts_with(EXTERNAL_EFFECT_COMMAND_MAGIC));
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
 
     for command in commands {
@@ -2577,7 +2714,7 @@ fn four_member_sql_batch_commits_one_exact_base_qwal_entry() {
 }
 
 #[test]
-fn oversized_sql_batch_halves_until_each_qwal_effect_fits() {
+fn large_sql_batch_uses_one_bounded_qefx_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let runtime =
         Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
@@ -2606,10 +2743,9 @@ fn oversized_sql_batch_halves_until_each_qwal_effect_fits() {
         .map(|result| result.as_ref().unwrap().applied_index)
         .collect::<Vec<_>>();
 
-    assert_eq!(indices, vec![2, 2, 3, 3]);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
+    assert_eq!(indices, vec![2, 2, 2, 2]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
     assert!(runtime.log_store().read(2).unwrap().unwrap().payload.len() <= MAX_COMMAND_BYTES);
-    assert!(runtime.log_store().read(3).unwrap().unwrap().payload.len() <= MAX_COMMAND_BYTES);
 }
 
 #[test]
@@ -3305,20 +3441,49 @@ fn consensus_named(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
     )
 }
 
-fn first_qwal_put_entry(root: &Path, request_id: &str, key: &str, value: &str) -> LogEntry {
-    let state = SqliteStateMachine::open(
+fn first_qefx_put_entry(
+    root: &Path,
+    consensus: &ThreeNodeConsensus,
+    request_id: &str,
+    key: &str,
+    value: &str,
+) -> LogEntry {
+    let state = SqliteStateMachine::open_with_configuration(
         root.join("db.sqlite"),
         "rhiza:sql:cluster-a",
-        "qwal-preparer",
+        "qefx-preparer",
         1,
-        1,
+        ConfigurationState::active(1, test_config_digest()),
     )
     .unwrap();
     let request_payload = format!("put\t{request_id}\t{key}\t{value}").into_bytes();
-    let payload = state
-        .prepare_put_effect(request_id, key, value, &request_payload, 0, LogHash::ZERO)
+    let prepared = state
+        .prepare_external_put_effect(request_id, key, value, &request_payload, 0, LogHash::ZERO)
         .unwrap();
-    assert!(payload.starts_with(QWAL_V3_MAGIC));
+    let external = prepared
+        .build_command(test_config_digest(), 1, LogHash::ZERO)
+        .unwrap();
+    let payload = external.encode().unwrap();
+    assert!(payload.starts_with(EXTERNAL_EFFECT_COMMAND_MAGIC));
+    let manifest_command = StoredCommand::new(EntryType::Command, payload.clone());
+    let bundle = RecorderEffectBundle::new(
+        EffectBundleBinding {
+            cluster_id: external.cluster_id().to_owned(),
+            epoch: external.epoch(),
+            config_id: external.config_id(),
+            config_digest: external.config_digest(),
+            intended_slot: external.intended_slot(),
+            prev_hash: external.prev_hash(),
+            manifest_command_hash: manifest_command.hash(),
+            effect_digest: external.effect_digest_value(),
+        },
+        prepared.chunks().to_vec(),
+    )
+    .unwrap();
+    let request = EffectBundleFinalizeRequest::new(bundle, manifest_command).unwrap();
+    consensus
+        .finalize_effect_bundle_on_quorum(&RecorderRpcContext::default_timeout(), &request)
+        .unwrap();
     entry(1, LogHash::ZERO, &payload)
 }
 
@@ -3597,6 +3762,8 @@ impl Gate {
 struct GatedRecorder {
     id: String,
     commands: Mutex<HashMap<LogHash, StoredCommand>>,
+    effect_chunks: Mutex<HashMap<(LogHash, u16), Vec<u8>>>,
+    effect_manifests: Mutex<HashMap<LogHash, StoredCommand>>,
     isr: Mutex<HashMap<u64, IsrState>>,
     proofs: Mutex<HashMap<u64, DecisionProof>>,
     gate: Arc<Gate>,
@@ -3607,6 +3774,8 @@ impl GatedRecorder {
         Self {
             id,
             commands: Mutex::new(HashMap::new()),
+            effect_chunks: Mutex::new(HashMap::new()),
+            effect_manifests: Mutex::new(HashMap::new()),
             isr: Mutex::new(HashMap::new()),
             proofs: Mutex::new(HashMap::new()),
             gate,
@@ -3649,6 +3818,62 @@ impl RecorderRpc for GatedRecorder {
     ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
         assert_test_recorder_context(&cluster_id, epoch, config_id, config_digest);
         Ok(self.commands.lock().unwrap().get(&command_hash).cloned())
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        _context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        _manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.gate.wait();
+        self.effect_chunks
+            .lock()
+            .unwrap()
+            .insert((binding.manifest_command_hash, ordinal), chunk);
+        Ok(())
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        _context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.effect_manifests
+            .lock()
+            .unwrap()
+            .insert(binding.manifest_command_hash, manifest_command);
+        Ok(())
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        _context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        Ok(self
+            .effect_manifests
+            .lock()
+            .unwrap()
+            .get(&binding.manifest_command_hash)
+            .cloned())
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        _context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        Ok(self
+            .effect_chunks
+            .lock()
+            .unwrap()
+            .get(&(binding.manifest_command_hash, ordinal))
+            .cloned())
     }
 
     fn record(

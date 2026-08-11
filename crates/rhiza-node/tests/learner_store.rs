@@ -30,6 +30,7 @@ async fn initialized_archive(root: &Path) -> ObjectArchiveStore {
             CLUSTER_ID,
             EPOCH,
             PREDECESSOR_CONFIG_ID,
+            LogHash::digest(&[b"learner-store-test-config"]),
             RECOVERY_GENERATION,
         ),
     );

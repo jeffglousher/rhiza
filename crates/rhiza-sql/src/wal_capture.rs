@@ -42,6 +42,7 @@ pub(crate) fn capture_wal(
     wal: &mut File,
     base_db_pages: u32,
     max_changed_bytes: usize,
+    max_raw_bytes: u64,
 ) -> Result<WalCapture> {
     if !(1..=MAX_PAGE_NO).contains(&base_db_pages) {
         return invalid("SQLite base database page count is out of range");
@@ -54,6 +55,11 @@ pub(crate) fn capture_wal(
     let file_bytes = metadata.len();
     if file_bytes == 0 {
         return Ok(WalCapture::NoChange);
+    }
+    if file_bytes > max_raw_bytes {
+        return Err(Error::ResourceExhausted(format!(
+            "SQLite WAL raw capture exceeds {max_raw_bytes} bytes"
+        )));
     }
     if file_bytes < WAL_HEADER_BYTES {
         return invalid("SQLite WAL header is truncated");
@@ -90,20 +96,6 @@ pub(crate) fn capture_wal(
         return invalid("SQLite WAL does not contain exact complete frames");
     }
     let frame_count = payload_bytes / frame_bytes;
-    let max_frames = u64::try_from(max_changed_bytes)
-        .map_err(|_| Error::ResourceExhausted("SQLite WAL changed byte limit overflows".into()))?
-        / u64::from(page_size);
-    if frame_count > max_frames {
-        let max_raw_bytes = max_frames
-            .checked_mul(frame_bytes)
-            .and_then(|bytes| WAL_HEADER_BYTES.checked_add(bytes))
-            .ok_or_else(|| {
-                Error::ResourceExhausted("SQLite WAL raw byte limit overflows".into())
-            })?;
-        return Err(Error::ResourceExhausted(format!(
-            "SQLite WAL raw bytes exceed {max_raw_bytes} bytes"
-        )));
-    }
     let salts = [be_u32(&header[16..20]), be_u32(&header[20..24])];
     let mut rolling_checksum = expected_header_checksum;
     let mut pages = BTreeMap::<u32, Vec<u8>>::new();
@@ -353,7 +345,7 @@ mod tests {
         max_changed_bytes: usize,
     ) -> crate::Result<WalCapture> {
         let mut wal = File::open(path).unwrap();
-        capture_wal(&mut wal, base_db_pages, max_changed_bytes)
+        capture_wal(&mut wal, base_db_pages, max_changed_bytes, u64::MAX)
     }
 
     fn committed(capture: WalCapture) -> super::WalCommit {
@@ -516,24 +508,99 @@ mod tests {
     }
 
     #[test]
-    fn capture_rejects_duplicate_frames_beyond_changed_byte_budget() {
+    fn capture_allows_repeated_frames_beyond_final_changed_byte_budget() {
         let dir = TempDir::new().unwrap();
         let wal = synthetic_wal(512, ChecksumOrder::Big, &[(1, 0, 1), (1, 0, 2), (1, 1, 3)]);
         let path = write_wal(&dir, &wal);
 
-        assert_eq!(
-            capture_path(&path, 1, 1024),
-            Err(crate::Error::ResourceExhausted(
-                "SQLite WAL raw bytes exceed 1104 bytes".into()
-            ))
+        let capture = committed(capture_path(&path, 1, 512).unwrap());
+        assert_eq!(capture.pages.len(), 1);
+        assert_eq!(capture.pages[0].after_image[0], 3);
+    }
+
+    #[test]
+    fn capture_accepts_over_128_frames_overwriting_two_retained_pages() {
+        let dir = TempDir::new().unwrap();
+        let frames = (0..256)
+            .map(|index| {
+                let page_no = 1 + index % 2;
+                let commit_pages = if index == 255 { 2 } else { 0 };
+                (page_no, commit_pages, index as u8)
+            })
+            .collect::<Vec<_>>();
+        let wal = synthetic_wal(4096, ChecksumOrder::Big, &frames);
+        assert!(wal.len() as u64 > crate::MAX_SQL_EFFECT_BYTES as u64);
+        let path = write_wal(&dir, &wal);
+        let mut file = File::open(path).unwrap();
+
+        let capture = committed(
+            capture_wal(
+                &mut file,
+                2,
+                crate::MAX_SQL_EFFECT_BYTES,
+                crate::MAX_NATIVE_WAL_CAPTURE_BYTES,
+            )
+            .unwrap(),
         );
+
+        assert_eq!(capture.pages.len(), 2);
+        assert_eq!(capture.pages[0].after_image[0], 254);
+        assert_eq!(capture.pages[1].after_image[0], 255);
+    }
+
+    #[test]
+    fn capture_rejects_raw_wal_above_work_budget_before_parsing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.sqlite-wal");
+        File::create(&path)
+            .unwrap()
+            .set_len(crate::MAX_NATIVE_WAL_CAPTURE_BYTES + 1)
+            .unwrap();
+        let mut wal = File::open(path).unwrap();
+
+        assert_eq!(
+            capture_wal(
+                &mut wal,
+                1,
+                crate::MAX_SQL_EFFECT_BYTES,
+                crate::MAX_NATIVE_WAL_CAPTURE_BYTES,
+            ),
+            Err(crate::Error::ResourceExhausted(format!(
+                "SQLite WAL raw capture exceeds {} bytes",
+                crate::MAX_NATIVE_WAL_CAPTURE_BYTES
+            )))
+        );
+    }
+
+    #[test]
+    fn capture_rejects_unique_pages_above_final_effect_budget() {
+        let dir = TempDir::new().unwrap();
+        let frames = (1..=1025)
+            .map(|page_no| {
+                let commit_pages = if page_no == 1025 { 1025 } else { 0 };
+                (page_no, commit_pages, 1)
+            })
+            .collect::<Vec<_>>();
+        let path = write_wal(&dir, &synthetic_wal(512, ChecksumOrder::Little, &frames));
+        let mut wal = File::open(path).unwrap();
+
+        assert!(matches!(
+            capture_wal(
+                &mut wal,
+                1025,
+                crate::MAX_SQL_EFFECT_BYTES,
+                crate::MAX_NATIVE_WAL_CAPTURE_BYTES,
+            ),
+            Err(crate::Error::ResourceExhausted(message))
+                if message.contains("changed page images")
+        ));
     }
 
     #[test]
     fn capture_rejects_non_file_input() {
         let dir = TempDir::new().unwrap();
         let mut directory = File::open(dir.path()).unwrap();
-        assert!(capture_wal(&mut directory, 1, 4096).is_err());
+        assert!(capture_wal(&mut directory, 1, 4096, u64::MAX).is_err());
     }
 
     #[test]
@@ -569,7 +636,7 @@ mod tests {
 
         let wal_path = db.with_extension("sqlite-wal");
         let mut wal = File::open(&wal_path).unwrap();
-        let capture = committed(capture_wal(&mut wal, base_pages, usize::MAX).unwrap());
+        let capture = committed(capture_wal(&mut wal, base_pages, usize::MAX, u64::MAX).unwrap());
         let mut target = OpenOptions::new().write(true).open(&overlay).unwrap();
         target.set_len(capture.target_file_bytes).unwrap();
         for page in capture.pages {
@@ -614,7 +681,7 @@ mod tests {
         drop(connection);
 
         assert_eq!(wal.metadata().unwrap().len(), sealed_len);
-        let capture = committed(capture_wal(&mut wal, base_pages, usize::MAX).unwrap());
+        let capture = committed(capture_wal(&mut wal, base_pages, usize::MAX, u64::MAX).unwrap());
         assert!(!capture.pages.is_empty());
     }
 }

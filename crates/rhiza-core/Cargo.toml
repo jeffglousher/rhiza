@@ -13,6 +13,7 @@ categories = ["database", "data-structures"]
 [dependencies]
 serde.workspace = true
 sha2.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

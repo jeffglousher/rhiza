@@ -68,7 +68,7 @@ macro_rules! recorder_root {
     };
 }
 
-// HTTP request roots: identity, StoreCommand, FetchCommand, both inspect
+// HTTP request roots: identity, command/effect storage and fetch, both inspect
 // requests, read fence, record, and proof installation. Response roots are
 // listed as well because the same decoder is used for client responses.
 // Audit result for these roots and their framed equivalents: owned variable
@@ -79,6 +79,10 @@ recorder_wire_root!(
     (),
     super::StoreCommandV2,
     super::FetchCommandV2,
+    super::StageEffectChunkV3,
+    super::FinalizeEffectBundleV3,
+    super::FetchEffectManifestV3,
+    super::FetchEffectChunkV3,
     super::InspectProofV2,
     rhiza_quepaxa::ReadFenceRequest,
     rhiza_quepaxa::RecordRequest,
@@ -86,6 +90,7 @@ recorder_wire_root!(
     super::RecorderV2Result<()>,
     super::RecorderV2Result<String>,
     super::RecorderV2Result<Option<rhiza_core::StoredCommand>>,
+    super::RecorderV2Result<Option<Vec<u8>>>,
     super::RecorderV2Result<rhiza_quepaxa::RecordSummary>,
     super::RecorderV2Result<Option<rhiza_quepaxa::DecisionProof>>,
     super::RecorderV2Result<Option<rhiza_quepaxa::RecordSummary>>,

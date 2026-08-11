@@ -1237,6 +1237,10 @@ async fn flush_applied_tip(inner: &Inner) -> Result<(), Error> {
         return Ok(());
     }
     let applied_tip = inner.runtime.applied_index()?;
+    let observed = coordinator.refresh_durable_tip().await?;
+    if observed.index() >= applied_tip {
+        return Ok(());
+    }
     coordinator.note_committed(applied_tip);
     coordinator
         .flush_runtime(&inner.runtime, applied_tip)
@@ -1480,6 +1484,55 @@ mod tests {
                 .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
         }
 
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+            manifest_command: rhiza_core::StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::stage_effect_bundle_chunk(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            )
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+            manifest_command: rhiza_core::StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::finalize_staged_effect_bundle(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+            )
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+            RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+        }
+
         fn record(
             &self,
             _context: &rhiza_quepaxa::RecorderRpcContext,
@@ -1565,6 +1618,55 @@ mod tests {
         ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
             self.inner
                 .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+            manifest_command: rhiza_core::StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::stage_effect_bundle_chunk(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            )
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+            manifest_command: rhiza_core::StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::finalize_staged_effect_bundle(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+            )
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+            RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            binding: rhiza_quepaxa::EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
         }
 
         fn record(

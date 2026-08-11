@@ -15,16 +15,21 @@ Consensus*](https://discovery.ucl.ac.uk/id/eprint/10181480/1/quepaxa.pdf), SOSP
 
 | Paper property | rhiza sql status |
 |---|---|
-| A designated first-round proposer can decide after phase 0, one recorder round trip, when its highest-priority proposal reaches a quorum. | Ordinary SQL/KV FastPath returns after that phase-0 recorder quorum. The one-RTT claim is protocol-level; it excludes HTTP handling, SQLite execution, local logging, and configured OSS durability work. |
+| A designated first-round proposer can decide after phase 0, one recorder round trip, when its highest-priority proposal reaches a quorum. | Rhiza forms a FastPath decision proof after that phase-0 recorder quorum. This is a protocol decision point, not the current public acknowledgement boundary: the normal success path then installs the proof durably on a recorder quorum. Rhiza therefore does not claim a one-RTT client-visible FastPath. |
 | If the first round does not decide, round 2 and later are leaderless and fully asynchronous. Each round has four phases and succeeds probabilistically rather than through a timeout-driven view change. | The driver continues through four-phase rounds. Its proposal loop has cancellation but no fixed retry/round cap; phase progress is not a timeout-based liveness proof. |
 | Hedging and leader selection reduce redundant work but are not safety or liveness requirements. The paper adapts both with MAB-style tuning. | rhiza sql currently uses a static preferred identity and preferred-first endpoint order; later endpoints are used only for fallback or hedge attempts. MAB leader/hedge tuning remains documentation-only in [`mab-leader-hedge-tuning.md`](mab-leader-hedge-tuning.md). |
 
-rhiza sql adds a configuration-safety boundary beyond the paper's static-membership
-model: ordinary FastPath decisions return without proof-quorum installation, while
-ordinary Phase2 decisions, `ConfigChange` decisions, and decisions reached after a
-transition was observed install a durable proof on a recorder quorum before
-returning. Recovery may reconstruct FastPath from recorder summaries, but never
-reconstructs Phase2 from summaries alone; it requires an installed decision proof.
+Rhiza adds a durable-publication boundary beyond the paper's protocol decision
+point. On the normal success path, FastPath and Phase2 decisions, including
+`ConfigChange` decisions and decisions reached after a transition was observed,
+install a durable proof on a recorder quorum before the public proposal API
+returns success. If installation
+reports an ambiguous failure, the API may still acknowledge only after a bounded
+inspection certifies the exact matching committed value; otherwise it returns
+`UnknownOutcome`, while conflicting safety evidence remains terminal. Recovery
+may reconstruct FastPath from recorder summaries, but that capability is not an
+unconditional live acknowledgement shortcut. Recovery never reconstructs
+Phase2 from summaries alone; it requires an installed decision proof.
 
 ## Executable safety evidence and boundaries
 

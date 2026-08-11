@@ -29,7 +29,13 @@ fn archive(root: &Path) -> ObjectArchiveStore {
             root: root.to_path_buf(),
         })
         .unwrap(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            Membership::new(NODE_IDS).unwrap().digest(),
+            1,
+        ),
     )
 }
 

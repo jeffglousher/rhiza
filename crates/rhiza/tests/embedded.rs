@@ -4,8 +4,11 @@ use std::{
 };
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+use rhiza_core::LogHash;
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
+use rhiza_quepaxa::{
+    DecisionProof, EffectBundleBinding, Membership, RecordRequest, RecordSummary, RecorderFileStore,
+};
 use rhizadb::{
     effective_cluster_id, BatchWriteError, CheckpointCoordinator, DurabilityHealth, DurabilityMode,
     EmbeddedConfig, EmbeddedIdentity, Error, ExecutionProfile, NodeError, ReadConsistency,
@@ -226,24 +229,13 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
     std::fs::remove_dir_all(&archive_root).unwrap();
     std::fs::write(&archive_root, b"archive unavailable").unwrap();
 
-    let retry_cap_attempt = coordinator
-        .checkpoint_publication_attempts()
-        .checked_add(7)
-        .unwrap();
     let write = tokio::spawn(async move { handle.put("request", "key", "value").await });
     tokio::time::timeout(OUTER_HANG_GUARD, async {
-        while coordinator.checkpoint_publication_attempts() < retry_cap_attempt {
+        while coordinator.health() != DurabilityHealth::Unavailable {
             assert!(
                 !write.is_finished(),
-                "the sync write finished before reaching the capped retry backoff"
+                "the sync write finished before checkpoint storage became unavailable"
             );
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("checkpoint publication retries must not hang the test");
-    tokio::time::timeout(BEHAVIOR_DEADLINE, async {
-        while coordinator.health() != DurabilityHealth::Unavailable {
             tokio::task::yield_now().await;
         }
     })
@@ -278,7 +270,9 @@ async fn proposal_drains_a_minority_rpc_before_shutdown() {
     write.await.unwrap().unwrap();
     rhiza.shutdown().await.unwrap();
 
-    let reopened = Rhiza::open(config(root.path())).await.unwrap();
+    let (reopen_config, _started, reopen_release) = config_with_blocked_minority(root.path());
+    reopen_release.release();
+    let reopened = Rhiza::open(reopen_config).await.unwrap();
     reopened.shutdown().await.unwrap();
     root.close().unwrap();
 }
@@ -467,6 +461,50 @@ impl RecorderRpc for BlockingRecorder {
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: rhiza_core::StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.inner,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: rhiza_core::StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::finalize_staged_effect_bundle(&self.inner, context, binding, manifest_command)
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+    }
+
     fn record(
         &self,
         _context: &rhiza_quepaxa::RecorderRpcContext,
@@ -510,7 +548,13 @@ async fn initialized_checkpoint(root: &std::path::Path) -> ObjectArchiveStore {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

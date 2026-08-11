@@ -20,9 +20,13 @@ use rhiza_core::{
     ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, StoredCommand,
 };
 use rhiza_log::{FileLogStore, LogStore};
+#[cfg(feature = "sql")]
+use rhiza_quepaxa::RecorderRpcContext;
 use rhiza_quepaxa::{CertifiedDecisionInspection, DecisionProof, Membership, ThreeNodeConsensus};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "sql")]
+use crate::resolve_external_sql_effect_from_consensus;
 use crate::{
     durability::{
         adopt_finalized_successor_prestage, finalize_successor_prestage_for_stop,
@@ -44,7 +48,7 @@ pub const TAIL_MEMBERSHIP_DIGEST_HEADER: &str = "x-rhiza-tail-membership-digest"
 pub const MAX_CERTIFIED_TAIL_ENTRIES: u32 = 1_024;
 pub const DEFAULT_CERTIFIED_TAIL_ENTRIES: u32 = 64;
 pub const MAX_CERTIFIED_TAIL_ENCODED_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_CERTIFIED_TAIL_ENTRY_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_CERTIFIED_TAIL_ENTRY_PAYLOAD_BYTES: usize = crate::MAX_COMMAND_BYTES;
 pub const MAX_CONCURRENT_CERTIFIED_TAIL_READS: usize = 2;
 pub const CERTIFIED_TAIL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TAIL_AUTHORIZATION_SCHEME: &str = "Rhiza-Tail ";
@@ -615,6 +619,8 @@ pub struct LearnerStore {
     config: TailReaderConfig,
     log: FileLogStore,
     materializer: Materializer,
+    #[cfg(feature = "sql")]
+    consensus: Option<Arc<ThreeNodeConsensus>>,
     apply_lock: Mutex<()>,
 }
 
@@ -636,6 +642,7 @@ pub enum LearnerStoreError {
     AnchorMismatch,
     InvalidStop,
     Poisoned,
+    Unavailable(String),
 }
 
 impl fmt::Display for LearnerStoreError {
@@ -667,6 +674,9 @@ impl fmt::Display for LearnerStoreError {
                 formatter.write_str("learner finalization requires the exact bound Stop")
             }
             Self::Poisoned => formatter.write_str("learner apply lock is poisoned"),
+            Self::Unavailable(message) => {
+                write!(formatter, "learner effect is unavailable: {message}")
+            }
         }
     }
 }
@@ -678,7 +688,24 @@ impl LearnerStore {
         data_dir: impl Into<PathBuf>,
         config: TailReaderConfig,
     ) -> Result<Self, LearnerStoreError> {
-        let data_dir = data_dir.into();
+        Self::open_inner(data_dir.into(), config, None)
+    }
+
+    /// Opens a SQL-capable learner which can resolve committed QEFX bundles
+    /// before making their entries durable locally.
+    pub fn open_with_consensus(
+        data_dir: impl Into<PathBuf>,
+        config: TailReaderConfig,
+        consensus: Arc<ThreeNodeConsensus>,
+    ) -> Result<Self, LearnerStoreError> {
+        Self::open_inner(data_dir.into(), config, Some(consensus))
+    }
+
+    fn open_inner(
+        data_dir: PathBuf,
+        config: TailReaderConfig,
+        _consensus: Option<Arc<ThreeNodeConsensus>>,
+    ) -> Result<Self, LearnerStoreError> {
         let prestage = inspect_successor_prestage(
             &data_dir,
             ConfigurationState::active(config.config_id, config.membership.digest()),
@@ -730,6 +757,8 @@ impl LearnerStore {
             config,
             log,
             materializer,
+            #[cfg(feature = "sql")]
+            consensus: _consensus,
             apply_lock: Mutex::new(()),
         };
         store.reconcile()?;
@@ -799,7 +828,10 @@ impl LearnerStore {
             .configuration_state()
             .map_err(|error| LearnerStoreError::Storage(error.to_string()))?;
         let mut entries = Vec::with_capacity(response.records.len());
+        let mut entry_configurations = Vec::with_capacity(response.records.len());
         for record in &response.records {
+            self.preflight_entry(&configuration, &record.entry)?;
+            entry_configurations.push(configuration.clone());
             configuration = validate_detached_entry(
                 self.prestage.identity().execution_profile(),
                 &self.config,
@@ -816,10 +848,8 @@ impl LearnerStore {
                 .sync()
                 .map_err(|error| LearnerStoreError::Storage(error.to_string()))?;
         }
-        for entry in &entries {
-            self.materializer
-                .apply_entry(entry)
-                .map_err(LearnerStoreError::Storage)?;
+        for (entry, configuration) in entries.iter().zip(&entry_configurations) {
+            self.apply_entry(configuration, entry)?;
         }
         let durable = self.durable_anchor()?;
         let applied = self.applied_anchor()?;
@@ -887,21 +917,81 @@ impl LearnerStore {
                 .read(index)
                 .map_err(|error| LearnerStoreError::Storage(error.to_string()))?
                 .ok_or(LearnerStoreError::AnchorMismatch)?;
+            self.preflight_entry(&configuration, &entry)?;
+            let entry_configuration = configuration.clone();
             configuration = validate_detached_entry(
                 self.prestage.identity().execution_profile(),
                 &self.config,
                 &configuration,
                 &entry,
             )?;
-            self.materializer
-                .apply_entry(&entry)
-                .map_err(LearnerStoreError::Storage)?;
+            self.apply_entry(&entry_configuration, &entry)?;
             applied = LogAnchor::new(entry.index, entry.hash);
         }
         if self.applied_anchor()? != durable {
             return Err(LearnerStoreError::AnchorMismatch);
         }
         Ok(())
+    }
+
+    fn preflight_entry(
+        &self,
+        _configuration: &ConfigurationState,
+        _entry: &LogEntry,
+    ) -> Result<(), LearnerStoreError> {
+        #[cfg(feature = "sql")]
+        if self.prestage.identity().execution_profile() == ExecutionProfile::Sqlite
+            && _entry.entry_type == rhiza_core::EntryType::Command
+            && !_entry.payload.is_empty()
+        {
+            let consensus = self.consensus.as_ref().ok_or_else(|| {
+                LearnerStoreError::Unavailable(
+                    "SQL learner requires a Recorder quorum resolver for QEFX".into(),
+                )
+            })?;
+            resolve_external_sql_effect_from_consensus(
+                consensus,
+                _configuration,
+                _entry,
+                &RecorderRpcContext::default_timeout(),
+            )
+            .map_err(map_effect_resolution_error)?;
+        }
+        Ok(())
+    }
+
+    fn apply_entry(
+        &self,
+        _configuration: &ConfigurationState,
+        entry: &LogEntry,
+    ) -> Result<(), LearnerStoreError> {
+        #[cfg(feature = "sql")]
+        if self.prestage.identity().execution_profile() == ExecutionProfile::Sqlite
+            && entry.entry_type == rhiza_core::EntryType::Command
+            && !entry.payload.is_empty()
+        {
+            let consensus = self.consensus.as_ref().ok_or_else(|| {
+                LearnerStoreError::Unavailable(
+                    "SQL learner requires a Recorder quorum resolver for QEFX".into(),
+                )
+            })?;
+            let effect = resolve_external_sql_effect_from_consensus(
+                consensus,
+                _configuration,
+                entry,
+                &RecorderRpcContext::default_timeout(),
+            )
+            .map_err(map_effect_resolution_error)?;
+            return self
+                .materializer
+                .apply_verified_external_sql_effect(&effect)
+                .map(|_| ())
+                .map_err(LearnerStoreError::Storage);
+        }
+        self.materializer
+            .apply_entry(entry)
+            .map(|_| ())
+            .map_err(LearnerStoreError::Storage)
     }
 
     fn validate_seed(&self) -> Result<(), LearnerStoreError> {
@@ -987,6 +1077,17 @@ impl LearnerStore {
             return Err(LearnerStoreError::InvalidStop);
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "sql")]
+fn map_effect_resolution_error(error: crate::NodeError) -> LearnerStoreError {
+    match error {
+        crate::NodeError::Unavailable(message)
+        | crate::NodeError::StartupCancelled { stage: message, .. } => {
+            LearnerStoreError::Unavailable(message)
+        }
+        other => LearnerStoreError::Storage(other.to_string()),
     }
 }
 

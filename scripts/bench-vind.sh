@@ -27,6 +27,7 @@ warmup=5s
 concurrency=4
 target_rate=""
 workload=mixed
+d1_exact_write="${RHIZA_BENCH_D1_EXACT_WRITE:-0}"
 write_percent=50
 fault=none
 fault_offset=10s
@@ -799,6 +800,7 @@ checkpoint_drain_json="$target/checkpoint-drain.json"
 object_access_log="$target/s3-access.jsonl"
 object_usage_json="$target/object-usage.json"
 artifacts_json="$target/artifacts.json"
+runtime_pods_artifact="$target/runtime-pods.json"
 rendered_rustfs="$target/rustfs.yaml"
 rendered_cluster="$target/rhiza-sql-c1.yaml"
 stop_sampler="$target/.stop-sampler"
@@ -957,6 +959,7 @@ emit_artifacts() {
     --arg object_usage "$object_usage_json" \
     --arg rustfs_manifest "$rendered_rustfs" \
     --arg cluster_manifest "$rendered_cluster" \
+    --arg runtime_pods "$runtime_pods_artifact" \
     --arg durability_mode "$durability_mode" \
     --arg durability_max_lag "$durability_max_lag" \
     --arg durability_interval "$durability_interval" \
@@ -979,7 +982,7 @@ emit_artifacts() {
       cleaned_up:$cleaned_up,artifacts:{benchmark_json:$benchmark,resource_samples_jsonl:$resources,
       resource_summary_json:$resource_summary,checkpoint_drain_json:$checkpoint_drain,
       object_access_log_jsonl:$object_access_log,
-      object_usage_json:$object_usage,rustfs_manifest:$rustfs_manifest,cluster_manifest:$cluster_manifest}}' > "$artifacts_json"
+      object_usage_json:$object_usage,rustfs_manifest:$rustfs_manifest,cluster_manifest:$cluster_manifest,runtime_pods_json:$runtime_pods}}' > "$artifacts_json"
 }
 
 cleanup_run() {
@@ -999,6 +1002,7 @@ cleanup_run() {
   if [ "$namespace_created" = true ] &&
     runtime_pods_json="$(k get pods -o json 2>/dev/null)" &&
     observed_runtime_image_ids="$(printf '%s\n' "$runtime_pods_json" | runtime_image_ids_from_pods)"; then
+    printf '%s\n' "$runtime_pods_json" > "$runtime_pods_artifact"
     runtime_image_ids_json="$observed_runtime_image_ids"
   fi
   if [ "$object_metering" = 0 ]; then
@@ -1127,7 +1131,7 @@ kubectl --context "$context" label namespace "$namespace" rhiza.dev/bench-manage
 
 node="$(kubectl --context "$context" get nodes -o jsonpath='{.items[0].metadata.name}')"
 [ -n "$node" ] || die "cannot discover vind node"
-vcluster node load-image "$node" --image "$image" >/dev/null
+(cd "$target" && vcluster node load-image "$node" --image "$image") >/dev/null
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
@@ -1312,6 +1316,8 @@ if [ "$object_metering" = 1 ]; then
 fi
 bench_args=(--duration "$duration" --warmup "$warmup" --concurrency "$concurrency"
   --workload "$workload" --write-percent "$write_percent" --skip-setup)
+[ "$d1_exact_write" = 0 ] || [ "$d1_exact_write" = 1 ] || die "RHIZA_BENCH_D1_EXACT_WRITE must be 0 or 1"
+[ "$d1_exact_write" = 0 ] || bench_args+=(--d1-exact-write)
 for endpoint_url in "${workload_endpoint_urls[@]}"; do bench_args+=(--endpoint "$endpoint_url"); done
 [ -z "$target_rate" ] || bench_args+=(--target-rate "$target_rate")
 case "$fault" in

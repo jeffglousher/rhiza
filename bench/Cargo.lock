@@ -2041,6 +2041,7 @@ dependencies = [
 name = "rhiza-core"
 version = "0.3.0"
 dependencies = [
+ "postcard",
  "serde",
  "sha2",
 ]
@@ -2114,6 +2115,7 @@ name = "rhiza-quepaxa"
 version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
+ "rhiza-archive",
  "rhiza-core",
  "serde",
 ]

@@ -72,6 +72,12 @@ fn run(config: Config) -> Result<(), String> {
     }
 
     let warmup = run_phase(&client, &config, &run_id, "warmup", config.warmup, None)?;
+    let d1_measurement_prefix = format!("{run_id}-measurement-");
+    let d1_before = if config.d1_exact_write {
+        count_request_rows(&client, &config, &d1_measurement_prefix)?
+    } else {
+        0
+    };
     let measurement = run_phase(
         &client,
         &config,
@@ -81,6 +87,38 @@ fn run(config: Config) -> Result<(), String> {
         config.fault.clone(),
     )?;
     let run_failure = benchmark_failure(&warmup, &measurement);
+    let measurement_totals = measurement.stats.output(config.duration);
+    let d1 = if config.d1_exact_write {
+        let (after, min_value, max_value) = value_ledger(&client, &config, &d1_measurement_prefix)?;
+        let row_count_delta = after
+            .checked_sub(d1_before)
+            .ok_or("D1 row count decreased")?;
+        let expected_value = write_value(&config, "");
+        let final_id = latest_request_id(&client, &config, &d1_measurement_prefix)?;
+        read_request(&client, &config, &final_id)?;
+        if measurement_totals.errors != 0
+            || measurement_totals.attempts != measurement_totals.successes
+            || row_count_delta != measurement_totals.successes
+            || min_value.as_deref() != Some(expected_value.as_str())
+            || max_value.as_deref() != Some(expected_value.as_str())
+        {
+            return Err("D1 attempts/successes/errors or row-count delta rejected".into());
+        }
+        let final_value = write_value(&config, &final_id);
+        Some(D1Output {
+            unique_request_ids: true,
+            insert_only: true,
+            row_count_delta,
+            final_consistent_verification: true,
+            final_id,
+            final_value,
+            value_ledger_verified: true,
+            endpoint_count: config.endpoints.len(),
+            endpoint_fallback_attempts: 0,
+        })
+    } else {
+        None
+    };
     let measurement_window = measurement
         .measurement_window
         .ok_or_else(|| "measurement phase did not record its wall-clock window".to_string())?;
@@ -98,13 +136,14 @@ fn run(config: Config) -> Result<(), String> {
             fault_timeout_seconds: config.fault_timeout.as_secs_f64(),
             table: config.table,
             setup_skipped: config.skip_setup,
+            d1_exact_write: config.d1_exact_write,
         },
         warmup: warmup.stats.output(config.warmup),
         measurement: MeasurementOutput {
             measurement_window,
             configured_duration_seconds: config.duration.as_secs_f64(),
             observed_wall_seconds: measurement.wall_elapsed.as_secs_f64(),
-            totals: measurement.stats.output(config.duration),
+            totals: measurement_totals,
             offered_iterations: measurement.offered_iterations,
             completed_iterations: measurement.stats.output(config.duration).attempts,
             dropped_schedule_iterations: measurement.dropped_schedule_iterations,
@@ -113,6 +152,7 @@ fn run(config: Config) -> Result<(), String> {
                 .output(measurement.wall_elapsed, measurement.fault.as_ref()),
         },
         fault: measurement.fault,
+        d1,
     };
     println!(
         "{}",
@@ -123,6 +163,69 @@ fn run(config: Config) -> Result<(), String> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+fn value_ledger(
+    client: &Client,
+    config: &Config,
+    prefix: &str,
+) -> Result<(u64, Option<String>, Option<String>), String> {
+    let response = protocol_post_failover(
+        client,
+        config,
+        "d1-ledger",
+        "/v1/sql/query",
+        json!({"statement":{"sql":format!("SELECT COUNT(*), MIN(value), MAX(value) FROM {} WHERE request_id LIKE ?", config.table),"parameters":[{"type":"text","value":format!("{prefix}%")}]},"consistency":"read_barrier","max_rows":1}),
+        "sql_query",
+    )?;
+    let values = response
+        .pointer("/rows/0")
+        .and_then(Value::as_array)
+        .ok_or("invalid D1 ledger response")?;
+    let count = values
+        .first()
+        .and_then(|v| v.get("value"))
+        .and_then(Value::as_u64)
+        .ok_or("invalid D1 ledger count")?;
+    let text = |index: usize| {
+        values
+            .get(index)
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    Ok((count, text(1), text(2)))
+}
+
+fn count_request_rows(client: &Client, config: &Config, prefix: &str) -> Result<u64, String> {
+    let response = protocol_post_failover(
+        client,
+        config,
+        "d1-count",
+        "/v1/sql/query",
+        json!({"statement":{"sql":format!("SELECT COUNT(*) FROM {} WHERE request_id LIKE ?", config.table),"parameters":[{"type":"text","value":format!("{prefix}%")}]},"consistency":"read_barrier","max_rows":1}),
+        "sql_query",
+    )?;
+    response
+        .pointer("/rows/0/0/value")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "invalid D1 COUNT response".into())
+}
+
+fn latest_request_id(client: &Client, config: &Config, prefix: &str) -> Result<String, String> {
+    let response = protocol_post_failover(
+        client,
+        config,
+        "d1-final",
+        "/v1/sql/query",
+        json!({"statement":{"sql":format!("SELECT request_id FROM {} WHERE request_id LIKE ? ORDER BY request_id DESC LIMIT 1", config.table),"parameters":[{"type":"text","value":format!("{prefix}%")}]},"consistency":"read_barrier","max_rows":1}),
+        "sql_query",
+    )?;
+    response
+        .pointer("/rows/0/0/value")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "invalid D1 final row response".into())
 }
 
 fn benchmark_failure(warmup: &PhaseResult, measurement: &PhaseResult) -> Option<String> {
@@ -529,6 +632,7 @@ fn wait_for_rate(
 }
 
 fn write_request(client: &Client, config: &Config, request_id: &str) -> Result<(), String> {
+    let value = write_value(config, request_id);
     let body = json!({
         "request_id": request_id,
         "statements": [{
@@ -538,7 +642,7 @@ fn write_request(client: &Client, config: &Config, request_id: &str) -> Result<(
             ),
             "parameters": [
                 {"type": "text", "value": request_id},
-                {"type": "text", "value": format!("value-{request_id}")}
+                {"type": "text", "value": value}
             ]
         }]
     });
@@ -580,7 +684,7 @@ fn read_request(client: &Client, config: &Config, request_id: &str) -> Result<()
     if response.get("columns").is_none() || response.get("rows").is_none() {
         return Err("invalid_sql_query_response".into());
     }
-    validate_read_response(&response, request_id)
+    validate_read_response(&response, config, request_id)
 }
 
 fn protocol_post_failover(
@@ -618,10 +722,22 @@ fn endpoint(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
-fn validate_read_response(response: &Value, request_id: &str) -> Result<(), String> {
+fn write_value(config: &Config, request_id: &str) -> String {
+    if config.d1_exact_write {
+        "d1-fixed-payload".repeat(128_usize.div_ceil("d1-fixed-payload".len()))[..128].to_owned()
+    } else {
+        format!("value-{request_id}")
+    }
+}
+
+fn validate_read_response(
+    response: &Value,
+    config: &Config,
+    request_id: &str,
+) -> Result<(), String> {
     let expected = json!([[
         {"type": "text", "value": request_id},
-        {"type": "text", "value": format!("value-{request_id}")}
+        {"type": "text", "value": write_value(config, request_id)}
     ]]);
     if response.get("rows") == Some(&expected) {
         Ok(())
@@ -948,6 +1064,21 @@ struct BenchmarkReport {
     measurement: MeasurementOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
     fault: Option<FaultOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d1: Option<D1Output>,
+}
+
+#[derive(Serialize)]
+struct D1Output {
+    unique_request_ids: bool,
+    insert_only: bool,
+    row_count_delta: u64,
+    final_consistent_verification: bool,
+    final_id: String,
+    final_value: String,
+    value_ledger_verified: bool,
+    endpoint_count: usize,
+    endpoint_fallback_attempts: u64,
 }
 
 #[derive(Serialize)]
@@ -960,6 +1091,7 @@ struct ConfigOutput {
     fault_timeout_seconds: f64,
     table: String,
     setup_skipped: bool,
+    d1_exact_write: bool,
 }
 
 #[derive(Serialize)]
@@ -1195,6 +1327,7 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             fault_timeout: Duration::from_secs(1),
             skip_setup: false,
+            d1_exact_write: false,
             fault: None,
         }
     }

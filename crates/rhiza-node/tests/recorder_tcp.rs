@@ -725,7 +725,7 @@ async fn recorder_tcp_lifecycle_receipts_listener_and_closes_a_partial_idle_read
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn three_tcp_recorders_durably_record_ordinary_proof_in_typed_summaries() {
+async fn tcp_recorders_durably_install_an_ordinary_proof_quorum() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
     let mut servers = Vec::new();
@@ -770,6 +770,7 @@ async fn three_tcp_recorders_durably_record_ordinary_proof_in_typed_summaries() 
         })
         .collect();
     let first_address = addresses[0];
+    let inspect_addresses = addresses.clone();
     let install_membership = membership.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -803,25 +804,39 @@ async fn three_tcp_recorders_durably_record_ordinary_proof_in_typed_summaries() 
             other => panic!("expected committed decision, got {other:?}"),
         };
 
+        let installed = inspect_addresses
+            .iter()
+            .enumerate()
+            .filter(|(index, address)| {
+                let recorder_id = format!("node-{}", index + 1);
+                let inspector = TcpPostcardRecorderClient::new(
+                    **address,
+                    recorder_id,
+                    "node-1",
+                    "peer-token-1",
+                    1,
+                )
+                .unwrap();
+                let summary = inspector
+                    .inspect_record_summary(&context(), 1)
+                    .unwrap()
+                    .unwrap();
+                summary.decided.as_ref() == Some(&proof)
+                    && summary.step == 4
+                    && summary.first_current.as_ref() == Some(proof.proposal())
+                    && summary.aggregate_prior.is_none()
+                    && inspector.inspect_decision_proof(&context(), 1).unwrap()
+                        == Some(proof.clone())
+            })
+            .count();
+        assert!(installed >= install_membership.quorum_size());
+
+        // The explicit proof-install transport remains idempotent for ordinary
+        // decisions as well as Phase2 and configuration transitions.
         let inspector =
             TcpPostcardRecorderClient::new(first_address, "node-1", "node-1", "peer-token-1", 1)
                 .unwrap();
         let context = context();
-        let summary = inspector
-            .inspect_record_summary(&context, 1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.decided.as_ref(), Some(&proof));
-        assert_eq!(summary.step, 4);
-        assert_eq!(summary.first_current.as_ref(), Some(proof.proposal()));
-        assert_eq!(summary.aggregate_prior, None);
-        assert_eq!(
-            inspector.inspect_decision_proof(&context, 1).unwrap(),
-            Some(proof.clone())
-        );
-
-        // The explicit proof-install transport remains idempotent for ordinary
-        // decisions as well as Phase2 and configuration transitions.
         inspector
             .install_decision_proof(&context, proof.clone(), &install_membership)
             .unwrap();

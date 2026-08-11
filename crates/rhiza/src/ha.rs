@@ -91,9 +91,9 @@ use rhiza_node::{
     RecorderPostcardRpcTlsServerConfig,
 };
 use rhiza_quepaxa::{
-    AcceptedValue, DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest,
-    RecordRequest, RecordSummary, RecorderFileStore, RecorderPreflight, RecorderRpc,
-    ThreeNodeConsensus,
+    AcceptedValue, DecisionProof, EffectBundleBinding, Membership, ReadFenceObservation,
+    ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore, RecorderPreflight,
+    RecorderRpc, ThreeNodeConsensus,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt as _;
@@ -1312,6 +1312,7 @@ pub struct HaSuccessorPrestageConfig {
     predecessor_membership: Membership,
     target_membership: Membership,
     tail_token: String,
+    effect_consensus: Option<Arc<ThreeNodeConsensus>>,
 }
 
 impl HaSuccessorPrestageConfig {
@@ -1332,7 +1333,15 @@ impl HaSuccessorPrestageConfig {
             predecessor_membership,
             target_membership,
             tail_token: tail_token.into(),
+            effect_consensus: None,
         }
+    }
+
+    /// Supplies the predecessor Recorder quorum used by a SQL successor to
+    /// fetch and verify QEFX bytes before it persists or applies a tail entry.
+    pub fn with_effect_consensus(mut self, consensus: Arc<ThreeNodeConsensus>) -> Self {
+        self.effect_consensus = Some(consensus);
+        self
     }
 
     /// Restores the current Active checkpoint into a detached successor stage.
@@ -1377,6 +1386,7 @@ impl HaSuccessorPrestageConfig {
             prestage,
             identity,
             tail_config,
+            effect_consensus: self.effect_consensus,
         })
     }
 
@@ -1410,6 +1420,7 @@ impl HaSuccessorPrestageConfig {
             prestage,
             identity,
             tail_config,
+            effect_consensus: None,
         })
     }
 
@@ -1520,6 +1531,7 @@ pub struct PreparedHaSuccessorPrestage {
     prestage: SuccessorPrestage,
     identity: HaSuccessorPrestageIdentity,
     tail_config: TailReaderConfig,
+    effect_consensus: Option<Arc<ThreeNodeConsensus>>,
 }
 
 impl PreparedHaSuccessorPrestage {
@@ -1540,7 +1552,13 @@ impl PreparedHaSuccessorPrestage {
         let data_dir = data_dir.into();
         let published = publish_successor_prestage(self.prestage, &data_dir).map_err(error)?;
         drop(published);
-        let learner = LearnerStore::open(&data_dir, self.tail_config).map_err(error)?;
+        let learner = match self.effect_consensus {
+            Some(consensus) => {
+                LearnerStore::open_with_consensus(&data_dir, self.tail_config, consensus)
+            }
+            None => LearnerStore::open(&data_dir, self.tail_config),
+        }
+        .map_err(error)?;
         Ok(PublishedHaSuccessorPrestage {
             learner,
             identity: self.identity,
@@ -2074,11 +2092,13 @@ impl PreparedHaStartup {
             LogAnchor::new(predecessor.stop.entry.index, predecessor.stop.entry.hash)
         });
         let target_config_id = self.target_config_id;
-        let coordinator_open = CheckpointCoordinator::open_with_holder_and_options(
+        let coordinator_open = CheckpointCoordinator::open_with_holder_options_local_state(
             self.config.archive,
             self.config.durability,
             self.config.node_config.node_id(),
             CheckpointPublisherOptions::new(self.config.lease_duration_ms),
+            self.recorder.clone(),
+            self.config.node_config.data_dir(),
         );
         tokio::pin!(coordinator_open);
         let coordinator = loop {
@@ -6409,6 +6429,57 @@ impl RecorderRpc for HaRecorder {
         )
     }
 
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.require_active()?;
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.require_active()?;
+        RecorderRpc::finalize_staged_effect_bundle(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+        )
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.recorder, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.recorder, context, binding, ordinal)
+    }
+
     fn record(
         &self,
         context: &rhiza_quepaxa::RecorderRpcContext,
@@ -7983,6 +8054,7 @@ fn verify_local_rejoin_checkpoint(
         config.cluster_id().to_owned(),
         config.epoch(),
         runtime.consensus().config_id(),
+        runtime.configuration_state().map_err(error)?.digest(),
         config.recovery_generation(),
     );
     if &local_identity != identity {
@@ -8453,7 +8525,13 @@ mod tests {
     use super::*;
 
     fn startup_fence_test_identity() -> CheckpointIdentity {
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1)
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"ha-test-config"]),
+            1,
+        )
     }
 
     async fn wait_for_ha_startup_transaction(entered: std::sync::mpsc::Receiver<()>) {
@@ -9125,7 +9203,13 @@ mod tests {
                 root: root.to_path_buf(),
             })
             .unwrap(),
-            CheckpointIdentity::new(cluster_id, 1, 1, 1),
+            CheckpointIdentity::new(
+                cluster_id,
+                1,
+                1,
+                rhiza_core::LogHash::digest(&[b"ha-test-config"]),
+                1,
+            ),
         )
     }
 
@@ -9599,6 +9683,62 @@ mod tests {
                     .unwrap(),
             ],
         )
+    }
+
+    #[test]
+    fn ha_recorder_forwards_external_effect_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let (recorder, _) = test_http_recorder(root.path());
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let chunks = vec![b"ha-effect".to_vec()];
+        let qefx = rhiza_core::ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "cluster-a",
+            1,
+            1,
+            membership.digest(),
+            1,
+            LogHash::ZERO,
+            rhiza_core::ExternalEffectProfile::sql(vec![1]),
+            &chunks,
+        )
+        .unwrap();
+        let manifest = StoredCommand::new(rhiza_core::EntryType::Command, qefx.encode().unwrap());
+        let binding = EffectBundleBinding {
+            cluster_id: qefx.cluster_id().into(),
+            epoch: qefx.epoch(),
+            config_id: qefx.config_id(),
+            config_digest: qefx.config_digest(),
+            intended_slot: qefx.intended_slot(),
+            prev_hash: qefx.prev_hash(),
+            manifest_command_hash: manifest.hash(),
+            effect_digest: qefx.effect_digest_value(),
+        };
+        let context = rhiza_quepaxa::RecorderRpcContext::default_timeout();
+        RecorderRpc::stage_effect_bundle_chunk(
+            &recorder,
+            &context,
+            binding.clone(),
+            manifest.clone(),
+            0,
+            chunks[0].clone(),
+        )
+        .unwrap();
+        RecorderRpc::finalize_staged_effect_bundle(
+            &recorder,
+            &context,
+            binding.clone(),
+            manifest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            RecorderRpc::fetch_effect_bundle_manifest(&recorder, &context, binding.clone(),)
+                .unwrap(),
+            Some(manifest)
+        );
+        assert_eq!(
+            RecorderRpc::fetch_effect_bundle_chunk(&recorder, &context, binding, 0).unwrap(),
+            Some(chunks[0].clone())
+        );
     }
 
     fn test_recorder_tls_material() -> (String, String) {
@@ -11763,12 +11903,24 @@ mod tests {
             .unwrap();
             let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                 store.clone(),
-                CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+                CheckpointIdentity::new(
+                    "rhiza:sql:cluster-a",
+                    1,
+                    1,
+                    LogHash::digest(&[b"ha-test-config"]),
+                    1,
+                ),
             );
             source_archive.initialize_checkpoint().await.unwrap();
             let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                 store,
-                CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+                CheckpointIdentity::new(
+                    "rhiza:sql:cluster-a",
+                    1,
+                    2,
+                    LogHash::digest(&[b"ha-test-config"]),
+                    1,
+                ),
             );
             let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
             let successor = Membership::new(["node-4", "node-5", "node-6"]).unwrap();
@@ -14584,7 +14736,13 @@ mod tests {
                     .expect("archive store must open");
                 let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                     store.clone(),
-                    CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+                    CheckpointIdentity::new(
+                        "rhiza:sql:cluster-a",
+                        1,
+                        1,
+                        LogHash::digest(&[b"ha-test-config"]),
+                        1,
+                    ),
                 );
                 source_archive
                     .initialize_checkpoint()
@@ -14668,7 +14826,13 @@ mod tests {
                 drop(source);
                 let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                     store,
-                    CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+                    CheckpointIdentity::new(
+                        "rhiza:sql:cluster-a",
+                        1,
+                        2,
+                        LogHash::digest(&[b"ha-test-config"]),
+                        1,
+                    ),
                 );
                 let peers = successor
                     .members()

@@ -56,7 +56,7 @@ pub struct RhizaClient {
     http: reqwest::Client,
     policy: ClientPolicy,
     #[cfg(feature = "tuner")]
-    tuner: Option<std::sync::Arc<rhiza_tuner::MabTuner>>,
+    routing: Option<ClientRouting>,
 }
 
 impl RhizaClient {
@@ -66,6 +66,44 @@ impl RhizaClient {
         bearer_token: impl Into<String>,
     ) -> Result<Self, ClientError> {
         Self::build(endpoints, bearer_token, ClientPolicy::default())
+    }
+
+    /// Attach an explicitly identified, runtime-controlled routing tuner.
+    ///
+    /// The ordinary constructor remains static. Tuning is enabled only when the
+    /// trusted snapshot maps every configured URL to one unique node id and its
+    /// static primary matches the client's existing first endpoint.
+    #[cfg(feature = "tuner")]
+    pub fn with_routing_tuner(
+        mut self,
+        tuner: std::sync::Arc<rhiza_tuner::RoutingTuner>,
+        snapshot: rhiza_tuner::RoutingSnapshot,
+    ) -> Result<Self, ClientError> {
+        self.validate_routing_snapshot(&snapshot)?;
+        self.routing = Some(ClientRouting {
+            tuner,
+            snapshot: std::sync::Arc::new(std::sync::RwLock::new(snapshot)),
+            cohort_id: uuid::Uuid::new_v4().to_string(),
+        });
+        Ok(self)
+    }
+
+    /// Replace the trusted routing snapshot used by subsequent requests.
+    #[cfg(feature = "tuner")]
+    pub fn update_routing_snapshot(
+        &self,
+        snapshot: rhiza_tuner::RoutingSnapshot,
+    ) -> Result<(), ClientError> {
+        self.validate_routing_snapshot(&snapshot)?;
+        let routing = self
+            .routing
+            .as_ref()
+            .ok_or_else(|| ClientError::invalid_configuration("routing tuner is not configured"))?;
+        *routing
+            .snapshot
+            .write()
+            .map_err(|_| ClientError::routing_state())? = snapshot;
+        Ok(())
     }
 
     #[cfg(feature = "sql")]
@@ -228,8 +266,47 @@ impl RhizaClient {
             http,
             policy,
             #[cfg(feature = "tuner")]
-            tuner: None,
+            routing: None,
         })
+    }
+
+    #[cfg(feature = "tuner")]
+    fn validate_routing_snapshot(
+        &self,
+        snapshot: &rhiza_tuner::RoutingSnapshot,
+    ) -> Result<(), ClientError> {
+        if self
+            .endpoints
+            .iter()
+            .enumerate()
+            .any(|(index, endpoint)| self.endpoints[..index].contains(endpoint))
+        {
+            return Err(ClientError::invalid_configuration(
+                "routing tuner requires unique endpoint URLs",
+            ));
+        }
+        if snapshot.endpoints().len() != self.endpoints.len()
+            || self
+                .endpoints
+                .iter()
+                .zip(snapshot.endpoints())
+                .any(|(configured, mapped)| configured != mapped.url())
+        {
+            return Err(ClientError::invalid_configuration(
+                "routing snapshot must map every configured endpoint exactly once",
+            ));
+        }
+        let primary_url = snapshot
+            .endpoints()
+            .iter()
+            .find(|endpoint| endpoint.node_id() == snapshot.static_primary())
+            .map(rhiza_tuner::RoutingEndpoint::url);
+        if primary_url != self.endpoints.first().map(String::as_str) {
+            return Err(ClientError::invalid_configuration(
+                "routing snapshot static primary must match the first configured endpoint",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(all(test, feature = "sql"))]
@@ -253,71 +330,151 @@ impl RhizaClient {
     {
         let body = serde_json::to_vec(request).map_err(|_| ClientError::request_encoding())?;
 
-        // Use tuner to determine endpoint order and hedge delay
         #[cfg(feature = "tuner")]
-        let (ordered_endpoints, hedge_delay_duration, correlation_id) = if let Some(tuner) =
-            &self.tuner
-        {
-            let identity = rhiza_tuner::Identity {
-                cluster_id: String::new(),
-                epoch: 0,
-                config_id: 0,
-                membership_digest: [0u8; 32],
-                recovery_generation: 0,
+        let (ordered_endpoints, hedge_delay_duration, routing_observation) =
+            if let Some(routing) = &self.routing {
+                match routing.snapshot.read() {
+                    Ok(snapshot) => {
+                        let snapshot = snapshot.clone();
+                        let correlation_id = uuid::Uuid::new_v4().to_string();
+                        let plan = routing.tuner.plan_for_cohort(
+                            &snapshot,
+                            routing_request_class(body.len()),
+                            &correlation_id,
+                            &routing.cohort_id,
+                        );
+                        match routing_urls(&snapshot, &plan.actual_order) {
+                            Some(ordered) => (
+                                ordered,
+                                plan.hedge_delay,
+                                Some(ClientRoutingObservation {
+                                    routing: routing.clone(),
+                                    planned_snapshot: snapshot,
+                                    correlation_id,
+                                    ticket: plan.ticket,
+                                }),
+                            ),
+                            None => {
+                                let _ = routing.tuner.observe(
+                                    plan.ticket,
+                                    &snapshot,
+                                    rhiza_tuner::ExecutionTrace::new(
+                                        correlation_id,
+                                        Vec::new(),
+                                        rhiza_tuner::AttemptOutcome::Cancelled,
+                                    ),
+                                );
+                                (self.endpoints.clone(), self.policy.hedge_delay, None)
+                            }
+                        }
+                    }
+                    Err(_) => (self.endpoints.clone(), self.policy.hedge_delay, None),
+                }
+            } else {
+                (self.endpoints.clone(), self.policy.hedge_delay, None)
             };
-            let eligible: Vec<rhiza_tuner::NodeId> = self.endpoints.to_vec();
-            let candidate_set = rhiza_tuner::CandidateSet {
-                identity: identity.clone(),
-                eligible_voters: eligible.clone(),
-                hedge_delay_allowlist: rhiza_tuner::HedgeDelayBucket::all_buckets().to_vec(),
-                static_hedge_delay_ms: 100,
-            };
-            let correlation_id = uuid::Uuid::new_v4().to_string();
-            let result = tuner.select_action(&identity, &eligible, &candidate_set, &correlation_id);
-            let preferred = &result.output.action.first_request_target;
-            let mut ordered = self.endpoints.clone();
-            if let Some(pos) = ordered.iter().position(|e| e == preferred) {
-                let endpoint = ordered.remove(pos);
-                ordered.insert(0, endpoint);
-            }
-            let delay_ms = result
-                .output
-                .action
-                .hedge_delay
-                .as_ms()
-                .unwrap_or(self.policy.hedge_delay.as_millis() as u64);
-            (
-                ordered,
-                Duration::from_millis(delay_ms),
-                Some(correlation_id),
-            )
-        } else {
-            (self.endpoints.clone(), self.policy.hedge_delay, None)
-        };
 
         #[cfg(not(feature = "tuner"))]
-        let (ordered_endpoints, hedge_delay_duration, _correlation_id): (
-            Vec<String>,
-            Duration,
-            Option<String>,
-        ) = (self.endpoints.clone(), self.policy.hedge_delay, None);
+        let (ordered_endpoints, hedge_delay_duration): (Vec<String>, Duration) =
+            (self.endpoints.clone(), self.policy.hedge_delay);
 
-        let attempt = ClientAttempt {
-            client: self.http.clone(),
-            token: self.bearer_token.clone(),
-            path: path.to_owned(),
-            body,
-            server_fields: ServerFieldSanitizer::new(&ordered_endpoints, &self.bearer_token),
-            timeout: self.policy.attempt_timeout,
-        };
+        #[cfg(feature = "tuner")]
+        let (mut ordered_endpoints, mut hedge_delay_duration, mut routing_observation) =
+            (ordered_endpoints, hedge_delay_duration, routing_observation);
+
+        let operation_start = tokio::time::Instant::now();
         let mut attempts = tokio::task::JoinSet::new();
+        let mut attempt_records = Vec::new();
         let mut next = 0;
         let mut last_error = None;
 
         #[cfg(feature = "tuner")]
-        let start_time = tokio::time::Instant::now();
-        spawn_client_attempt(&mut attempts, &ordered_endpoints[next], &attempt);
-        next += 1;
+        let attempt = {
+            let launch_routing = routing_observation
+                .as_ref()
+                .map(|observation| observation.routing.clone());
+            let planned_snapshot = routing_observation
+                .as_ref()
+                .map(|observation| observation.planned_snapshot.clone());
+            let tuned_attempt = ClientAttempt {
+                client: self.http.clone(),
+                token: self.bearer_token.clone(),
+                path: path.to_owned(),
+                body: body.clone(),
+                server_fields: ServerFieldSanitizer::new(&ordered_endpoints, &self.bearer_token),
+                timeout: self.policy.attempt_timeout,
+            };
+            let launched = launch_routing.as_ref().is_some_and(|routing| {
+                routing.launch_if_current(
+                    planned_snapshot
+                        .as_ref()
+                        .expect("routing plan has a snapshot"),
+                    || {
+                        spawn_client_attempt(
+                            &mut attempts,
+                            &mut attempt_records,
+                            &ordered_endpoints[next],
+                            &tuned_attempt,
+                            operation_start,
+                            ClientAttemptTrigger::Initial,
+                        );
+                    },
+                )
+            });
+            if launched {
+                next += 1;
+                tuned_attempt
+            } else {
+                if let Some(observation) = routing_observation.take() {
+                    observation.censor();
+                }
+                ordered_endpoints = self.endpoints.clone();
+                hedge_delay_duration = self.policy.hedge_delay;
+                let static_attempt = ClientAttempt {
+                    client: self.http.clone(),
+                    token: self.bearer_token.clone(),
+                    path: path.to_owned(),
+                    body,
+                    server_fields: ServerFieldSanitizer::new(
+                        &ordered_endpoints,
+                        &self.bearer_token,
+                    ),
+                    timeout: self.policy.attempt_timeout,
+                };
+                spawn_client_attempt(
+                    &mut attempts,
+                    &mut attempt_records,
+                    &ordered_endpoints[next],
+                    &static_attempt,
+                    operation_start,
+                    ClientAttemptTrigger::Initial,
+                );
+                next += 1;
+                static_attempt
+            }
+        };
+
+        #[cfg(not(feature = "tuner"))]
+        let attempt = {
+            let attempt = ClientAttempt {
+                client: self.http.clone(),
+                token: self.bearer_token.clone(),
+                path: path.to_owned(),
+                body,
+                server_fields: ServerFieldSanitizer::new(&ordered_endpoints, &self.bearer_token),
+                timeout: self.policy.attempt_timeout,
+            };
+            spawn_client_attempt(
+                &mut attempts,
+                &mut attempt_records,
+                &ordered_endpoints[next],
+                &attempt,
+                operation_start,
+                ClientAttemptTrigger::Initial,
+            );
+            next += 1;
+            attempt
+        };
 
         let hedge_delay = tokio::time::sleep(hedge_delay_duration);
         let operation_deadline = tokio::time::sleep(self.policy.operation_timeout);
@@ -331,20 +488,38 @@ impl RhizaClient {
             tokio::select! {
                 result = attempts.join_next(), if !attempts.is_empty() => {
                     match result.expect("a nonempty attempt set must yield a result") {
-                        Ok(Ok(response)) => {
-                            attempts.abort_all();
-                            break Ok(response);
-                        }
-                        Ok(Err(error)) if !error.retryable() => {
-                            attempts.abort_all();
-                            break Err(error);
-                        }
-                        Ok(Err(error)) => {
-                            last_error = Some(error);
-                            if let Some(endpoint) = ordered_endpoints.get(next) {
-                                spawn_client_attempt(&mut attempts, endpoint, &attempt);
-                                next += 1;
-                                hedge_delay.as_mut().reset(tokio::time::Instant::now() + hedge_delay_duration);
+                        Ok(completed) => {
+                            let result = completed.result;
+                            attempt_records[completed.attempt_index].completed_after = Some(operation_start.elapsed());
+                            attempt_records[completed.attempt_index].outcome = Some(ClientAttemptOutcome::from_result(&result));
+                            match result {
+                                Ok(response) => {
+                                    attempts.abort_all();
+                                    break Ok(response);
+                                }
+                                Err(error) if !error.retryable() => {
+                                    attempts.abort_all();
+                                    break Err(error);
+                                }
+                                Err(error) => {
+                                    last_error = Some(error);
+                                    if let Some(endpoint) = ordered_endpoints.get(next) {
+                                        spawn_client_attempt(
+                                            &mut attempts,
+                                            &mut attempt_records,
+                                            endpoint,
+                                            &attempt,
+                                            operation_start,
+                                            ClientAttemptTrigger::Retry,
+                                        );
+                                        next += 1;
+                                        if hedge && next < ordered_endpoints.len() {
+                                            hedge_delay.as_mut().reset(
+                                                tokio::time::Instant::now() + hedge_delay_duration,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(_) => {
@@ -354,9 +529,20 @@ impl RhizaClient {
                     }
                 }
                 () = &mut hedge_delay, if hedge && next < ordered_endpoints.len() => {
-                    spawn_client_attempt(&mut attempts, &ordered_endpoints[next], &attempt);
+                    spawn_client_attempt(
+                        &mut attempts,
+                        &mut attempt_records,
+                        &ordered_endpoints[next],
+                        &attempt,
+                        operation_start,
+                        ClientAttemptTrigger::TimerHedge,
+                    );
                     next += 1;
-                    hedge_delay.as_mut().reset(tokio::time::Instant::now() + hedge_delay_duration);
+                    if next < ordered_endpoints.len() {
+                        hedge_delay.as_mut().reset(
+                            tokio::time::Instant::now() + hedge_delay_duration,
+                        );
+                    }
                 }
                 () = &mut operation_deadline => {
                     attempts.abort_all();
@@ -365,31 +551,183 @@ impl RhizaClient {
             }
         };
 
-        // Record outcome to tuner
         #[cfg(feature = "tuner")]
-        if let (Some(tuner), Some(cid)) = (&self.tuner, &correlation_id) {
-            let latency_us = start_time.elapsed().as_micros() as u64;
-            let action = rhiza_tuner::Action {
-                first_request_target: ordered_endpoints.first().cloned().unwrap_or_default(),
-                hedge_delay: rhiza_tuner::HedgeDelayBucket::Static,
-            };
-            let outcome = match &result {
-                Ok(_) => rhiza_tuner::TerminalOutcome::Success {
-                    decision_latency_us: latency_us,
-                    additional_rpcs: (next - 1) as u32,
-                    duplicate_proposer_work: next > 1,
-                    contention_or_round_escalation: false,
-                },
-                Err(error) if error.retryable() => rhiza_tuner::TerminalOutcome::Timeout,
-                Err(_) => rhiza_tuner::TerminalOutcome::Error {
-                    additional_rpcs: (next - 1) as u32,
-                    duplicate_proposer_work: next > 1,
-                },
-            };
-            tuner.record_outcome(cid, &action, &outcome);
+        if let Some(observation) = routing_observation {
+            observation.observe(&attempt_records, &result, operation_start.elapsed());
         }
 
         result
+    }
+}
+
+#[cfg(feature = "tuner")]
+#[derive(Clone)]
+struct ClientRouting {
+    tuner: std::sync::Arc<rhiza_tuner::RoutingTuner>,
+    snapshot: std::sync::Arc<std::sync::RwLock<rhiza_tuner::RoutingSnapshot>>,
+    cohort_id: String,
+}
+
+#[cfg(feature = "tuner")]
+impl ClientRouting {
+    fn launch_if_current(
+        &self,
+        planned: &rhiza_tuner::RoutingSnapshot,
+        launch: impl FnOnce(),
+    ) -> bool {
+        let Ok(current) = self.snapshot.read() else {
+            return false;
+        };
+        if current.identity() != planned.identity()
+            || current.topology_generation() != planned.topology_generation()
+        {
+            return false;
+        }
+        launch();
+        true
+    }
+}
+
+#[cfg(feature = "tuner")]
+struct ClientRoutingObservation {
+    routing: ClientRouting,
+    planned_snapshot: rhiza_tuner::RoutingSnapshot,
+    correlation_id: String,
+    ticket: rhiza_tuner::ObservationTicket,
+}
+
+#[cfg(feature = "tuner")]
+impl ClientRoutingObservation {
+    fn censor(self) {
+        let trace = rhiza_tuner::ExecutionTrace::new(
+            self.correlation_id,
+            Vec::new(),
+            rhiza_tuner::AttemptOutcome::Cancelled,
+        );
+        match self.routing.snapshot.read() {
+            Ok(snapshot) => {
+                let _ = self.routing.tuner.observe(self.ticket, &snapshot, trace);
+            }
+            Err(_) => {
+                let _ = self
+                    .routing
+                    .tuner
+                    .observe(self.ticket, &self.planned_snapshot, trace);
+            }
+        }
+    }
+
+    fn observe<T>(
+        self,
+        attempts: &[ClientAttemptRecord],
+        result: &Result<T, ClientError>,
+        elapsed: Duration,
+    ) {
+        let traces = attempts
+            .iter()
+            .map(|attempt| {
+                let node_id = self
+                    .planned_snapshot
+                    .endpoints()
+                    .iter()
+                    .find(|endpoint| endpoint.url() == attempt.endpoint)
+                    .map(|endpoint| endpoint.node_id().clone())?;
+                let outcome = match attempt.outcome {
+                    Some(ClientAttemptOutcome::Success) => rhiza_tuner::AttemptOutcome::Success {
+                        latency: attempt
+                            .completed_after
+                            .unwrap_or(elapsed)
+                            .saturating_sub(attempt.started_after),
+                    },
+                    Some(ClientAttemptOutcome::Timeout) => rhiza_tuner::AttemptOutcome::Timeout,
+                    Some(
+                        ClientAttemptOutcome::RetryableError
+                        | ClientAttemptOutcome::NonRetryableError,
+                    ) => rhiza_tuner::AttemptOutcome::Error,
+                    None => rhiza_tuner::AttemptOutcome::Cancelled,
+                };
+                Some(rhiza_tuner::AttemptTrace::with_timing(
+                    node_id,
+                    attempt.started_after,
+                    attempt.completed_after,
+                    outcome,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        let hedge_launched_at = attempts
+            .iter()
+            .find(|attempt| matches!(attempt.trigger, ClientAttemptTrigger::TimerHedge))
+            .map(|attempt| attempt.started_after);
+        let winner = traces.iter().find_map(|attempt| {
+            matches!(attempt.outcome, rhiza_tuner::AttemptOutcome::Success { .. })
+                .then(|| attempt.node_id.clone())
+        });
+        let terminal_outcome = match result {
+            Ok(_) => rhiza_tuner::AttemptOutcome::Success { latency: elapsed },
+            Err(error) if error.is_deadline() => rhiza_tuner::AttemptOutcome::Timeout,
+            Err(error) if error.code() == "attempt_task_failed" => {
+                rhiza_tuner::AttemptOutcome::Cancelled
+            }
+            Err(_) => rhiza_tuner::AttemptOutcome::Error,
+        };
+        match self.routing.snapshot.read() {
+            Ok(snapshot) => {
+                let trace = rhiza_tuner::ExecutionTrace::with_metadata(
+                    self.correlation_id,
+                    traces,
+                    hedge_launched_at,
+                    winner,
+                    terminal_outcome,
+                );
+                let _ = self.routing.tuner.observe(self.ticket, &snapshot, trace);
+            }
+            Err(_) => {
+                let trace = rhiza_tuner::ExecutionTrace::with_metadata(
+                    self.correlation_id,
+                    traces,
+                    hedge_launched_at,
+                    winner,
+                    rhiza_tuner::AttemptOutcome::Cancelled,
+                );
+                let _ = self
+                    .routing
+                    .tuner
+                    .observe(self.ticket, &self.planned_snapshot, trace);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tuner")]
+fn routing_urls(
+    snapshot: &rhiza_tuner::RoutingSnapshot,
+    order: &[rhiza_tuner::NodeId],
+) -> Option<Vec<String>> {
+    order
+        .iter()
+        .map(|node_id| {
+            snapshot
+                .endpoints()
+                .iter()
+                .find(|endpoint| endpoint.node_id() == node_id)
+                .map(|endpoint| endpoint.url().to_owned())
+        })
+        .collect()
+}
+
+#[cfg(feature = "tuner")]
+fn routing_request_class(body_len: usize) -> rhiza_tuner::RequestClass {
+    let size = if body_len <= 4 * 1024 {
+        rhiza_tuner::SizeBucket::Small
+    } else if body_len <= 64 * 1024 {
+        rhiza_tuner::SizeBucket::Medium
+    } else {
+        rhiza_tuner::SizeBucket::Large
+    };
+    rhiza_tuner::RequestClass {
+        durability: rhiza_tuner::DurabilityMode::Sync,
+        size,
     }
 }
 
@@ -457,16 +795,27 @@ struct ClientAttempt {
 }
 
 fn spawn_client_attempt<T>(
-    attempts: &mut tokio::task::JoinSet<Result<T, ClientError>>,
+    attempts: &mut tokio::task::JoinSet<ClientAttemptResult<T>>,
+    records: &mut Vec<ClientAttemptRecord>,
     endpoint: &str,
     attempt: &ClientAttempt,
+    operation_start: tokio::time::Instant,
+    trigger: ClientAttemptTrigger,
 ) where
     T: DeserializeOwned + Send + 'static,
 {
+    let attempt_index = records.len();
+    records.push(ClientAttemptRecord {
+        endpoint: endpoint.to_owned(),
+        started_after: operation_start.elapsed(),
+        completed_after: None,
+        outcome: None,
+        trigger,
+    });
     let endpoint = endpoint.to_string();
     let attempt = attempt.clone();
     attempts.spawn(async move {
-        tokio::time::timeout(attempt.timeout, async {
+        let result = tokio::time::timeout(attempt.timeout, async {
             let response =
                 protocol_request(&attempt.client, Method::POST, &endpoint, &attempt.path)
                     .bearer_auth(attempt.token)
@@ -477,8 +826,52 @@ fn spawn_client_attempt<T>(
             client_attempt_response(response, &attempt.server_fields).await
         })
         .await
-        .unwrap_or_else(|_| Err(ClientError::attempt_deadline()))
+        .unwrap_or_else(|_| Err(ClientError::attempt_deadline()));
+        ClientAttemptResult {
+            attempt_index,
+            result,
+        }
     });
+}
+
+struct ClientAttemptResult<T> {
+    attempt_index: usize,
+    result: Result<T, ClientError>,
+}
+
+#[cfg_attr(not(feature = "tuner"), allow(dead_code))]
+struct ClientAttemptRecord {
+    endpoint: String,
+    started_after: Duration,
+    completed_after: Option<Duration>,
+    outcome: Option<ClientAttemptOutcome>,
+    trigger: ClientAttemptTrigger,
+}
+
+#[derive(Clone, Copy)]
+enum ClientAttemptTrigger {
+    Initial,
+    Retry,
+    TimerHedge,
+}
+
+#[derive(Clone, Copy)]
+enum ClientAttemptOutcome {
+    Success,
+    Timeout,
+    RetryableError,
+    NonRetryableError,
+}
+
+impl ClientAttemptOutcome {
+    fn from_result<T>(result: &Result<T, ClientError>) -> Self {
+        match result {
+            Ok(_) => Self::Success,
+            Err(error) if error.is_deadline() => Self::Timeout,
+            Err(error) if error.retryable() => Self::RetryableError,
+            Err(_) => Self::NonRetryableError,
+        }
+    }
 }
 
 async fn client_attempt_response<T: DeserializeOwned>(
@@ -571,6 +964,17 @@ impl ClientError {
     fn client_build() -> Self {
         Self::new(
             "client_build_failed",
+            ErrorCategory::Internal,
+            false,
+            None,
+            ClientErrorDetail::ClientBuild,
+        )
+    }
+
+    #[cfg(feature = "tuner")]
+    fn routing_state() -> Self {
+        Self::new(
+            "routing_state_unavailable",
             ErrorCategory::Internal,
             false,
             None,
@@ -709,6 +1113,13 @@ impl ClientError {
         self.classification.retryable()
     }
 
+    fn is_deadline(&self) -> bool {
+        matches!(
+            self.code(),
+            "attempt_deadline_exceeded" | "operation_deadline_exceeded"
+        )
+    }
+
     pub const fn statement_index(&self) -> Option<usize> {
         self.statement_index
     }
@@ -768,6 +1179,8 @@ mod kv_tests {
 
     use super::{wire::*, RhizaClient};
 
+    type CapturedScan = Arc<Mutex<Option<(HeaderMap, KvScanRequest)>>>;
+
     #[tokio::test]
     async fn kv_scan_sends_the_typed_request_with_auth() {
         let captured = Arc::new(Mutex::new(None));
@@ -775,7 +1188,7 @@ mod kv_tests {
             .route(
                 rhiza_node::KV_SCAN_PATH,
                 post(
-                    |State(captured): State<Arc<Mutex<Option<(HeaderMap, KvScanRequest)>>>>,
+                    |State(captured): State<CapturedScan>,
                      headers: HeaderMap,
                      Json(request): Json<KvScanRequest>| async move {
                         *captured.lock().unwrap() = Some((headers, request));
@@ -824,7 +1237,10 @@ mod kv_tests {
 mod tests {
     use std::{
         future,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use axum::{
@@ -875,6 +1291,72 @@ mod tests {
         (endpoint, task)
     }
 
+    #[cfg(feature = "tuner")]
+    fn routing_snapshot(first: &str, second: &str) -> rhiza_tuner::RoutingSnapshot {
+        routing_snapshot_at(first, second, 1)
+    }
+
+    #[cfg(feature = "tuner")]
+    fn routing_snapshot_at(
+        first: &str,
+        second: &str,
+        topology_generation: u64,
+    ) -> rhiza_tuner::RoutingSnapshot {
+        let identity = rhiza_tuner::LearningIdentity::new(
+            rhiza_tuner::Identity {
+                cluster_id: "test-cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                membership_digest: [7; 32],
+                recovery_generation: 0,
+            },
+            1,
+        );
+        rhiza_tuner::RoutingSnapshot::new(
+            identity,
+            topology_generation,
+            vec![
+                rhiza_tuner::RoutingEndpoint::new("node-a".into(), first, true),
+                rhiza_tuner::RoutingEndpoint::new("node-b".into(), second, true),
+            ],
+            "node-a".into(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "tuner")]
+    fn train_routing_target(
+        tuner: &rhiza_tuner::RoutingTuner,
+        snapshot: &rhiza_tuner::RoutingSnapshot,
+        correlation_id: &str,
+        latency: Duration,
+    ) {
+        let plan = tuner.plan(
+            snapshot,
+            rhiza_tuner::RequestClass {
+                durability: rhiza_tuner::DurabilityMode::Sync,
+                size: rhiza_tuner::SizeBucket::Small,
+            },
+            correlation_id,
+        );
+        let target = plan.actual_order[0].clone();
+        assert_eq!(
+            tuner.observe(
+                plan.ticket,
+                snapshot,
+                rhiza_tuner::ExecutionTrace::new(
+                    correlation_id,
+                    vec![rhiza_tuner::AttemptTrace::new(
+                        target,
+                        rhiza_tuner::AttemptOutcome::Success { latency },
+                    )],
+                    rhiza_tuner::AttemptOutcome::Success { latency },
+                ),
+            ),
+            rhiza_tuner::ObservationResult::Updated,
+        );
+    }
+
     #[derive(Clone, Default)]
     struct CapturedRequests(Arc<Mutex<Vec<(HeaderMap, String)>>>);
 
@@ -917,6 +1399,220 @@ mod tests {
             captured[0].1,
             serde_json::to_string(&write_request()).unwrap(),
         );
+    }
+
+    #[cfg(feature = "tuner")]
+    #[tokio::test]
+    async fn routing_tuner_uses_trusted_node_mapping_and_applied_target() {
+        let first_app =
+            Router::new().route(rhiza_node::WRITE_PATH, post(|| async { write_response(1) }));
+        let (first, first_server) = serve(first_app).await;
+        let second_app =
+            Router::new().route(rhiza_node::WRITE_PATH, post(|| async { write_response(2) }));
+        let (second, second_server) = serve(second_app).await;
+        let snapshot = routing_snapshot(&first, &second);
+        let tuner = Arc::new(rhiza_tuner::RoutingTuner::with_stage(
+            rhiza_tuner::RoutingConfig {
+                canary_basis_points: 10_000,
+                ..Default::default()
+            },
+            rhiza_tuner::RolloutStage::ProposerCanary,
+        ));
+
+        train_routing_target(&tuner, &snapshot, "baseline", Duration::from_millis(100));
+        train_routing_target(&tuner, &snapshot, "explore-b", Duration::from_millis(1));
+
+        let response = RhizaClient::new(vec![first, second], "client-secret")
+            .unwrap()
+            .with_routing_tuner(tuner, snapshot)
+            .unwrap()
+            .write(write_request())
+            .await
+            .unwrap();
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(response.applied_index, 2);
+    }
+
+    #[cfg(feature = "tuner")]
+    #[tokio::test]
+    async fn shadow_routing_keeps_the_static_endpoint_order() {
+        let first_app =
+            Router::new().route(rhiza_node::WRITE_PATH, post(|| async { write_response(1) }));
+        let (first, first_server) = serve(first_app).await;
+        let second_app =
+            Router::new().route(rhiza_node::WRITE_PATH, post(|| async { write_response(2) }));
+        let (second, second_server) = serve(second_app).await;
+        let snapshot = routing_snapshot(&first, &second);
+        let tuner = Arc::new(rhiza_tuner::RoutingTuner::with_stage(
+            rhiza_tuner::RoutingConfig::default(),
+            rhiza_tuner::RolloutStage::Shadow,
+        ));
+
+        let response = RhizaClient::new(vec![first, second], "client-secret")
+            .unwrap()
+            .with_routing_tuner(tuner, snapshot)
+            .unwrap()
+            .write(write_request())
+            .await
+            .unwrap();
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(response.applied_index, 1);
+    }
+
+    #[cfg(feature = "tuner")]
+    #[tokio::test]
+    async fn topology_update_censors_an_in_flight_observation() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_signal = Arc::clone(&entered);
+        let release_signal = Arc::clone(&release);
+        let first_app = Router::new().route(
+            rhiza_node::WRITE_PATH,
+            post(move || {
+                let entered = Arc::clone(&entered_signal);
+                let release = Arc::clone(&release_signal);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    write_response(1)
+                }
+            }),
+        );
+        let (first, first_server) = serve(first_app).await;
+        let second_app = Router::new().route(
+            rhiza_node::WRITE_PATH,
+            post(|| async { future::pending::<Json<WriteResponse>>().await }),
+        );
+        let (second, second_server) = serve(second_app).await;
+        let tuner = Arc::new(rhiza_tuner::RoutingTuner::with_stage(
+            rhiza_tuner::RoutingConfig {
+                canary_basis_points: 10_000,
+                ..Default::default()
+            },
+            rhiza_tuner::RolloutStage::ProposerCanary,
+        ));
+        let client = RhizaClient::new(vec![first.clone(), second.clone()], "client-secret")
+            .unwrap()
+            .with_routing_tuner(Arc::clone(&tuner), routing_snapshot_at(&first, &second, 1))
+            .unwrap();
+        let request_client = client.clone();
+        let operation = tokio::spawn(async move { request_client.write(write_request()).await });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the planned endpoint receives the request");
+        client
+            .update_routing_snapshot(routing_snapshot_at(&first, &second, 2))
+            .unwrap();
+        release.notify_one();
+        let response = operation.await.unwrap().unwrap();
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(response.applied_index, 1);
+        let metrics = tuner.metrics();
+        assert_eq!(metrics.updated_observations, 0);
+        assert_eq!(metrics.topology_mismatches, 1);
+    }
+
+    #[cfg(feature = "tuner")]
+    #[test]
+    fn routing_snapshot_must_match_the_static_client_configuration() {
+        let client = RhizaClient::new(
+            vec!["http://first".into(), "http://second".into()],
+            "client-secret",
+        )
+        .unwrap();
+        let mismatched = routing_snapshot("http://first", "http://different");
+        let tuner = Arc::new(rhiza_tuner::RoutingTuner::new(
+            rhiza_tuner::RoutingConfig::default(),
+        ));
+
+        let error = match client.with_routing_tuner(tuner, mismatched) {
+            Ok(_) => panic!("mismatched routing snapshot must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), "invalid_client_configuration");
+
+        let identity = rhiza_tuner::LearningIdentity::new(
+            rhiza_tuner::Identity {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                membership_digest: [0; 32],
+                recovery_generation: 0,
+            },
+            1,
+        );
+        let reordered = rhiza_tuner::RoutingSnapshot::new(
+            identity,
+            1,
+            vec![
+                rhiza_tuner::RoutingEndpoint::new("node-a".into(), "http://first", true),
+                rhiza_tuner::RoutingEndpoint::new("node-c".into(), "http://third", true),
+                rhiza_tuner::RoutingEndpoint::new("node-b".into(), "http://second", true),
+            ],
+            "node-a".into(),
+        )
+        .unwrap();
+        let client = RhizaClient::new(
+            vec![
+                "http://first".into(),
+                "http://second".into(),
+                "http://third".into(),
+            ],
+            "client-secret",
+        )
+        .unwrap();
+        assert!(client
+            .with_routing_tuner(
+                Arc::new(rhiza_tuner::RoutingTuner::new(Default::default())),
+                reordered,
+            )
+            .is_err());
+
+        let duplicate_client = RhizaClient::new(
+            vec!["http://first".into(), "http://first".into()],
+            "client-secret",
+        )
+        .unwrap();
+        let duplicate_snapshot = routing_snapshot("http://first", "http://second");
+        assert!(duplicate_client
+            .with_routing_tuner(
+                Arc::new(rhiza_tuner::RoutingTuner::new(Default::default())),
+                duplicate_snapshot,
+            )
+            .is_err());
+    }
+
+    #[cfg(feature = "tuner")]
+    #[test]
+    fn client_routing_uses_one_stable_canary_cohort() {
+        let snapshot = routing_snapshot("http://first", "http://second");
+        let tuner = Arc::new(rhiza_tuner::RoutingTuner::with_stage(
+            rhiza_tuner::RoutingConfig {
+                canary_basis_points: 5_000,
+                ..Default::default()
+            },
+            rhiza_tuner::RolloutStage::ProposerCanary,
+        ));
+        let client = RhizaClient::new(
+            vec!["http://first".into(), "http://second".into()],
+            "client-secret",
+        )
+        .unwrap()
+        .with_routing_tuner(Arc::clone(&tuner), snapshot.clone())
+        .unwrap();
+        let cohort = &client.routing.as_ref().unwrap().cohort_id;
+        let first = tuner.plan_for_cohort(&snapshot, routing_request_class(1), "request-a", cohort);
+        let second =
+            tuner.plan_for_cohort(&snapshot, routing_request_class(1), "request-b", cohort);
+        assert_eq!(first.proposer_applied, second.proposer_applied);
     }
 
     #[tokio::test]
@@ -1226,6 +1922,67 @@ mod tests {
                 .request_id,
             "request-1"
         );
+    }
+
+    #[tokio::test]
+    async fn timer_hedges_progress_through_the_bounded_endpoint_set() {
+        let primary_entered = Arc::new(Notify::new());
+        let primary_signal = Arc::clone(&primary_entered);
+        let primary_app = Router::new().route(
+            rhiza_node::WRITE_PATH,
+            post(move || {
+                let entered = Arc::clone(&primary_signal);
+                async move {
+                    entered.notify_one();
+                    future::pending::<Json<WriteResponse>>().await
+                }
+            }),
+        );
+        let (primary, primary_server) = serve(primary_app).await;
+
+        let hedge_app = Router::new().route(
+            rhiza_node::WRITE_PATH,
+            post(|| async { future::pending::<Json<WriteResponse>>().await }),
+        );
+        let (hedge, hedge_server) = serve(hedge_app).await;
+
+        let third_calls = Arc::new(AtomicUsize::new(0));
+        let third_counter = Arc::clone(&third_calls);
+        let third_app = Router::new().route(
+            rhiza_node::WRITE_PATH,
+            post(move || {
+                let calls = Arc::clone(&third_counter);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    write_response(3)
+                }
+            }),
+        );
+        let (third, third_server) = serve(third_app).await;
+
+        let policy = ClientPolicy {
+            connect_timeout: Duration::from_millis(50),
+            attempt_timeout: Duration::from_secs(1),
+            operation_timeout: Duration::from_secs(2),
+            hedge_delay: Duration::from_millis(20),
+        };
+        let client = test_client(vec![primary, hedge, third], policy);
+        let operation = tokio::spawn(async move { client.write(write_request()).await });
+
+        tokio::time::timeout(Duration::from_secs(1), primary_entered.notified())
+            .await
+            .expect("primary endpoint receives the request");
+        let response = tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("the finite hedge chain reaches the third endpoint")
+            .unwrap()
+            .unwrap();
+
+        primary_server.abort();
+        hedge_server.abort();
+        third_server.abort();
+        assert_eq!(response.applied_index, 3);
+        assert_eq!(third_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1901,6 +2658,11 @@ mod tests {
         assert_eq!(error.code(), "invalid_client_configuration");
         assert!(RhizaClient::new(vec![String::new()], "token").is_err());
         assert!(RhizaClient::new(vec!["http://127.0.0.1:1".into()], "").is_err());
+        assert!(RhizaClient::new(
+            vec!["http://duplicate".into(), "http://duplicate".into()],
+            "token",
+        )
+        .is_ok());
     }
 
     #[test]

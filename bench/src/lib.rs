@@ -35,6 +35,7 @@ pub struct Config {
     pub request_timeout: Duration,
     pub fault_timeout: Duration,
     pub skip_setup: bool,
+    pub d1_exact_write: bool,
     pub fault: Option<FaultConfig>,
 }
 
@@ -64,6 +65,14 @@ impl Config {
         }
         if self.concurrency == 0 {
             return Err("--concurrency must be greater than zero".into());
+        }
+        if self.d1_exact_write && self.workload != Workload::Write {
+            return Err("--d1-exact-write requires --workload write".into());
+        }
+        if self.d1_exact_write && self.endpoints.len() != 1 {
+            return Err(
+                "--d1-exact-write requires exactly one endpoint (no fallback retries)".into(),
+            );
         }
         if self.table.is_empty()
             || !self
@@ -111,6 +120,7 @@ pub fn parse_config(
     let mut request_timeout = None;
     let mut fault_timeout = None;
     let mut skip_setup = false;
+    let mut d1_exact_write = false;
     let mut fault = None;
     let values: Vec<_> = args.into_iter().collect();
     let mut index = 0;
@@ -179,6 +189,10 @@ pub fn parse_config(
                 skip_setup = true;
                 index += 1;
             }
+            "--d1-exact-write" => {
+                d1_exact_write = true;
+                index += 1;
+            }
             "--fault" => {
                 let offset = values
                     .get(index + 1)
@@ -230,6 +244,7 @@ pub fn parse_config(
         request_timeout: request_timeout.unwrap_or(Duration::from_secs(10)),
         fault_timeout: fault_timeout.unwrap_or(Duration::from_secs(300)),
         skip_setup,
+        d1_exact_write,
         fault,
     };
     if config.write_percent > 100 {

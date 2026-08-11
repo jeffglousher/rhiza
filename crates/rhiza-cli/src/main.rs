@@ -13,7 +13,7 @@ use reqwest::{header, Method, RequestBuilder, Response};
 use rhiza_archive::{CheckpointIdentity, CheckpointTip, GcPlan, GcPolicy, ObjectArchiveStore};
 use rhiza_client::RhizaClient;
 use rhiza_core::{
-    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, StoredCommand,
+    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, StoredCommand,
 };
 use rhiza_node::{
     effective_cluster_id, execution_profile_compiled, install_successor_recorder, node_router,
@@ -765,6 +765,7 @@ impl PrestageServeConfig {
                 target.cluster_id.clone(),
                 target.epoch,
                 source_bundle.config_id,
+                source_bundle.membership.digest(),
                 target.recovery_generation,
             ),
         )
@@ -803,6 +804,7 @@ struct CheckpointCommandConfig {
     cluster_id: String,
     epoch: u64,
     config_id: u64,
+    config_digest: LogHash,
     recovery_generation: u64,
     object_store: ObjStoreConfig,
 }
@@ -814,7 +816,9 @@ impl CheckpointCommandConfig {
         let cluster_id = effective_cluster_id(execution_profile, &logical_cluster_id)
             .map_err(|error| error.to_string())?;
         let epoch = positive_env(&mut lookup, "RHIZA_EPOCH")?;
-        let config_id = configuration_id(&mut lookup)?;
+        let bundle = load_configuration_bundle(&mut lookup, |path| fs::read_to_string(path))?;
+        let config_id = bundle.config_id;
+        let config_digest = bundle.membership.digest();
         let recovery_generation = positive_env(&mut lookup, "RHIZA_RECOVERY_GENERATION")?;
         let mode = required_env(&mut lookup, "RHIZA_OBJECT_STORE")?;
         let object_store = parse_object_store_with_lookup(&mode, false, &mut lookup)?;
@@ -822,6 +826,7 @@ impl CheckpointCommandConfig {
             cluster_id,
             epoch,
             config_id,
+            config_digest,
             recovery_generation,
             object_store,
         })
@@ -832,6 +837,7 @@ impl CheckpointCommandConfig {
             self.cluster_id.clone(),
             self.epoch,
             self.config_id,
+            self.config_digest,
             self.recovery_generation,
         )
     }
@@ -1970,6 +1976,7 @@ fn optional_env(
     }
 }
 
+#[cfg(test)]
 fn configuration_id(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<u64, String> {
     load_configuration_bundle(&mut *lookup, |path| fs::read_to_string(path))
         .map(|bundle| bundle.config_id)
@@ -2639,6 +2646,7 @@ fn prestage_startup_config(config: &ServeConfig) -> Result<HaStartupConfig, Stri
             config.cluster_id.clone(),
             config.epoch,
             config.bundle.config_id,
+            config.bundle.membership.digest(),
             config.recovery_generation,
         ),
     )
@@ -2965,6 +2973,7 @@ where
             config.cluster_id.clone(),
             config.epoch,
             config.bundle.config_id,
+            config.bundle.membership.digest(),
             config.recovery_generation,
         ),
     )
@@ -3851,6 +3860,7 @@ async fn run_checkpoint_compact_offline(config: ServeConfig) -> Result<String, S
             config.cluster_id.clone(),
             config.epoch,
             config.bundle.config_id,
+            config.bundle.membership.digest(),
             config.recovery_generation,
         ),
     )
@@ -6533,7 +6543,13 @@ mod tests {
         .unwrap();
         ObjectArchiveStore::new_checkpoint_for_single_process(
             store,
-            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, generation),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"cli-test-config"]),
+                generation,
+            ),
         )
     }
 

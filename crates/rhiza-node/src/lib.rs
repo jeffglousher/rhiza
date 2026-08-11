@@ -43,6 +43,8 @@ use axum::{
 use http_body::Frame;
 #[cfg(feature = "sql")]
 use rhiza_archive::SnapshotRecord;
+#[cfg(feature = "sql")]
+use rhiza_core::ExternalEffectCommand;
 use rhiza_core::{
     Command, CommandKind, ConfigChange, ConfigurationState, EntryType, ErrorClassification,
     ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor, StoredCommand,
@@ -66,17 +68,19 @@ use rhiza_log::{FileLogStore, IndexRange, LogStore};
 #[cfg(feature = "sql")]
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
-    CertifiedDecisionInspection, DecisionInspection, DecisionProof, Membership,
-    ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
-    RecorderRpc, RecorderRpcContext, RejectReason, ThreeNodeConsensus,
+    CertifiedDecisionInspection, DecisionInspection, DecisionProof, EffectBundleBinding,
+    Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary,
+    RecorderFileStore, RecorderRpc, RecorderRpcContext, RejectReason, ThreeNodeConsensus,
     DEFAULT_RECORDER_RPC_TIMEOUT,
 };
 #[cfg(feature = "sql")]
+use rhiza_quepaxa::{EffectBundleFinalizeRequest, RecorderEffectBundle};
+#[cfg(feature = "sql")]
 use rhiza_sql::{
-    decode_qwal_v3, encode_put_request, encode_sql_command, restore_snapshot_file,
+    encode_put_request, encode_sql_command, restore_snapshot_file, QwalEffectManifestV4,
     RecoverySnapshot, RequestConflict, RequestOutcome, SqlBatchMember, SqlCommand,
     SqlCommandResult, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
-    MAX_QWAL_V3_RECEIPTS, MAX_SQL_STATEMENTS, QWAL_V3_MAGIC,
+    VerifiedQwalEffectBundleV4, MAX_QWAL_V3_RECEIPTS, MAX_SQL_STATEMENTS,
 };
 #[cfg(not(feature = "sql"))]
 type SqlCommandResult = ();
@@ -685,6 +689,11 @@ impl fmt::Debug for TunerTelemetry {
 
 pub const RECORDER_STORE_COMMAND_PATH: &str = "/v2/quepaxa/recorder/store-command";
 pub const RECORDER_FETCH_COMMAND_PATH: &str = "/v2/quepaxa/recorder/fetch-command";
+pub const RECORDER_STAGE_EFFECT_CHUNK_PATH: &str = "/v3/quepaxa/recorder/stage-effect-chunk";
+pub const RECORDER_FINALIZE_EFFECT_BUNDLE_PATH: &str =
+    "/v3/quepaxa/recorder/finalize-effect-bundle";
+pub const RECORDER_FETCH_EFFECT_MANIFEST_PATH: &str = "/v3/quepaxa/recorder/fetch-effect-manifest";
+pub const RECORDER_FETCH_EFFECT_CHUNK_PATH: &str = "/v3/quepaxa/recorder/fetch-effect-chunk";
 pub const RECORDER_INSPECT_PROOF_PATH: &str = "/v2/quepaxa/recorder/inspect-proof";
 pub const RECORDER_INSPECT_RECORD_PATH: &str = "/v2/quepaxa/recorder/inspect-record";
 pub const RECORDER_READ_FENCE_PATH: &str = "/v3/quepaxa/recorder/read-fence";
@@ -721,6 +730,7 @@ pub const LIVEZ_PATH: &str = "/livez";
 pub const READYZ_PATH: &str = "/readyz";
 const MAX_STARTUP_RECOVERY_ENTRIES: usize = 100_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const RECORDER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_FENCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 // Leave enough of the public one-second write budget to classify and return a
@@ -1929,6 +1939,10 @@ pub(crate) enum RecorderWireErrorCode {
     NoQuorum,
     ProposeFailed,
     CommandUnavailable,
+    EffectBundleConflict,
+    EffectBundleInvalid,
+    EffectBundleQuotaExceeded,
+    EffectBundleUnavailable,
     Other,
 }
 
@@ -1942,6 +1956,10 @@ pub(crate) enum RecorderWireErrorDetail {
     CommandTooLarge {
         actual: usize,
         limit: usize,
+    },
+    EffectBundleQuotaExceeded {
+        actual: u64,
+        limit: u64,
     },
     Message(String),
     Path(PathBuf),
@@ -1972,6 +1990,19 @@ pub(crate) fn recorder_wire_error(error: rhiza_quepaxa::Error) -> RecorderWireEr
             }),
         ),
         Error::CommandUnavailable => (RecorderWireErrorCode::CommandUnavailable, None),
+        Error::EffectBundleConflict => (RecorderWireErrorCode::EffectBundleConflict, None),
+        Error::EffectBundleInvalid(message) => (
+            RecorderWireErrorCode::EffectBundleInvalid,
+            Some(RecorderWireErrorDetail::Message(message.clone())),
+        ),
+        Error::EffectBundleQuotaExceeded { actual, limit } => (
+            RecorderWireErrorCode::EffectBundleQuotaExceeded,
+            Some(RecorderWireErrorDetail::EffectBundleQuotaExceeded {
+                actual: *actual,
+                limit: *limit,
+            }),
+        ),
+        Error::EffectBundleUnavailable => (RecorderWireErrorCode::EffectBundleUnavailable, None),
         Error::Cancelled => (RecorderWireErrorCode::Cancelled, None),
         Error::RpcCancelled => (RecorderWireErrorCode::RpcCancelled, None),
         Error::RpcDeadlineExceeded => (RecorderWireErrorCode::RpcDeadlineExceeded, None),
@@ -2045,6 +2076,16 @@ pub(crate) fn recorder_error_from_wire(error: RecorderWireError) -> rhiza_quepax
         (RecorderWireErrorCode::RpcCancelled, None) => Error::RpcCancelled,
         (RecorderWireErrorCode::RpcDeadlineExceeded, None) => Error::RpcDeadlineExceeded,
         (RecorderWireErrorCode::CommandUnavailable, None) => Error::CommandUnavailable,
+        (RecorderWireErrorCode::EffectBundleConflict, None) => Error::EffectBundleConflict,
+        (
+            RecorderWireErrorCode::EffectBundleInvalid,
+            Some(RecorderWireErrorDetail::Message(message)),
+        ) => Error::EffectBundleInvalid(message),
+        (
+            RecorderWireErrorCode::EffectBundleQuotaExceeded,
+            Some(RecorderWireErrorDetail::EffectBundleQuotaExceeded { actual, limit }),
+        ) => Error::EffectBundleQuotaExceeded { actual, limit },
+        (RecorderWireErrorCode::EffectBundleUnavailable, None) => Error::EffectBundleUnavailable,
         (RecorderWireErrorCode::Cancelled, None) => Error::Cancelled,
         (RecorderWireErrorCode::ConflictingCertificates, None) => Error::ConflictingCertificates,
         (RecorderWireErrorCode::Decode, Some(RecorderWireErrorDetail::Message(message))) => {
@@ -2113,6 +2154,31 @@ struct FetchCommandV2 {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct StageEffectChunkV3 {
+    binding: EffectBundleBinding,
+    manifest_command: StoredCommand,
+    ordinal: u16,
+    chunk: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct FinalizeEffectBundleV3 {
+    binding: EffectBundleBinding,
+    manifest_command: StoredCommand,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct FetchEffectManifestV3 {
+    binding: EffectBundleBinding,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct FetchEffectChunkV3 {
+    binding: EffectBundleBinding,
+    ordinal: u16,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct InspectProofV2 {
     slot: u64,
 }
@@ -2145,6 +2211,7 @@ struct HttpRecorderWorkerPermit {
 
 enum HttpCall<U> {
     Response(StatusCode, RecorderWire<RecorderV2Result<U>>),
+    NotSent(String),
     Transport(String),
     Decode(String),
 }
@@ -2315,7 +2382,13 @@ impl HttpRecorderShared {
             return Ok(client.clone());
         }
         let client = reqwest::blocking::Client::builder()
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .connect_timeout(RECORDER_HTTP_CONNECT_TIMEOUT)
+            // Recorder membership binds one canonical endpoint. Redirects, implicit retries,
+            // and environment proxies would make a final Connect error insufficient evidence
+            // that no earlier endpoint received a mutating request.
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy()
             .build()
             .map_err(|error| rhiza_quepaxa::Error::Io(error.to_string()))?;
         self.client
@@ -2520,13 +2593,23 @@ impl HttpRecorderClient {
                         .send()
                     {
                         Ok(response) => read_bounded_http_recorder_response(response),
+                        // reqwest reports DNS/TCP/TLS establishment failures as Connect. No
+                        // HTTP request was available to the recorder, so a mutating call is a
+                        // definite proposal failure rather than an unknown remote outcome.
+                        Err(error) if error.is_connect() => HttpCall::NotSent(error.to_string()),
                         Err(error) => HttpCall::Transport(error.to_string()),
                     },
-                    Err(error) => HttpCall::Transport(error.to_string()),
+                    Err(error) => HttpCall::NotSent(error.to_string()),
                 };
                 let _ = reply.send(outcome);
             })
-            .map_err(|error| rhiza_quepaxa::Error::Io(error.to_string()))?;
+            .map_err(|error| {
+                if mutating {
+                    rhiza_quepaxa::Error::ProposeFailed
+                } else {
+                    rhiza_quepaxa::Error::Io(error.to_string())
+                }
+            })?;
         let outcome = loop {
             match context.check() {
                 Ok(()) => {}
@@ -2554,6 +2637,13 @@ impl HttpRecorderClient {
         };
         let (status, wire) = match outcome {
             HttpCall::Response(status, wire) => (status, wire),
+            HttpCall::NotSent(error) => {
+                return Err(if mutating {
+                    rhiza_quepaxa::Error::ProposeFailed
+                } else {
+                    rhiza_quepaxa::Error::Io(error)
+                });
+            }
             HttpCall::Transport(error) => {
                 return Err(if mutating {
                     rhiza_quepaxa::Error::UnknownOutcome
@@ -2662,6 +2752,71 @@ impl RecorderRpc for HttpRecorderClient {
                 config_digest,
                 command_hash,
             },
+            false,
+        )
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.post_v2(
+            context,
+            RECORDER_STAGE_EFFECT_CHUNK_PATH,
+            StageEffectChunkV3 {
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            },
+            true,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.post_v2(
+            context,
+            RECORDER_FINALIZE_EFFECT_BUNDLE_PATH,
+            FinalizeEffectBundleV3 {
+                binding,
+                manifest_command,
+            },
+            true,
+        )
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        self.post_v2(
+            context,
+            RECORDER_FETCH_EFFECT_MANIFEST_PATH,
+            FetchEffectManifestV3 { binding },
+            false,
+        )
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &rhiza_quepaxa::RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        self.post_v2(
+            context,
+            RECORDER_FETCH_EFFECT_CHUNK_PATH,
+            FetchEffectChunkV3 { binding, ordinal },
             false,
         )
     }
@@ -4177,6 +4332,22 @@ where
             post(handle_recorder_fetch_command::<R>),
         )
         .route(
+            RECORDER_STAGE_EFFECT_CHUNK_PATH,
+            post(handle_recorder_stage_effect_chunk::<R>),
+        )
+        .route(
+            RECORDER_FINALIZE_EFFECT_BUNDLE_PATH,
+            post(handle_recorder_finalize_effect_bundle::<R>),
+        )
+        .route(
+            RECORDER_FETCH_EFFECT_MANIFEST_PATH,
+            post(handle_recorder_fetch_effect_manifest::<R>),
+        )
+        .route(
+            RECORDER_FETCH_EFFECT_CHUNK_PATH,
+            post(handle_recorder_fetch_effect_chunk::<R>),
+        )
+        .route(
             RECORDER_INSPECT_PROOF_PATH,
             post(handle_recorder_inspect_proof::<R>),
         )
@@ -4389,6 +4560,155 @@ where
                 body.config_digest,
                 body.command_hash,
             )
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_stage_effect_chunk<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request = match decode_recorder_json::<StageEffectChunkV3, _>(&state, &headers, body).await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.version != RECORDER_WIRE_VERSION
+        || !valid_recorder_command(&request.body.manifest_command)
+    {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("invalid recorder effect request".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_mutation_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let body = request.body;
+            recorder.stage_effect_bundle_chunk(
+                &context,
+                body.binding,
+                body.manifest_command,
+                body.ordinal,
+                body.chunk,
+            )
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_finalize_effect_bundle<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request =
+        match decode_recorder_json::<FinalizeEffectBundleV3, _>(&state, &headers, body).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    if request.version != RECORDER_WIRE_VERSION
+        || !valid_recorder_command(&request.body.manifest_command)
+    {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("invalid recorder effect request".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_mutation_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let body = request.body;
+            recorder.finalize_staged_effect_bundle(&context, body.binding, body.manifest_command)
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_fetch_effect_manifest<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request =
+        match decode_recorder_json::<FetchEffectManifestV3, _>(&state, &headers, body).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    if request.version != RECORDER_WIRE_VERSION {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            recorder.fetch_effect_bundle_manifest(&context, request.body.binding)
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_fetch_effect_chunk<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    let request = match decode_recorder_json::<FetchEffectChunkV3, _>(&state, &headers, body).await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.version != RECORDER_WIRE_VERSION {
+        return recorder_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into()),
+        );
+    }
+    let context = match request.rpc_context() {
+        Ok(context) => context,
+        Err(error) => return recorder_v2_error_response(StatusCode::REQUEST_TIMEOUT, error),
+    };
+    let recorder = state.recorder;
+    recorder_v2_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let body = request.body;
+            recorder.fetch_effect_bundle_chunk(&context, body.binding, body.ordinal)
         })
         .await,
     )
@@ -5727,10 +6047,17 @@ fn next_sync_flush_retry(current: Duration) -> Duration {
     current.saturating_mul(2).min(SYNC_FLUSH_RETRY_MAX)
 }
 
+fn retryable_sync_flush_error(error: &DurabilityError) -> bool {
+    matches!(
+        error,
+        DurabilityError::Archive(_) | DurabilityError::Io(_) | DurabilityError::Unavailable
+    )
+}
+
 /// Confirms that a committed write has reached the configured durability boundary.
 ///
-/// Synchronous archive I/O failures are retried with bounded backoff until the
-/// archive recovers or the runtime begins shutdown.
+/// Transient archive I/O and Recorder effect-read unavailability are retried
+/// with bounded backoff until durability recovers or shutdown begins.
 pub async fn confirm_write_durability(
     runtime: &NodeRuntime,
     coordinator: Option<&CheckpointCoordinator>,
@@ -5744,20 +6071,24 @@ pub async fn confirm_write_durability(
         return Ok(());
     }
 
+    let mut confirmation = coordinator.sync_durability_confirmation();
     let mut retry_delay = SYNC_FLUSH_RETRY_INITIAL;
     loop {
         if runtime.operation_cancelled.load(Ordering::Acquire) {
             return Err(DurabilityError::Unavailable);
         }
         match coordinator.flush_runtime(runtime, index).await {
-            Ok(tip) if tip.index() >= index => return Ok(()),
+            Ok(tip) if tip.index() >= index => {
+                confirmation.disarm();
+                return Ok(());
+            }
             Ok(tip) => {
                 return Err(DurabilityError::LocalLogGap {
                     expected: index,
                     actual: Some(tip.index()),
                 });
             }
-            Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
+            Err(error) if retryable_sync_flush_error(&error) => {
                 let cancelled = runtime.operation_cancelled_notify.notified();
                 tokio::pin!(cancelled);
                 cancelled.as_mut().enable();
@@ -8239,6 +8570,23 @@ impl Materializer {
                 .map_err(|error| error.to_string()),
         }
     }
+
+    #[cfg(feature = "sql")]
+    pub(crate) fn apply_verified_external_sql_effect(
+        &self,
+        effect: &VerifiedQwalEffectBundleV4,
+    ) -> Result<Option<SqlCommandResult>, String> {
+        match self {
+            Self::Sql(state) => state
+                .apply_verified_external_effect(effect)
+                .map(|outcome| outcome.sql_result().cloned())
+                .map_err(|error| error.to_string()),
+            #[cfg(feature = "graph")]
+            Self::Graph(_) => Err("external SQL effect reached graph materializer".into()),
+            #[cfg(feature = "kv")]
+            Self::Kv(_) => Err("external SQL effect reached KV materializer".into()),
+        }
+    }
 }
 
 const READ_BARRIER_COALESCE_WINDOW: Duration = Duration::from_micros(50);
@@ -8555,6 +8903,34 @@ pub struct NodeRuntime {
 }
 
 #[cfg(feature = "sql")]
+struct PreparedExternalSqlBundleResolution {
+    consensus: Arc<ThreeNodeConsensus>,
+    binding: EffectBundleBinding,
+    manifest_command: StoredCommand,
+    command: ExternalEffectCommand,
+}
+
+#[cfg(feature = "sql")]
+impl PreparedExternalSqlBundleResolution {
+    fn resolve(self) -> Result<Option<RecorderEffectBundle>, rhiza_quepaxa::Error> {
+        let bundle = self.consensus.resolve_effect_bundle_from_quorum(
+            // Archive publication remains available during shutdown/recovery,
+            // but the synchronous RPC wait runs on Tokio's blocking pool.
+            &RecorderRpcContext::with_timeout(DEFAULT_RECORDER_RPC_TIMEOUT),
+            &self.binding,
+            &self.manifest_command,
+        )?;
+        bundle
+            .map(|bundle| {
+                verify_resolved_external_sql_bundle(&self.command, &bundle)
+                    .map(|_| bundle)
+                    .map_err(|error| rhiza_quepaxa::Error::EffectBundleInvalid(error.to_string()))
+            })
+            .transpose()
+    }
+}
+
+#[cfg(feature = "sql")]
 struct ExecutedPayload {
     response: WriteResponse,
     sql_result: Option<SqlCommandResult>,
@@ -8825,7 +9201,7 @@ impl NodeRuntime {
             let _permit = startup.admit_local_io("materializer open and reconciliation")?;
             let materializer =
                 Materializer::open(&config, &persisted_configuration, recovery_anchor.as_ref())?;
-            reconcile_local_storage(&config, &log_store, &materializer)?;
+            reconcile_local_storage(&config, consensus.as_ref(), &log_store, &materializer)?;
             materializer
         };
         startup.check("peer recovery")?;
@@ -9536,7 +9912,7 @@ impl NodeRuntime {
         }
         profile.add_precheck_classification(classification_mark);
 
-        while !pending.is_empty() {
+        'sql_batches: while !pending.is_empty() {
             let eligible = pending
                 .iter()
                 .copied()
@@ -9564,6 +9940,25 @@ impl NodeRuntime {
                     break;
                 }
             };
+            let slot = match last_index.checked_add(1) {
+                Some(slot) => slot,
+                None => {
+                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let configuration = match self.configuration_state() {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
             let mut attempt_count = eligible.len();
             let (proposal_payload, prepared_results) = loop {
                 let attempted = &eligible[..attempt_count];
@@ -9582,7 +9977,7 @@ impl NodeRuntime {
                 let preparation_mark = profile.mark();
                 let preparation = self.lock_sqlite().and_then(|sqlite| {
                     sqlite
-                        .prepare_sql_batch_effect(&batch_members, last_index, last_hash)
+                        .prepare_external_sql_batch_effect(&batch_members, last_index, last_hash)
                         .map_err(|error| self.map_sqlite_error(error))
                 });
                 profile.add_qwal_prepare(preparation_mark);
@@ -9615,7 +10010,11 @@ impl NodeRuntime {
                 }
 
                 let mut proposed = Vec::with_capacity(attempted.len());
-                for (index, member_result) in attempted.iter().copied().zip(preparation.results) {
+                for (index, member_result) in attempted
+                    .iter()
+                    .copied()
+                    .zip(preparation.results.iter().cloned())
+                {
                     match member_result {
                         Ok(result) => proposed.push((index, result)),
                         Err(error) => {
@@ -9623,66 +10022,109 @@ impl NodeRuntime {
                         }
                     }
                 }
-                match preparation.effect {
-                    Some(_) if proposed.is_empty() => {
+                let Some(preparation) = preparation.effect else {
+                    if proposed.is_empty() {
+                        break (None, Vec::new());
+                    }
+                    let error = self.latch(NodeError::Invariant(
+                        "SQLite omitted the external effect for successful SQL members".into(),
+                    ));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break (None, Vec::new());
+                };
+                let command = match preparation
+                    .build_command(configuration.digest(), slot, last_hash)
+                    .map_err(|error| self.map_sqlite_error(error))
+                {
+                    Ok(command) => command,
+                    Err(error) => {
+                        for index in pending.drain(..) {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                        break (None, Vec::new());
+                    }
+                };
+                let payload = match command.encode() {
+                    Ok(payload) if payload.len() <= MAX_COMMAND_BYTES => payload,
+                    Ok(_) => {
                         let error = self.latch(NodeError::Invariant(
-                            "SQLite prepared an effect without a successful SQL member".into(),
+                            "canonical QEFX command exceeds the generic command bound".into(),
                         ));
                         for index in pending.drain(..) {
                             results[index] = Some(Err(error.clone()));
                         }
                         break (None, Vec::new());
                     }
-                    Some(payload) if !payload.starts_with(QWAL_V3_MAGIC) => {
-                        let error = self.latch(NodeError::Invariant(
-                            "SQLite materializer prepared a non-QWAL v3 SQL batch".into(),
-                        ));
+                    Err(error) => {
+                        let error = self.latch(NodeError::Invariant(format!(
+                            "canonical QEFX command encoding failed: {error}"
+                        )));
                         for index in pending.drain(..) {
                             results[index] = Some(Err(error.clone()));
                         }
                         break (None, Vec::new());
                     }
-                    Some(payload) if payload.len() <= MAX_COMMAND_BYTES => {
-                        break (Some(payload), proposed);
-                    }
-                    Some(_) if attempt_count > 1 => {
-                        for index in attempted {
-                            results[*index] = None;
-                        }
-                        attempt_count = attempt_count.div_ceil(2);
-                    }
-                    Some(_) => {
-                        results[attempted[0]] = Some(Err(NodeError::ResourceExhausted(format!(
-                            "SQL effect exceeds {MAX_COMMAND_BYTES} bytes"
-                        ))));
-                        break (None, Vec::new());
-                    }
-                    None if proposed.is_empty() => break (None, Vec::new()),
-                    None => {
-                        let error = self.latch(NodeError::Invariant(
-                            "SQLite omitted the effect for successful SQL members".into(),
-                        ));
+                };
+                let manifest_command = StoredCommand::new(EntryType::Command, payload.clone());
+                let binding = effect_bundle_binding(&command, &manifest_command);
+                let bundle = match RecorderEffectBundle::new(binding, preparation.chunks().to_vec())
+                {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        let error = self.latch(NodeError::Invariant(error.to_string()));
                         for index in pending.drain(..) {
                             results[index] = Some(Err(error.clone()));
                         }
                         break (None, Vec::new());
                     }
+                };
+                let request = match EffectBundleFinalizeRequest::new(bundle, manifest_command) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let error = self.latch(NodeError::Invariant(error.to_string()));
+                        for index in pending.drain(..) {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                        break (None, Vec::new());
+                    }
+                };
+                if let Err(error) = self
+                    .consensus
+                    .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
+                {
+                    // A competing proposer can decide this exact slot after
+                    // the SQLite sandbox was prepared but before its bundle
+                    // was finalized.  The rejected orphan must not turn into
+                    // a client-visible no-quorum: materialize the certified
+                    // winner and prepare the same requests at its successor.
+                    if let Ok(DecisionInspection::Committed(winner)) = self
+                        .consensus
+                        .inspect_decision_at(&self.consensus_context(), slot, last_hash)
+                    {
+                        if let Err(error) =
+                            self.persist_sql_entry_profiled(&winner, slot, last_hash, profile)
+                        {
+                            for index in pending.drain(..) {
+                                results[index] = Some(Err(error.clone()));
+                            }
+                            break (None, Vec::new());
+                        }
+                        continue 'sql_batches;
+                    }
+                    let error = self.map_consensus_error(error);
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break (None, Vec::new());
                 }
+                break (Some(payload), proposed);
             };
 
             pending.retain(|index| results[*index].is_none());
             let Some(proposal_payload) = proposal_payload else {
                 continue;
-            };
-            let slot = match last_index.checked_add(1) {
-                Some(slot) => slot,
-                None => {
-                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
             };
             let consensus_mark = profile.mark();
             #[cfg(feature = "tuner")]
@@ -10531,11 +10973,16 @@ impl NodeRuntime {
 
         loop {
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
-            let proposal_payload =
-                self.prepare_sql_proposal(command, &request_payload, last_index, last_hash)?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
             })?;
+            let proposal_payload = self.prepare_external_sql_proposal(
+                command,
+                &request_payload,
+                last_index,
+                last_hash,
+                slot,
+            )?;
             let entry = self
                 .consensus
                 .propose_at(
@@ -10545,7 +10992,12 @@ impl NodeRuntime {
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
-            let sql_result = self.persist_entry(&entry, slot, last_hash)?;
+            let sql_result = self.persist_sql_entry_profiled(
+                &entry,
+                slot,
+                last_hash,
+                &mut DisabledSqlWritePhaseProfile,
+            )?;
             if let Some(outcome) = self.check_request(&command.request_id, &request_payload)? {
                 return Ok(ExecutedPayload {
                     response: write_response(outcome),
@@ -10565,15 +11017,16 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "sql")]
-    fn prepare_sql_proposal(
+    fn prepare_external_sql_proposal(
         &self,
         command: &SqlCommand,
         request_payload: &[u8],
         base_index: LogIndex,
         base_hash: LogHash,
+        intended_slot: LogIndex,
     ) -> Result<Vec<u8>, NodeError> {
         let sqlite = self.lock_sqlite()?;
-        let preparation = sqlite.prepare_sql_batch_effect(
+        let preparation = sqlite.prepare_external_sql_batch_effect(
             &[SqlBatchMember {
                 command,
                 request_payload,
@@ -10590,8 +11043,8 @@ impl NodeRuntime {
         };
         let result = preparation
             .results
-            .into_iter()
-            .next()
+            .first()
+            .cloned()
             .expect("one-member SQL preparation returns one result");
         if let Err(error) = result {
             if let rhiza_sql::Error::ResourceExhausted(message) = error {
@@ -10609,11 +11062,15 @@ impl NodeRuntime {
                     command: prefix,
                     request_payload: &prefix_payload,
                 }];
-                match sqlite.prepare_sql_batch_effect(&prefix_member, base_index, base_hash) {
+                match sqlite.prepare_external_sql_batch_effect(
+                    &prefix_member,
+                    base_index,
+                    base_hash,
+                ) {
                     Ok(preparation) => preparation
                         .results
-                        .into_iter()
-                        .next()
+                        .first()
+                        .cloned()
                         .is_none_or(|result| result.is_err()),
                     Err(_) => true,
                 }
@@ -10626,21 +11083,30 @@ impl NodeRuntime {
                 None => Err(NodeError::InvalidRequest(message)),
             };
         }
-        let payload = preparation.effect.ok_or_else(|| {
+        let preparation = preparation.effect.ok_or_else(|| {
             self.latch(NodeError::Invariant(
-                "successful SQL preparation omitted its QWAL v3 effect".into(),
+                "successful SQL preparation omitted its external effect".into(),
             ))
         })?;
-        if !payload.starts_with(QWAL_V3_MAGIC) {
-            return Err(self.latch(NodeError::Invariant(
-                "SQLite materializer prepared a non-QWAL v3 SQL proposal".into(),
-            )));
-        }
-        if payload.len() > MAX_COMMAND_BYTES {
-            return Err(NodeError::ResourceExhausted(format!(
-                "SQL effect exceeds {MAX_COMMAND_BYTES} bytes"
-            )));
-        }
+        let configuration = self.configuration_state()?;
+        let external = preparation
+            .build_command(configuration.digest(), intended_slot, base_hash)
+            .map_err(|error| self.map_sqlite_error(error))?;
+        let payload = external.encode().map_err(|error| {
+            self.latch(NodeError::Invariant(format!(
+                "canonical QEFX encoding failed: {error}"
+            )))
+        })?;
+        validate_command_size(&payload)?;
+        let manifest_command = StoredCommand::new(EntryType::Command, payload.clone());
+        let binding = effect_bundle_binding(&external, &manifest_command);
+        let bundle = RecorderEffectBundle::new(binding, preparation.chunks().to_vec())
+            .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
+        let request = EffectBundleFinalizeRequest::new(bundle, manifest_command)
+            .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
+        self.consensus
+            .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
+            .map_err(|error| self.map_consensus_error(error))?;
         Ok(payload)
     }
 
@@ -10664,23 +11130,34 @@ impl NodeRuntime {
 
         loop {
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
-            let proposal_payload = self
-                .lock_sqlite()?
-                .prepare_put_effect(request_id, key, value, &payload, last_index, last_hash)
-                .map_err(|error| self.map_sqlite_error(error))?;
-            if !proposal_payload.starts_with(QWAL_V3_MAGIC) {
-                return Err(self.latch(NodeError::Invariant(
-                    "SQLite materializer prepared a non-QWAL v3 key/value write proposal".into(),
-                )));
-            }
-            if proposal_payload.len() > MAX_COMMAND_BYTES {
-                return Err(NodeError::ResourceExhausted(format!(
-                    "SQLite QWAL effect exceeds {MAX_COMMAND_BYTES} bytes"
-                )));
-            }
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
             })?;
+            let preparation = self
+                .lock_sqlite()?
+                .prepare_external_put_effect(
+                    request_id, key, value, &payload, last_index, last_hash,
+                )
+                .map_err(|error| self.map_sqlite_error(error))?;
+            let configuration = self.configuration_state()?;
+            let external = preparation
+                .build_command(configuration.digest(), slot, last_hash)
+                .map_err(|error| self.map_sqlite_error(error))?;
+            let proposal_payload = external.encode().map_err(|error| {
+                self.latch(NodeError::Invariant(format!(
+                    "canonical QEFX encoding failed: {error}"
+                )))
+            })?;
+            validate_command_size(&proposal_payload)?;
+            let manifest_command = StoredCommand::new(EntryType::Command, proposal_payload.clone());
+            let binding = effect_bundle_binding(&external, &manifest_command);
+            let bundle = RecorderEffectBundle::new(binding, preparation.chunks().to_vec())
+                .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
+            let request = EffectBundleFinalizeRequest::new(bundle, manifest_command)
+                .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
+            self.consensus
+                .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
+                .map_err(|error| self.map_consensus_error(error))?;
             let entry = self
                 .consensus
                 .propose_at(
@@ -10690,7 +11167,12 @@ impl NodeRuntime {
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
-            self.persist_entry(&entry, slot, last_hash)?;
+            self.persist_sql_entry_profiled(
+                &entry,
+                slot,
+                last_hash,
+                &mut DisabledSqlWritePhaseProfile,
+            )?;
 
             if let Some(outcome) = self.check_request(request_id, &payload)? {
                 return Ok(ExecutedPayload {
@@ -11430,18 +11912,9 @@ impl NodeRuntime {
     ) -> Result<SqlQueryResponse, NodeError> {
         self.ensure_ready()?;
         self.ensure_writes_active()?;
-        let sqlite = self.lock_sqlite()?;
-        let (applied_index, hash) = sqlite
-            .applied_tip_value()
-            .map_err(|error| self.map_sqlite_error(error))?;
-        if required_index.is_some_and(|required| applied_index < required) {
-            return Err(NodeError::Unavailable(format!(
-                "local applied index {applied_index} has not reached {}",
-                required_index.expect("checked above")
-            )));
-        }
-        let SqlQueryResult { columns, rows } = sqlite
-            .query_sql(
+        let sqlite = self.sql_read_handle()?;
+        let (applied_index, hash, query_result) = sqlite
+            .query_sql_with_applied_tip(
                 statement,
                 usize::try_from(max_rows).expect("u32 fits usize"),
                 MAX_SQL_RESULT_BYTES,
@@ -11455,6 +11928,13 @@ impl NodeRuntime {
                     message: other.to_string(),
                 },
             })?;
+        if required_index.is_some_and(|required| applied_index < required) {
+            return Err(NodeError::Unavailable(format!(
+                "local applied index {applied_index} has not reached {}",
+                required_index.expect("checked above")
+            )));
+        }
+        let SqlQueryResult { columns, rows } = query_result;
         Ok(SqlQueryResponse {
             columns,
             rows,
@@ -11822,6 +12302,18 @@ impl NodeRuntime {
         expected_index: LogIndex,
         expected_prev_hash: LogHash,
     ) -> Result<Option<SqlCommandResult>, NodeError> {
+        #[cfg(feature = "sql")]
+        if self.config.execution_profile == ExecutionProfile::Sqlite
+            && entry.entry_type == EntryType::Command
+            && !entry.payload.is_empty()
+        {
+            return self.persist_sql_entry_profiled(
+                entry,
+                expected_index,
+                expected_prev_hash,
+                &mut DisabledSqlWritePhaseProfile,
+            );
+        }
         let configuration_state = self.configuration_state()?;
         validate_runtime_entry(
             &self.config,
@@ -11865,6 +12357,9 @@ impl NodeRuntime {
         expected_prev_hash: LogHash,
         profile: &mut P,
     ) -> Result<Option<SqlCommandResult>, NodeError> {
+        if entry.entry_type != EntryType::Command || entry.payload.is_empty() {
+            return self.persist_entry(entry, expected_index, expected_prev_hash);
+        }
         let configuration_state = self.configuration_state()?;
         validate_runtime_entry(
             &self.config,
@@ -11874,6 +12369,8 @@ impl NodeRuntime {
             expected_prev_hash,
         )
         .map_err(|error| self.latch(error))?;
+
+        let verified = self.resolve_external_sql_effect(entry)?;
 
         let qlog_mark = profile.mark();
         let append_result = self
@@ -11886,7 +12383,7 @@ impl NodeRuntime {
         let materializer_mark = profile.mark();
         let apply_result = self
             .lock_materializer()?
-            .apply_entry(entry)
+            .apply_verified_external_sql_effect(&verified)
             .map_err(|error| self.latch(NodeError::Invariant(error)));
         profile.add_sql_materializer_apply(materializer_mark);
 
@@ -11898,6 +12395,80 @@ impl NodeRuntime {
         }
 
         apply_result
+    }
+
+    #[cfg(feature = "sql")]
+    fn resolve_external_sql_effect(
+        &self,
+        entry: &LogEntry,
+    ) -> Result<VerifiedQwalEffectBundleV4, NodeError> {
+        let bundle = self.resolve_external_sql_bundle_for_archive(entry)?;
+        let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+            self.latch(NodeError::Invariant(format!(
+                "invalid committed QEFX command: {error}"
+            )))
+        })?;
+        verify_resolved_external_sql_bundle(&command, &bundle)
+            .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))
+    }
+
+    /// Resolves and fully verifies the Recorder-held bytes for a committed
+    /// QEFX entry before exposing their immutable chunks to archive code.
+    /// Archive publishers must retain the command and re-verify its digest at
+    /// their own persistence boundary.
+    #[cfg(feature = "sql")]
+    pub(crate) fn resolve_external_sql_bundle_for_archive(
+        &self,
+        entry: &LogEntry,
+    ) -> Result<RecorderEffectBundle, NodeError> {
+        self.prepare_external_sql_bundle_resolution(entry)?
+            .resolve()
+            .map_err(|error| self.map_consensus_error(error))?
+            .ok_or_else(|| {
+                NodeError::Unavailable("committed QEFX bundle is temporarily unavailable".into())
+            })
+    }
+
+    #[cfg(feature = "sql")]
+    fn prepare_external_sql_bundle_resolution(
+        &self,
+        entry: &LogEntry,
+    ) -> Result<PreparedExternalSqlBundleResolution, NodeError> {
+        let configuration = self.configuration_state()?;
+        let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+            self.latch(NodeError::Invariant(format!(
+                "invalid committed QEFX command: {error}"
+            )))
+        })?;
+        validate_external_sql_entry(entry, &configuration)
+            .map_err(|error| self.latch(NodeError::Invariant(error)))?;
+        let manifest_command = StoredCommand::new(EntryType::Command, entry.payload.clone());
+        let binding = effect_bundle_binding(&command, &manifest_command);
+        Ok(PreparedExternalSqlBundleResolution {
+            consensus: self.consensus.clone(),
+            binding,
+            manifest_command,
+            command,
+        })
+    }
+
+    /// Resolves archive payloads on Tokio's blocking pool. Recorder quorum
+    /// reads are synchronous and may consume their full bounded deadline; they
+    /// must never starve HTTP liveness or the durability executor.
+    #[cfg(feature = "sql")]
+    pub(crate) async fn resolve_external_sql_bundle_for_archive_async(
+        &self,
+        entry: &LogEntry,
+    ) -> Result<RecorderEffectBundle, NodeError> {
+        let prepared = self.prepare_external_sql_bundle_resolution(entry)?;
+        let result = tokio::task::spawn_blocking(move || prepared.resolve())
+            .await
+            .map_err(node_service_task_error)?
+            .map_err(|error| self.map_consensus_error(error))?
+            .ok_or_else(|| {
+                NodeError::Unavailable("committed QEFX bundle is temporarily unavailable".into())
+            })?;
+        Ok(result)
     }
 
     fn require_execution_profile(&self, expected: ExecutionProfile) -> Result<(), NodeError> {
@@ -12007,10 +12578,34 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "sql")]
+    #[cfg_attr(
+        all(not(feature = "graph"), not(feature = "kv")),
+        allow(irrefutable_let_patterns)
+    )]
+    fn sql_read_handle(&self) -> Result<rhiza_sql::SqlReadHandle, NodeError> {
+        let materializer = self.lock_materializer()?;
+        let Materializer::Sql(sqlite) = &*materializer else {
+            return Err(NodeError::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Sqlite,
+                actual: materializer.profile(),
+            });
+        };
+        Ok(sqlite.read_handle())
+    }
+
+    #[cfg(feature = "sql")]
     fn map_sqlite_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
             rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
             rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
+            rhiza_sql::Error::InvalidCommand(message)
+                if message == "external SQL batch produced no successful member" =>
+            {
+                NodeError::InvalidSqlStatement {
+                    statement_index: 0,
+                    message,
+                }
+            }
             rhiza_sql::Error::InvalidCommand(message)
             | rhiza_sql::Error::IdentityMismatch(message)
             | rhiza_sql::Error::InvalidEntry(message)
@@ -12065,11 +12660,15 @@ impl NodeRuntime {
             rhiza_quepaxa::Error::NoQuorum
             | rhiza_quepaxa::Error::ProposeFailed
             | rhiza_quepaxa::Error::CommandUnavailable
+            | rhiza_quepaxa::Error::EffectBundleUnavailable
             | rhiza_quepaxa::Error::Cancelled
             | rhiza_quepaxa::Error::RpcCancelled
             | rhiza_quepaxa::Error::RpcDeadlineExceeded
             | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
-            rhiza_quepaxa::Error::ConflictingCertificates
+            rhiza_quepaxa::Error::EffectBundleConflict
+            | rhiza_quepaxa::Error::EffectBundleInvalid(_)
+            | rhiza_quepaxa::Error::EffectBundleQuotaExceeded { .. }
+            | rhiza_quepaxa::Error::ConflictingCertificates
             | rhiza_quepaxa::Error::ChainConflict { .. }
             | rhiza_quepaxa::Error::UnknownOutcome => {
                 self.latch(NodeError::Reconciliation(error.to_string()))
@@ -12116,6 +12715,9 @@ pub fn rehydrate_recorder_after_checkpoint(
             "checkpoint tip {checkpoint_index} is ahead of local applied index {applied_index}"
         )));
     }
+
+    #[cfg(feature = "sql")]
+    rehydrate_checkpoint_qefx_handoff(runtime, recorder)?;
 
     for index in checkpoint_index.saturating_add(1)..=applied_index {
         startup.check("recorder rehydration qlog read")?;
@@ -12164,6 +12766,26 @@ pub fn rehydrate_recorder_after_checkpoint(
         }
         let command = StoredCommand::new(entry.entry_type, entry.payload.clone());
         let proof = certified.proof.clone();
+        #[cfg(feature = "sql")]
+        if runtime.config.execution_profile == ExecutionProfile::Sqlite
+            && entry.entry_type == EntryType::Command
+            && !entry.payload.is_empty()
+        {
+            // Rehydrating only the small command/proof would leave this
+            // recorder unable to serve a committed QEFX after restart.
+            let bundle = runtime.resolve_external_sql_bundle_for_archive(&entry)?;
+            let request =
+                EffectBundleFinalizeRequest::new(bundle, command.clone()).map_err(|error| {
+                    NodeError::Reconciliation(format!(
+                        "cannot reconstruct recorder QEFX bundle at qlog index {index}: {error}"
+                    ))
+                })?;
+            recorder.finalize_effect_bundle(&request).map_err(|error| {
+                NodeError::Reconciliation(format!(
+                    "cannot install recorder QEFX bundle at qlog index {index}: {error}"
+                ))
+            })?;
+        }
         // Recorder rehydration is outside the local startup-I/O publication
         // fence. It retains its existing cooperative cancellation check, but
         // does not claim quiescence for recorder persistence here.
@@ -12186,14 +12808,131 @@ pub fn rehydrate_recorder_after_checkpoint(
     Ok(())
 }
 
+/// Installs checkpoint-owned QEFX bundles from the local restore staging
+/// handoff. The archive was fully verified before the restore was published;
+/// this startup step performs no recorder RPC or archive read, and runs before
+/// command/proof rehydration can make the recorder advertise the entry.
+#[cfg(feature = "sql")]
+fn rehydrate_checkpoint_qefx_handoff(
+    runtime: &NodeRuntime,
+    recorder: &RecorderFileStore,
+) -> Result<(), NodeError> {
+    let root = runtime
+        .config
+        .data_dir
+        .join(durability::QEFX_RESTORE_HANDOFF_DIR);
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut directories = fs::read_dir(&root)
+        .map_err(|error| {
+            NodeError::Reconciliation(format!("cannot read QEFX restore handoff: {error}"))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            NodeError::Reconciliation(format!("cannot enumerate QEFX restore handoff: {error}"))
+        })?;
+    directories.sort_by_key(|entry| entry.file_name());
+    for directory in directories {
+        let metadata = directory.metadata().map_err(|error| {
+            NodeError::Reconciliation(format!("cannot inspect QEFX restore handoff: {error}"))
+        })?;
+        if !metadata.is_dir() {
+            return Err(NodeError::Reconciliation(
+                "QEFX restore handoff contains a non-directory entry".into(),
+            ));
+        }
+        let index = directory
+            .file_name()
+            .to_str()
+            .ok_or_else(|| {
+                NodeError::Reconciliation("QEFX restore handoff index is not UTF-8".into())
+            })?
+            .parse::<LogIndex>()
+            .map_err(|_| {
+                NodeError::Reconciliation("QEFX restore handoff index is invalid".into())
+            })?;
+        let entry = runtime
+            .log_store()
+            .read(index)
+            .map_err(|error| NodeError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                NodeError::Reconciliation(format!(
+                    "QEFX restore handoff entry {index} is absent from qlog"
+                ))
+            })?;
+        let manifest = fs::read(directory.path().join("binding.qefx")).map_err(|error| {
+            NodeError::Reconciliation(format!("cannot read QEFX restore binding {index}: {error}"))
+        })?;
+        if manifest != entry.payload {
+            return Err(NodeError::Reconciliation(format!(
+                "QEFX restore binding {index} differs from its qlog entry"
+            )));
+        }
+        let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
+            NodeError::Reconciliation(format!("invalid QEFX restore binding {index}: {error}"))
+        })?;
+        if command.cluster_id() != entry.cluster_id
+            || command.epoch() != entry.epoch
+            || command.config_id() != entry.config_id
+            || command.intended_slot() != entry.index
+            || command.prev_hash() != entry.prev_hash
+        {
+            return Err(NodeError::Reconciliation(format!(
+                "QEFX restore binding {index} does not match its qlog entry"
+            )));
+        }
+        let mut chunks = Vec::with_capacity(command.chunks().len());
+        for ordinal in 0..command.chunks().len() {
+            chunks.push(
+                fs::read(directory.path().join(format!("{ordinal:03}.qefc"))).map_err(|error| {
+                    NodeError::Reconciliation(format!(
+                        "cannot read QEFX restore chunk {index}/{ordinal}: {error}"
+                    ))
+                })?,
+            );
+        }
+        let mut encoded = Vec::new();
+        for chunk in &chunks {
+            encoded.extend_from_slice(chunk);
+        }
+        QwalEffectManifestV4::verify_external_bundle(&command, &encoded).map_err(|error| {
+            NodeError::Reconciliation(format!("invalid QEFX restore bundle {index}: {error}"))
+        })?;
+        let stored = StoredCommand::new(EntryType::Command, manifest);
+        let bundle = RecorderEffectBundle::new(effect_bundle_binding(&command, &stored), chunks)
+            .map_err(|error| {
+                NodeError::Reconciliation(format!(
+                    "cannot reconstruct QEFX restore bundle {index}: {error}"
+                ))
+            })?;
+        let request = EffectBundleFinalizeRequest::new(bundle, stored).map_err(|error| {
+            NodeError::Reconciliation(format!(
+                "cannot finalize QEFX restore bundle {index}: {error}"
+            ))
+        })?;
+        recorder.finalize_effect_bundle(&request).map_err(|error| {
+            NodeError::Reconciliation(format!(
+                "cannot install QEFX restore bundle {index}: {error}"
+            ))
+        })?;
+    }
+    fs::remove_dir_all(&root).map_err(|error| {
+        NodeError::Reconciliation(format!(
+            "cannot clear completed QEFX restore handoff: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
 
     use rhiza_core::{
         Command, CommandKind, ConfigurationState, EntryType, ErrorCategory, ErrorClassification,
-        ExecutionProfile, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
-        StoredCommand,
+        ExecutionProfile, ExternalEffectCommand, LogAnchor, LogEntry, LogHash, RecoveryAnchor,
+        SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
@@ -12233,11 +12972,11 @@ mod tests {
     };
     use super::{
         client_authenticated, next_sync_flush_retry, post,
-        retain_peer_permit_until_response_body_complete, run_read_operation,
-        sql_query_http_response, valid_recorder_record, Body, Duration, FileLogStore, HeaderMap,
-        Instant, Json, NodeError, ReadConsistency, Request, Response, Router, SqlCommand,
-        SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
-        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
+        retain_peer_permit_until_response_body_complete, retryable_sync_flush_error,
+        run_read_operation, sql_query_http_response, valid_recorder_record, Body, DurabilityError,
+        Duration, FileLogStore, HeaderMap, Instant, Json, NodeError, ReadConsistency, Request,
+        Response, Router, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler,
+        MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL,
         VERSION_HEADER,
     };
 
@@ -12278,6 +13017,99 @@ mod tests {
 
     #[derive(Clone)]
     struct HttpIdentityRecorder;
+
+    #[derive(Clone)]
+    struct GatedRecorder {
+        enabled: Arc<AtomicBool>,
+        inner: RecorderFileStore,
+    }
+
+    impl RecorderRpc for GatedRecorder {
+        fn record(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            if !self.enabled.load(Ordering::Acquire) {
+                return Err(rhiza_quepaxa::Error::ProposeFailed);
+            }
+            RecorderRpc::record(&self.inner, context, request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
+    }
 
     impl RecorderRpc for HttpIdentityRecorder {
         fn recorder_id(
@@ -12992,7 +13824,7 @@ mod tests {
     {
         let _hook_lock = test_startup_effect_hook_lock().lock().await;
         let root = tempfile::tempdir().unwrap();
-        let (config, _consensus) = startup_local_io_runtime_parts(&root, "persist-partial");
+        let (config, consensus) = startup_local_io_runtime_parts(&root, "persist-partial");
         fs::create_dir_all(config.data_dir()).unwrap();
         let log_store = FileLogStore::open_with_configuration(
             config.data_dir().join("consensus/log"),
@@ -13037,6 +13869,7 @@ mod tests {
         let worker = tokio::task::spawn_blocking(move || {
             persist_startup_entry(
                 &worker_config,
+                consensus.as_ref(),
                 &log_store,
                 &materializer,
                 &entry,
@@ -14034,6 +14867,14 @@ mod tests {
             delays,
             [50, 100, 200, 400, 800, 1_000, 1_000].map(Duration::from_millis)
         );
+    }
+
+    #[test]
+    fn transient_qefx_unavailability_is_a_retryable_sync_flush_error() {
+        assert!(retryable_sync_flush_error(&DurabilityError::Unavailable));
+        assert!(!retryable_sync_flush_error(
+            &DurabilityError::SnapshotVerification("corrupt QEFX evidence".into())
+        ));
     }
 
     #[test]
@@ -15325,8 +16166,9 @@ mod tests {
             .read(first.applied_index)
             .unwrap()
             .unwrap();
+        let command = ExternalEffectCommand::decode(&entry.payload).unwrap();
         assert_eq!(
-            rhiza_sql::decode_qwal_v3(&entry.payload)
+            rhiza_sql::QwalEffectManifestV4::from_external_command(&command)
                 .unwrap()
                 .receipts
                 .len(),
@@ -15394,15 +16236,19 @@ mod tests {
         assert!(calls[4]
             .iter()
             .all(|result| result.as_ref().unwrap().applied_index == 3));
+        let first = runtime.log_store().read(2).unwrap().unwrap();
+        let first = ExternalEffectCommand::decode(&first.payload).unwrap();
         assert_eq!(
-            rhiza_sql::decode_qwal_v3(&runtime.log_store().read(2).unwrap().unwrap().payload)
+            rhiza_sql::QwalEffectManifestV4::from_external_command(&first)
                 .unwrap()
                 .receipts
                 .len(),
             1024
         );
+        let second = runtime.log_store().read(3).unwrap().unwrap();
+        let second = ExternalEffectCommand::decode(&second.payload).unwrap();
         assert_eq!(
-            rhiza_sql::decode_qwal_v3(&runtime.log_store().read(3).unwrap().unwrap().payload)
+            rhiza_sql::QwalEffectManifestV4::from_external_command(&second)
                 .unwrap()
                 .receipts
                 .len(),
@@ -15862,7 +16708,7 @@ mod tests {
     }
 
     #[test]
-    fn key_value_write_commits_qwal_instead_of_raw_put_payload() {
+    fn key_value_write_commits_external_effect_instead_of_raw_put_payload() {
         let (_dir, runtime) = sql_test_runtime();
 
         let response = runtime.write("key-value-put", "key", "value").unwrap();
@@ -15872,7 +16718,7 @@ mod tests {
             .read(response.applied_index)
             .unwrap()
             .unwrap();
-        assert!(entry.payload.starts_with(QWAL_V3_MAGIC));
+        assert!(ExternalEffectCommand::decode(&entry.payload).is_ok());
         assert!(!entry.payload.starts_with(b"put\t"));
         assert_eq!(
             runtime.read("key", ReadConsistency::Local).unwrap().value,
@@ -15881,7 +16727,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_batch_preserves_order_commits_one_qwal_effect_and_retries_exactly() {
+    fn sql_batch_preserves_order_commits_one_external_effect_and_retries_exactly() {
         let (_dir, runtime) = sql_test_runtime();
         runtime
             .execute_sql(SqlCommand {
@@ -15922,7 +16768,8 @@ mod tests {
         );
         for index in 1..=2 {
             let entry = runtime.log_store().read(index).unwrap().unwrap();
-            assert!(entry.payload.starts_with(QWAL_V3_MAGIC));
+            assert!(entry.payload.len() <= MAX_COMMAND_BYTES);
+            assert!(ExternalEffectCommand::decode(&entry.payload).is_ok());
         }
         assert_eq!(
             replay
@@ -15935,7 +16782,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_effect_over_qlog_limit_is_resource_exhausted() {
+    fn sql_effect_over_qlog_limit_is_stored_as_external_bundle() {
         let (_dir, runtime) = sql_test_runtime();
         runtime
             .execute_sql(SqlCommand {
@@ -15947,7 +16794,7 @@ mod tests {
             })
             .unwrap();
 
-        let error = runtime
+        let response = runtime
             .execute_sql(SqlCommand {
                 request_id: "large-effect".into(),
                 statements: vec![SqlStatement {
@@ -15955,10 +16802,13 @@ mod tests {
                     parameters: vec![],
                 }],
             })
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, NodeError::ResourceExhausted(_)));
-        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert_eq!(response.applied_index, 2);
+        let entry = runtime.log_store().read(2).unwrap().unwrap();
+        assert!(entry.payload.len() <= MAX_COMMAND_BYTES);
+        let command = ExternalEffectCommand::decode(&entry.payload).unwrap();
+        assert!(command.total_effect_bytes() > MAX_COMMAND_BYTES as u32);
     }
 
     #[test]
@@ -16290,6 +17140,305 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_recorder_connect_failure_is_definite_for_mutation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        assert!(matches!(
+            client.recorder_id(&rhiza_quepaxa::RecorderRpcContext::with_timeout(
+                Duration::from_secs(2)
+            )),
+            Err(rhiza_quepaxa::Error::Io(_))
+        ));
+        let result = client.record(
+            &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+            RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            },
+        );
+        assert_eq!(result, Err(rhiza_quepaxa::Error::ProposeFailed));
+    }
+
+    #[test]
+    fn recorder_connect_and_result_delivery_fit_the_default_consensus_budget() {
+        let delivery_margin = Duration::from_millis(50);
+        assert!(
+            super::RECORDER_HTTP_CONNECT_TIMEOUT + delivery_margin
+                < super::QUORUM_RECORD_REQUEST_TIMEOUT
+        );
+        assert!(
+            super::QUORUM_RECORD_REQUEST_TIMEOUT + Duration::from_millis(100)
+                < rhiza_quepaxa::DEFAULT_RECORDER_RPC_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn http_recorder_post_send_disconnect_remains_unknown_for_mutation() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let (header_bytes, content_length) = loop {
+                let bytes = stream.read(&mut chunk).unwrap();
+                assert!(bytes > 0, "request closed before complete headers");
+                request.extend_from_slice(&chunk[..bytes]);
+                let Some(header_bytes) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_bytes]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .expect("mutation request declares content-length");
+                break (header_bytes, content_length);
+            };
+            while request.len() < header_bytes + content_length {
+                let bytes = stream.read(&mut chunk).unwrap();
+                assert!(bytes > 0, "request closed before complete body");
+                request.extend_from_slice(&chunk[..bytes]);
+            }
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let result = client.record(
+            &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+            RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            },
+        );
+        assert_eq!(result, Err(rhiza_quepaxa::Error::UnknownOutcome));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_recorder_mutation_never_follows_a_redirect_after_full_post() {
+        use std::io::{Read, Write};
+
+        let redirected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        redirected.set_nonblocking(true).unwrap();
+        let redirected_address = redirected.local_addr().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let (header_bytes, content_length) = loop {
+                let bytes = stream.read(&mut chunk).unwrap();
+                assert!(bytes > 0, "request closed before complete headers");
+                request.extend_from_slice(&chunk[..bytes]);
+                let Some(header_bytes) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_bytes]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .expect("mutation request declares content-length");
+                break (header_bytes, content_length);
+            };
+            while request.len() < header_bytes + content_length {
+                let bytes = stream.read(&mut chunk).unwrap();
+                assert!(bytes > 0, "request closed before complete body");
+                request.extend_from_slice(&chunk[..bytes]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{redirected_address}/record\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let client =
+            HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2").unwrap();
+        let result = client.record(
+            &rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+            RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            },
+        );
+        assert_eq!(result, Err(rhiza_quepaxa::Error::UnknownOutcome));
+        server.join().unwrap();
+        assert_eq!(
+            redirected.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn definite_remote_failures_preserve_local_accept_for_same_slot_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let local = RecorderFileStore::new_with_membership(
+            dir.path().join("n1"),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let remotes_enabled = Arc::new(AtomicBool::new(false));
+        let n2 = RecorderFileStore::new_with_membership(
+            dir.path().join("n2"),
+            "n2",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let n3 = RecorderFileStore::new_with_membership(
+            dir.path().join("n3"),
+            "n3",
+            "cluster",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "cluster",
+                "n1",
+                1,
+                1,
+                vec![
+                    ("n1".into(), Box::new(local.clone()) as Box<dyn RecorderRpc>),
+                    (
+                        "n2".into(),
+                        Box::new(GatedRecorder {
+                            enabled: Arc::clone(&remotes_enabled),
+                            inner: n2.clone(),
+                        }),
+                    ),
+                    (
+                        "n3".into(),
+                        Box::new(GatedRecorder {
+                            enabled: Arc::clone(&remotes_enabled),
+                            inner: n3.clone(),
+                        }),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        let offered = Command::new(CommandKind::Deterministic, b"original".to_vec());
+        let first = consensus.propose_at(
+            rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+            1,
+            LogHash::ZERO,
+            offered.clone(),
+        );
+        assert_eq!(first, Err(rhiza_quepaxa::Error::ProposeFailed));
+        assert!(local.inspect_record_summary(1).unwrap().is_some());
+
+        let (_runtime_dir, runtime) = sql_test_runtime();
+        let response =
+            node_error_response(runtime.map_consensus_error(rhiza_quepaxa::Error::ProposeFailed));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let local_enabled = Arc::new(AtomicBool::new(false));
+        let foreign = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n2",
+            1,
+            1,
+            vec![
+                (
+                    "n1".into(),
+                    Box::new(GatedRecorder {
+                        enabled: local_enabled,
+                        inner: local,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                ("n2".into(), Box::new(n2)),
+                ("n3".into(), Box::new(n3)),
+            ],
+        )
+        .unwrap();
+        let foreign_winner = foreign
+            .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                1,
+                LogHash::ZERO,
+                Command::new(CommandKind::Deterministic, b"foreign".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(foreign_winner.payload, b"foreign");
+
+        remotes_enabled.store(true, Ordering::Release);
+        let learned = consensus
+            .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                1,
+                LogHash::ZERO,
+                offered.clone(),
+            )
+            .unwrap();
+        assert_eq!(learned.hash, foreign_winner.hash);
+        assert_eq!(learned.payload, b"foreign");
+
+        let decided = consensus
+            .propose_at(
+                rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                2,
+                learned.hash,
+                offered,
+            )
+            .unwrap();
+        assert_eq!(decided.payload, b"original");
+        assert_ne!(decided.hash, learned.hash);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn http_recorder_rejects_schema_valid_many_member_request_at_decode_budget_and_recovers()
     {
@@ -16366,6 +17515,91 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.unwrap(), "node-1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_recorder_round_trips_external_effect_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "node-1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                recorder_router(
+                    store,
+                    vec![PeerConfig::new("node-2", "http://node-2:8081", "peer-token-2").unwrap()],
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let chunks = vec![b"http-effect-bundle".to_vec()];
+        let command = ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "cluster",
+            1,
+            1,
+            membership.digest(),
+            1,
+            LogHash::ZERO,
+            rhiza_core::ExternalEffectProfile::sql(vec![1]),
+            &chunks,
+        )
+        .unwrap();
+        let manifest_command = StoredCommand::new(EntryType::Command, command.encode().unwrap());
+        let binding = rhiza_quepaxa::EffectBundleBinding {
+            cluster_id: command.cluster_id().into(),
+            epoch: command.epoch(),
+            config_id: command.config_id(),
+            config_digest: command.config_digest(),
+            intended_slot: command.intended_slot(),
+            prev_hash: command.prev_hash(),
+            manifest_command_hash: manifest_command.hash(),
+            effect_digest: command.effect_digest_value(),
+        };
+        let bundle =
+            rhiza_quepaxa::RecorderEffectBundle::new(binding.clone(), chunks.clone()).unwrap();
+        let request =
+            rhiza_quepaxa::EffectBundleFinalizeRequest::new(bundle, manifest_command.clone())
+                .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            let client =
+                HttpRecorderClient::new(format!("http://{address}"), "node-2", "peer-token-2")
+                    .unwrap();
+            let context = rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5));
+            client.stage_effect_bundle_chunk(
+                &context,
+                binding.clone(),
+                manifest_command.clone(),
+                0,
+                chunks[0].clone(),
+            )?;
+            client.finalize_staged_effect_bundle(
+                &context,
+                binding.clone(),
+                manifest_command.clone(),
+            )?;
+            let fetched_manifest =
+                client.fetch_effect_bundle_manifest(&context, binding.clone())?;
+            let fetched_chunk = client.fetch_effect_bundle_chunk(&context, binding, 0)?;
+            Ok::<_, rhiza_quepaxa::Error>((fetched_manifest, fetched_chunk))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, Some(request.manifest_command));
+        assert_eq!(result.1, Some(b"http-effect-bundle".to_vec()));
         server.abort();
     }
 
@@ -17370,6 +18604,7 @@ fn write_response(outcome: RequestOutcome) -> WriteResponse {
 
 fn reconcile_local_storage(
     config: &NodeConfig,
+    consensus: &ThreeNodeConsensus,
     log_store: &FileLogStore,
     materializer: &Materializer,
 ) -> Result<(), NodeError> {
@@ -17474,9 +18709,14 @@ fn reconcile_local_storage(
             }
             None => validate_entry_envelope(config, &entry, index, expected_prev_hash)?,
         };
-        materializer
-            .apply_entry(&entry)
-            .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+        apply_reconciled_entry(
+            config,
+            consensus,
+            materializer,
+            materializer_configuration.as_ref(),
+            &entry,
+            &RecorderRpcContext::default_timeout(),
+        )?;
         materializer_configuration = materializer
             .configuration_state()
             .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
@@ -17495,6 +18735,58 @@ fn reconcile_local_storage(
         )));
     }
     Ok(())
+}
+
+fn apply_reconciled_entry(
+    _config: &NodeConfig,
+    _consensus: &ThreeNodeConsensus,
+    materializer: &Materializer,
+    _configuration: Option<&ConfigurationState>,
+    entry: &LogEntry,
+    _context: &RecorderRpcContext,
+) -> Result<(), NodeError> {
+    #[cfg(feature = "sql")]
+    if _config.execution_profile() == ExecutionProfile::Sqlite
+        && entry.entry_type == EntryType::Command
+        && !entry.payload.is_empty()
+    {
+        let configuration = _configuration.ok_or_else(|| {
+            NodeError::Reconciliation("SQL materializer omitted its configuration state".into())
+        })?;
+        let verified =
+            resolve_external_sql_effect_from_consensus(_consensus, configuration, entry, _context)?;
+        return materializer
+            .apply_verified_external_sql_effect(&verified)
+            .map(|_| ())
+            .map_err(|error| NodeError::Reconciliation(error.to_string()));
+    }
+    materializer
+        .apply_entry(entry)
+        .map(|_| ())
+        .map_err(|error| NodeError::Reconciliation(error.to_string()))
+}
+
+#[cfg(feature = "sql")]
+pub(crate) fn resolve_external_sql_effect_from_consensus(
+    consensus: &ThreeNodeConsensus,
+    configuration: &ConfigurationState,
+    entry: &LogEntry,
+    context: &RecorderRpcContext,
+) -> Result<VerifiedQwalEffectBundleV4, NodeError> {
+    validate_external_sql_entry(entry, configuration).map_err(NodeError::Reconciliation)?;
+    let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+        NodeError::Reconciliation(format!("invalid committed QEFX command: {error}"))
+    })?;
+    let manifest_command = StoredCommand::new(EntryType::Command, entry.payload.clone());
+    let binding = effect_bundle_binding(&command, &manifest_command);
+    let bundle = consensus
+        .resolve_effect_bundle_from_quorum(context, &binding, &manifest_command)
+        .map_err(startup_consensus_error)?
+        .ok_or_else(|| {
+            NodeError::Unavailable("committed QEFX bundle is temporarily unavailable".into())
+        })?;
+    verify_resolved_external_sql_bundle(&command, &bundle)
+        .map_err(|error| NodeError::Reconciliation(error.to_string()))
 }
 
 fn recover_peer_candidates(
@@ -17555,6 +18847,7 @@ fn recover_peer_candidates(
                     startup.check("peer decision inspection")?;
                     persist_startup_entry(
                         config,
+                        consensus,
                         log_store,
                         materializer,
                         &candidate,
@@ -17611,6 +18904,7 @@ fn recover_startup_decisions(
                 startup.check("recorder decision inspection")?;
                 persist_startup_entry(
                     config,
+                    consensus,
                     log_store,
                     materializer,
                     &entry,
@@ -17631,6 +18925,7 @@ fn recover_startup_decisions(
                 startup.check("recorder pending decision recovery")?;
                 persist_startup_entry(
                     config,
+                    consensus,
                     log_store,
                     materializer,
                     &entry,
@@ -17652,8 +18947,10 @@ fn recover_startup_decisions(
     )))
 }
 
+#[allow(clippy::too_many_arguments)] // Startup recovery needs the explicit consensus resolver.
 fn persist_startup_entry(
     config: &NodeConfig,
+    _consensus: &ThreeNodeConsensus,
     log_store: &FileLogStore,
     materializer: &Materializer,
     entry: &LogEntry,
@@ -17672,11 +18969,36 @@ fn persist_startup_entry(
         expected_index,
         expected_prev_hash,
     )?;
+    #[cfg(feature = "sql")]
+    let verified = if config.execution_profile() == ExecutionProfile::Sqlite
+        && entry.entry_type == EntryType::Command
+        && !entry.payload.is_empty()
+    {
+        Some(resolve_external_sql_effect_from_consensus(
+            _consensus,
+            &configuration_state,
+            entry,
+            &startup.recorder_context(),
+        )?)
+    } else {
+        None
+    };
     log_store
         .append(entry)
         .map_err(|error| NodeError::Storage(error.to_string()))?;
     #[cfg(test)]
     test_startup_persistence_hook_after_qlog_append(startup.inner.context_id)?;
+    #[cfg(feature = "sql")]
+    if let Some(verified) = verified {
+        materializer
+            .apply_verified_external_sql_effect(&verified)
+            .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+    } else {
+        materializer
+            .apply_entry(entry)
+            .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+    }
+    #[cfg(not(feature = "sql"))]
     materializer
         .apply_entry(entry)
         .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
@@ -17701,6 +19023,13 @@ fn validate_runtime_entry(
     validate_entry_envelope(config, entry, expected_index, expected_prev_hash)?;
     validate_profile_entry_shape(config.execution_profile(), entry)
         .map_err(NodeError::Invariant)?;
+    #[cfg(feature = "sql")]
+    if config.execution_profile() == ExecutionProfile::Sqlite
+        && entry.entry_type == EntryType::Command
+        && !entry.payload.is_empty()
+    {
+        validate_external_sql_entry(entry, configuration_state).map_err(NodeError::Invariant)?;
+    }
     configuration_state
         .validate_entry(entry)
         .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
@@ -17762,11 +19091,62 @@ pub(crate) fn validate_profile_entry_shape(
 ) -> Result<(), String> {
     validate_entry_shape(entry)?;
     #[cfg(feature = "sql")]
-    if _profile == ExecutionProfile::Sqlite && entry.entry_type == EntryType::Command {
-        decode_qwal_v3(&entry.payload)
-            .map_err(|error| format!("SQLite command is not canonical QWAL v3: {error}"))?;
+    if _profile == ExecutionProfile::Sqlite
+        && entry.entry_type == EntryType::Command
+        && !entry.payload.is_empty()
+    {
+        ExternalEffectCommand::decode(&entry.payload)
+            .map_err(|error| format!("SQLite command is not canonical QEFX: {error}"))?;
     }
     Ok(())
+}
+
+#[cfg(feature = "sql")]
+fn validate_external_sql_entry(
+    entry: &LogEntry,
+    configuration: &ConfigurationState,
+) -> Result<(), String> {
+    let command = ExternalEffectCommand::decode(&entry.payload)
+        .map_err(|error| format!("SQLite command is not canonical QEFX: {error}"))?;
+    if command.cluster_id() != entry.cluster_id
+        || command.epoch() != entry.epoch
+        || command.config_id() != entry.config_id
+        || command.config_digest() != configuration.digest()
+        || command.intended_slot() != entry.index
+        || command.prev_hash() != entry.prev_hash
+    {
+        return Err("QEFX command context does not match its log entry".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+fn effect_bundle_binding(
+    command: &ExternalEffectCommand,
+    manifest_command: &StoredCommand,
+) -> EffectBundleBinding {
+    EffectBundleBinding {
+        cluster_id: command.cluster_id().into(),
+        epoch: command.epoch(),
+        config_id: command.config_id(),
+        config_digest: command.config_digest(),
+        intended_slot: command.intended_slot(),
+        prev_hash: command.prev_hash(),
+        manifest_command_hash: manifest_command.hash(),
+        effect_digest: command.effect_digest_value(),
+    }
+}
+
+#[cfg(feature = "sql")]
+fn verify_resolved_external_sql_bundle(
+    command: &ExternalEffectCommand,
+    bundle: &RecorderEffectBundle,
+) -> rhiza_sql::Result<VerifiedQwalEffectBundleV4> {
+    let mut bytes = Vec::with_capacity(bundle.total_len());
+    for chunk in bundle.chunks() {
+        bytes.extend_from_slice(chunk);
+    }
+    QwalEffectManifestV4::verify_external_bundle(command, &bytes)
 }
 
 fn startup_consensus_error(error: rhiza_quepaxa::Error) -> NodeError {
@@ -17774,6 +19154,7 @@ fn startup_consensus_error(error: rhiza_quepaxa::Error) -> NodeError {
         rhiza_quepaxa::Error::NoQuorum
         | rhiza_quepaxa::Error::ProposeFailed
         | rhiza_quepaxa::Error::CommandUnavailable
+        | rhiza_quepaxa::Error::EffectBundleUnavailable
         | rhiza_quepaxa::Error::Cancelled
         | rhiza_quepaxa::Error::RpcCancelled
         | rhiza_quepaxa::Error::RpcDeadlineExceeded

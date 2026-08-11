@@ -828,6 +828,391 @@ impl std::fmt::Display for CommandEnvelopeError {
 
 impl std::error::Error for CommandEnvelopeError {}
 
+/// Clean-break prefix for the canonical external-effect command envelope.
+pub const EXTERNAL_EFFECT_COMMAND_MAGIC: &[u8; 6] = b"QEFX\0\x01";
+/// Immutable layout identity for [`ExternalEffectCommand`].
+pub const EXTERNAL_EFFECT_COMMAND_FINGERPRINT: [u8; 32] = *b"rhiza:external-effect-command:v1";
+pub const MAX_EXTERNAL_EFFECT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXTERNAL_EFFECT_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_EXTERNAL_EFFECT_CHUNKS: usize = 256;
+pub const MAX_EXTERNAL_EFFECT_PROFILE_MANIFEST_BYTES: usize = 512 * 1024;
+pub const MAX_EXTERNAL_EFFECT_COMMAND_BYTES: usize = 512 * 1024;
+const MAX_EXTERNAL_EFFECT_CLUSTER_ID_BYTES: usize = 256;
+
+const EXTERNAL_EFFECT_CHUNK_DOMAIN: &[u8] = b"rhiza:external-effect:chunk:v1\0";
+const EXTERNAL_EFFECT_BUNDLE_DOMAIN: &[u8] = b"rhiza:external-effect:bundle:v1\0";
+const EXTERNAL_EFFECT_COMMAND_DOMAIN: &[u8] = b"rhiza:external-effect:command:v1\0";
+
+/// The execution profile which interprets an external effect manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum ExternalEffectProfileKind {
+    Sql,
+}
+
+/// Profile-owned manifest bytes carried by an external-effect command.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum ExternalEffectProfile {
+    Sql { manifest: Vec<u8> },
+}
+
+impl ExternalEffectProfile {
+    pub fn sql(manifest: Vec<u8>) -> Self {
+        Self::Sql { manifest }
+    }
+
+    pub const fn kind(&self) -> ExternalEffectProfileKind {
+        match self {
+            Self::Sql { .. } => ExternalEffectProfileKind::Sql,
+        }
+    }
+
+    pub fn manifest(&self) -> &[u8] {
+        match self {
+            Self::Sql { manifest } => manifest,
+        }
+    }
+}
+
+/// One ordered, content-addressed chunk in an external effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ExternalEffectChunk {
+    digest: LogHash,
+    encoded_len: u32,
+}
+
+impl ExternalEffectChunk {
+    pub fn new(digest: LogHash, encoded_len: u32) -> Result<Self, ExternalEffectCommandError> {
+        let chunk = Self {
+            digest,
+            encoded_len,
+        };
+        validate_external_effect_chunk(&chunk)?;
+        Ok(chunk)
+    }
+
+    pub fn for_bytes(bytes: &[u8]) -> Result<Self, ExternalEffectCommandError> {
+        let encoded_len =
+            u32::try_from(bytes.len()).map_err(|_| ExternalEffectCommandError::ChunkTooLarge)?;
+        Self::new(ExternalEffectCommand::chunk_digest(bytes), encoded_len)
+    }
+
+    pub const fn digest(&self) -> LogHash {
+        self.digest
+    }
+
+    pub const fn encoded_len(&self) -> u32 {
+        self.encoded_len
+    }
+}
+
+/// The sole canonical replicated commitment to externally stored effect bytes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ExternalEffectCommand {
+    cluster_id: ClusterId,
+    epoch: Epoch,
+    config_id: ConfigId,
+    config_digest: LogHash,
+    intended_slot: LogIndex,
+    prev_hash: LogHash,
+    profile: ExternalEffectProfile,
+    total_effect_bytes: u32,
+    effect_digest: LogHash,
+    chunks: Vec<ExternalEffectChunk>,
+}
+
+impl ExternalEffectCommand {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cluster_id: impl Into<ClusterId>,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        intended_slot: LogIndex,
+        prev_hash: LogHash,
+        profile: ExternalEffectProfile,
+        chunks: Vec<ExternalEffectChunk>,
+    ) -> Result<Self, ExternalEffectCommandError> {
+        let (total_effect_bytes, effect_digest) = Self::effect_digest(&chunks)?;
+        let command = Self {
+            cluster_id: cluster_id.into(),
+            epoch,
+            config_id,
+            config_digest,
+            intended_slot,
+            prev_hash,
+            profile,
+            total_effect_bytes,
+            effect_digest,
+            chunks,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_profile_bytes_and_chunks(
+        cluster_id: impl Into<ClusterId>,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        intended_slot: LogIndex,
+        prev_hash: LogHash,
+        profile: ExternalEffectProfile,
+        chunks: &[Vec<u8>],
+    ) -> Result<Self, ExternalEffectCommandError> {
+        let chunks = chunks
+            .iter()
+            .map(|chunk| ExternalEffectChunk::for_bytes(chunk))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            intended_slot,
+            prev_hash,
+            profile,
+            chunks,
+        )
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+    pub const fn config_id(&self) -> ConfigId {
+        self.config_id
+    }
+    pub const fn config_digest(&self) -> LogHash {
+        self.config_digest
+    }
+    pub const fn intended_slot(&self) -> LogIndex {
+        self.intended_slot
+    }
+    pub const fn prev_hash(&self) -> LogHash {
+        self.prev_hash
+    }
+    pub const fn profile(&self) -> &ExternalEffectProfile {
+        &self.profile
+    }
+    pub const fn total_effect_bytes(&self) -> u32 {
+        self.total_effect_bytes
+    }
+    pub const fn effect_digest_value(&self) -> LogHash {
+        self.effect_digest
+    }
+    pub fn chunks(&self) -> &[ExternalEffectChunk] {
+        &self.chunks
+    }
+
+    pub fn chunk_digest(bytes: &[u8]) -> LogHash {
+        LogHash::digest(&[
+            EXTERNAL_EFFECT_CHUNK_DOMAIN,
+            &(bytes.len() as u64).to_be_bytes(),
+            bytes,
+        ])
+    }
+
+    pub fn effect_digest(
+        chunks: &[ExternalEffectChunk],
+    ) -> Result<(u32, LogHash), ExternalEffectCommandError> {
+        validate_external_effect_chunks(chunks)?;
+        let total = chunks.iter().try_fold(0usize, |total, chunk| {
+            total
+                .checked_add(chunk.encoded_len as usize)
+                .ok_or(ExternalEffectCommandError::EffectTooLarge)
+        })?;
+        if total > MAX_EXTERNAL_EFFECT_BYTES {
+            return Err(ExternalEffectCommandError::EffectTooLarge);
+        }
+        let mut encoded = Vec::with_capacity(8 + chunks.len() * 44);
+        encoded.extend_from_slice(&(chunks.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(&(total as u64).to_be_bytes());
+        for (ordinal, chunk) in chunks.iter().enumerate() {
+            encoded.extend_from_slice(&(ordinal as u64).to_be_bytes());
+            encoded.extend_from_slice(&chunk.encoded_len.to_be_bytes());
+            encoded.extend_from_slice(chunk.digest.as_bytes());
+        }
+        Ok((
+            u32::try_from(total).map_err(|_| ExternalEffectCommandError::EffectTooLarge)?,
+            LogHash::digest(&[EXTERNAL_EFFECT_BUNDLE_DOMAIN, &encoded]),
+        ))
+    }
+
+    pub fn command_digest(&self) -> Result<LogHash, ExternalEffectCommandError> {
+        Ok(LogHash::digest(&[
+            EXTERNAL_EFFECT_COMMAND_DOMAIN,
+            &self.encode()?,
+        ]))
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ExternalEffectCommandError> {
+        self.validate()?;
+        let body = postcard::to_allocvec(self)
+            .map_err(|error| ExternalEffectCommandError::Encode(error.to_string()))?;
+        let mut encoded = Vec::with_capacity(
+            EXTERNAL_EFFECT_COMMAND_MAGIC.len()
+                + EXTERNAL_EFFECT_COMMAND_FINGERPRINT.len()
+                + body.len(),
+        );
+        encoded.extend_from_slice(EXTERNAL_EFFECT_COMMAND_MAGIC);
+        encoded.extend_from_slice(&EXTERNAL_EFFECT_COMMAND_FINGERPRINT);
+        encoded.extend_from_slice(&body);
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, ExternalEffectCommandError> {
+        if encoded.len() > MAX_EXTERNAL_EFFECT_COMMAND_BYTES {
+            return Err(ExternalEffectCommandError::EncodedTooLarge);
+        }
+        let body = encoded
+            .strip_prefix(EXTERNAL_EFFECT_COMMAND_MAGIC)
+            .ok_or(ExternalEffectCommandError::InvalidMagic)?
+            .strip_prefix(&EXTERNAL_EFFECT_COMMAND_FINGERPRINT)
+            .ok_or(ExternalEffectCommandError::InvalidFingerprint)?;
+        if body.is_empty() {
+            return Err(ExternalEffectCommandError::EmptyBody);
+        }
+        let command: Self = postcard::from_bytes(body)
+            .map_err(|error| ExternalEffectCommandError::Decode(error.to_string()))?;
+        command.validate()?;
+        let canonical = postcard::to_allocvec(&command)
+            .map_err(|error| ExternalEffectCommandError::Encode(error.to_string()))?;
+        if canonical.as_slice() != body {
+            return Err(ExternalEffectCommandError::NonCanonical);
+        }
+        Ok(command)
+    }
+
+    pub fn validate(&self) -> Result<(), ExternalEffectCommandError> {
+        if self.cluster_id.is_empty()
+            || self.cluster_id.len() > MAX_EXTERNAL_EFFECT_CLUSTER_ID_BYTES
+        {
+            return Err(ExternalEffectCommandError::EmptyClusterId);
+        }
+        if self.intended_slot == 0 {
+            return Err(ExternalEffectCommandError::InvalidIntendedSlot);
+        }
+        if self.profile.manifest().is_empty() {
+            return Err(ExternalEffectCommandError::EmptyProfileManifest);
+        }
+        if self.profile.manifest().len() > MAX_EXTERNAL_EFFECT_PROFILE_MANIFEST_BYTES {
+            return Err(ExternalEffectCommandError::ProfileManifestTooLarge);
+        }
+        let (total_effect_bytes, effect_digest) = Self::effect_digest(&self.chunks)?;
+        if self.total_effect_bytes != total_effect_bytes || self.effect_digest != effect_digest {
+            return Err(ExternalEffectCommandError::EffectDigestMismatch);
+        }
+        let body = postcard::to_allocvec(self)
+            .map_err(|error| ExternalEffectCommandError::Encode(error.to_string()))?;
+        if EXTERNAL_EFFECT_COMMAND_MAGIC.len()
+            + EXTERNAL_EFFECT_COMMAND_FINGERPRINT.len()
+            + body.len()
+            > MAX_EXTERNAL_EFFECT_COMMAND_BYTES
+        {
+            return Err(ExternalEffectCommandError::EncodedTooLarge);
+        }
+        Ok(())
+    }
+}
+
+fn validate_external_effect_chunk(
+    chunk: &ExternalEffectChunk,
+) -> Result<(), ExternalEffectCommandError> {
+    if chunk.digest == LogHash::ZERO {
+        return Err(ExternalEffectCommandError::ZeroChunkDigest);
+    }
+    if chunk.encoded_len == 0 || chunk.encoded_len as usize > MAX_EXTERNAL_EFFECT_CHUNK_BYTES {
+        return Err(ExternalEffectCommandError::ChunkTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_external_effect_chunks(
+    chunks: &[ExternalEffectChunk],
+) -> Result<(), ExternalEffectCommandError> {
+    if chunks.is_empty() || chunks.len() > MAX_EXTERNAL_EFFECT_CHUNKS {
+        return Err(ExternalEffectCommandError::InvalidChunkCount);
+    }
+    for chunk in chunks {
+        validate_external_effect_chunk(chunk)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalEffectCommandError {
+    InvalidMagic,
+    InvalidFingerprint,
+    EmptyBody,
+    EmptyClusterId,
+    InvalidIntendedSlot,
+    EmptyProfileManifest,
+    ProfileManifestTooLarge,
+    InvalidChunkCount,
+    ZeroChunkDigest,
+    ChunkTooLarge,
+    EffectTooLarge,
+    EffectDigestMismatch,
+    EncodedTooLarge,
+    Encode(String),
+    Decode(String),
+    NonCanonical,
+}
+
+impl std::fmt::Display for ExternalEffectCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidMagic => formatter.write_str("external effect command magic is invalid"),
+            Self::InvalidFingerprint => {
+                formatter.write_str("external effect command fingerprint is invalid")
+            }
+            Self::EmptyBody => formatter.write_str("external effect command body is empty"),
+            Self::EmptyClusterId => {
+                formatter.write_str("external effect command cluster id is empty")
+            }
+            Self::InvalidIntendedSlot => {
+                formatter.write_str("external effect command intended slot must be positive")
+            }
+            Self::EmptyProfileManifest => {
+                formatter.write_str("external effect command profile manifest is empty")
+            }
+            Self::ProfileManifestTooLarge => formatter
+                .write_str("external effect command profile manifest exceeds its byte bound"),
+            Self::InvalidChunkCount => {
+                formatter.write_str("external effect command chunk count is outside its bound")
+            }
+            Self::ZeroChunkDigest => {
+                formatter.write_str("external effect command chunk digest is zero")
+            }
+            Self::ChunkTooLarge => {
+                formatter.write_str("external effect command chunk length is outside its bound")
+            }
+            Self::EffectTooLarge => {
+                formatter.write_str("external effect command exceeds its byte bound")
+            }
+            Self::EffectDigestMismatch => {
+                formatter.write_str("external effect command effect digest does not match chunks")
+            }
+            Self::EncodedTooLarge => formatter
+                .write_str("external effect command exceeds the replicated command byte bound"),
+            Self::Encode(error) => {
+                write!(formatter, "external effect command encode failed: {error}")
+            }
+            Self::Decode(error) => {
+                write!(formatter, "external effect command decode failed: {error}")
+            }
+            Self::NonCanonical => {
+                formatter.write_str("external effect command is not canonically encoded")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExternalEffectCommandError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CommandKind {
     Deterministic,
@@ -1545,7 +1930,8 @@ mod tests {
         read_config_hash, read_config_hash_at, read_config_string, read_config_u16,
         read_config_u64, read_config_u64_at, CommandEnvelopeError, ConfigChangeDecodeError,
         ErrorCategory, ErrorClassification, ExecutionProfile, ExecutionProfileParseError,
-        ReplicatedCommandEnvelope,
+        ExternalEffectCommand, ExternalEffectCommandError, ReplicatedCommandEnvelope,
+        MAX_EXTERNAL_EFFECT_COMMAND_BYTES,
     };
 
     #[test]
@@ -1830,6 +2216,15 @@ mod tests {
         assert_eq!(
             read_config_hash_at(&bytes, &mut cursor),
             Err(ConfigChangeDecodeError)
+        );
+    }
+
+    #[test]
+    fn external_effect_decoder_rejects_oversized_input_before_deserialization() {
+        let encoded = vec![0_u8; MAX_EXTERNAL_EFFECT_COMMAND_BYTES + 1];
+        assert_eq!(
+            ExternalEffectCommand::decode(&encoded),
+            Err(ExternalEffectCommandError::EncodedTooLarge)
         );
     }
 }

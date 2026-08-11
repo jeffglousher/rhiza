@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
@@ -31,9 +31,9 @@ use rhiza_node::{
 use rhiza_node::{GraphCommandV1, GraphValueV1};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
-    install_test_control_operation_probe, DecisionProof, Membership, ReadFenceObservation,
-    ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
-    RecorderRpcContext, TestControlOperationProbe, ThreeNodeConsensus,
+    install_test_control_operation_probe, DecisionProof, EffectBundleBinding, Membership,
+    ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
+    RecorderRpc, RecorderRpcContext, TestControlOperationProbe, ThreeNodeConsensus,
 };
 use rhiza_sql::SqliteStateMachine;
 
@@ -79,7 +79,10 @@ fn expected_restore_state_for_test(
         node_id,
         prepared.identity(),
         prepared.execution_profile(),
-        ConfigurationState::active(prepared.identity().config_id(), LogHash::ZERO),
+        ConfigurationState::active(
+            prepared.identity().config_id(),
+            prepared.identity().config_digest(),
+        ),
         completion_marker_name,
     )
 }
@@ -200,7 +203,15 @@ async fn coordinator_open_rejects_tampered_segment_checksum_metadata() {
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            runtime_config(PathBuf::from("unused"))
+                .configuration_state()
+                .digest(),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
@@ -1006,6 +1017,55 @@ impl RecorderRpc for BlockingRehydrateRecorder {
     ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
         self.recorder
             .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+    }
+
+    fn stage_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: rhiza_core::StoredCommand,
+        ordinal: u16,
+        chunk: Vec<u8>,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::stage_effect_bundle_chunk(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+        )
+    }
+
+    fn finalize_staged_effect_bundle(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        manifest_command: rhiza_core::StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::finalize_staged_effect_bundle(
+            &self.recorder,
+            context,
+            binding,
+            manifest_command,
+        )
+    }
+
+    fn fetch_effect_bundle_manifest(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        RecorderRpc::fetch_effect_bundle_manifest(&self.recorder, context, binding)
+    }
+
+    fn fetch_effect_bundle_chunk(
+        &self,
+        context: &RecorderRpcContext,
+        binding: EffectBundleBinding,
+        ordinal: u16,
+    ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+        RecorderRpc::fetch_effect_bundle_chunk(&self.recorder, context, binding, ordinal)
     }
 }
 
@@ -2003,7 +2063,7 @@ async fn restore_roundtrip_replays_normally_through_node_runtime() {
     assert_eq!(tip.hash(), second.hash);
     assert_ne!(tip.hash(), first.hash);
 
-    let restored = runtime(restored_dir);
+    let restored = runtime(&restored_dir);
     assert_eq!(restored.applied_index().unwrap(), 2);
     assert_eq!(
         restored
@@ -2128,7 +2188,7 @@ async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
     assert_eq!(restored_checkpoint.suffix().len(), 1);
     assert_eq!(restored_checkpoint.suffix()[0].index, second.applied_index);
 
-    let restored = runtime(restored_dir);
+    let restored = runtime(&restored_dir);
     assert_eq!(
         restored
             .read("alpha", ReadConsistency::Local)
@@ -2144,6 +2204,26 @@ async fn checkpoint_compact_publishes_canonical_snapshot_with_exact_suffix() {
             .value
             .as_deref(),
         Some("two")
+    );
+    let recorder = RecorderFileStore::new_with_membership(
+        root.path().join("restored-handoff-recorder"),
+        "node-1",
+        "rhiza:sql:cluster-a",
+        1,
+        1,
+        restored.consensus().membership().clone(),
+    )
+    .unwrap();
+    rehydrate_recorder_after_checkpoint(
+        &restored,
+        &recorder,
+        second.applied_index,
+        &StartupIoContext::new(),
+    )
+    .unwrap();
+    assert!(
+        !restored_dir.join("consensus/qefx-restore").exists(),
+        "the verified local QEFX handoff is consumed before normal recorder rehydration"
     );
 }
 
@@ -2331,7 +2411,25 @@ async fn initialized_profile_checkpoint(
     .unwrap();
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new(effective_cluster_id(profile, "cluster-a").unwrap(), 1, 1, 1),
+        CheckpointIdentity::new(
+            effective_cluster_id(profile, "cluster-a").unwrap(),
+            1,
+            1,
+            NodeConfig::new_embedded(
+                "cluster-a",
+                "n1",
+                root.join("checkpoint-identity"),
+                1,
+                1,
+                ["n1", "n2", "n3"],
+            )
+            .unwrap()
+            .with_execution_profile(profile)
+            .unwrap()
+            .configuration_state()
+            .digest(),
+            1,
+        ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive
@@ -2397,8 +2495,33 @@ fn checkpoint_store(root: &Path) -> ObjectArchiveStore {
     .unwrap();
     ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            runtime_config(PathBuf::from("unused"))
+                .configuration_state()
+                .digest(),
+            1,
+        ),
     )
+}
+
+fn runtime_config(data_dir: PathBuf) -> NodeConfig {
+    NodeConfig::new(
+        "rhiza:sql:cluster-a",
+        "node-1",
+        data_dir,
+        1,
+        1,
+        [
+            PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
+            PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
+            PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
+        ],
+        "client-token",
+    )
+    .unwrap()
 }
 
 fn runtime(data_dir: impl AsRef<Path>) -> NodeRuntime {
@@ -2408,20 +2531,7 @@ fn runtime(data_dir: impl AsRef<Path>) -> NodeRuntime {
         data_dir.file_name().unwrap().to_string_lossy()
     ));
     NodeRuntime::open(
-        NodeConfig::new(
-            "rhiza:sql:cluster-a",
-            "node-1",
-            data_dir,
-            1,
-            1,
-            [
-                PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
-                PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
-                PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
-            ],
-            "client-token",
-        )
-        .unwrap(),
+        runtime_config(data_dir),
         Arc::new(
             ThreeNodeConsensus::from_recovered_tip(
                 "rhiza:sql:cluster-a",

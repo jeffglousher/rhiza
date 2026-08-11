@@ -1196,6 +1196,7 @@ fn error_value(code: AdminErrorCode) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use rhiza_core::LogHash;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Barrier, Condvar, Mutex,
@@ -1391,7 +1392,13 @@ mod tests {
         .unwrap();
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             store,
-            CheckpointIdentity::new("rhiza:sql:admin-status-test", 1, 1, 1),
+            CheckpointIdentity::new(
+                "rhiza:sql:admin-status-test",
+                1,
+                1,
+                LogHash::digest(&[b"admin-test-config"]),
+                1,
+            ),
         );
         archive.initialize_checkpoint().await.unwrap();
         Arc::new(

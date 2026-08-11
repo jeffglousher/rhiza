@@ -35,7 +35,7 @@ winning 결과를 exact replay한다. 패배한 제안은 canonical DB를 바꾸
 | native WAL parser와 checksum/commit 검증 | [`wal_capture.rs`](../crates/rhiza-sql/src/wal_capture.rs) |
 | `StateIdentityV3` Merkle page state | [`page_state.rs`](../crates/rhiza-sql/src/page_state.rs) |
 | QWAL v3 codec과 in-place page apply | [`qwal.rs`](../crates/rhiza-sql/src/qwal.rs) |
-| 준비, inode seal, exact promotion, foreign apply | [`SqliteStateMachine`](../crates/rhiza-sql/src/lib.rs) |
+| 준비, inode seal, canonical WAL 격리, decided apply | [`SqliteStateMachine`](../crates/rhiza-sql/src/lib.rs) |
 | generation 6 control, receipt, embedded qlog | [`control.rs`](../crates/rhiza-sql/src/control.rs) |
 | runtime recovery와 readiness | [`NodeRuntime`](../crates/rhiza-node/src/lib.rs) |
 | checkpoint publish, restore와 compaction | [`durability.rs`](../crates/rhiza-node/src/durability.rs) |
@@ -89,16 +89,25 @@ QWAL 검증은 다음을 fail closed로 강제한다.
 확인한다. lifecycle gate 아래에서 canonical connection을 닫고 Unix에서는 열린 file과
 pathname이 같은 regular inode인지 `dev/ino/len/mtime/ctime` seal로 고정한다.
 
-speculative target은 같은 filesystem에서 만든다. 256 KiB 이상은 macOS `clonefile` 또는
-Linux `FICLONE`을 우선하고, 지원되지 않으면 full copy로 fallback한다. 이 clone/copy는
-winning SQL을 격리하기 위한 로컬 준비물이지 QWAL correctness 증명이나 follower apply
-방식이 아니다.
+별도 clone, reflink, full-copy staging file은 만들지 않는다. exclusive lifecycle gate가 read pool과
+canonical writer를 모두 배제한 동안 canonical main file 자체를 sealed base로 유지하고, SQLite의
+native `-wal`만 speculative overlay로 사용한다.
 
-staging connection은 WAL mode, `synchronous=OFF`, checkpoint-on-close disabled로 실행한다.
+speculative connection은 WAL mode, `synchronous=OFF`, autocheckpoint 0,
+checkpoint-on-close disabled로 실행한다.
 commit 뒤 connection이 살아 있을 때 `-wal` descriptor를 열고 metadata를 seal한 다음,
 connection을 닫아도 보존된 descriptor에서 frame을 직접 파싱한다. parser는 WAL magic/version,
 page size, salts, rolling checksums, complete frames, 하나의 최종 commit marker와 target page
 count를 검증한다. capture 전후 descriptor seal이 달라지면 거부한다.
+
+capture 성공과 모든 오류 경로에서 owned WAL/SHM을 제거하고 parent directory를 sync한 뒤 main
+file의 inode seal과 전체 page-state root가 준비 전 control state와 정확히 같은지 다시 확인한다.
+이 증명이 끝나기 전에는 canonical connection을 reopen하지 않는다. 시작 시 남은 sidecar도 SQLite가
+열기 전에 같은 검사를 거치며, main root가 committed control state와 같을 때만 폐기한다. 다르면
+replay를 추측하지 않고 fail closed한다.
+
+현재 canonical WAL 준비는 held descriptor와 pathname의 동일 inode를 증명할 수 있는 Unix에서만
+지원한다. 동등한 file-identity primitive가 없는 non-Unix target에서는 준비를 명시적으로 거부한다.
 
 마지막 committed frame의 page after-image만 보존하고 base와 같은 image는 제거한다. 새 page는
 누락 없이 포함한다. custom recording VFS, checkpoint 뒤 full-file diff, full target digest는
@@ -117,18 +126,15 @@ unseen member만 다시 준비한다.
 winning proposer가 관측한 결과를 그대로 반환한다. pure-read execute는 changed page가 없는 QWAL을
 만들 수 있지만 receipt와 log anchor는 남는다. 일반 조회에는 log를 쓰지 않는 query API를 사용한다.
 
-## 5. 적용: exact promotion과 foreign patch
+## 5. 적용: decided effect patch
 
 적용 전 lifecycle/read-write gate를 닫고 entry chain, identity, receipt와 page-state transition을
 모두 검증한다.
 
-- **exact local winner**: prepared effect digest, base/target roots, node identity와 configuration이
-  모두 같고 base/target inode seal이 유지된 경우에만 prepared target을 canonical path로
-  rename한다. Unix에서 inode 동일성을 증명할 수 없거나 seal이 달라지면 이 최적화는 사용하지
-  않는다.
-- **foreign winner 또는 promotion 불가**: connection을 checkpoint/close한 뒤 seal된 canonical
-  inode에 changed page만 in-place write하고 target 길이를 맞춘다. 설치한 page bytes와 갱신된
-  Merkle target root를 다시 확인한다. 전체 DB temp reconstruction/rename은 하지 않는다.
+local proposal의 승패와 무관하게 consensus가 결정한 QWAL effect만 적용한다. connection을
+checkpoint/close한 뒤 seal된 canonical inode에 changed page만 in-place write하고 target 길이를
+맞춘다. 설치한 page bytes와 갱신된 Merkle target root를 다시 확인한다. prepared target promotion,
+전체 DB temp reconstruction/rename은 없다.
 
 물리 설치 뒤 control generation 6의 한 비내구 transaction이 applied tip, target state,
 receipts와 embedded qlog entry를 같은 anchor로 게시한다. connection은 exclusive lifecycle
@@ -255,7 +261,19 @@ directory에서 시작한다. 다음 입력은 fallback 없이 거부한다.
   request ID 최대 256 bytes, canonical encoded command 최대 512 KiB
 - command 전체 typed result는 최대 1,024행/1 MiB지만, receipt와 page를 포함한 QWAL envelope
   자체는 최대 512 KiB이므로 더 작은 physical 한계가 먼저 적용될 수 있음
-- 한 physical group에는 receipt 1..=1,024개, changed page/QWAL envelope 최대 512 KiB
+- inline physical group에는 receipt 1..=1,024개, changed page/QWAL envelope 최대 512 KiB.
+  batch receipt encoding은 각 member savepoint commit 전에 누적 512 KiB를 검사하며, 전부 실패한
+  external batch는 effect 없이 정렬된 member error만 반환한다.
+- native WAL parser의 raw capture work는 최대 8 MiB다. 같은 1~2개 page를 반복 overwrite한
+  frame은 이 별도 work budget 안에서 허용하지만, 최종 고유 page image와 encoded QWAL은 계속
+  512 KiB 이하이어야 한다. 따라서 이 변경은 큰 `CREATE INDEX`나 bulk `UPDATE` 지원이 아니다.
+- 외부 effect producer는 같은 canonical WAL sandbox를 사용하되 최종 typed SQL page effect와
+  receipt prefix를 합쳐 64 MiB, raw WAL capture work를 256 MiB로 제한한다. receipt aggregate는
+  계속 512 KiB 이하이며 bundle은 canonical 256 KiB chunk로 나뉜다. producer는 config digest,
+  intended slot, prev hash가 정확히 주어진 뒤에만 QEFX command를 만든다.
+- 외부 apply는 QEFX chunk/digest/profile manifest와 canonical page-effect encoding을 모두 검증해
+  만든 `VerifiedQwalEffectBundleV4`만 받는다. raw external bytes나 inline QWAL fallback을 apply
+  경계에 전달하지 않는다. Node/Recorder transport 연결은 별도 integration 단계다.
 - query는 기본 1,000행, 요청 최대 10,000행, 결과 최대 1 MiB, 기본 실행 제한 5초
 - SQL value는 NULL, signed 64-bit integer, finite real, UTF-8 text와 blob으로 제한
 
@@ -268,9 +286,10 @@ directory에서 시작한다. 다음 입력은 fallback 없이 거부한다.
   RTT와 quorum flush를 제거하지 않는다. 처리량은 concurrent outstanding request와 logical
   batch가 group commit을 채울 때 올라간다.
 - SQLite/control/qlog만 가진 한 node의 peer 없는 독립 재개는 strict 계약이 아니다.
-- QWAL은 512 KiB 상한이다. 더 큰 transaction은 durable content-addressed payload protocol
-  없이는 지원하지 않는다.
-- exact prepared promotion의 inode proof는 Unix에서만 활성화된다.
+- inline QWAL은 512 KiB 상한이다. typed QEFX SQL foundation은 64 MiB까지 producer/verify/apply를
+  제공하지만 durable Recorder transport와 consensus 연결 전에는 Node request path에서 사용하지 않는다.
+- canonical main inode seal proof는 Unix에서 활성화되며, sidecar와 page-state 검증은 모든
+  플랫폼에서 fail closed한다.
 
 ## 9. 구현 완료와 남은 검증
 
@@ -278,7 +297,7 @@ directory에서 시작한다. 다음 입력은 fallback 없이 거부한다.
 
 - native WAL checksum/commit parsing과 changed-page reproduction
 - Merkle base/target transition, grow/shrink와 corrupt page/root 거부
-- exact prepared promotion, foreign in-place patch, inode/symlink race 거부
+- canonical WAL prepare의 main-file 불변성, decided in-place patch, inode/symlink race 거부
 - partial apply 및 post-control failure의 read 차단과 exact retry
 - QSNP restore, checkpoint-root equality, tail catch-up와 readiness gate
 - QWAL v2 및 control generation 5 rejection

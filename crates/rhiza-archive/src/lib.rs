@@ -1,5 +1,6 @@
 use rhiza_core::{
-    ConfigId, Epoch, LogEntry, LogHash, LogIndex, RecoveryAnchor, Snapshot, SnapshotManifest,
+    ConfigId, Epoch, ExternalEffectCommand, LogEntry, LogHash, LogIndex, RecoveryAnchor, Snapshot,
+    SnapshotManifest, MAX_EXTERNAL_EFFECT_BYTES, MAX_EXTERNAL_EFFECT_CHUNKS,
     RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 use rhiza_log::{
@@ -679,6 +680,7 @@ pub struct CheckpointIdentity {
     cluster_id: String,
     epoch: Epoch,
     config_id: ConfigId,
+    config_digest: LogHash,
     recovery_generation: u64,
 }
 
@@ -687,12 +689,19 @@ impl CheckpointIdentity {
         cluster_id: impl Into<String>,
         epoch: Epoch,
         config_id: ConfigId,
+        config_digest: LogHash,
         recovery_generation: u64,
     ) -> Self {
+        assert_ne!(
+            config_digest,
+            LogHash::ZERO,
+            "checkpoint config digest must be nonzero"
+        );
         Self {
             cluster_id: cluster_id.into(),
             epoch,
             config_id,
+            config_digest,
             recovery_generation,
         }
     }
@@ -707,6 +716,10 @@ impl CheckpointIdentity {
 
     pub const fn config_id(&self) -> ConfigId {
         self.config_id
+    }
+
+    pub const fn config_digest(&self) -> LogHash {
+        self.config_digest
     }
 
     pub const fn recovery_generation(&self) -> u64 {
@@ -746,6 +759,43 @@ pub struct CheckpointSegmentRecord {
     object_key: String,
     sha256: String,
     size_bytes: u64,
+    effects: Vec<CheckpointEffectRecord>,
+}
+
+/// Immutable archive references for one QEFX bundle. The manifest object is
+/// the canonical QEFX command bytes themselves; no second effect codec exists.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointEffectRecord {
+    entry_index: LogIndex,
+    manifest_object_key: String,
+    manifest_sha256: String,
+    manifest_size_bytes: u64,
+    chunk_object_keys: Vec<String>,
+    chunk_sha256: Vec<String>,
+    chunk_size_bytes: Vec<u64>,
+}
+
+impl CheckpointEffectRecord {
+    pub const fn entry_index(&self) -> LogIndex {
+        self.entry_index
+    }
+}
+
+/// Verified bytes for one checkpoint-owned QEFX reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoredCheckpointEffect {
+    manifest: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
+}
+
+impl RestoredCheckpointEffect {
+    pub fn manifest(&self) -> &[u8] {
+        &self.manifest
+    }
+    pub fn chunks(&self) -> &[Vec<u8>] {
+        &self.chunks
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -837,6 +887,10 @@ impl CheckpointSegmentRecord {
 
     pub const fn size_bytes(&self) -> u64 {
         self.size_bytes
+    }
+
+    pub fn effects(&self) -> &[CheckpointEffectRecord] {
+        &self.effects
     }
 }
 
@@ -1046,6 +1100,35 @@ pub struct LoadedCheckpointManifest {
     version: UpdateVersion,
 }
 
+/// Evidence returned only after a checkpoint manifest has been read back from
+/// object storage. `manifest_digest` is the hash of the canonical manifest
+/// bytes; no parallel certificate codec is introduced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointReadbackCertificate {
+    identity: CheckpointIdentity,
+    tip: CheckpointTip,
+    manifest_digest: LogHash,
+    object_generation: UpdateVersion,
+}
+
+impl CheckpointReadbackCertificate {
+    pub const fn identity(&self) -> &CheckpointIdentity {
+        &self.identity
+    }
+
+    pub const fn tip(&self) -> &CheckpointTip {
+        &self.tip
+    }
+
+    pub const fn manifest_digest(&self) -> LogHash {
+        self.manifest_digest
+    }
+
+    pub const fn object_generation(&self) -> &UpdateVersion {
+        &self.object_generation
+    }
+}
+
 impl LoadedCheckpointManifest {
     pub const fn manifest(&self) -> &CheckpointManifest {
         &self.manifest
@@ -1248,6 +1331,32 @@ impl CheckpointPublisher {
         })
     }
 
+    /// Appends one exact batch together with the immutable QEFX references
+    /// required to replay its external SQL effects.  This path is deliberately
+    /// not coalesced: the references belong to this exact segment and are
+    /// verified before its manifest CAS becomes visible.
+    pub async fn publish_committed_with_effects(
+        &self,
+        entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
+    ) -> Result<LoadedCheckpointManifest> {
+        let _operation = self.operation.lock().await;
+        let loaded = self.state.lock().await.loaded.clone();
+        let published = self
+            .store
+            .publish_committed_from_loaded_unleased_with_effects_and_limits(
+                entries,
+                effects,
+                &self.lease_id,
+                self.options.lease_duration_ms,
+                loaded,
+                CHECKPOINT_RESTORE_LIMITS,
+            )
+            .await?;
+        self.state.lock().await.loaded = published.clone();
+        Ok(published)
+    }
+
     pub async fn publish_checkpoint_snapshot(
         &self,
         anchor: RecoveryAnchor,
@@ -1334,6 +1443,7 @@ impl CheckpointPublisher {
                         let prepared = self.store.prepare_local_checkpoint_append(
                             loaded.manifest(),
                             &flush.entries,
+                            &[],
                             CHECKPOINT_RESTORE_LIMITS,
                         )?;
                         self.store
@@ -1346,6 +1456,7 @@ impl CheckpointPublisher {
                             .finalize_checkpoint_append_under_lease(
                                 loaded.manifest(),
                                 &flush.entries,
+                                &[],
                                 prepared,
                                 CHECKPOINT_RESTORE_LIMITS,
                             )
@@ -1853,6 +1964,26 @@ async fn test_gc_control_gate(
 }
 
 impl ObjectArchiveStore {
+    pub async fn checkpoint_readback_certificate(
+        &self,
+        expected: &LoadedCheckpointManifest,
+    ) -> Result<CheckpointReadbackCertificate> {
+        let actual = self.load_checkpoint().await?.ok_or_else(|| {
+            Error::InvalidCheckpoint("checkpoint disappeared before GC certificate readback".into())
+        })?;
+        if actual.manifest != expected.manifest || actual.version != expected.version {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint changed before GC certificate readback".into(),
+            ));
+        }
+        let bytes = serialize_checkpoint_manifest(actual.manifest())?;
+        Ok(CheckpointReadbackCertificate {
+            identity: actual.manifest.identity().clone(),
+            tip: *actual.manifest.tip(),
+            manifest_digest: LogHash::digest(&[&bytes]),
+            object_generation: actual.version,
+        })
+    }
     pub fn new(store: ObjStore, cluster_id: impl Into<String>) -> Result<Self> {
         if !store.supports_strong_cross_process_cas() {
             return Err(Error::WeakCompareAndSwap);
@@ -1894,6 +2025,148 @@ impl ObjectArchiveStore {
         self.checkpoint_identity
             .as_ref()
             .ok_or(Error::CheckpointUnbound)
+    }
+
+    /// Publishes one already quorum-verified QEFX bundle. Every immutable
+    /// chunk and the canonical QEFX manifest are read back before this method
+    /// returns a reference suitable for a later checkpoint-manifest CAS.
+    pub async fn publish_verified_qefx_bundle(
+        &self,
+        entry: &LogEntry,
+        chunks: &[Vec<u8>],
+    ) -> Result<CheckpointEffectRecord> {
+        let identity = self.checkpoint_identity()?;
+        let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+            Error::InvalidCheckpoint(format!("invalid QEFX archive entry: {error}"))
+        })?;
+        if command.cluster_id() != identity.cluster_id
+            || command.epoch() != identity.epoch
+            || command.config_id() != identity.config_id
+            || command.intended_slot() != entry.index
+            || command.prev_hash() != entry.prev_hash
+            || chunks.len() != command.chunks().len()
+            || chunks.len() > MAX_EXTERNAL_EFFECT_CHUNKS
+        {
+            return Err(Error::InvalidCheckpoint(
+                "QEFX archive binding mismatch".into(),
+            ));
+        }
+        let total = chunks
+            .iter()
+            .try_fold(0usize, |sum, chunk| sum.checked_add(chunk.len()))
+            .ok_or(Error::InvalidCheckpoint(
+                "QEFX archive size overflow".into(),
+            ))?;
+        if total > MAX_EXTERNAL_EFFECT_BYTES || total != command.total_effect_bytes() as usize {
+            return Err(Error::InvalidCheckpoint(
+                "QEFX archive size exceeds canonical bound".into(),
+            ));
+        }
+        let prefix = checkpoint_effect_prefix(identity, entry.index, command.effect_digest_value());
+        let mut chunk_object_keys = Vec::with_capacity(chunks.len());
+        let mut chunk_sha256 = Vec::with_capacity(chunks.len());
+        let mut chunk_size_bytes = Vec::with_capacity(chunks.len());
+        for (ordinal, (chunk, expected)) in chunks.iter().zip(command.chunks()).enumerate() {
+            if chunk.len() != expected.encoded_len() as usize
+                || ExternalEffectCommand::chunk_digest(chunk) != expected.digest()
+            {
+                return Err(Error::InvalidCheckpoint(
+                    "QEFX archive chunk mismatch".into(),
+                ));
+            }
+            let key = format!(
+                "{prefix}/chunks/{ordinal:03}-{}.qefc",
+                expected.digest().to_hex()
+            );
+            match self.store.create(&key, chunk).await {
+                Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let sha256 = sha256_hex(chunk);
+            self.download_verified(&key, chunk.len() as u64, &sha256)
+                .await?;
+            chunk_object_keys.push(key);
+            chunk_sha256.push(sha256);
+            chunk_size_bytes.push(chunk.len() as u64);
+        }
+        let manifest_object_key = format!("{prefix}/binding.qefx");
+        match self
+            .store
+            .create(&manifest_object_key, &entry.payload)
+            .await
+        {
+            Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let manifest_sha256 = sha256_hex(&entry.payload);
+        let manifest = self
+            .download_verified(
+                &manifest_object_key,
+                entry.payload.len() as u64,
+                &manifest_sha256,
+            )
+            .await?;
+        if ExternalEffectCommand::decode(&manifest).map_err(|error| {
+            Error::InvalidCheckpoint(format!("invalid archived QEFX binding: {error}"))
+        })? != command
+        {
+            return Err(Error::InvalidCheckpoint(
+                "archived QEFX binding readback differs".into(),
+            ));
+        }
+        Ok(CheckpointEffectRecord {
+            entry_index: entry.index,
+            manifest_object_key,
+            manifest_sha256,
+            manifest_size_bytes: entry.payload.len() as u64,
+            chunk_object_keys,
+            chunk_sha256,
+            chunk_size_bytes,
+        })
+    }
+
+    pub async fn restore_checkpoint_effect(
+        &self,
+        effect: &CheckpointEffectRecord,
+    ) -> Result<RestoredCheckpointEffect> {
+        let manifest = self
+            .download_verified(
+                &effect.manifest_object_key,
+                effect.manifest_size_bytes,
+                &effect.manifest_sha256,
+            )
+            .await?;
+        let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
+            Error::InvalidCheckpoint(format!("invalid archived QEFX binding: {error}"))
+        })?;
+        if command.intended_slot() != effect.entry_index
+            || command.chunks().len() != effect.chunk_object_keys.len()
+            || effect.chunk_object_keys.len() != effect.chunk_sha256.len()
+            || effect.chunk_object_keys.len() != effect.chunk_size_bytes.len()
+        {
+            return Err(Error::InvalidCheckpoint(
+                "archived QEFX reference shape mismatch".into(),
+            ));
+        }
+        let mut chunks = Vec::with_capacity(command.chunks().len());
+        for (((key, sha256), size), expected) in effect
+            .chunk_object_keys
+            .iter()
+            .zip(&effect.chunk_sha256)
+            .zip(&effect.chunk_size_bytes)
+            .zip(command.chunks())
+        {
+            let chunk = self.download_verified(key, *size, sha256).await?;
+            if chunk.len() != expected.encoded_len() as usize
+                || ExternalEffectCommand::chunk_digest(&chunk) != expected.digest()
+            {
+                return Err(Error::InvalidCheckpoint(
+                    "archived QEFX chunk differs from binding".into(),
+                ));
+            }
+            chunks.push(chunk);
+        }
+        Ok(RestoredCheckpointEffect { manifest, chunks })
     }
 
     pub fn checkpoint_manifest_key(&self) -> Result<String> {
@@ -2096,33 +2369,45 @@ impl ObjectArchiveStore {
         &self,
         entries: &[LogEntry],
     ) -> Result<LoadedCheckpointManifest> {
-        self.publish_committed_with_limits(entries, CHECKPOINT_RESTORE_LIMITS)
+        self.publish_committed_with_effects(entries, &[]).await
+    }
+
+    /// Atomically publishes `entries` and their already-read-back QEFX
+    /// references in the same checkpoint manifest generation.
+    pub async fn publish_committed_with_effects(
+        &self,
+        entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
+    ) -> Result<LoadedCheckpointManifest> {
+        self.publish_committed_with_effects_and_limits(entries, effects, CHECKPOINT_RESTORE_LIMITS)
             .await
     }
 
-    async fn publish_committed_with_limits(
+    async fn publish_committed_with_effects_and_limits(
         &self,
         entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
         limits: CheckpointRestoreLimits,
     ) -> Result<LoadedCheckpointManifest> {
-        self.validate_publication_entries(entries)?;
+        self.validate_publication_entries_with_effects(entries, effects)?;
         self.ensure_generation_not_retired().await?;
         let observed = self.load_checkpoint_unleased().await?;
         if let Some(loaded) = &observed {
-            self.prepare_local_checkpoint_append(loaded.manifest(), entries, limits)?;
+            self.prepare_local_checkpoint_append(loaded.manifest(), entries, effects, limits)?;
             if entries.is_empty() {
                 return Ok(loaded.clone());
             }
         } else {
             let genesis = CheckpointManifest::new(self.checkpoint_identity()?.clone());
-            self.prepare_local_checkpoint_append(&genesis, entries, limits)?;
+            self.prepare_local_checkpoint_append(&genesis, entries, effects, limits)?;
         }
         let lease = self
             .acquire_operation_lease(GcLeaseKind::Publisher, now_ms(), DEFAULT_LEASE_MS)
             .await?;
         let result = self
-            .publish_committed_unleased_with_limits(
+            .publish_committed_unleased_with_effects_and_limits(
                 entries,
+                effects,
                 &lease.lease_id,
                 DEFAULT_LEASE_MS,
                 limits,
@@ -2135,25 +2420,37 @@ impl ObjectArchiveStore {
         }
     }
 
-    async fn publish_committed_unleased_with_limits(
+    #[cfg(test)]
+    async fn publish_committed_with_limits(
         &self,
         entries: &[LogEntry],
+        limits: CheckpointRestoreLimits,
+    ) -> Result<LoadedCheckpointManifest> {
+        self.publish_committed_with_effects_and_limits(entries, &[], limits)
+            .await
+    }
+
+    async fn publish_committed_unleased_with_effects_and_limits(
+        &self,
+        entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
         lease_id: &str,
         lease_duration_ms: u64,
         limits: CheckpointRestoreLimits,
     ) -> Result<LoadedCheckpointManifest> {
-        self.validate_publication_entries(entries)?;
+        self.validate_publication_entries_with_effects(entries, effects)?;
         let loaded = if let Some(loaded) = self.load_checkpoint_unleased().await? {
-            self.prepare_local_checkpoint_append(loaded.manifest(), entries, limits)?;
+            self.prepare_local_checkpoint_append(loaded.manifest(), entries, effects, limits)?;
             loaded
         } else {
             let genesis = CheckpointManifest::new(self.checkpoint_identity()?.clone());
-            self.prepare_local_checkpoint_append(&genesis, entries, limits)?;
+            self.prepare_local_checkpoint_append(&genesis, entries, effects, limits)?;
             self.initialize_checkpoint_unleased(lease_id, lease_duration_ms)
                 .await?
         };
-        self.publish_committed_from_loaded_unleased_with_limits(
+        self.publish_committed_from_loaded_unleased_with_effects_and_limits(
             entries,
+            effects,
             lease_id,
             lease_duration_ms,
             loaded,
@@ -2169,8 +2466,9 @@ impl ObjectArchiveStore {
         lease_duration_ms: u64,
         loaded: LoadedCheckpointManifest,
     ) -> Result<LoadedCheckpointManifest> {
-        self.publish_committed_from_loaded_unleased_with_limits(
+        self.publish_committed_from_loaded_unleased_with_effects_and_limits(
             entries,
+            &[],
             lease_id,
             lease_duration_ms,
             loaded,
@@ -2179,9 +2477,30 @@ impl ObjectArchiveStore {
         .await
     }
 
+    #[cfg(test)]
     async fn publish_committed_from_loaded_unleased_with_limits(
         &self,
         entries: &[LogEntry],
+        lease_id: &str,
+        lease_duration_ms: u64,
+        loaded: LoadedCheckpointManifest,
+        limits: CheckpointRestoreLimits,
+    ) -> Result<LoadedCheckpointManifest> {
+        self.publish_committed_from_loaded_unleased_with_effects_and_limits(
+            entries,
+            &[],
+            lease_id,
+            lease_duration_ms,
+            loaded,
+            limits,
+        )
+        .await
+    }
+
+    async fn publish_committed_from_loaded_unleased_with_effects_and_limits(
+        &self,
+        entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
         lease_id: &str,
         lease_duration_ms: u64,
         mut loaded: LoadedCheckpointManifest,
@@ -2190,13 +2509,14 @@ impl ObjectArchiveStore {
         for _ in 0..MAX_CHECKPOINT_CAS_ATTEMPTS {
             self.ensure_generation_not_retired().await?;
             let prepared =
-                self.prepare_local_checkpoint_append(loaded.manifest(), entries, limits)?;
+                self.prepare_local_checkpoint_append(loaded.manifest(), entries, effects, limits)?;
             self.renew_active_publisher_gc_lease(lease_id, lease_duration_ms)
                 .await?;
             let Some(prepared) = self
                 .finalize_checkpoint_append_under_lease(
                     loaded.manifest(),
                     entries,
+                    effects,
                     prepared,
                     limits,
                 )
@@ -4414,9 +4734,10 @@ impl ObjectArchiveStore {
         &self,
         manifest: &CheckpointManifest,
         entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
         limits: CheckpointRestoreLimits,
     ) -> Result<PreparedCheckpointAppend> {
-        self.validate_publication_entries(entries)?;
+        self.validate_publication_entries_with_effects(entries, effects)?;
         if entries.is_empty() {
             self.checkpoint_declared_decoded_budget(manifest, limits)?;
             return Ok(PreparedCheckpointAppend {
@@ -4432,10 +4753,15 @@ impl ObjectArchiveStore {
                 candidate: None,
             });
         };
+        let suffix_effects = checkpoint_effect_refs_for_suffix(entries, effects, suffix_start)?;
         let mut budget = self.checkpoint_declared_decoded_budget(manifest, limits)?;
         let bytes = encode_segment(&entries[suffix_start..]);
-        let record =
-            self.checkpoint_segment_record_with_limits(&entries[suffix_start..], &bytes, limits)?;
+        let record = self.checkpoint_segment_record_with_limits(
+            &entries[suffix_start..],
+            &bytes,
+            &suffix_effects,
+            limits,
+        )?;
         let max_decoded_bytes = budget.next_object_limit()?;
         let decoded_upper_bound = self.checkpoint_segment_decoded_upper_bound(&record)?;
         budget.charge(record.object_key(), decoded_upper_bound)?;
@@ -4486,6 +4812,7 @@ impl ObjectArchiveStore {
         &self,
         manifest: &CheckpointManifest,
         entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
         prepared: PreparedCheckpointAppend,
         limits: CheckpointRestoreLimits,
     ) -> Result<Option<FinalizedCheckpointAppend>> {
@@ -4505,7 +4832,15 @@ impl ObjectArchiveStore {
         let suffix_start = prepared
             .suffix_start
             .expect("prepared append candidate has suffix");
+        let expected_effects = checkpoint_effect_refs_for_suffix(entries, effects, suffix_start)?;
+        if candidate.record.effects != expected_effects {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint QEFX effect references changed before manifest publication".into(),
+            ));
+        }
         self.validate_decoded_entries(&entries[suffix_start..], manifest.tip())?;
+        self.verify_checkpoint_effect_refs(&candidate.record.effects)
+            .await?;
         let mut next = manifest.clone();
         next.tip = CheckpointTip::new(candidate.record.end_index, candidate.record.last_hash);
         next.segments.push(candidate.record);
@@ -4604,13 +4939,14 @@ impl ObjectArchiveStore {
         entries: &[LogEntry],
         bytes: &[u8],
     ) -> Result<CheckpointSegmentRecord> {
-        self.checkpoint_segment_record_with_limits(entries, bytes, CHECKPOINT_RESTORE_LIMITS)
+        self.checkpoint_segment_record_with_limits(entries, bytes, &[], CHECKPOINT_RESTORE_LIMITS)
     }
 
     fn checkpoint_segment_record_with_limits(
         &self,
         entries: &[LogEntry],
         bytes: &[u8],
+        effects: &[CheckpointEffectRecord],
         limits: CheckpointRestoreLimits,
     ) -> Result<CheckpointSegmentRecord> {
         let first = entries
@@ -4637,7 +4973,95 @@ impl ObjectArchiveStore {
             object_key,
             sha256: sha256_hex(bytes),
             size_bytes,
+            effects: effects.to_vec(),
         })
+    }
+
+    fn validate_publication_entries_with_effects(
+        &self,
+        entries: &[LogEntry],
+        effects: &[CheckpointEffectRecord],
+    ) -> Result<()> {
+        self.validate_publication_entries(entries)?;
+        let mut entries_by_index = std::collections::BTreeMap::new();
+        for entry in entries {
+            if entries_by_index.insert(entry.index, entry).is_some() {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint publication repeats an entry index".into(),
+                ));
+            }
+        }
+        let mut effects_by_index = std::collections::BTreeSet::new();
+        for effect in effects {
+            if !effects_by_index.insert(effect.entry_index) {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint publication repeats a QEFX effect reference".into(),
+                ));
+            }
+            let entry = entries_by_index.get(&effect.entry_index).ok_or_else(|| {
+                Error::InvalidCheckpoint(
+                    "checkpoint QEFX effect reference has no matching entry".into(),
+                )
+            })?;
+            let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
+                Error::InvalidCheckpoint(format!(
+                    "checkpoint QEFX effect reference targets a non-QEFX entry: {error}"
+                ))
+            })?;
+            if command.intended_slot() != entry.index {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint QEFX effect reference has a wrong slot binding".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_checkpoint_effect_refs(
+        &self,
+        effects: &[CheckpointEffectRecord],
+    ) -> Result<()> {
+        if effects.len() > MAX_EXTERNAL_EFFECT_CHUNKS {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint segment has too many QEFX refs".into(),
+            ));
+        }
+        for effect in effects {
+            if effect.chunk_object_keys.len() != effect.chunk_sha256.len()
+                || effect.chunk_object_keys.len() != effect.chunk_size_bytes.len()
+                || effect.chunk_object_keys.len() > MAX_EXTERNAL_EFFECT_CHUNKS
+            {
+                return Err(Error::InvalidCheckpoint(
+                    "invalid QEFX checkpoint ref shape".into(),
+                ));
+            }
+            let manifest = self
+                .download_verified(
+                    &effect.manifest_object_key,
+                    effect.manifest_size_bytes,
+                    &effect.manifest_sha256,
+                )
+                .await?;
+            let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
+                Error::InvalidCheckpoint(format!("invalid QEFX checkpoint ref: {error}"))
+            })?;
+            if command.intended_slot() != effect.entry_index
+                || command.chunks().len() != effect.chunk_object_keys.len()
+            {
+                return Err(Error::InvalidCheckpoint(
+                    "QEFX checkpoint ref binding mismatch".into(),
+                ));
+            }
+            for ((key, sha256), size) in effect
+                .chunk_object_keys
+                .iter()
+                .zip(&effect.chunk_sha256)
+                .zip(&effect.chunk_size_bytes)
+            {
+                self.download_verified(key, *size, sha256).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn load_checkpoint_segment(
@@ -4821,6 +5245,7 @@ impl ObjectArchiveStore {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidCheckpoint("checkpoint base index overflow".into()))?;
         let mut expected_hash = base_tip.hash;
+        let mut effect_indices = std::collections::BTreeSet::new();
         for record in &manifest.segments {
             if record.format_version != CHECKPOINT_SEGMENT_FORMAT_VERSION {
                 return Err(Error::UnsupportedFormatVersion {
@@ -4868,6 +5293,16 @@ impl ObjectArchiveStore {
                     "segment {} has invalid size or checksum metadata",
                     record.object_key
                 )));
+            }
+            for effect in &record.effects {
+                if effect.entry_index < record.start_index
+                    || effect.entry_index > record.end_index
+                    || !effect_indices.insert(effect.entry_index)
+                {
+                    return Err(Error::InvalidCheckpoint(
+                        "checkpoint has duplicate or out-of-segment QEFX effect references".into(),
+                    ));
+                }
             }
             ensure_restore_limit(
                 "object encoded bytes",
@@ -5415,6 +5850,41 @@ fn local_publication_suffix_start(
     Ok(Some(0))
 }
 
+fn checkpoint_effect_refs_for_suffix(
+    entries: &[LogEntry],
+    effects: &[CheckpointEffectRecord],
+    suffix_start: usize,
+) -> Result<Vec<CheckpointEffectRecord>> {
+    // The caller may replay an overlapping batch and therefore provide refs
+    // for its already-archived prefix. Validate the complete input first, but
+    // serialize only the exact new suffix in entry-index order.
+    let effects_by_index = effects
+        .iter()
+        .map(|effect| (effect.entry_index, effect))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut suffix_effects = Vec::new();
+    for entry in entries.get(suffix_start..).ok_or_else(|| {
+        Error::InvalidCheckpoint("checkpoint suffix is outside publication batch".into())
+    })? {
+        let is_external_effect = ExternalEffectCommand::decode(&entry.payload).is_ok();
+        match (is_external_effect, effects_by_index.get(&entry.index)) {
+            (true, Some(effect)) => suffix_effects.push((*effect).clone()),
+            (true, None) => {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint QEFX suffix entry has no effect reference".into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint effect reference targets a non-QEFX suffix entry".into(),
+                ));
+            }
+            (false, None) => {}
+        }
+    }
+    Ok(suffix_effects)
+}
+
 fn checkpoint_namespace(identity: &CheckpointIdentity) -> String {
     format!(
         "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}/generation-{:020}",
@@ -5430,6 +5900,18 @@ fn checkpoint_segment_key(
     format!(
         "{}/segments/{start_index:020}-{end_index:020}.qlog",
         checkpoint_namespace(identity)
+    )
+}
+
+fn checkpoint_effect_prefix(
+    identity: &CheckpointIdentity,
+    index: LogIndex,
+    digest: LogHash,
+) -> String {
+    format!(
+        "{}/effects/{index:020}-{}",
+        checkpoint_namespace(identity),
+        digest.to_hex()
     )
 }
 
@@ -5603,7 +6085,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rhiza_core::{ConfigurationState, EntryType, LogAnchor, SnapshotIdentity};
+    use rhiza_core::{
+        ConfigurationState, EntryType, ExternalEffectProfile, LogAnchor, SnapshotIdentity,
+    };
     use rhiza_obj_store::{Error as ObjStoreError, ObjStoreConfig};
 
     const TEST_READER_LEASE_MS: u64 = 60_000;
@@ -6373,7 +6857,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retired_generation_cancels_a_delayed_manifest_fetch_without_reinserting_its_lease() {
         let (_dir, store, archive) = fixture();
-        let root_identity = CheckpointIdentity::new("cluster-a", 7, 3, 3);
+        let root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            3,
+        );
         let root =
             ObjectArchiveStore::new_checkpoint_for_single_process(store, root_identity.clone());
         archive.publish_committed(&[entry()]).await.unwrap();
@@ -6996,6 +7486,7 @@ mod tests {
                 object_key: "one".into(),
                 sha256: LogHash::ZERO.to_hex(),
                 size_bytes: 1,
+                effects: Vec::new(),
             },
             CheckpointSegmentRecord {
                 format_version: CHECKPOINT_SEGMENT_FORMAT_VERSION,
@@ -7006,6 +7497,7 @@ mod tests {
                 object_key: "two".into(),
                 sha256: LogHash::ZERO.to_hex(),
                 size_bytes: 1,
+                effects: Vec::new(),
             },
         ];
         assert_eq!(
@@ -7116,7 +7608,13 @@ mod tests {
         let cluster_id = "c".repeat(200);
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             store,
-            CheckpointIdentity::new(&cluster_id, 7, 3, 1),
+            CheckpointIdentity::new(
+                &cluster_id,
+                7,
+                3,
+                LogHash::digest(&[b"archive-test-config"]),
+                1,
+            ),
         );
         let payload = b"small".to_vec();
         let hash = LogEntry::calculate_hash(
@@ -7195,7 +7693,13 @@ mod tests {
         let cluster_id = "c".repeat(200);
         let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
             store.clone(),
-            CheckpointIdentity::new(&cluster_id, 7, 3, 1),
+            CheckpointIdentity::new(
+                &cluster_id,
+                7,
+                3,
+                LogHash::digest(&[b"archive-test-config"]),
+                1,
+            ),
         );
         let loaded = archive.initialize_checkpoint().await.unwrap();
         let payload = b"compact".to_vec();
@@ -7894,7 +8398,13 @@ mod tests {
     async fn recovery_roll_does_not_revive_an_expired_source_reader() {
         let (_source_directory, source_store, source) = fixture();
         let source_checkpoint = source.publish_committed(&[entry()]).await.unwrap();
-        let source_root_identity = CheckpointIdentity::new("cluster-a", 7, 3, 2);
+        let source_root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            2,
+        );
         let source_root = ObjectArchiveStore::new_checkpoint_for_single_process(
             source_store.clone(),
             source_root_identity.clone(),
@@ -7912,7 +8422,13 @@ mod tests {
         .unwrap();
         let target = ObjectArchiveStore::new_checkpoint_for_single_process(
             target_store,
-            CheckpointIdentity::new("cluster-a", 7, 3, 2),
+            CheckpointIdentity::new(
+                "cluster-a",
+                7,
+                3,
+                LogHash::digest(&[b"archive-test-config"]),
+                2,
+            ),
         );
         let source_segment_key = source_checkpoint.manifest().segments()[0]
             .object_key()
@@ -7992,7 +8508,13 @@ mod tests {
             root: target_directory.path().to_path_buf(),
         })
         .unwrap();
-        let target_identity = CheckpointIdentity::new("cluster-a", 7, 3, 2);
+        let target_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            2,
+        );
         let target = ObjectArchiveStore::new_checkpoint_for_single_process(
             target_store.clone(),
             target_identity.clone(),
@@ -8002,7 +8524,13 @@ mod tests {
         // superseded generation after the copy lease expires.
         target.ensure_gc_control().await.unwrap();
         target.register_generation(now_ms()).await.unwrap();
-        let root_identity = CheckpointIdentity::new("cluster-a", 7, 3, 3);
+        let root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            3,
+        );
         let root = ObjectArchiveStore::new_checkpoint_for_single_process(
             target_store.clone(),
             root_identity.clone(),
@@ -8083,8 +8611,88 @@ mod tests {
         (dir, store, archive)
     }
 
+    #[tokio::test]
+    async fn overlapping_qefx_append_attaches_only_new_suffix_effects() {
+        let (_directory, _store, archive) = fixture();
+        let (first, first_chunks) = external_entry(None);
+        let first_effect = archive
+            .publish_verified_qefx_bundle(&first, &first_chunks)
+            .await
+            .unwrap();
+        archive
+            .publish_committed_with_effects(
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&first_effect),
+            )
+            .await
+            .unwrap();
+
+        let (second, second_chunks) = external_entry(Some(&first));
+        let second_effect = archive
+            .publish_verified_qefx_bundle(&second, &second_chunks)
+            .await
+            .unwrap();
+        let before_missing = archive.load_checkpoint().await.unwrap().unwrap();
+        let missing = archive
+            .publish_committed_with_effects(
+                &[first.clone(), second.clone()],
+                std::slice::from_ref(&first_effect),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            Error::InvalidCheckpoint(ref message)
+                if message == "checkpoint QEFX suffix entry has no effect reference"
+        ));
+        let after_missing = archive.load_checkpoint().await.unwrap().unwrap();
+        assert_eq!(after_missing.manifest(), before_missing.manifest());
+        assert_eq!(after_missing.version(), before_missing.version());
+
+        let loaded = archive
+            .publish_committed_with_effects(
+                &[first.clone(), second.clone()],
+                &[second_effect.clone(), first_effect.clone()],
+            )
+            .await
+            .unwrap();
+
+        let segments = loaded.manifest().segments();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].effects(), std::slice::from_ref(&first_effect));
+        assert_eq!(segments[1].effects(), std::slice::from_ref(&second_effect));
+        let effect_indices = segments
+            .iter()
+            .flat_map(|segment| segment.effects())
+            .map(CheckpointEffectRecord::entry_index)
+            .collect::<Vec<_>>();
+        assert_eq!(effect_indices, vec![first.index, second.index]);
+
+        let restored = archive.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(
+            restored.restored().suffix(),
+            &[first.clone(), second.clone()]
+        );
+        for effect in segments.iter().flat_map(|segment| segment.effects()) {
+            archive.restore_checkpoint_effect(effect).await.unwrap();
+        }
+
+        let replayed = archive
+            .publish_committed_with_effects(&[first, second], &[second_effect, first_effect])
+            .await
+            .unwrap();
+        assert_eq!(replayed.manifest(), loaded.manifest());
+        assert_eq!(replayed.version(), loaded.version());
+    }
+
     fn identity() -> CheckpointIdentity {
-        CheckpointIdentity::new("cluster-a", 7, 3, 1)
+        CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            1,
+        )
     }
 
     fn entry() -> LogEntry {
@@ -8132,5 +8740,45 @@ mod tests {
             prev_hash: previous.hash,
             hash,
         }
+    }
+
+    fn external_entry(previous: Option<&LogEntry>) -> (LogEntry, Vec<Vec<u8>>) {
+        let index = previous.map_or(1, |entry| entry.index + 1);
+        let prev_hash = previous.map_or(LogHash::ZERO, |entry| entry.hash);
+        let chunks = vec![format!("external-effect-{index}").into_bytes()];
+        let command = ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "cluster-a",
+            7,
+            3,
+            identity().config_digest(),
+            index,
+            prev_hash,
+            ExternalEffectProfile::sql(format!("sql-profile-{index}").into_bytes()),
+            &chunks,
+        )
+        .unwrap();
+        let payload = command.encode().unwrap();
+        let hash = LogEntry::calculate_hash(
+            "cluster-a",
+            index,
+            7,
+            3,
+            EntryType::Command,
+            prev_hash,
+            &payload,
+        );
+        (
+            LogEntry {
+                cluster_id: "cluster-a".into(),
+                epoch: 7,
+                config_id: 3,
+                index,
+                entry_type: EntryType::Command,
+                payload,
+                prev_hash,
+                hash,
+            },
+            chunks,
+        )
     }
 }

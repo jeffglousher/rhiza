@@ -8,7 +8,7 @@ use std::{
 };
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_core::{ConfigurationState, LogAnchor};
+use rhiza_core::{ConfigurationState, LogAnchor, LogHash};
 use rhiza_node::{
     durability::{finalize_successor_prestage_for_stop, inspect_successor_prestage},
     install_successor_recorder, NodeRuntime,
@@ -271,7 +271,15 @@ fn archive(root: &Path) -> ObjectArchiveStore {
             root: root.to_path_buf(),
         })
         .unwrap(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
+            1,
+        ),
     )
 }
 
@@ -532,7 +540,13 @@ async fn finalized_successor_restart_handles_empty_target_archive_before_activat
     .unwrap();
     let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     source_archive.initialize_checkpoint().await.unwrap();
     let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
@@ -595,7 +609,15 @@ async fn finalized_successor_restart_handles_empty_target_archive_before_activat
 
     let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            2,
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
+            1,
+        ),
     );
     assert!(target_archive.load_checkpoint().await.unwrap().is_none());
     let peers = successor
@@ -825,7 +847,13 @@ async fn start_faulting_live_successor(
     .unwrap();
     let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     source_archive.initialize_checkpoint().await.unwrap();
     let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
@@ -855,7 +883,13 @@ async fn start_faulting_live_successor(
 
     let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            2,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     let peers = successor
         .members()
@@ -929,7 +963,13 @@ async fn unavailable_tail_retry_is_interrupted_by_short_successor_shutdown_deadl
     .unwrap();
     let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     source_archive.initialize_checkpoint().await.unwrap();
     let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
@@ -960,7 +1000,13 @@ async fn unavailable_tail_retry_is_interrupted_by_short_successor_shutdown_deadl
 
     let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            2,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     let peers = successor
         .members()
@@ -1100,7 +1146,13 @@ async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_
     .unwrap();
     let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     source_archive.initialize_checkpoint().await.unwrap();
     let coordinator = CheckpointCoordinator::open(source_archive.clone(), DurabilityMode::Sync)
@@ -1132,7 +1184,13 @@ async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_
     let target_data_dir = root.path().join("successor");
     let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            2,
+            LogHash::digest(&[b"rhiza-test-config"]),
+            1,
+        ),
     );
     let peers = successor
         .members()
@@ -1335,12 +1393,28 @@ async fn fresh_live_successor_rejoins_the_active_target_checkpoint_without_prede
     .unwrap();
     let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
+            1,
+        ),
     );
     source_archive.initialize_checkpoint().await.unwrap();
     let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
-        CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, 1),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            2,
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
+            1,
+        ),
     );
     target_archive.initialize_checkpoint().await.unwrap();
 

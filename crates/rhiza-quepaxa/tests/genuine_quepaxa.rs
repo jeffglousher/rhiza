@@ -2093,7 +2093,7 @@ fn noncurrent_recorder_state_fails_closed_without_rewrite() {
     assert!(matches!(
         RecorderFileStore::new_with_id(root.path(), "n1", "cluster", 1, 1),
         Err(Error::Decode(message))
-            if message == "recorder directory is not a current durable layout"
+            if message == "recorder storage generation missing; reset required"
     ));
     assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
@@ -2828,7 +2828,7 @@ fn record_broadcast_returns_typed_rejection_when_quorum_is_impossible() {
 }
 
 #[test]
-fn consensus_drop_is_bounded_with_a_blocked_minority_rpc() {
+fn consensus_drop_is_bounded_after_quarantining_a_blocked_minority_rpc() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let started = Arc::new((Mutex::new(false), Condvar::new()));
@@ -2855,15 +2855,15 @@ fn consensus_drop_is_bounded_with_a_blocked_minority_rpc() {
     ));
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
-    assert_eq!(
-        consensus.propose_at(
+    let entry = consensus
+        .propose_at(
             rhiza_quepaxa::RecorderRpcContext::default_timeout(),
             1,
             LogHash::ZERO,
             Command::new(CommandKind::Deterministic, b"background-record".to_vec()),
-        ),
-        Err(Error::UnknownOutcome)
-    );
+        )
+        .unwrap();
+    assert_eq!(entry.payload, b"background-record");
 
     let (started_lock, started_condition) = &*started;
     let (record_started, _) = started_condition
@@ -3114,9 +3114,15 @@ fn consecutive_ordinary_decisions_remain_reconstructable_from_durable_proofs() {
         b"third".as_slice(),
     ] {
         let command = StoredCommand::new(EntryType::Command, payload.to_vec());
-        assert!(stores
-            .iter()
-            .all(|store| store.fetch_command(command.hash()).unwrap() == Some(command.clone())));
+        assert!(
+            stores
+                .iter()
+                .filter(|store| {
+                    store.fetch_command(command.hash()).unwrap() == Some(command.clone())
+                })
+                .count()
+                >= membership.quorum_size()
+        );
     }
     let first_hash = first.hash;
     let second_hash = second.hash;
