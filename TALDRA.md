@@ -1,0 +1,35 @@
+﻿# Taldra-maintained Rhiza fork
+
+This repository is a maintained fork of [mrchypark/rhiza](https://github.com/mrchypark/rhiza)
+for [Taldra](https://github.com/jeffglousher/taldra).
+
+Rhiza / `rhiza-quepaxa` is treated as **experimental**. Taldra does **not**
+depend on crates.io `rhiza-quepaxa`: that registry package also claims version
+`0.3.0` but ships an older public API (`Consensus::propose(&self, Command)`
+without `RecorderRpcContext`). The audited git surface requires caller-owned
+deadlines and cancellation via `RecorderRpcContext`.
+
+## Policy
+
+1. **Source of truth for Taldra:** this fork (jeffglousher/rhiza), not crates.io.
+2. **Pin exact revisions** in Taldra `Cargo.toml` / `Cargo.lock`; do not float
+   on a moving branch tip without a deliberate bump.
+3. **Sync from upstream** periodically with merge or rebase onto
+   `mrchypark/rhiza` `main`, then re-run Rhiza and Taldra gates before bumping
+   the Taldra pin.
+4. **Taldra-required changes** (actor-owned drive seams, bounds, no product-type
+   leakage helpers) land as commits on this fork first, then Taldra retargets the
+   pin. Prefer minimal, reviewable patches over silent rewrites.
+5. **Do not** publish a competing crates.io crate from this fork unless the
+   owner Accepts a versioning/identity plan.
+
+## Current Taldra pin baseline
+
+At fork adoption, Taldra tracks tip:
+
+`	ext
+f08b2046c928f69ac1c90dff37bf58ddbb608f48
+`
+
+See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
+`https://github.com/jeffglousher/rhiza`.
