@@ -26,7 +26,10 @@ pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
 const CHECKPOINT_SEGMENT_FORMAT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_CAS_ATTEMPTS: usize = 16;
 const CHECKPOINT_RESTORE_LIMITS: CheckpointRestoreLimits = CheckpointRestoreLimits {
-    manifest_encoded_bytes: 1024 * 1024,
+    // Version 2 manifests written before compact QEFX references can be just
+    // over 1 MiB at the default compaction boundary. Keep one bounded
+    // transition window so those manifests can be read and compacted.
+    manifest_encoded_bytes: 2 * 1024 * 1024,
     segment_count: 256,
     object_count: 257,
     object_encoded_bytes: 256 * 1024 * 1024,
@@ -771,8 +774,11 @@ pub struct CheckpointEffectRecord {
     manifest_object_key: String,
     manifest_sha256: String,
     manifest_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_object_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_sha256: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_size_bytes: Vec<u64>,
 }
 
@@ -2059,6 +2065,7 @@ impl ObjectArchiveStore {
         if command.cluster_id() != identity.cluster_id
             || command.epoch() != identity.epoch
             || command.config_id() != identity.config_id
+            || command.config_digest() != identity.config_digest
             || command.intended_slot() != entry.index
             || command.prev_hash() != entry.prev_hash
             || chunks.len() != command.chunks().len()
@@ -2080,9 +2087,6 @@ impl ObjectArchiveStore {
             ));
         }
         let prefix = checkpoint_effect_prefix(identity, entry.index, command.effect_digest_value());
-        let mut chunk_object_keys = Vec::with_capacity(chunks.len());
-        let mut chunk_sha256 = Vec::with_capacity(chunks.len());
-        let mut chunk_size_bytes = Vec::with_capacity(chunks.len());
         for (ordinal, (chunk, expected)) in chunks.iter().zip(command.chunks()).enumerate() {
             if chunk.len() != expected.encoded_len() as usize
                 || ExternalEffectCommand::chunk_digest(chunk) != expected.digest()
@@ -2102,9 +2106,6 @@ impl ObjectArchiveStore {
             let sha256 = sha256_hex(chunk);
             self.download_verified(&key, chunk.len() as u64, &sha256)
                 .await?;
-            chunk_object_keys.push(key);
-            chunk_sha256.push(sha256);
-            chunk_size_bytes.push(chunk.len() as u64);
         }
         let manifest_object_key = format!("{prefix}/binding.qefx");
         match self
@@ -2136,9 +2137,13 @@ impl ObjectArchiveStore {
             manifest_object_key,
             manifest_sha256,
             manifest_size_bytes: entry.payload.len() as u64,
-            chunk_object_keys,
-            chunk_sha256,
-            chunk_size_bytes,
+            // The canonical QEFX binding already commits the ordered chunk
+            // lengths and digests, and the archive keys are deterministic.
+            // Keep accepting the three legacy arrays on restore, but do not
+            // repeat them in every root checkpoint manifest record.
+            chunk_object_keys: Vec::new(),
+            chunk_sha256: Vec::new(),
+            chunk_size_bytes: Vec::new(),
         })
     }
 
@@ -2156,24 +2161,50 @@ impl ObjectArchiveStore {
         let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
             Error::InvalidCheckpoint(format!("invalid archived QEFX binding: {error}"))
         })?;
-        if command.intended_slot() != effect.entry_index
-            || command.chunks().len() != effect.chunk_object_keys.len()
-            || effect.chunk_object_keys.len() != effect.chunk_sha256.len()
-            || effect.chunk_object_keys.len() != effect.chunk_size_bytes.len()
+        let identity = self.checkpoint_identity()?;
+        let prefix =
+            checkpoint_effect_prefix(identity, effect.entry_index, command.effect_digest_value());
+        let expected_manifest_key = format!("{prefix}/binding.qefx");
+        let compact = effect.chunk_object_keys.is_empty()
+            && effect.chunk_sha256.is_empty()
+            && effect.chunk_size_bytes.is_empty();
+        let legacy = effect.chunk_object_keys.len() == command.chunks().len()
+            && effect.chunk_sha256.len() == command.chunks().len()
+            && effect.chunk_size_bytes.len() == command.chunks().len();
+        if command.cluster_id() != identity.cluster_id()
+            || command.epoch() != identity.epoch()
+            || command.config_id() != identity.config_id()
+            || command.config_digest() != identity.config_digest()
+            || command.intended_slot() != effect.entry_index
+            || effect.manifest_object_key != expected_manifest_key
+            || (!compact && !legacy)
         {
             return Err(Error::InvalidCheckpoint(
                 "archived QEFX reference shape mismatch".into(),
             ));
         }
         let mut chunks = Vec::with_capacity(command.chunks().len());
-        for (((key, sha256), size), expected) in effect
-            .chunk_object_keys
-            .iter()
-            .zip(&effect.chunk_sha256)
-            .zip(&effect.chunk_size_bytes)
-            .zip(command.chunks())
-        {
-            let chunk = self.download_verified(key, *size, sha256).await?;
+        for (ordinal, expected) in command.chunks().iter().enumerate() {
+            let expected_key = format!(
+                "{prefix}/chunks/{ordinal:03}-{}.qefc",
+                expected.digest().to_hex()
+            );
+            let chunk = if compact {
+                self.store
+                    .get_bounded(&expected_key, u64::from(expected.encoded_len()))
+                    .await
+                    .map_err(|error| map_restore_object_error(error, "object encoded bytes"))?
+            } else {
+                let key = &effect.chunk_object_keys[ordinal];
+                let size = effect.chunk_size_bytes[ordinal];
+                if key != &expected_key || size != u64::from(expected.encoded_len()) {
+                    return Err(Error::InvalidCheckpoint(
+                        "archived QEFX chunk reference differs from binding".into(),
+                    ));
+                }
+                self.download_verified(key, size, &effect.chunk_sha256[ordinal])
+                    .await?
+            };
             if chunk.len() != expected.encoded_len() as usize
                 || ExternalEffectCommand::chunk_digest(&chunk) != expected.digest()
             {
@@ -5044,39 +5075,7 @@ impl ObjectArchiveStore {
             ));
         }
         for effect in effects {
-            if effect.chunk_object_keys.len() != effect.chunk_sha256.len()
-                || effect.chunk_object_keys.len() != effect.chunk_size_bytes.len()
-                || effect.chunk_object_keys.len() > MAX_EXTERNAL_EFFECT_CHUNKS
-            {
-                return Err(Error::InvalidCheckpoint(
-                    "invalid QEFX checkpoint ref shape".into(),
-                ));
-            }
-            let manifest = self
-                .download_verified(
-                    &effect.manifest_object_key,
-                    effect.manifest_size_bytes,
-                    &effect.manifest_sha256,
-                )
-                .await?;
-            let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
-                Error::InvalidCheckpoint(format!("invalid QEFX checkpoint ref: {error}"))
-            })?;
-            if command.intended_slot() != effect.entry_index
-                || command.chunks().len() != effect.chunk_object_keys.len()
-            {
-                return Err(Error::InvalidCheckpoint(
-                    "QEFX checkpoint ref binding mismatch".into(),
-                ));
-            }
-            for ((key, sha256), size) in effect
-                .chunk_object_keys
-                .iter()
-                .zip(&effect.chunk_sha256)
-                .zip(&effect.chunk_size_bytes)
-            {
-                self.download_verified(key, *size, sha256).await?;
-            }
+            self.restore_checkpoint_effect(effect).await?;
         }
         Ok(())
     }
@@ -8636,6 +8635,39 @@ mod tests {
             .publish_verified_qefx_bundle(&first, &first_chunks)
             .await
             .unwrap();
+        assert!(first_effect.chunk_object_keys.is_empty());
+        assert!(first_effect.chunk_sha256.is_empty());
+        assert!(first_effect.chunk_size_bytes.is_empty());
+        let compact_json = serialize_json(&first_effect).unwrap();
+        assert!(!compact_json
+            .windows(b"chunk_object_keys".len())
+            .any(|window| window == b"chunk_object_keys"));
+
+        // Manifests already published by the first QEFX release carried
+        // redundant chunk arrays. They remain readable long enough for a
+        // current node to compact the checkpoint into the compact shape.
+        let first_command = ExternalEffectCommand::decode(&first.payload).unwrap();
+        let first_prefix = checkpoint_effect_prefix(
+            archive.checkpoint_identity().unwrap(),
+            first.index,
+            first_command.effect_digest_value(),
+        );
+        let mut legacy_effect = first_effect.clone();
+        for (ordinal, (chunk, expected)) in
+            first_chunks.iter().zip(first_command.chunks()).enumerate()
+        {
+            legacy_effect.chunk_object_keys.push(format!(
+                "{first_prefix}/chunks/{ordinal:03}-{}.qefc",
+                expected.digest().to_hex()
+            ));
+            legacy_effect.chunk_sha256.push(sha256_hex(chunk));
+            legacy_effect.chunk_size_bytes.push(chunk.len() as u64);
+        }
+        archive
+            .restore_checkpoint_effect(&legacy_effect)
+            .await
+            .unwrap();
+        assert!(serialize_json(&legacy_effect).unwrap().len() > compact_json.len());
         archive
             .publish_committed_with_effects(
                 std::slice::from_ref(&first),
@@ -8700,6 +8732,68 @@ mod tests {
             .unwrap();
         assert_eq!(replayed.manifest(), loaded.manifest());
         assert_eq!(replayed.version(), loaded.version());
+    }
+
+    #[test]
+    fn legacy_qefx_manifest_has_bounded_transition_headroom() {
+        let mut manifest = CheckpointManifest::new(identity());
+        let mut previous_hash = LogHash::ZERO;
+        for start_index in (1_u64..=1_400).step_by(32) {
+            let end_index = start_index.saturating_add(31).min(1_400);
+            let last_hash = LogHash::digest(&[&end_index.to_le_bytes()]);
+            manifest.segments.push(CheckpointSegmentRecord {
+                format_version: CHECKPOINT_SEGMENT_FORMAT_VERSION,
+                start_index,
+                end_index,
+                first_prev_hash: previous_hash,
+                last_hash,
+                object_key: checkpoint_segment_key(&identity(), start_index, end_index),
+                sha256: "c".repeat(64),
+                size_bytes: 1,
+                effects: (start_index..=end_index)
+                    .map(|entry_index| CheckpointEffectRecord {
+                        entry_index,
+                        manifest_object_key: format!(
+                            "{}/effects/{entry_index}/{}",
+                            "m".repeat(220),
+                            "binding.qefx"
+                        ),
+                        manifest_sha256: "a".repeat(64),
+                        manifest_size_bytes: 512,
+                        chunk_object_keys: vec![format!(
+                            "{}/effects/{entry_index}/chunks/000-{}.qefc",
+                            "c".repeat(180),
+                            "d".repeat(64)
+                        )],
+                        chunk_sha256: vec!["b".repeat(64)],
+                        chunk_size_bytes: vec![256 * 1024],
+                    })
+                    .collect(),
+            });
+            previous_hash = last_hash;
+        }
+        manifest.tip = CheckpointTip::new(1_400, previous_hash);
+
+        let bytes = serialize_json(&manifest).unwrap();
+        assert!(bytes.len() > 1024 * 1024);
+        assert!(bytes.len() < CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes as usize);
+        assert_eq!(serialize_checkpoint_manifest(&manifest).unwrap(), bytes);
+        let (_directory, _store, archive) = fixture();
+        archive.validate_checkpoint_manifest(&manifest).unwrap();
+
+        let mut compact = manifest;
+        for effect in compact
+            .segments
+            .iter_mut()
+            .flat_map(|segment| &mut segment.effects)
+        {
+            effect.chunk_object_keys.clear();
+            effect.chunk_sha256.clear();
+            effect.chunk_size_bytes.clear();
+        }
+        let compact_bytes = serialize_checkpoint_manifest(&compact).unwrap();
+        assert!(compact_bytes.len() < 1024 * 1024);
+        assert!(compact_bytes.len() + 256 * 1024 < bytes.len());
     }
 
     fn identity() -> CheckpointIdentity {
