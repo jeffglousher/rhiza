@@ -9656,13 +9656,12 @@ mod tests {
             .await
             .expect("opened owner cleanup must finish before the original deadline");
         let snapshot = state.borrow().clone();
-        let recorder_rebound = tokio::net::TcpListener::bind(recorder_address)
+        assert!(tokio::net::TcpStream::connect(recorder_address)
             .await
-            .unwrap();
-        let service_rebound = tokio::net::TcpListener::bind(service_address)
+            .is_err());
+        assert!(tokio::net::TcpStream::connect(service_address)
             .await
-            .unwrap();
-        drop((recorder_rebound, service_rebound));
+            .is_err());
         (result, snapshot)
     }
 
