@@ -1312,8 +1312,6 @@ impl CheckpointPublisher {
             self.renew().await?;
             return Ok(self.cached_checkpoint().await);
         }
-        self.renew().await?;
-
         let (result, receiver) = tokio::sync::oneshot::channel();
         {
             let mut state = self.state.lock().await;
@@ -1323,7 +1321,7 @@ impl CheckpointPublisher {
             });
         }
         tokio::task::yield_now().await;
-        self.drive_flushes().await;
+        self.drive_flushes_with_public_renewal().await;
 
         receiver.await.unwrap_or_else(|_| {
             Err(Error::InvalidCheckpoint(
@@ -1412,8 +1410,22 @@ impl CheckpointPublisher {
         self.store.release_gc_lease(&self.lease_id).await
     }
 
+    #[cfg(test)]
     async fn drive_flushes(&self) {
+        self.drive_flushes_inner(false).await;
+    }
+
+    async fn drive_flushes_with_public_renewal(&self) {
+        self.drive_flushes_inner(true).await;
+    }
+
+    async fn drive_flushes_inner(&self, renew_missing_lease: bool) {
         let _operation = self.operation.lock().await;
+        let renewal = if renew_missing_lease {
+            self.renew().await
+        } else {
+            Ok(())
+        };
         let (pending, loaded) = {
             let mut state = self.state.lock().await;
             if state.pending.is_empty() {
@@ -1422,20 +1434,21 @@ impl CheckpointPublisher {
             (std::mem::take(&mut state.pending), state.loaded.clone())
         };
         let published_index = loaded.manifest().tip().index();
-        let published = match coalesce_pending_entries(&pending, published_index) {
-            Ok(entries) if entries.is_empty() => Ok(loaded),
-            Ok(entries) => {
-                self.store
-                    .publish_committed_from_loaded_unleased(
-                        &entries,
-                        &self.lease_id,
-                        self.options.lease_duration_ms,
-                        loaded,
-                    )
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+        let published =
+            match renewal.and_then(|()| coalesce_pending_entries(&pending, published_index)) {
+                Ok(entries) if entries.is_empty() => Ok(loaded),
+                Ok(entries) => {
+                    self.store
+                        .publish_committed_from_loaded_unleased(
+                            &entries,
+                            &self.lease_id,
+                            self.options.lease_duration_ms,
+                            loaded,
+                        )
+                        .await
+                }
+                Err(error) => Err(error),
+            };
 
         if let Ok(loaded) = &published {
             self.state.lock().await.loaded = loaded.clone();
