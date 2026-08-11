@@ -69,6 +69,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 type RecorderClients = Vec<(String, Box<dyn RecorderRpc>)>;
 
+const MIN_GCS_CHECKPOINT_LEASE_MS: u64 = 60_000;
+
 #[tokio::main]
 async fn main() {
     process::exit(run(env::args().skip(1)).await);
@@ -1041,6 +1043,13 @@ impl ServeConfig {
                 let lease_duration_ms =
                     optional_positive_env(&mut lookup, "RHIZA_CHECKPOINT_LEASE_MS")?
                         .unwrap_or(300_000);
+                if matches!(&object_store, ObjStoreConfig::Gcs { .. })
+                    && lease_duration_ms < MIN_GCS_CHECKPOINT_LEASE_MS
+                {
+                    return Err(format!(
+                        "RHIZA_CHECKPOINT_LEASE_MS must be at least {MIN_GCS_CHECKPOINT_LEASE_MS} for gcs"
+                    ));
+                }
                 (
                     recovery_generation,
                     Some(RemoteCheckpointConfig {
@@ -6283,6 +6292,15 @@ mod tests {
             config.remote.as_ref().unwrap().object_store,
             ObjStoreConfig::S3 { .. }
         ));
+        s3.insert("RHIZA_CHECKPOINT_LEASE_MS", "5000");
+        assert_eq!(
+            parse_serve_env(&s3)
+                .unwrap()
+                .remote
+                .unwrap()
+                .lease_duration_ms,
+            5_000
+        );
 
         let mut gcs = base_serve_env();
         gcs.extend([
@@ -6298,6 +6316,21 @@ mod tests {
             parse_serve_env(&gcs).unwrap().remote.unwrap().object_store,
             ObjStoreConfig::Gcs { .. }
         ));
+
+        gcs.insert("RHIZA_CHECKPOINT_LEASE_MS", "59999");
+        assert_eq!(
+            parse_serve_env(&gcs).unwrap_err(),
+            "RHIZA_CHECKPOINT_LEASE_MS must be at least 60000 for gcs"
+        );
+        gcs.insert("RHIZA_CHECKPOINT_LEASE_MS", "60000");
+        assert_eq!(
+            parse_serve_env(&gcs)
+                .unwrap()
+                .remote
+                .unwrap()
+                .lease_duration_ms,
+            60_000
+        );
 
         let mut azure = base_serve_env();
         azure.extend([
