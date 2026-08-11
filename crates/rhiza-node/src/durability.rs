@@ -1145,6 +1145,8 @@ pub struct CheckpointCoordinator {
     state: Mutex<CoordinatorState>,
     successor_baseline_required: AtomicBool,
     publication_attempts: AtomicU64,
+    #[cfg(test)]
+    injected_flush_unavailable: AtomicU64,
     local_recorder: Mutex<Option<RecorderFileStore>>,
     #[cfg(feature = "sql")]
     qefx_gc_maintenance: tokio::sync::Mutex<()>,
@@ -1245,6 +1247,8 @@ impl CheckpointCoordinator {
             }),
             successor_baseline_required: AtomicBool::new(false),
             publication_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            injected_flush_unavailable: AtomicU64::new(0),
             local_recorder: Mutex::new(None),
             #[cfg(feature = "sql")]
             qefx_gc_maintenance: tokio::sync::Mutex::new(()),
@@ -1291,6 +1295,23 @@ impl CheckpointCoordinator {
         observe_durable_tip(&self.state, *accepted.manifest().tip())
     }
 
+    async fn refresh_after_retryable_flush_error(
+        &self,
+        error: &DurabilityError,
+    ) -> Result<(), DurabilityError> {
+        let DurabilityError::Archive(error) = error else {
+            return Ok(());
+        };
+        if !retryable_sync_archive_error(error) {
+            return Err(DurabilityError::Archive(error.clone()));
+        }
+        match self.refresh_durable_tip().await {
+            Ok(_) => Ok(()),
+            Err(refresh_error) if retryable_sync_recovery_error(&refresh_error) => Ok(()),
+            Err(refresh_error) => Err(refresh_error),
+        }
+    }
+
     pub fn health(&self) -> DurabilityHealth {
         self.lock_state().health
     }
@@ -1298,6 +1319,12 @@ impl CheckpointCoordinator {
     #[doc(hidden)]
     pub fn checkpoint_publication_attempts(&self) -> u64 {
         self.publication_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn inject_flush_unavailable(&self, attempts: u64) {
+        self.injected_flush_unavailable
+            .store(attempts, Ordering::Release);
     }
 
     pub fn note_committed(&self, index: LogIndex) {
@@ -1535,6 +1562,16 @@ impl CheckpointCoordinator {
         runtime: &NodeRuntime,
         target_index: LogIndex,
     ) -> Result<CheckpointTip, DurabilityError> {
+        #[cfg(test)]
+        if self
+            .injected_flush_unavailable
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(DurabilityError::Unavailable);
+        }
         let log_state = runtime.log_store().logical_state()?;
         let local_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
         let mut durable_tip = self.durable_tip();
@@ -1892,9 +1929,9 @@ impl CheckpointCoordinator {
                 () = &mut shutdown => return Ok(()),
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {
                     let now = Instant::now();
-                    let sync_unavailable = matches!(self.mode, DurabilityMode::Sync)
-                        && self.health() == DurabilityHealth::Unavailable;
-                    if sync_unavailable && recovery_retry_at.is_none() {
+                    let durability_unavailable =
+                        self.health() == DurabilityHealth::Unavailable;
+                    if durability_unavailable && recovery_retry_at.is_none() {
                         recovery_retry_at = Some(now);
                     }
                     let recovery_due = recovery_retry_at.is_some_and(|deadline| now >= deadline);
@@ -1942,22 +1979,46 @@ impl CheckpointCoordinator {
                                 recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
                             }
                             Err(error) if retryable_sync_recovery_error(&error) => {
-                                recovery_retry_at = Instant::now().checked_add(recovery_retry_delay);
-                                recovery_retry_delay = next_sync_recovery_retry(recovery_retry_delay);
+                                eprintln!("durability recovery deferred: {error}");
+                                self.refresh_after_retryable_flush_error(&error).await?;
+                                if self.health() == DurabilityHealth::Available {
+                                    recovery_retry_at = None;
+                                    recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
+                                } else {
+                                    recovery_retry_at =
+                                        Instant::now().checked_add(recovery_retry_delay);
+                                    recovery_retry_delay =
+                                        next_sync_recovery_retry(recovery_retry_delay);
+                                }
                             }
                             Err(error) => return Err(error),
                         }
-                    } else if !sync_unavailable {
+                    } else if !durability_unavailable {
                         recovery_retry_at = None;
                         recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
                     }
-                    if !matches!(self.mode, DurabilityMode::Sync) {
+                    if !matches!(self.mode, DurabilityMode::Sync)
+                        && self.health() == DurabilityHealth::Available
+                    {
                         match self.flush_runtime(&runtime, LogIndex::MAX).await {
-                            Ok(_) | Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {}
+                            Ok(_) => {}
+                            Err(error) if retryable_sync_recovery_error(&error) => {
+                                eprintln!("durability recovery scheduled: {error}");
+                                self.refresh_after_retryable_flush_error(&error).await?;
+                                if self.health() == DurabilityHealth::Unavailable {
+                                    recovery_retry_at =
+                                        Instant::now().checked_add(recovery_retry_delay);
+                                    recovery_retry_delay =
+                                        next_sync_recovery_retry(recovery_retry_delay);
+                                }
+                            }
                             Err(error) => return Err(error),
                         }
                     }
-                    if now >= next_compaction && self.publisher.compaction_recommended().await {
+                    if self.health() == DurabilityHealth::Available
+                        && now >= next_compaction
+                        && self.publisher.compaction_recommended().await
+                    {
                         match self.checkpoint_compact(&runtime).await {
                             Ok(_) => {}
                             Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
@@ -6684,6 +6745,103 @@ mod tests {
         .await
         .unwrap();
         assert!(coordinator.write_allowed().is_ok());
+
+        shutdown_tx.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn periodic_background_retries_transient_unavailability_without_new_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder_and_options(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_millis(10),
+                },
+                "periodic-recovery",
+                CheckpointPublisherOptions::default().with_compaction_segment_limit(1),
+            )
+            .await
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            root.path().join("node"),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:sql:cluster-a",
+                "node-1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/node-1"),
+                    root.path().join("recorders/node-2"),
+                    root.path().join("recorders/node-3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+
+        let baseline = runtime.write("request-0", "alpha", "zero").unwrap();
+        coordinator.note_committed(baseline.applied_index);
+        coordinator
+            .flush_runtime(&runtime, baseline.applied_index)
+            .await
+            .unwrap();
+        assert!(coordinator.publisher.compaction_recommended().await);
+
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+        coordinator.note_committed(committed.applied_index);
+        // Two consecutive failures cover both the initial periodic flush and
+        // the first recovery attempt. Compaction must not bypass that backoff
+        // with its own nested flush while durability is unavailable.
+        coordinator.inject_flush_unavailable(2);
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker = tokio::spawn(coordinator.clone().run_background(runtime, async move {
+            if !*shutdown_rx.borrow() {
+                let _ = shutdown_rx.changed().await;
+            }
+        }));
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if coordinator.durable_tip().index() >= committed.applied_index
+                    && coordinator.health() == DurabilityHealth::Available
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            result = &mut worker => panic!("periodic durability worker exited before recovery: {result:?}"),
+            result = recovered => result.unwrap(),
+        }
 
         shutdown_tx.send(true).unwrap();
         worker.await.unwrap().unwrap();

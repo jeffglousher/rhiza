@@ -23404,13 +23404,15 @@ mod tests {
     fn cooperative_record_hedge_is_reclaimed_without_contaminating_later_broadcasts() {
         let (started_tx, started_rx) = mpsc::sync_channel(2);
         let (_release_tx, release_rx) = mpsc::sync_channel(0);
+        let (fast_observed_tx, _fast_observed_rx) = mpsc::sync_channel(6);
+        let fast_release = Arc::new((Mutex::new(false), Condvar::new()));
         let recorders = vec![
             (
                 "n1".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedObservedSlotRecorder {
                     recorder_id: "n1",
-                    reject_slot: None,
-                    observed: None,
+                    observed: fast_observed_tx.clone(),
+                    release: Arc::clone(&fast_release),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
@@ -23423,10 +23425,10 @@ mod tests {
             ),
             (
                 "n3".into(),
-                Box::new(SlotRecorder {
+                Box::new(GatedObservedSlotRecorder {
                     recorder_id: "n3",
-                    reject_slot: None,
-                    observed: None,
+                    observed: fast_observed_tx,
+                    release: Arc::clone(&fast_release),
                 }) as Box<dyn RecorderRpc>,
             ),
         ];
@@ -23434,11 +23436,23 @@ mod tests {
             ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
         );
 
-        let first = consensus
-            .record_broadcast(record_requests(&consensus, 1))
-            .unwrap();
-        assert_eq!(first.len(), 2);
+        let first_consensus = Arc::clone(&consensus);
+        let first = thread::spawn(move || {
+            first_consensus
+                .record_broadcast(record_requests(&first_consensus, 1))
+                .unwrap()
+        });
+        // Hold both quorum replies until the minority hedge has definitely
+        // entered its cooperative RPC. Scheduler order can no longer turn
+        // this into a queued-job cancellation test by accident.
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        {
+            let (released, condition) = &*fast_release;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+        }
+        let first = first.join().unwrap();
+        assert_eq!(first.len(), 2);
 
         let second = consensus
             .record_broadcast(record_requests(&consensus, 2))
