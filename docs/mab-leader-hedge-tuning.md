@@ -1,14 +1,40 @@
-# MAB Preferred-Proposer and Hedge-Delay Auto-Tuning
+# Runtime Request-Routing Tuner
 
-> **Status: DESIGN ONLY / NOT IMPLEMENTED.** This document proposes a bounded
-> performance policy. It does not describe current rhiza sql behavior.
+> **Status: PHASE 1 IMPLEMENTED, OPT-IN.** `rhiza-client/tuner` can attach a
+> trusted routing snapshot and `RoutingTuner` at runtime. The CLI and deployment
+> images do not enable it by default. Phase 1 selects only the first healthy
+> request endpoint; hedge delay stays fixed at 100 ms.
+
+## Implemented Phase 1
+
+- `RoutingSnapshot` validates a unique `NodeId` ↔ URL mapping, learning identity,
+  topology generation, eligibility, and static primary.
+- `RoutingTuner::plan` returns the exact endpoint order that the client executes,
+  a fixed hedge delay, rollout metadata, selection propensity, and an opaque
+  single-use observation ticket.
+- Canary assignment is stable for the lifetime of the attached client routing
+  cohort; per-request correlation IDs remain unique observation identifiers.
+- `RhizaClient` records actual attempt order, timing, timer-hedge launch, winner,
+  and terminal outcome. `RoutingTuner::observe` learns only when that trace
+  matches the ticket, identity, topology generation, and applied action.
+- The model is a small first-target-only UCB policy with EWMA reward. It never
+  creates target×delay arms.
+- `Disabled`, `Shadow`, `ProposerCanary`, `ProposerDefault`, `HedgeCanary`, and
+  `BoundedDefault` are runtime stages. Phase 1 changes routing only in proposer
+  stages; the hedge-related stages reserve future rollout names but still use
+  the fixed delay.
+- The runtime kill switch makes the next plan use validated static routing and
+  prevents learning without rebuilding or restarting.
+- The older experimental `MabTuner`/`ContextualBandit` API remains only for
+  source and benchmark compatibility. It is not connected to `RhizaClient` and
+  is outside this phase-one contract; new integrations must use `RoutingTuner`.
 
 ## Goals
 
 - Select the preferred proposer that is most likely to complete a write quickly
   under current cluster conditions.
-- Tune when a coordinator starts an additional proposer (the hedge delay) to
-  reduce tail latency without creating excessive duplicate work or contention.
+- Preserve the existing fixed hedge policy while first-target tuning is proven.
+- Evaluate hedge-delay tuning only as a later, separately controlled phase.
 - Adapt to topology, load, and partial degradation while remaining observable,
   reversible, and no worse than a fixed-policy baseline.
 
@@ -46,7 +72,19 @@ The tuner must never affect QuePaxa validity, quorum, or liveness correctness:
 - Missing, stale, invalid, or unavailable model output atomically falls back to
   static proposer selection and a configured static hedge delay.
 
-## Contextual Bandit
+## Phase 1 Learning Model
+
+Phase 1 uses only prevalidated eligible targets. It maintains one small arm per
+`NodeId`, records an EWMA latency reward, explores untried targets only in the
+bounded proposer canary, and otherwise uses deterministic UCB selection. The
+static target wins cold-start ties. `ProposerDefault` freezes exploration.
+
+The learning identity contains the exact consensus identity tuple plus a routing
+policy version. Any identity change clears model and pending-ticket state
+atomically. A topology-generation change censors an in-flight observation but
+does not discard compatible historical target statistics.
+
+## Future Contextual Signals
 
 Use a contextual bandit with a bounded, versioned feature vector. Model and
 policy state is keyed by the exact tuple `(cluster_id, epoch, config_id,
@@ -68,12 +106,15 @@ Features:
 - Feature age, sample count, and missingness flags so stale or sparse telemetry is
   explicit.
 
-### Actions
+### Future Actions
 
-An action is a pair:
+Phase 1 has one action dimension: `first_request_target`. A later hedge phase may
+add a separate, bounded delay experiment only after the target policy is frozen.
+It must not reintroduce a joint target×delay arm space.
 
-1. `first_request_target`: one currently eligible voter from the active membership.
-2. `hedge_delay`: one administrator-approved bucket between the configured
+The future delay action, if enabled, is:
+
+1. `hedge_delay`: one administrator-approved bucket between the configured
    nonzero minimum and maximum, for example `5`, `10`, `25`, `50`, or `100 ms`,
    plus `static` to use the configured baseline.
 
@@ -106,10 +147,10 @@ because it introduces survivorship bias.
 
 ### Exploration and Cold Start
 
-- Start with the static policy until every eligible proposer has a minimum sample
-  count and telemetry freshness passes its gate.
-- Use constrained Thompson sampling or an equivalent contextual method with a
-  small exploration budget. Exploration chooses only allowlisted actions.
+- Start with the static policy until telemetry and attribution gates pass.
+- Begin learning with a deterministic, small proposer-canary cohort; static-only
+  traffic is not expected to produce samples for untried targets.
+- Exploration chooses only validated eligible endpoints.
 - Cap exploratory traffic per cluster and per time window; disable exploration
   automatically during incidents, reconfiguration, overload, or elevated errors.
 - Initialize new epochs and newly eligible proposers from the static policy.
@@ -120,8 +161,10 @@ because it introduces survivorship bias.
 
 - Clamp hedge delay to administrator-set minimum and maximum values and the
   discrete allowlist. A nonzero minimum may be required to bound duplicate load.
-- Enforce per-node in-flight limits, a cluster-wide hedge budget, and a maximum of
-  one additional proposer per request in the initial design.
+- Phase 1 preserves the client's existing bounded progression through its finite
+  configured endpoint set at fixed hedge intervals. The tuner neither adds
+  attempts nor changes the interval. Any future stricter hedge budget is a
+  separate transport-policy change.
 - Refuse decisions when features exceed a freshness limit, model/config versions
   disagree, confidence is below threshold, or guardrail metrics are unhealthy.
 - Keep a locally cached, validated policy snapshot; on startup, corruption,
@@ -144,19 +187,15 @@ concentration, stale telemetry, and model/config mismatch.
 
 ## Rollout Stages
 
-1. **Offline replay:** train and evaluate against recorded, sanitized traces;
-   verify action bounds and compare with static-policy counterfactuals where valid.
-2. **Shadow:** compute actions but never apply them; validate attribution,
-   freshness, stability, and projected guardrails.
-3. **Preferred-proposer canary:** apply proposer choice only, with static hedge
-   delay, to a small request cohort and one non-critical cluster.
-4. **Hedge-delay canary:** enable bounded delay actions with strict duplicate-work
-   and error budgets.
-5. **Gradual expansion:** increase traffic and clusters only after a full review
-   window at each step; retain a concurrent static-policy control cohort.
-6. **Default-on:** require automated rollback, periodic policy review, and ongoing
-   control-cohort comparison. This stage still does not make tuning correctness
-   critical.
+1. **Disabled:** execute static routing and do not explore.
+2. **Shadow:** compute a model order but execute static routing. Shadow outcomes
+   never train the unexecuted model action.
+3. **ProposerCanary:** apply first-target selection to a deterministic attached-
+   client cohort and learn only the first target's own observed outcome.
+4. **ProposerDefault:** apply the proven target policy without exploration.
+5. **HedgeCanary:** freeze the target policy before any future delay-only test.
+   The current implementation still uses the fixed delay.
+6. **BoundedDefault:** reserved for a separately accepted bounded hedge policy.
 
 ## Failure Handling
 

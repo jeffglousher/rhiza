@@ -1,12 +1,7 @@
-/// Rollout stage configuration using Cargo feature flags.
-///
-/// Stages are cumulative: each stage enables all previous stages.
-///
-/// - `shadow`: compute actions but never apply them
-/// - `proposer-canary` (implies `shadow`): apply proposer choice only, with static hedge delay
-/// - `hedge-canary` (implies `proposer-canary`): apply bounded delay actions
-/// - `default-on` (implies `hedge-canary`): full tuning enabled by default
+/// Runtime rollout stage. Builds always start disabled; operators advance stages
+/// through [`RolloutGuard::set_stage`] without rebuilding or restarting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
 pub enum RolloutStage {
     /// Disabled: use static policy only.
     Disabled,
@@ -14,15 +9,21 @@ pub enum RolloutStage {
     Shadow,
     /// Apply proposer choice only, with static hedge delay.
     ProposerCanary,
+    /// Apply proposer selection to all traffic while retaining the fixed hedge delay.
+    ProposerDefault,
     /// Apply bounded delay actions with strict duplicate-work and error budgets.
     HedgeCanary,
+    /// Reserved for bounded hedge tuning; v1 routing still uses the fixed delay.
+    BoundedDefault,
     /// Full tuning enabled by default with automated rollback.
     DefaultOn,
 }
 
 impl RolloutStage {
-    /// Determine the current rollout stage from Cargo feature flags.
-    pub fn from_features() -> Self {
+    /// Compatibility constructor for the legacy [`crate::MabTuner`] API.
+    /// [`crate::RoutingTuner`] does not use this constructor and always starts
+    /// disabled unless its caller supplies an explicit runtime stage.
+    pub const fn from_features() -> Self {
         if cfg!(feature = "default-on") {
             Self::DefaultOn
         } else if cfg!(feature = "hedge-canary") {
@@ -38,22 +39,32 @@ impl RolloutStage {
 
     /// Whether the tuner should compute actions at all.
     pub fn computes_actions(&self) -> bool {
-        *self >= Self::Shadow
+        !matches!(self, Self::Disabled)
     }
 
     /// Whether proposer choice should be applied to real traffic.
     pub fn applies_proposer_choice(&self) -> bool {
-        *self >= Self::ProposerCanary
+        matches!(
+            self,
+            Self::ProposerCanary
+                | Self::HedgeCanary
+                | Self::ProposerDefault
+                | Self::BoundedDefault
+                | Self::DefaultOn
+        )
     }
 
     /// Whether hedge delay actions should be applied.
     pub fn applies_hedge_delay(&self) -> bool {
-        *self >= Self::HedgeCanary
+        matches!(
+            self,
+            Self::HedgeCanary | Self::BoundedDefault | Self::DefaultOn
+        )
     }
 
     /// Whether exploration is enabled.
     pub fn exploration_enabled(&self) -> bool {
-        *self >= Self::Shadow
+        matches!(self, Self::Shadow | Self::ProposerCanary)
     }
 
     /// Whether this is a canary stage (for cohort comparison).
@@ -64,31 +75,46 @@ impl RolloutStage {
 
 /// Rollout guard that wraps an action with stage-appropriate behavior.
 pub struct RolloutGuard {
-    stage: RolloutStage,
+    stage: std::sync::atomic::AtomicU8,
 }
 
 impl RolloutGuard {
     pub fn new() -> Self {
-        Self {
-            stage: RolloutStage::from_features(),
-        }
+        Self::with_stage(RolloutStage::from_features())
     }
 
     pub fn with_stage(stage: RolloutStage) -> Self {
-        Self { stage }
+        Self {
+            stage: std::sync::atomic::AtomicU8::new(stage as u8),
+        }
     }
 
     pub fn stage(&self) -> RolloutStage {
+        match self.stage.load(std::sync::atomic::Ordering::Acquire) {
+            0 => RolloutStage::Disabled,
+            1 => RolloutStage::Shadow,
+            2 => RolloutStage::ProposerCanary,
+            3 => RolloutStage::ProposerDefault,
+            4 => RolloutStage::HedgeCanary,
+            5 => RolloutStage::BoundedDefault,
+            _ => RolloutStage::DefaultOn,
+        }
+    }
+
+    /// Change rollout behavior without a process restart.
+    pub fn set_stage(&self, stage: RolloutStage) {
         self.stage
+            .store(stage as u8, std::sync::atomic::Ordering::Release);
     }
 
     /// Determine whether to apply the tuned action or fall back to static.
     ///
     /// Returns (apply_proposer, apply_hedge_delay, is_shadow).
     pub fn evaluate(&self) -> (bool, bool, bool) {
-        let is_shadow = self.stage == RolloutStage::Shadow;
-        let apply_proposer = self.stage.applies_proposer_choice();
-        let apply_hedge = self.stage.applies_hedge_delay();
+        let stage = self.stage();
+        let is_shadow = stage == RolloutStage::Shadow;
+        let apply_proposer = stage.applies_proposer_choice();
+        let apply_hedge = stage.applies_hedge_delay();
         (apply_proposer, apply_hedge, is_shadow)
     }
 }
@@ -107,8 +133,26 @@ mod tests {
     fn stage_ordering() {
         assert!(RolloutStage::Disabled < RolloutStage::Shadow);
         assert!(RolloutStage::Shadow < RolloutStage::ProposerCanary);
+        assert!(RolloutStage::ProposerCanary < RolloutStage::ProposerDefault);
         assert!(RolloutStage::ProposerCanary < RolloutStage::HedgeCanary);
+        assert!(RolloutStage::ProposerDefault < RolloutStage::HedgeCanary);
         assert!(RolloutStage::HedgeCanary < RolloutStage::DefaultOn);
+    }
+
+    #[test]
+    fn legacy_feature_default_is_preserved() {
+        let expected = if cfg!(feature = "default-on") {
+            RolloutStage::DefaultOn
+        } else if cfg!(feature = "hedge-canary") {
+            RolloutStage::HedgeCanary
+        } else if cfg!(feature = "proposer-canary") {
+            RolloutStage::ProposerCanary
+        } else if cfg!(feature = "shadow") {
+            RolloutStage::Shadow
+        } else {
+            RolloutStage::Disabled
+        };
+        assert_eq!(RolloutStage::from_features(), expected);
     }
 
     #[test]

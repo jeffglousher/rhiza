@@ -1,10 +1,12 @@
 //! # rhiza-tuner
 //!
-//! MAB-based preferred-proposer and hedge-delay auto-tuning for rhiza.
+//! Runtime-controlled first-target routing tuning for rhiza.
 //!
-//! This crate implements a contextual bandit system that selects the preferred
-//! proposer most likely to complete a write quickly and tunes hedge delay to
-//! reduce tail latency without excessive duplicate work.
+//! [`RoutingTuner`] selects only the first healthy request target. Hedge delay
+//! remains a fixed caller policy in v1. The legacy experimental [`MabTuner`] API
+//! remains for source and benchmark compatibility, may still produce the old
+//! target×delay action shape, and is not used by `rhiza-client` or covered by the
+//! phase-one routing safety contract.
 //!
 //! ## Safety Boundary
 //!
@@ -14,12 +16,9 @@
 //!
 //! ## Rollout Stages
 //!
-//! Controlled by Cargo feature flags:
-//!
-//! - `shadow`: compute actions but never apply them
-//! - `proposer-canary`: apply proposer choice only, with static hedge delay
-//! - `hedge-canary`: apply bounded delay actions
-//! - `default-on`: full tuning enabled by default
+//! [`RoutingTuner`] is controlled at runtime with [`RoutingTuner::set_stage`],
+//! starts disabled regardless of legacy Cargo features, and returns the next
+//! plan to validated static routing when its kill switch is active.
 
 pub mod bandit;
 pub mod collector;
@@ -27,6 +26,7 @@ pub mod killswitch;
 pub mod observability;
 pub mod reward;
 pub mod rollout;
+pub mod routing;
 pub mod safety;
 pub mod tuner;
 pub mod types;
@@ -38,6 +38,7 @@ pub use killswitch::KillSwitch;
 pub use observability::{AggregateMetrics, Observability, ObservabilityConfig};
 pub use reward::{RewardConfig, RewardPipeline};
 pub use rollout::{RolloutGuard, RolloutStage};
+pub use routing::*;
 pub use safety::{SafetyBoundary, SafetyConfig};
 pub use tuner::{ActionSelectionResult, MabTuner, TunerConfig};
 pub use types::*;

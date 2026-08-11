@@ -766,9 +766,13 @@ ext4/XFS/Kubernetes CSI stack.
 The primary-source protocol conformance and performance-comparability limits are
 in [docs/quepaxa-paper-conformance-2026-07-12.md](docs/quepaxa-paper-conformance-2026-07-12.md).
 
-## Deferred Performance Tuning
+## Optional Routing Tuner
 
-MAB-based preferred-proposer and hedge-delay auto-tuning is deliberately **not
-implemented**. Its safety boundary, bounded action space, fallback behavior,
-telemetry, and staged rollout requirements remain documentation-only in
+The feature-gated `rhiza-client/tuner` path implements phase-one request routing
+tuning. A caller must explicitly attach a trusted `NodeId`-to-URL snapshot and a
+runtime-controlled `RoutingTuner`; the CLI and default client remain static.
+Phase one tunes only the first healthy request target. Hedge delay remains the
+fixed 100 ms client policy, and no model output reaches QuePaxa priority, quorum,
+proof, persistence, or recovery logic. The API, rollout stages, and remaining
+future hedge work are documented in
 [docs/mab-leader-hedge-tuning.md](docs/mab-leader-hedge-tuning.md).

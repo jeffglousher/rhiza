@@ -275,8 +275,8 @@ impl MabTuner {
         };
         self.observability
             .record_outcome(correlation_id, outcome, &reward);
-        // Update bandit model (only if not shadow and not killed)
-        if !self.killswitch.is_active() && self.rollout.stage().computes_actions() {
+        // Legacy compatibility path: never train a counterfactual shadow action.
+        if !self.killswitch.is_active() && self.rollout.stage().applies_proposer_choice() {
             if let Ok(mut bandit) = self.bandit.lock() {
                 bandit.update(action, reward.total);
             }
@@ -318,6 +318,11 @@ impl MabTuner {
     /// Get the current rollout stage.
     pub fn stage(&self) -> RolloutStage {
         self.rollout.stage()
+    }
+
+    /// Change the legacy tuner's rollout stage without rebuilding it.
+    pub fn set_stage(&self, stage: RolloutStage) {
+        self.rollout.set_stage(stage);
     }
 
     /// Reset all state (used on identity change).

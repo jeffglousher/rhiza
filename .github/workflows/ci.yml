@@ -87,6 +87,8 @@ jobs:
           cargo clippy --locked -p rhiza-cli --all-targets "${tuner_features[@]}" -- -D warnings
           cargo test --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
           cargo test --locked -p rhiza-cli --all-targets "${tuner_features[@]}"
+          cargo test --locked -p rhiza-client --no-default-features \
+            --features "$RHIZA_PROFILE,tuner"
           if [ "$RHIZA_PROFILE" = graph ]; then
             cargo test --locked -p rhiza-graph
             cargo test --locked -p rhiza-node --no-default-features --features graph --test graph_runtime

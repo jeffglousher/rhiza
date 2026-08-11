@@ -10,6 +10,7 @@ publish = false
 
 [features]
 default = []
+# Legacy `MabTuner::new` defaults; `RoutingTuner` uses runtime stages only.
 shadow = []
 proposer-canary = ["shadow"]
 hedge-canary = ["proposer-canary"]
