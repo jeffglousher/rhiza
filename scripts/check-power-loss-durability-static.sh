@@ -105,7 +105,7 @@ fi
 [ ! -e "$tmp/must-not-exist" ] || { echo 'default provider run changed state' >&2; exit 1; }
 
 make_fixture "$tmp/valid"
-bash "$gate" validate-artifacts "$tmp/valid" | rg -q '^publishable-eligible:'
+bash "$gate" validate-artifacts "$tmp/valid" | grep -Eq '^publishable-eligible:'
 make_live_shims
 run_live_case pass normal
 run_live_case reject canonical

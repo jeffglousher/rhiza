@@ -10,7 +10,7 @@ fixture_raw="$tmp/raw"
 mkdir -p "$fixture_raw"
 
 scripts/bench-rhiza-hiqlite.sh plan "$tmp/plan.json"
-if rg -n '\beval\b|RECOVERY_.*HOOK|\$\{.*COMMAND' scripts/bench-rhiza-hiqlite.sh >/dev/null; then
+if grep -En '\beval\b|RECOVERY_.*HOOK|\$\{.*COMMAND' scripts/bench-rhiza-hiqlite.sh >/dev/null; then
   echo "recovery coordinator permits an arbitrary hook" >&2; exit 1
 fi
 # shellcheck disable=SC2016 # Fixed source fragments are deliberately literal.
@@ -26,7 +26,7 @@ for required in 'mkdir -p "$cell_root/rhiza" "$cell_root/hiqlite"' \
   'event == "phase_summary" and .cell_id == $cell' \
   'select(has("phase") and .event != "phase_summary")' \
   'git -C "$hiqlite_source_dir" rev-parse --is-inside-work-tree' 'cleanup proof failed'; do
-  rg -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
+  grep -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
     echo "missing fixed prepare/run/cleanup coordinator step: $required" >&2; exit 1; }
 done
 # shellcheck disable=SC2016 # jq program intentionally contains $cell.
@@ -105,7 +105,7 @@ for required in '.cell_id == $cell and .stage == $stage' \
   '["hiqlite-recovery-0","hiqlite-recovery-1","hiqlite-recovery-2"]' \
   '.valid == true and .cell_id == $cell' \
   'transition ledger source mismatch'; do
-  rg -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
+  grep -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
     echo "missing image/ledger binding guard: $required" >&2; exit 1; }
 done
 # shellcheck disable=SC2016 # Literal coordinator source contracts.
@@ -116,17 +116,17 @@ for required in 'snapshot_failure_establishment_proof "$hiqlite_phase" "$cell_ro
   'proof_end_epoch' 'application-no-quorum-rejection' 'no_ack_unknown' \
   'failure_establishment_post_ack' 'write-ack-violation-' \
   'HIQLITE_RECOVERY_EXPECTED_LOCKFILE_PATH'; do
-  rg -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
+  grep -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
     echo "missing failure proof integration: $required" >&2; exit 1; }
 done
 # shellcheck disable=SC2016 # Literal coordinator source contracts.
 for required in 'openraft_version_source == "generated-cargo-lock"' \
   'openraft_version_source:$first.openraft_version_source' \
   'resolved from the generated Cargo.lock'; do
-  rg -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
+  grep -F "$required" scripts/bench-rhiza-hiqlite.sh >/dev/null || {
     echo "missing lock-derived OpenRaft provenance guard: $required" >&2; exit 1; }
 done
-reuse_line="$(rg -F 'HIQLITE_RECOVERY_REUSE_EXACT_LOCAL_IMAGES=1' scripts/bench-rhiza-hiqlite.sh)"
+reuse_line="$(grep -F 'HIQLITE_RECOVERY_REUSE_EXACT_LOCAL_IMAGES=1' scripts/bench-rhiza-hiqlite.sh)"
 if [[ "$reuse_line" != *'HIQLITE_BUILD_IMAGE=1'* ]] || [[ "$reuse_line" == *'HIQLITE_BUILD_IMAGE=0'* ]]; then
   echo "Hiqlite exact local reuse must stay in the build-image reuse branch" >&2
   exit 1

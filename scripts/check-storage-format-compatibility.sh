@@ -60,12 +60,12 @@ validate_contract() {
 
 const_version() {
   local file="$1" constant="$2"
-  rg -o "(pub )?const ${constant}: [^=]+ = [0-9]+" "$repo_root/$file" | head -n1 | awk '{print $NF}'
+  grep -Eo "(pub )?const ${constant}: [^=]+ = [0-9]+" "$repo_root/$file" | head -n1 | awk '{print $NF}'
 }
 
 magic_version() {
   local file="$1" constant="$2" line
-  line="$(rg -F "${constant}" "$repo_root/$file" | head -n1)"
+  line="$(grep -F "${constant}" "$repo_root/$file" | head -n1)"
   [[ "$line" =~ \\x([0-9A-Fa-f]{2}) ]] || return 1
   printf '%d\n' "$((16#${BASH_REMATCH[1]}))"
 }
@@ -86,7 +86,7 @@ function_version() {
 
 require_literal() {
   local file="$1" literal="$2"
-  rg -F "$literal" "$repo_root/$file" >/dev/null || {
+  grep -F "$literal" "$repo_root/$file" >/dev/null || {
     echo "missing authoritative storage parser marker: $file: $literal" >&2
     exit 1
   }
