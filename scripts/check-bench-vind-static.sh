@@ -631,7 +631,8 @@ meter_line="$(grep -n "k exec .*': > /var/log/nginx/s3-access.log'" scripts/benc
 [ -n "$build_line" ] && [ "$build_line" -lt "$sample_line" ] && [ "$build_line" -lt "$meter_line" ]
 # shellcheck disable=SC2016 # Literal direct-execution check.
 grep -Fq 'RHIZA_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}"' scripts/bench-vind.sh
-grep -Fq 'scripts/check-bench-vind-static.sh' .github/workflows/ci.yml
+grep -Fq 'run: scripts/check-ci.sh' .github/workflows/ci.yml
+grep -Fq 'run scripts/check-bench-vind-static.sh' scripts/check-ci.sh
 grep -Fq 'YQ_VERSION: v4.47.2' .github/workflows/ci.yml
 
 printf '%s\n' 'fixture port-forward failure' > "$tmp/port-forward-0.log"
