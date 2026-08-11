@@ -5214,9 +5214,9 @@ async fn coordinate_write(
         ),
         Err(_) => client_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "write_timeout",
+            "write_outcome_unknown",
             true,
-            "write did not complete before the response deadline",
+            "write was admitted but its durable outcome was not observed before the response deadline; retry the same request id",
             None,
         ),
     }
@@ -6174,6 +6174,7 @@ fn node_error_response(error: NodeError) -> Response {
         NodeError::PreconditionFailed(_) => (StatusCode::CONFLICT, None),
         NodeError::SnapshotRequired(_)
         | NodeError::Unavailable(_)
+        | NodeError::OutcomeUnknown(_)
         | NodeError::StartupCancelled { .. }
         | NodeError::ResourceExhausted(_)
         | NodeError::ConfigurationTransition { .. }
@@ -7171,6 +7172,7 @@ pub enum NodeError {
     SnapshotRequired(Box<RecoveryAnchor>),
     Storage(String),
     Reconciliation(String),
+    OutcomeUnknown(String),
     Invariant(String),
     Unavailable(String),
     StartupCancelled {
@@ -7218,6 +7220,7 @@ impl fmt::Display for NodeError {
             ),
             Self::Storage(message) => write!(f, "node storage failed: {message}"),
             Self::Reconciliation(message) => write!(f, "node reconciliation failed: {message}"),
+            Self::OutcomeUnknown(message) => write!(f, "write outcome is unknown: {message}"),
             Self::Invariant(message) => write!(f, "node invariant failed: {message}"),
             Self::Unavailable(message) => write!(f, "node unavailable: {message}"),
             Self::StartupCancelled { stage, .. } => {
@@ -7262,6 +7265,7 @@ impl NodeError {
             Self::PreconditionFailed(_) => ("precondition_failed", false),
             Self::SnapshotRequired(_) => ("snapshot_required", false),
             Self::Unavailable(_) => ("unavailable", true),
+            Self::OutcomeUnknown(_) => ("write_outcome_unknown", true),
             Self::StartupCancelled { .. } => ("unavailable", true),
             Self::ResourceExhausted(_) => ("resource_exhausted", true),
             Self::ConfigurationTransition { .. } => ("configuration_transition", true),
@@ -9334,6 +9338,7 @@ impl NodeRuntime {
             return Ok(GraphMutationOutcome::from_record(record));
         }
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -9477,6 +9482,7 @@ impl NodeRuntime {
             return Ok(KvMutationOutcome::from_record(record));
         }
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -9716,7 +9722,10 @@ impl NodeRuntime {
             let grouped_results = match execution {
                 Ok(Ok(grouped_results)) => grouped_results,
                 Ok(Err(error)) => {
-                    let error = if matches!(error, NodeError::Unavailable(_)) {
+                    let error = if matches!(
+                        error,
+                        NodeError::Unavailable(_) | NodeError::OutcomeUnknown(_)
+                    ) {
                         error
                     } else {
                         self.latch(error)
@@ -9913,6 +9922,12 @@ impl NodeRuntime {
         profile.add_precheck_classification(classification_mark);
 
         'sql_batches: while !pending.is_empty() {
+            if let Err(error) = self.ensure_writes_active() {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
             let eligible = pending
                 .iter()
                 .copied()
@@ -10346,7 +10361,10 @@ impl NodeRuntime {
             let grouped_results = match execution {
                 Ok(Ok(grouped_results)) => grouped_results,
                 Ok(Err(error)) => {
-                    let error = if matches!(error, NodeError::Unavailable(_)) {
+                    let error = if matches!(
+                        error,
+                        NodeError::Unavailable(_) | NodeError::OutcomeUnknown(_)
+                    ) {
                         error
                     } else {
                         self.latch(error)
@@ -10513,6 +10531,12 @@ impl NodeRuntime {
         }
 
         while !pending.is_empty() {
+            if let Err(error) = self.ensure_writes_active() {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
             if pending.len() == 1 {
                 let index = pending[0];
                 results[index] = Some(self.execute_profile_member_locked(&members[index]));
@@ -10709,6 +10733,12 @@ impl NodeRuntime {
         }
 
         while !pending.is_empty() {
+            if let Err(error) = self.ensure_writes_active() {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
             if pending.len() == 1 {
                 let index = pending[0];
                 results[index] = Some(self.execute_profile_member_locked(&members[index]));
@@ -10972,6 +11002,7 @@ impl NodeRuntime {
         }
 
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -11129,6 +11160,7 @@ impl NodeRuntime {
         }
 
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -11445,6 +11477,7 @@ impl NodeRuntime {
         .map_err(|error| NodeError::Invariant(error.to_string()))?
         .to_stored_command();
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index
                 .checked_add(1)
@@ -12665,12 +12698,17 @@ impl NodeRuntime {
             | rhiza_quepaxa::Error::RpcCancelled
             | rhiza_quepaxa::Error::RpcDeadlineExceeded
             | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
+            // UnknownOutcome is the caller's observation of an admitted,
+            // idempotent Recorder mutation. The next operation revisits the
+            // same consensus slot and reconciles the durable result; a lost
+            // reply is not contradictory storage evidence and must not make
+            // the whole runtime permanently fatal.
+            rhiza_quepaxa::Error::UnknownOutcome => NodeError::OutcomeUnknown(error.to_string()),
             rhiza_quepaxa::Error::EffectBundleConflict
             | rhiza_quepaxa::Error::EffectBundleInvalid(_)
             | rhiza_quepaxa::Error::EffectBundleQuotaExceeded { .. }
             | rhiza_quepaxa::Error::ConflictingCertificates
-            | rhiza_quepaxa::Error::ChainConflict { .. }
-            | rhiza_quepaxa::Error::UnknownOutcome => {
+            | rhiza_quepaxa::Error::ChainConflict { .. } => {
                 self.latch(NodeError::Reconciliation(error.to_string()))
             }
             other => self.latch(NodeError::Invariant(other.to_string())),
@@ -13022,6 +13060,102 @@ mod tests {
     struct GatedRecorder {
         enabled: Arc<AtomicBool>,
         inner: RecorderFileStore,
+    }
+
+    #[cfg(feature = "graph")]
+    #[derive(Clone)]
+    struct UnknownAfterFirstRecord {
+        first: Arc<AtomicBool>,
+        inner: RecorderFileStore,
+    }
+
+    #[cfg(feature = "graph")]
+    impl RecorderRpc for UnknownAfterFirstRecord {
+        fn record(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            let summary = RecorderRpc::record(&self.inner, context, request)?;
+            if self.first.swap(false, Ordering::AcqRel) {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            Ok(summary)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
     }
 
     impl RecorderRpc for GatedRecorder {
@@ -16918,6 +17052,103 @@ mod tests {
         );
         assert!(!runtime.is_ready());
         assert!(runtime.is_fatal());
+    }
+
+    #[test]
+    fn recorder_unknown_outcome_is_retryable_without_killing_runtime() {
+        let (_dir, runtime) = sql_test_runtime();
+
+        let error = runtime.map_consensus_error(rhiza_quepaxa::Error::UnknownOutcome);
+
+        assert!(matches!(error, NodeError::OutcomeUnknown(_)));
+        assert!(error.classification().retryable());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let conflict = runtime.map_consensus_error(rhiza_quepaxa::Error::ConflictingCertificates);
+        assert!(matches!(conflict, NodeError::Reconciliation(_)));
+        assert!(!runtime.is_ready());
+        assert!(runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_write_retries_the_same_request_after_unknown_recorder_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let mut recorders = Vec::<(String, Box<dyn RecorderRpc>)>::new();
+        for node_id in ["n1", "n2"] {
+            let recorder = RecorderFileStore::new_with_membership(
+                dir.path().join("recorders").join(node_id),
+                node_id,
+                "rhiza:graph:unknown-outcome",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            recorders.push((
+                node_id.into(),
+                Box::new(UnknownAfterFirstRecord {
+                    first: Arc::new(AtomicBool::new(true)),
+                    inner: recorder,
+                }),
+            ));
+        }
+        let unavailable = RecorderFileStore::new_with_membership(
+            dir.path().join("recorders/n3"),
+            "n3",
+            "rhiza:graph:unknown-outcome",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        recorders.push((
+            "n3".into(),
+            Box::new(GatedRecorder {
+                enabled: Arc::new(AtomicBool::new(false)),
+                inner: unavailable,
+            }),
+        ));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:unknown-outcome",
+                "n1",
+                1,
+                1,
+                recorders,
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "unknown-outcome",
+            "n1",
+            dir.path().join("node"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+        let command = GraphCommandV1::put_document(
+            "stable-request",
+            "document",
+            GraphValueV1::String("value".into()),
+        )
+        .unwrap();
+
+        let first = runtime.mutate_graph(command.clone()).unwrap_err();
+        assert!(matches!(first, NodeError::OutcomeUnknown(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let retried = runtime.mutate_graph(command).unwrap();
+        assert_eq!(retried.applied_index(), 1);
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
     }
 
     fn sql_test_runtime() -> (tempfile::TempDir, NodeRuntime) {

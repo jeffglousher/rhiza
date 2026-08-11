@@ -1231,20 +1231,7 @@ impl CheckpointCoordinator {
         let publisher = store
             .open_checkpoint_publisher(holder, publisher_options)
             .await?;
-        let loaded = publisher.cached_checkpoint().await;
-        let durable_tip = *loaded.manifest().tip();
-        let restored = store
-            .load_checkpoint_restore()
-            .await?
-            .ok_or(DurabilityError::MissingCheckpoint)?;
-        let restored_tip = *restored.restored().tip();
-        if restored_tip != durable_tip {
-            return Err(DurabilityError::Archive(
-                rhiza_archive::Error::InvalidCheckpoint(
-                    "restored entries changed while verifying the loaded manifest".into(),
-                ),
-            ));
-        }
+        let durable_tip = load_coordinator_restore_baseline(&store, &publisher).await?;
         Ok(Self {
             store,
             publisher,
@@ -2006,6 +1993,32 @@ impl CheckpointCoordinator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Loads one manifest/state pair and makes that exact pair the coordinator's
+/// startup baseline. The publisher cache is observational state: another
+/// publisher may advance the archive after this publisher was opened, so a
+/// separately sampled cached tip must never be compared with the restored
+/// tip for equality.
+async fn load_coordinator_restore_baseline(
+    store: &ObjectArchiveStore,
+    publisher: &CheckpointPublisher,
+) -> Result<CheckpointTip, DurabilityError> {
+    let restored = store
+        .load_checkpoint_restore()
+        .await?
+        .ok_or(DurabilityError::MissingCheckpoint)?;
+    let (loaded, restored) = restored.into_parts();
+    let durable_tip = *restored.tip();
+    if loaded.manifest().tip() != &durable_tip {
+        return Err(DurabilityError::Archive(
+            rhiza_archive::Error::InvalidCheckpoint(
+                "restored state does not match its loaded manifest".into(),
+            ),
+        ));
+    }
+    publisher.cache_observed_checkpoint(loaded).await?;
+    Ok(durable_tip)
 }
 
 fn create_runtime_checkpoint_snapshot(
@@ -5007,15 +5020,16 @@ mod tests {
         capture_expected_local_restore_state, capture_expected_qlog_state,
         checkpoint_identity_configuration, checkpoint_restore_intent_bytes,
         install_prepared_checkpoint_for_rejoin_preserving_recorder, install_test_restore_lock_gate,
-        install_test_restore_lock_path_replacement_hook, mark_durable_state,
-        next_sync_recovery_retry, observe_durable_tip, publisher_lease_renewal_interval,
-        retryable_sync_archive_error, snapshot_profile, validate_local_qlog,
-        validate_restored_suffix, write_repair_artifact_ownership, CheckpointCoordinator,
-        CheckpointInstallMode, CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth,
-        DurabilityMode, ExecutionProfile, ExpectedLocalRestoreState, ExpectedQlogState, LogAnchor,
-        LogHash, PendingLag, PreparedCheckpointRestore, RecoveryArtifactIdentity,
-        RepairArtifactRole, RestoreCompletionMarker, SuccessorRestorePreparation,
-        RESTORE_INTENT_FILE, SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
+        install_test_restore_lock_path_replacement_hook, load_coordinator_restore_baseline,
+        mark_durable_state, next_sync_recovery_retry, observe_durable_tip,
+        publisher_lease_renewal_interval, retryable_sync_archive_error, snapshot_profile,
+        validate_local_qlog, validate_restored_suffix, write_repair_artifact_ownership,
+        CheckpointCoordinator, CheckpointInstallMode, CheckpointTip, CoordinatorState,
+        DurabilityError, DurabilityHealth, DurabilityMode, ExecutionProfile,
+        ExpectedLocalRestoreState, ExpectedQlogState, LogAnchor, LogHash, PendingLag,
+        PreparedCheckpointRestore, RecoveryArtifactIdentity, RepairArtifactRole,
+        RestoreCompletionMarker, SuccessorRestorePreparation, RESTORE_INTENT_FILE,
+        SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
         SUCCESSOR_RESTORE_LOCK_FILE, SYNC_RECOVERY_RETRY_INITIAL,
     };
     use super::{install_prepared_checkpoint_to_fresh_data_dir, prepare_checkpoint_restore};
@@ -6412,6 +6426,66 @@ mod tests {
             delay = next_sync_recovery_retry(delay);
             assert_eq!(delay, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn coordinator_startup_uses_one_loaded_restore_when_archive_advances() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+
+        // This publisher models the coordinator's cache sampled at open.
+        let stale = archive
+            .open_checkpoint_publisher("stale-coordinator", Default::default())
+            .await
+            .unwrap();
+        assert_eq!(stale.cached_checkpoint().await.manifest().tip().index(), 0);
+
+        // A peer advances the archive before the coordinator loads its exact
+        // restore pair. The old equality check rejected this valid sequence.
+        let peer = archive
+            .open_checkpoint_publisher("peer", Default::default())
+            .await
+            .unwrap();
+        let entry = LogEntry {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            index: 1,
+            entry_type: EntryType::Noop,
+            prev_hash: LogHash::ZERO,
+            hash: LogEntry::calculate_hash(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                1,
+                EntryType::Noop,
+                LogHash::ZERO,
+                &[],
+            ),
+            payload: Vec::new(),
+        };
+        peer.publish_committed(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+
+        let tip = load_coordinator_restore_baseline(&archive, &stale)
+            .await
+            .unwrap();
+        assert_eq!(tip, CheckpointTip::new(1, entry.hash));
+        assert_eq!(stale.cached_checkpoint().await.manifest().tip(), &tip);
     }
 
     #[tokio::test]

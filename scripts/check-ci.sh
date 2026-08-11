@@ -33,6 +33,8 @@ run cargo fmt --all -- --check
 run cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc
 run cargo clippy --locked --all-targets "${package_args[@]}" -- -D warnings
 run cargo test --locked --all-targets "${package_args[@]}"
+run cargo test --locked -p rhiza-node --features graph --lib \
+  graph_write_retries_the_same_request_after_unknown_recorder_outcome
 
 for feature in shadow proposer-canary hedge-canary default-on; do
   run cargo test --locked -p rhiza-tuner --no-default-features --features "$feature" \

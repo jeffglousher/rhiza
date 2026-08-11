@@ -1168,6 +1168,7 @@ fn node_admin_status(error: &NodeError) -> (StatusCode, AdminErrorCode) {
         #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed),
         NodeError::Unavailable(_)
+        | NodeError::OutcomeUnknown(_)
         | NodeError::StartupCancelled { .. }
         | NodeError::ResourceExhausted(_)
         | NodeError::Contention(_)

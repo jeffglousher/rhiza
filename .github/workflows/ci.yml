@@ -92,6 +92,8 @@ jobs:
             --features "$RHIZA_PROFILE,tuner"
           if [ "$RHIZA_PROFILE" = graph ]; then
             cargo test --locked -p rhiza-graph
+            cargo test --locked -p rhiza-node --features graph --lib \
+              graph_write_retries_the_same_request_after_unknown_recorder_outcome
             cargo test --locked -p rhiza-node --no-default-features --features graph --test graph_runtime
             cargo test --locked -p rhiza-node --features graph --test durability \
               graph_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node

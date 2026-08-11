@@ -52,6 +52,7 @@ impl ErrorClassification {
             "unavailable"
             | "durability_unavailable"
             | "write_timeout"
+            | "write_outcome_unknown"
             | "writes_unavailable"
             | "configuration_transition"
             | "contention"
@@ -1946,6 +1947,7 @@ mod tests {
             ("unavailable", ErrorCategory::Unavailable, true),
             ("durability_unavailable", ErrorCategory::Unavailable, true),
             ("write_timeout", ErrorCategory::Unavailable, true),
+            ("write_outcome_unknown", ErrorCategory::Unavailable, true),
             ("writes_unavailable", ErrorCategory::Unavailable, true),
             ("configuration_transition", ErrorCategory::Unavailable, true),
             ("contention", ErrorCategory::Unavailable, true),

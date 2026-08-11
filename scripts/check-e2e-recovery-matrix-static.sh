@@ -263,14 +263,14 @@ fi
   exit 1
 }
 require_literal 'matrix_expect_write_no_quorum'
-require_literal '(.code == "write_timeout" or .code == "unavailable")'
+require_literal '(.code == "write_timeout" or .code == "write_outcome_unknown" or .code == "unavailable")'
 require_literal 'write_retry_deadline_seconds=60'
 # The post-restore probe may encounter a short-lived quorum convergence window.
 # It must retry only known retryable HTTP errors, with the original request ID.
 require_literal 'retryable_write_failure'
-require_literal 'HTTP 503 Service Unavailable code=(write_timeout|unavailable|writes_unavailable)'
-retryable_write_pattern='^write failed: HTTP 503 Service Unavailable code=(write_timeout|unavailable|writes_unavailable)( |$)'
-for retryable_code in write_timeout unavailable writes_unavailable; do
+require_literal 'HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|unavailable|writes_unavailable)'
+retryable_write_pattern='^write failed: HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|unavailable|writes_unavailable)( |$)'
+for retryable_code in write_timeout write_outcome_unknown unavailable writes_unavailable; do
   printf 'write failed: HTTP 503 Service Unavailable code=%s retryable=true\n' "$retryable_code" |
     grep -Eq "$retryable_write_pattern" || {
       echo "retryable write classifier rejected $retryable_code" >&2

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Makes checkpoint coordinator startup consume one manifest/restore pair, so
+  a concurrent peer publication cannot be misclassified as checkpoint
+  corruption.
+- Keeps Recorder RPC `UnknownOutcome` retryable and non-fatal at runtime while
+  preserving fatal handling for contradictory durable evidence, and rechecks
+  configuration activity before every retried write proposal.
+- Reports admitted writes whose response deadline expires as
+  `write_outcome_unknown`; retrying the same request ID reconciles the exact
+  result instead of treating a possibly committed write as a definite timeout.
+
 ## v0.7.0
 
 - Replaces SQLite speculative full-database clones with a clone-free native-WAL

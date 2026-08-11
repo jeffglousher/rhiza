@@ -792,7 +792,7 @@ async fn graph_query_returns_explicit_errors_for_capacity_rows_and_invalid_value
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn graph_sync_checkpoint_outage_times_out_releases_capacity_and_retries_original_outcome() {
+async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outcome() {
     let root = tempfile::tempdir().unwrap();
     let archive_root = root.path().join("archive");
     let archive_backup = root.path().join("archive-backup");
@@ -837,7 +837,7 @@ async fn graph_sync_checkpoint_outage_times_out_releases_capacity_and_retries_or
     assert_eq!(first.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         first.json::<ClientErrorResponse>().await.unwrap().code,
-        "write_timeout"
+        "write_outcome_unknown"
     );
     let read = client
         .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))

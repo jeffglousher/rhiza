@@ -722,7 +722,7 @@ async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_original_outcome() {
+async fn kv_sync_checkpoint_outage_reports_unknown_and_retries_original_outcome() {
     let _lock = kv_runtime_test_lock();
     let root = tempfile::tempdir().unwrap();
     let archive_root = root.path().join("archive");
@@ -768,7 +768,7 @@ async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_origi
     assert_eq!(first.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         first.json::<ClientErrorResponse>().await.unwrap().code,
-        "write_timeout"
+        "write_outcome_unknown"
     );
     let read = client
         .post(format!("http://{addr}{KV_GET_PATH}"))

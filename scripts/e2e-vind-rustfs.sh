@@ -784,7 +784,7 @@ matrix_service_read() {
 matrix_expect_write_no_quorum() {
   [ "$matrix_last_http_status" = 503 ] || return 1
   jq -e '.retryable == true and
-    (.code == "write_timeout" or .code == "unavailable")' \
+    (.code == "write_timeout" or .code == "write_outcome_unknown" or .code == "unavailable")' \
     "$matrix_last_http_body" >/dev/null
 }
 matrix_last_http_failure_detail() {
@@ -896,7 +896,7 @@ matrix_expect_read_zero_endpoint_failure() {
 retryable_write_failure() {
   local attempt_log="$1"
   grep -Eq \
-    '^write failed: HTTP 503 Service Unavailable code=(write_timeout|unavailable|writes_unavailable)( |$)' \
+    '^write failed: HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|unavailable|writes_unavailable)( |$)' \
     "$attempt_log"
 }
 write_value() {

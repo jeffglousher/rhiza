@@ -1958,7 +1958,7 @@ mod tests {
             outcome.is_ok()
                 || matches!(
                     outcome,
-                    Err(Error::Node(NodeError::Reconciliation(ref message)))
+                    Err(Error::Node(NodeError::OutcomeUnknown(ref message)))
                         if message == "QuePaxa recorder RPC outcome is unknown; recover recorder state"
                 ),
             "the owned proposal must resolve to its exact success or mutation-unknown outcome: {outcome:?}"
@@ -2148,7 +2148,7 @@ mod tests {
             assert!(
                 matches!(
                     owned_outcome,
-                    Err(Error::Node(NodeError::Reconciliation(ref message)))
+                    Err(Error::Node(NodeError::OutcomeUnknown(ref message)))
                         if message == "QuePaxa recorder RPC outcome is unknown; recover recorder state"
                 ),
                 "owned operation {iteration} must report the exact shutdown mutation-indeterminate result: {owned_outcome:?}"
