@@ -6047,10 +6047,17 @@ fn next_sync_flush_retry(current: Duration) -> Duration {
     current.saturating_mul(2).min(SYNC_FLUSH_RETRY_MAX)
 }
 
+fn retryable_sync_flush_error(error: &DurabilityError) -> bool {
+    matches!(
+        error,
+        DurabilityError::Archive(_) | DurabilityError::Io(_) | DurabilityError::Unavailable
+    )
+}
+
 /// Confirms that a committed write has reached the configured durability boundary.
 ///
-/// Synchronous archive I/O failures are retried with bounded backoff until the
-/// archive recovers or the runtime begins shutdown.
+/// Transient archive I/O and Recorder effect-read unavailability are retried
+/// with bounded backoff until durability recovers or shutdown begins.
 pub async fn confirm_write_durability(
     runtime: &NodeRuntime,
     coordinator: Option<&CheckpointCoordinator>,
@@ -6081,7 +6088,7 @@ pub async fn confirm_write_durability(
                     actual: Some(tip.index()),
                 });
             }
-            Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
+            Err(error) if retryable_sync_flush_error(&error) => {
                 let cancelled = runtime.operation_cancelled_notify.notified();
                 tokio::pin!(cancelled);
                 cancelled.as_mut().enable();
@@ -8893,6 +8900,34 @@ pub struct NodeRuntime {
     #[cfg(all(test, any(feature = "graph", feature = "kv")))]
     read_barrier_before_snapshot_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     _data_root_lock: fs::File,
+}
+
+#[cfg(feature = "sql")]
+struct PreparedExternalSqlBundleResolution {
+    consensus: Arc<ThreeNodeConsensus>,
+    binding: EffectBundleBinding,
+    manifest_command: StoredCommand,
+    command: ExternalEffectCommand,
+}
+
+#[cfg(feature = "sql")]
+impl PreparedExternalSqlBundleResolution {
+    fn resolve(self) -> Result<Option<RecorderEffectBundle>, rhiza_quepaxa::Error> {
+        let bundle = self.consensus.resolve_effect_bundle_from_quorum(
+            // Archive publication remains available during shutdown/recovery,
+            // but the synchronous RPC wait runs on Tokio's blocking pool.
+            &RecorderRpcContext::with_timeout(DEFAULT_RECORDER_RPC_TIMEOUT),
+            &self.binding,
+            &self.manifest_command,
+        )?;
+        bundle
+            .map(|bundle| {
+                verify_resolved_external_sql_bundle(&self.command, &bundle)
+                    .map(|_| bundle)
+                    .map_err(|error| rhiza_quepaxa::Error::EffectBundleInvalid(error.to_string()))
+            })
+            .transpose()
+    }
 }
 
 #[cfg(feature = "sql")]
@@ -12386,6 +12421,19 @@ impl NodeRuntime {
         &self,
         entry: &LogEntry,
     ) -> Result<RecorderEffectBundle, NodeError> {
+        self.prepare_external_sql_bundle_resolution(entry)?
+            .resolve()
+            .map_err(|error| self.map_consensus_error(error))?
+            .ok_or_else(|| {
+                NodeError::Unavailable("committed QEFX bundle is temporarily unavailable".into())
+            })
+    }
+
+    #[cfg(feature = "sql")]
+    fn prepare_external_sql_bundle_resolution(
+        &self,
+        entry: &LogEntry,
+    ) -> Result<PreparedExternalSqlBundleResolution, NodeError> {
         let configuration = self.configuration_state()?;
         let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
             self.latch(NodeError::Invariant(format!(
@@ -12396,23 +12444,31 @@ impl NodeRuntime {
             .map_err(|error| self.latch(NodeError::Invariant(error)))?;
         let manifest_command = StoredCommand::new(EntryType::Command, entry.payload.clone());
         let binding = effect_bundle_binding(&command, &manifest_command);
-        let bundle = self
-            .consensus
-            .resolve_effect_bundle_from_quorum(
-                // Archive publication is part of shutdown/recovery cleanup
-                // and must remain able to perform bounded read-only QEFX
-                // resolution after ordinary operation admission is closed.
-                &RecorderRpcContext::with_timeout(DEFAULT_RECORDER_RPC_TIMEOUT),
-                &binding,
-                &manifest_command,
-            )
+        Ok(PreparedExternalSqlBundleResolution {
+            consensus: self.consensus.clone(),
+            binding,
+            manifest_command,
+            command,
+        })
+    }
+
+    /// Resolves archive payloads on Tokio's blocking pool. Recorder quorum
+    /// reads are synchronous and may consume their full bounded deadline; they
+    /// must never starve HTTP liveness or the durability executor.
+    #[cfg(feature = "sql")]
+    pub(crate) async fn resolve_external_sql_bundle_for_archive_async(
+        &self,
+        entry: &LogEntry,
+    ) -> Result<RecorderEffectBundle, NodeError> {
+        let prepared = self.prepare_external_sql_bundle_resolution(entry)?;
+        let result = tokio::task::spawn_blocking(move || prepared.resolve())
+            .await
+            .map_err(node_service_task_error)?
             .map_err(|error| self.map_consensus_error(error))?
             .ok_or_else(|| {
                 NodeError::Unavailable("committed QEFX bundle is temporarily unavailable".into())
             })?;
-        verify_resolved_external_sql_bundle(&command, &bundle)
-            .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
-        Ok(bundle)
+        Ok(result)
     }
 
     fn require_execution_profile(&self, expected: ExecutionProfile) -> Result<(), NodeError> {
@@ -12916,11 +12972,12 @@ mod tests {
     };
     use super::{
         client_authenticated, next_sync_flush_retry, post,
-        retain_peer_permit_until_response_body_complete, run_read_operation,
-        sql_query_http_response, valid_recorder_record, Body, Duration, FileLogStore, HeaderMap,
-        Instant, Json, NodeError, ReadConsistency, Request, Response, Router, SqlCommand,
-        SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
-        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+        retain_peer_permit_until_response_body_complete, retryable_sync_flush_error,
+        run_read_operation, sql_query_http_response, valid_recorder_record, Body, DurabilityError,
+        Duration, FileLogStore, HeaderMap, Instant, Json, NodeError, ReadConsistency, Request,
+        Response, Router, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler,
+        MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL,
+        VERSION_HEADER,
     };
 
     struct PendingThenDataBody {
@@ -14810,6 +14867,14 @@ mod tests {
             delays,
             [50, 100, 200, 400, 800, 1_000, 1_000].map(Duration::from_millis)
         );
+    }
+
+    #[test]
+    fn transient_qefx_unavailability_is_a_retryable_sync_flush_error() {
+        assert!(retryable_sync_flush_error(&DurabilityError::Unavailable));
+        assert!(!retryable_sync_flush_error(
+            &DurabilityError::SnapshotVerification("corrupt QEFX evidence".into())
+        ));
     }
 
     #[test]

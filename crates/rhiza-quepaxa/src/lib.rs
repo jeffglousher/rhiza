@@ -2079,6 +2079,8 @@ pub struct EffectBundleGcOutcome {
     pub current_anchor: Slot,
     pub removed_manifests: usize,
     pub removed_chunks: usize,
+    /// True when no additional object eligible under `current_anchor` remains.
+    pub sweep_complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3890,6 +3892,26 @@ impl RecorderFileStore {
         certificate: &CheckpointReadbackCertificate,
         protected_pins: &[EffectBundleGcPin],
     ) -> Result<EffectBundleGcOutcome> {
+        self.advance_effect_bundle_gc_anchor_bounded(certificate, protected_pins, usize::MAX)
+    }
+
+    /// Advances the durable anchor while limiting destructive maintenance work.
+    ///
+    /// The anchor is always published before deletion. Callers may retry the
+    /// exact certificate until `sweep_complete`; each call removes at most
+    /// `max_removals` manifests and chunks, respectively. This keeps online
+    /// Recorder RPC admission from being monopolized by a directory-wide GC.
+    pub fn advance_effect_bundle_gc_anchor_bounded(
+        &self,
+        certificate: &CheckpointReadbackCertificate,
+        protected_pins: &[EffectBundleGcPin],
+        max_removals: usize,
+    ) -> Result<EffectBundleGcOutcome> {
+        if max_removals == 0 {
+            return Err(Error::EffectBundleInvalid(
+                "effect GC removal budget must be positive".into(),
+            ));
+        }
         let _guard = self
             .sync
             .lock()
@@ -3949,14 +3971,16 @@ impl RecorderFileStore {
             self.effect_root_anchor.sync()?;
         }
 
-        let removed_manifests =
-            self.sweep_effect_bundle_manifests_unlocked(tip.index(), &protected)?;
-        let removed_chunks = self.reap_unreachable_effect_chunks_unlocked(&protected)?;
+        let (removed_manifests, manifests_complete) =
+            self.sweep_effect_bundle_manifests_unlocked(tip.index(), &protected, max_removals)?;
+        let (removed_chunks, chunks_complete) =
+            self.reap_unreachable_effect_chunks_unlocked(&protected, max_removals)?;
         Ok(EffectBundleGcOutcome {
             previous_anchor: previous.map(|anchor| anchor.through_slot),
             current_anchor: tip.index(),
             removed_manifests,
             removed_chunks,
+            sweep_complete: manifests_complete && chunks_complete,
         })
     }
 
@@ -4039,8 +4063,10 @@ impl RecorderFileStore {
         &self,
         through_slot: Slot,
         protected: &EffectBundleGcProtected,
-    ) -> Result<usize> {
+        max_removals: usize,
+    ) -> Result<(usize, bool)> {
         let mut removed = 0;
+        let mut complete = true;
         for name in self.effect_root_anchor.list()? {
             if !name.starts_with(EFFECT_BUNDLE_PREFIX) {
                 continue;
@@ -4065,12 +4091,16 @@ impl RecorderFileStore {
             if manifest.binding.intended_slot <= through_slot
                 && !protected.bindings.contains(&binding_digest)
             {
+                if removed == max_removals {
+                    complete = false;
+                    continue;
+                }
                 self.effect_root_anchor.remove(&name)?;
                 removed += 1;
             }
         }
         self.effect_root_anchor.sync()?;
-        Ok(removed)
+        Ok((removed, complete))
     }
 
     fn validate_effect_bundle_binding(&self, binding: &EffectBundleBinding) -> Result<()> {
@@ -4170,7 +4200,8 @@ impl RecorderFileStore {
     fn reap_unreachable_effect_chunks_unlocked(
         &self,
         protected: &EffectBundleGcProtected,
-    ) -> Result<usize> {
+        max_removals: usize,
+    ) -> Result<(usize, bool)> {
         let mut reachable = protected.chunks.clone();
         let names = self.effect_root_anchor.list()?;
         for name in &names {
@@ -4196,6 +4227,7 @@ impl RecorderFileStore {
             reachable.extend(manifest.chunk_hashes);
         }
         let mut removed = 0;
+        let mut complete = true;
         for name in names {
             if !name.starts_with(EFFECT_CHUNK_PREFIX) {
                 continue;
@@ -4206,12 +4238,16 @@ impl RecorderFileStore {
                 ));
             };
             if !reachable.contains(&hash) {
+                if removed == max_removals {
+                    complete = false;
+                    continue;
+                }
                 self.effect_root_anchor.remove(&name)?;
                 removed += 1;
             }
         }
         self.effect_root_anchor.sync()?;
-        Ok(removed)
+        Ok((removed, complete))
     }
 
     fn is_effect_chunk_name(&self, name: &str) -> bool {

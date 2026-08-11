@@ -53,6 +53,10 @@ const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const SYNC_COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SYNC_RECOVERY_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const SYNC_RECOVERY_RETRY_MAX: Duration = Duration::from_secs(1);
+#[cfg(feature = "sql")]
+const ONLINE_QEFX_GC_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(feature = "sql")]
+const ONLINE_QEFX_GC_REMOVAL_BUDGET: usize = 1;
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
@@ -89,7 +93,7 @@ fn retryable_sync_archive_error(error: &rhiza_archive::Error) -> bool {
 }
 
 fn retryable_sync_recovery_error(error: &DurabilityError) -> bool {
-    matches!(error, DurabilityError::Io(_))
+    matches!(error, DurabilityError::Io(_) | DurabilityError::Unavailable)
         || matches!(error, DurabilityError::Archive(error) if retryable_sync_archive_error(error))
 }
 
@@ -1120,7 +1124,7 @@ struct CoordinatorState {
     health: DurabilityHealth,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[cfg(feature = "sql")]
 struct PendingQefxGc {
@@ -1142,6 +1146,8 @@ pub struct CheckpointCoordinator {
     successor_baseline_required: AtomicBool,
     publication_attempts: AtomicU64,
     local_recorder: Mutex<Option<RecorderFileStore>>,
+    #[cfg(feature = "sql")]
+    qefx_gc_maintenance: tokio::sync::Mutex<()>,
 }
 
 /// Marks a Sync coordinator unavailable if its post-commit durability confirmation is dropped.
@@ -1253,6 +1259,8 @@ impl CheckpointCoordinator {
             successor_baseline_required: AtomicBool::new(false),
             publication_attempts: AtomicU64::new(0),
             local_recorder: Mutex::new(None),
+            #[cfg(feature = "sql")]
+            qefx_gc_maintenance: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1540,8 +1548,6 @@ impl CheckpointCoordinator {
         runtime: &NodeRuntime,
         target_index: LogIndex,
     ) -> Result<CheckpointTip, DurabilityError> {
-        #[cfg(feature = "sql")]
-        self.retry_pending_qefx_gc(runtime).await?;
         let log_state = runtime.log_store().logical_state()?;
         let local_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
         let mut durable_tip = self.durable_tip();
@@ -1600,6 +1606,7 @@ impl CheckpointCoordinator {
                 let configuration = runtime
                     .configuration_state()
                     .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+                let _maintenance = self.qefx_gc_maintenance.lock().await;
                 persist_pending_qefx_gc(
                     runtime.config.data_dir(),
                     &PendingQefxGc {
@@ -1612,23 +1619,6 @@ impl CheckpointCoordinator {
                         manifest_digest: certificate.manifest_digest().to_hex(),
                     },
                 )?;
-                if let Some(recorder) = self
-                    .local_recorder
-                    .lock()
-                    .map_err(|_| {
-                        DurabilityError::SnapshotVerification(
-                            "local recorder attachment lock is poisoned".into(),
-                        )
-                    })?
-                    .clone()
-                {
-                    if recorder
-                        .advance_effect_bundle_gc_anchor(&certificate, &[])
-                        .is_ok()
-                    {
-                        clear_pending_qefx_gc(runtime.config.data_dir())?;
-                    }
-                }
             }
             durable_tip = *published.manifest().tip();
             self.mark_durable(durable_tip);
@@ -1648,13 +1638,8 @@ impl CheckpointCoordinator {
     }
 
     #[cfg(feature = "sql")]
-    async fn retry_pending_qefx_gc(&self, runtime: &NodeRuntime) -> Result<(), DurabilityError> {
-        self.retry_pending_qefx_gc_at(runtime.config.data_dir())
-            .await
-    }
-
-    #[cfg(feature = "sql")]
     async fn retry_pending_qefx_gc_at(&self, data_dir: &Path) -> Result<(), DurabilityError> {
+        let _maintenance = self.qefx_gc_maintenance.lock().await;
         let Some(pending) = load_pending_qefx_gc(data_dir)? else {
             return Ok(());
         };
@@ -1677,23 +1662,33 @@ impl CheckpointCoordinator {
             .ok_or(DurabilityError::MissingCheckpoint)?;
         let certificate = self.store.checkpoint_readback_certificate(&loaded).await?;
         let identity_mismatch = certificate.identity().cluster_id() != pending.cluster_id
-            || certificate.identity().epoch() != pending.epoch
-            || certificate.identity().config_id() != pending.config_id
-            || certificate.identity().config_digest().to_hex() != pending.config_digest;
+            || certificate.identity().epoch() != pending.epoch;
         let visible_tip = certificate.tip().index();
         let rollback = visible_tip < pending.through_slot;
         let same_tip_conflict = visible_tip == pending.through_slot
-            && (certificate.tip().hash().to_hex() != pending.checkpoint_hash
+            && (certificate.identity().config_id() != pending.config_id
+                || certificate.identity().config_digest().to_hex() != pending.config_digest
+                || certificate.tip().hash().to_hex() != pending.checkpoint_hash
                 || certificate.manifest_digest().to_hex() != pending.manifest_digest);
         if identity_mismatch || rollback || same_tip_conflict {
             return Err(DurabilityError::SnapshotVerification(
                 "pending QEFX GC evidence no longer matches the visible checkpoint".into(),
             ));
         }
-        if recorder
-            .advance_effect_bundle_gc_anchor(&certificate, &[])
-            .is_ok()
-        {
+        let outcome = tokio::task::spawn_blocking(move || {
+            recorder.advance_effect_bundle_gc_anchor_bounded(
+                &certificate,
+                &[],
+                ONLINE_QEFX_GC_REMOVAL_BUDGET,
+            )
+        })
+        .await
+        .map_err(|error| {
+            DurabilityError::SnapshotVerification(format!(
+                "QEFX GC maintenance task failed: {error}"
+            ))
+        })?;
+        if outcome.is_ok_and(|outcome| outcome.sweep_complete) {
             clear_pending_qefx_gc(data_dir)?;
         }
         Ok(())
@@ -1719,7 +1714,8 @@ impl CheckpointCoordinator {
                 ))
             })?;
             let bundle = runtime
-                .resolve_external_sql_bundle_for_archive(entry)
+                .resolve_external_sql_bundle_for_archive_async(entry)
+                .await
                 .map_err(|error| match error {
                     crate::NodeError::Unavailable(_) | crate::NodeError::Contention(_) => {
                         DurabilityError::Unavailable
@@ -1888,6 +1884,8 @@ impl CheckpointCoordinator {
             .unwrap_or_else(Instant::now);
         let mut recovery_retry_at = None;
         let mut recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
+        #[cfg(feature = "sql")]
+        let mut next_qefx_gc = now;
         tokio::pin!(shutdown);
         loop {
             let heartbeat_at = if matches!(self.mode, DurabilityMode::Sync) {
@@ -1899,6 +1897,10 @@ impl CheckpointCoordinator {
             if let Some(recovery_at) = recovery_retry_at {
                 wake_at = wake_at.min(recovery_at);
             }
+            #[cfg(feature = "sql")]
+            {
+                wake_at = wake_at.min(next_qefx_gc);
+            }
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {
@@ -1909,6 +1911,22 @@ impl CheckpointCoordinator {
                         recovery_retry_at = Some(now);
                     }
                     let recovery_due = recovery_retry_at.is_some_and(|deadline| now >= deadline);
+                    #[cfg(feature = "sql")]
+                    if now >= next_qefx_gc {
+                        // GC is post-durability maintenance. It runs on the
+                        // blocking pool in a one-object slice and never changes
+                        // Sync health; failures retain the fsynced pending record
+                        // for an exact later retry.
+                        if let Err(error) = self
+                            .retry_pending_qefx_gc_at(runtime.config.data_dir())
+                            .await
+                        {
+                            eprintln!("QEFX GC maintenance deferred: {error}");
+                        }
+                        next_qefx_gc = Instant::now()
+                            .checked_add(ONLINE_QEFX_GC_INTERVAL)
+                            .unwrap_or_else(Instant::now);
+                    }
                     if matches!(self.mode, DurabilityMode::Sync)
                         && (recovery_due || now >= next_publisher_lease_renewal)
                     {
@@ -4650,6 +4668,26 @@ fn persist_pending_qefx_gc(
     data_dir: &Path,
     pending: &PendingQefxGc,
 ) -> Result<(), DurabilityError> {
+    if let Some(existing) = load_pending_qefx_gc(data_dir)? {
+        if existing.cluster_id != pending.cluster_id || existing.epoch != pending.epoch {
+            return Err(DurabilityError::SnapshotVerification(
+                "pending QEFX GC record belongs to a different cluster or epoch".into(),
+            ));
+        }
+        if existing.through_slot > pending.through_slot {
+            return Ok(());
+        }
+        if existing.through_slot == pending.through_slot {
+            if existing.checkpoint_hash == pending.checkpoint_hash
+                && existing.manifest_digest == pending.manifest_digest
+            {
+                return Ok(());
+            }
+            return Err(DurabilityError::SnapshotVerification(
+                "pending QEFX GC record conflicts at the same checkpoint slot".into(),
+            ));
+        }
+    }
     let path = data_dir.join(PENDING_QEFX_GC_FILE);
     let parent = path.parent().ok_or_else(|| {
         DurabilityError::SnapshotVerification("pending QEFX GC path has no parent".into())
@@ -4657,16 +4695,18 @@ fn persist_pending_qefx_gc(
     fs::create_dir_all(parent)?;
     let bytes = serde_json::to_vec(pending)
         .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
-    let temporary = parent.join(".pending-qefx-gc.tmp");
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
+    let temporary = parent.join(format!(
+        ".pending-qefx-gc.tmp-{}-{}",
+        process::id(),
+        RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&temporary, &path)?;
     sync_directory(parent)
 }
@@ -5760,6 +5800,46 @@ mod tests {
 
         assert!(super::read_bounded_regular_file(&path, 4).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"12345");
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn pending_qefx_gc_record_never_regresses_or_conflicts_at_one_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let record = |through_slot, checkpoint_hash: &str| super::PendingQefxGc {
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::digest(&[b"config"]).to_hex(),
+            through_slot,
+            checkpoint_hash: checkpoint_hash.into(),
+            manifest_digest: LogHash::digest(&[b"manifest", &through_slot.to_be_bytes()]).to_hex(),
+        };
+        let newer = record(12, &LogHash::digest(&[b"tip-12"]).to_hex());
+        super::persist_pending_qefx_gc(root.path(), &newer).unwrap();
+
+        super::persist_pending_qefx_gc(
+            root.path(),
+            &record(11, &LogHash::digest(&[b"tip-11"]).to_hex()),
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_pending_qefx_gc(root.path())
+                .unwrap()
+                .unwrap()
+                .through_slot,
+            12
+        );
+
+        assert!(super::persist_pending_qefx_gc(
+            root.path(),
+            &record(12, &LogHash::digest(&[b"conflict"]).to_hex()),
+        )
+        .is_err());
+        assert_eq!(
+            super::load_pending_qefx_gc(root.path()).unwrap().unwrap(),
+            newer
+        );
     }
 
     #[test]

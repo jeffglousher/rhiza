@@ -507,6 +507,44 @@ fn certified_gc_persists_monotonically_and_preserves_newer_effects_after_reopen(
 }
 
 #[test]
+fn certified_gc_bounded_sweep_requires_exact_retries_and_caps_each_slice() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let (first, first_request) = sql_qefx(&membership, vec![b"first-effect".to_vec()], 79);
+    let (second, second_request) = sql_qefx(&membership, vec![b"second-effect".to_vec()], 80);
+    store.finalize_effect_bundle(&first_request).unwrap();
+    store.finalize_effect_bundle(&second_request).unwrap();
+    let certificate = gc_certificate(
+        root.path(),
+        CLUSTER_ID,
+        CONFIG_ID,
+        membership.digest(),
+        80,
+        1,
+    );
+
+    let first_slice = store
+        .advance_effect_bundle_gc_anchor_bounded(&certificate, &[], 1)
+        .unwrap();
+    assert_eq!(first_slice.removed_manifests, 1);
+    assert!(first_slice.removed_chunks <= 1);
+    assert!(!first_slice.sweep_complete);
+
+    let second_slice = store
+        .advance_effect_bundle_gc_anchor_bounded(&certificate, &[], 1)
+        .unwrap();
+    assert_eq!(second_slice.removed_manifests, 1);
+    assert!(second_slice.removed_chunks <= 1);
+
+    let final_slice = store
+        .advance_effect_bundle_gc_anchor_bounded(&certificate, &[], 1)
+        .unwrap();
+    assert!(final_slice.sweep_complete);
+    assert_eq!(store.load_effect_bundle(first.binding()).unwrap(), None);
+    assert_eq!(store.load_effect_bundle(second.binding()).unwrap(), None);
+}
+
+#[test]
 fn certified_gc_does_not_reap_chunks_between_stage_and_finalize() {
     let root = tempfile::tempdir().unwrap();
     let (store, membership) = open_store(root.path());
