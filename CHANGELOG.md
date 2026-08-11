@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.7.0
+
+- Replaces SQLite speculative full-database clones with a clone-free native-WAL
+  preparation path and adds a bounded persistent read-connection pool.
+- Adds quorum-finalized, content-addressed external SQL effects so atomic
+  `CREATE INDEX` and bulk `UPDATE` operations can exceed the 512 KiB consensus
+  command limit while remaining bounded to 64 MiB.
+- Carries external SQL effects through learner catch-up, checkpoints, archive
+  restore, Recorder rehydration, and checkpoint-certified garbage collection.
+- Introduces a clean-install storage-generation boundary. Existing pre-v0.7.0
+  durable roots and archive namespaces are intentionally not migrated or
+  accepted by this release.
+- Hardens postcard/TCP Recorder operation, synchronous durability recovery,
+  FastPath proof publication, root-anchored durable I/O, and failure evidence.
+- Adds an opt-in client ingress-routing tuner with bounded observations and
+  fail-safe static routing fallback. QuePaxa proposer preference and hedge
+  delay remain static.
+- Adds pinned Chaos Mesh qualification tooling and three-peer Rhiza/Hiqlite
+  comparison programs. Chaos results are not physical power-loss evidence.
+
+### Release scope
+
+`v0.7.0` publishes GitHub source, SQL/Graph/KV CLI archives, and immutable
+multi-architecture GHCR images. Rust crate versions remain independently
+versioned and are not published by this release.
+
 ## v0.6.1
 
 - Removes unreachable match arm in KV batch handler that caused clippy failure
