@@ -16,6 +16,9 @@
   to rejoin the voter instead of leaving it permanently not ready.
 - Makes the staggered-cluster CLI reuse the exact request ID after an ambiguous
   write outcome, preserving at-most-once reconciliation during failure tests.
+- Fixes the non-Unix anchored-storage fallback so Windows CLI release targets
+  compile, and adds the exact Windows-target portability check to the shared
+  local/hosted CI suite.
 
 ### Release scope
 
