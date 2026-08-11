@@ -1,4 +1,4 @@
-﻿# Taldra-maintained Rhiza fork
+# Taldra-maintained Rhiza fork
 
 This repository is a maintained fork of [mrchypark/rhiza](https://github.com/mrchypark/rhiza)
 for [Taldra](https://github.com/jeffglousher/taldra).
@@ -11,7 +11,7 @@ deadlines and cancellation via `RecorderRpcContext`.
 
 ## Policy
 
-1. **Source of truth for Taldra:** this fork (jeffglousher/rhiza), not crates.io.
+1. **Source of truth for Taldra:** this fork (`jeffglousher/rhiza`), not crates.io.
 2. **Pin exact revisions** in Taldra `Cargo.toml` / `Cargo.lock`; do not float
    on a moving branch tip without a deliberate bump.
 3. **Sync from upstream** periodically with merge or rebase onto
@@ -25,11 +25,16 @@ deadlines and cancellation via `RecorderRpcContext`.
 
 ## Current Taldra pin baseline
 
-At fork adoption, Taldra tracks tip:
-
-`	ext
-f08b2046c928f69ac1c90dff37bf58ddbb608f48
-`
+At fork adoption, Taldra tracks tip of this fork after the `archive-gc`
+optionalization patch (see below). Exact revision is pinned in Taldra
+`crates/taldra-consensus/Cargo.toml`.
 
 See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
 `https://github.com/jeffglousher/rhiza`.
+
+## Fork patches (Taldra)
+
+- `archive-gc` feature: `rhiza-quepaxa` no longer hard-depends on
+  `rhiza-archive` / `object_store` / `aws-lc-sys`. Enable `archive-gc` only when
+  checkpoint GC APIs are required. Taldra's dual-engine pin uses
+  `default-features = false` and does not enable `archive-gc`.

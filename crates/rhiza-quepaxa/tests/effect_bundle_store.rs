@@ -1,3 +1,4 @@
+#![cfg(feature = "archive-gc")]
 use rhiza_archive::{CheckpointIdentity, CheckpointReadbackCertificate, ObjectArchiveStore};
 use rhiza_core::{
     EntryType, ExternalEffectCommand, ExternalEffectProfile, LogEntry, LogHash, StoredCommand,

@@ -27,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "archive-gc")]
 use rhiza_archive::CheckpointReadbackCertificate;
 use rhiza_core::canonical_membership_digest;
 
@@ -3882,6 +3883,7 @@ impl RecorderFileStore {
         self.load_effect_bundle_unlocked(binding).map(Some)
     }
 
+    #[cfg(feature = "archive-gc")]
     /// Persists a monotonic, archive-readback-certified GC anchor and then
     /// removes only finalized manifests at or below that anchor. The anchor is
     /// fsynced before any deletion, so a crash yields either the old complete
@@ -3895,6 +3897,7 @@ impl RecorderFileStore {
         self.advance_effect_bundle_gc_anchor_bounded(certificate, protected_pins, usize::MAX)
     }
 
+    #[cfg(feature = "archive-gc")]
     /// Advances the durable anchor while limiting destructive maintenance work.
     ///
     /// The anchor is always published before deletion. Callers may retry the
@@ -3996,6 +3999,7 @@ impl RecorderFileStore {
             .map(|anchor| anchor.through_slot))
     }
 
+    #[cfg(feature = "archive-gc")]
     fn validate_effect_bundle_gc_certificate(
         &self,
         certificate: &CheckpointReadbackCertificate,
