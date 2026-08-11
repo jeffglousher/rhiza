@@ -41,3 +41,21 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
 
 - Windows / non-unix64 `anchored_fs` stub: import `crate::{Error, Result}` so
   the unsupported platform path type-checks (upstream tip omitted the import).
+
+
+## Next fork patch (planned)
+
+**Caller-owned / actor-owned drive seam (ADR-0005 exit condition 1):**
+
+- Keep `RecorderRpc` as the transport-independent recorder contract.
+- Add a caller-driven propose/drive path that does **not** spawn
+  `RecordWorker` / `ControlWorker` / read-fence OS threads per cluster.
+- Dispatch record / install / inspect RPCs on the calling thread (or through a
+  Taldra-owned shared bounded I/O pool later), returning
+  `UnknownOutcome` on deadline/cancel after mutation may have started.
+- Preserve file-backed recorder durability and proof-install semantics.
+- `ThreeNodeConsensus` worker runtime remains available for Rhiza-native
+  tests; Taldra lab will migrate off it after the seam lands and the pin bumps.
+
+Until that patch merges, Taldra comparative labs may use `ThreeNodeConsensus`
+only as a temporary harness (documented in ADR-0015).
