@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
+consumer_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 
 cd "$repo_root"
 rm -rf target/package
@@ -98,4 +99,9 @@ fn main() {
 }
 EOF
 
-cargo run --quiet --manifest-path "$work_dir/consumer/Cargo.toml"
+# The extracted package sources must remain outside the workspace, but their
+# build artifacts need not be duplicated in the system temporary volume. Reuse
+# the caller's Cargo target so the full local CI gate has one bounded build
+# cache instead of compiling the dependency graph into a second multi-GiB tree.
+CARGO_TARGET_DIR="$consumer_target_dir" \
+  cargo run --quiet --manifest-path "$work_dir/consumer/Cargo.toml"

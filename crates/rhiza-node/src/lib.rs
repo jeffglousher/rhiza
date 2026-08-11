@@ -17077,6 +17077,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
         let mut recorders = Vec::<(String, Box<dyn RecorderRpc>)>::new();
+        let first = Arc::new(AtomicBool::new(true));
         for node_id in ["n1", "n2"] {
             let recorder = RecorderFileStore::new_with_membership(
                 dir.path().join("recorders").join(node_id),
@@ -17090,7 +17091,7 @@ mod tests {
             recorders.push((
                 node_id.into(),
                 Box::new(UnknownAfterFirstRecord {
-                    first: Arc::new(AtomicBool::new(true)),
+                    first: Arc::clone(&first),
                     inner: recorder,
                 }),
             ));

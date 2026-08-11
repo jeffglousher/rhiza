@@ -45,6 +45,12 @@ const _: () = assert!(
     std::mem::size_of::<LogEntry>() <= CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES as usize
 );
 const MAX_GC_CONTROL_CAS_ATTEMPTS: usize = 128;
+// Seven total attempts plus equal-jitter sleeps remain below the GCS minimum
+// 60s GCS Publisher lease while spanning multiple one-second mutation windows for
+// a simultaneous three-peer startup.
+const MAX_GC_CONTROL_THROTTLE_RETRIES: usize = 6;
+const GC_CONTROL_THROTTLE_BACKOFF_BASE_MS: u64 = 100;
+const GC_CONTROL_THROTTLE_BACKOFF_MAX_MS: u64 = 1_600;
 const GC_FORMAT_VERSION: u32 = 1;
 const GC_CONTROL_ENCODED_BYTES: u64 = 1024 * 1024;
 const DEFAULT_LEASE_MS: u64 = 60_000;
@@ -52,6 +58,7 @@ const DEFAULT_LEASE_MS: u64 = 60_000;
 // Renew well before the lease expires so that a live fetch remains fenced from
 // GC, while leaving enough room for a transient control-plane retry.
 const READER_LEASE_RENEW_DIVISOR: u64 = 3;
+const PUBLISHER_LEASE_RENEW_DIVISOR: u64 = 3;
 pub const DEFAULT_CHECKPOINT_COMPACTION_SEGMENTS: usize = 64;
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
@@ -474,6 +481,36 @@ struct GcLease {
     kind: GcLeaseKind,
     fence: u64,
     expires_at_ms: u64,
+}
+
+// Publisher operations may prove the same still-fresh lease several times per
+// checkpoint append.  Avoid rewriting the shared GC-control CAS object until
+// the last third of the lease, while still forcing a write after a fence change
+// or during an active GC barrier.
+fn publisher_lease_has_renewal_margin(lease: &GcLease, now_ms: u64, duration_ms: u64) -> bool {
+    let renewal_margin_ms = (duration_ms / PUBLISHER_LEASE_RENEW_DIVISOR).max(1);
+    lease.expires_at_ms.saturating_sub(now_ms) > renewal_margin_ms
+}
+
+fn gc_control_throttled(error: &ObjStoreError) -> bool {
+    matches!(
+        error,
+        ObjStoreError::Transport { message, .. }
+            if message.contains("429 Too Many Requests")
+                || message.contains("<Code>SlowDown</Code>")
+    )
+}
+
+fn gc_control_throttle_backoff(seed: &[u8], retry: usize) -> Duration {
+    let exponent = u32::try_from(retry).unwrap_or(u32::MAX).min(16);
+    let cap_ms = GC_CONTROL_THROTTLE_BACKOFF_BASE_MS
+        .saturating_mul(1_u64.checked_shl(exponent).unwrap_or(u64::MAX))
+        .min(GC_CONTROL_THROTTLE_BACKOFF_MAX_MS);
+    let floor_ms = (cap_ms / 2).max(1);
+    let retry_bytes = u64::try_from(retry).unwrap_or(u64::MAX).to_be_bytes();
+    let digest = LogHash::digest(&[b"rhiza-gc-control-throttle-v1", seed, &retry_bytes]);
+    let jitter = u64::from_be_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes"));
+    Duration::from_millis(floor_ms.saturating_add(jitter % (cap_ms - floor_ms + 1)))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1848,7 +1885,7 @@ async fn test_checkpoint_manifest_gate(store_identity: u64) {
 enum TestGcControlOperation {
     Load,
     Update,
-    UpdateError,
+    MutationError,
 }
 
 /// A test-only pause inside one exact GC-control operation. The gate is
@@ -1860,6 +1897,9 @@ struct TestGcControlGate {
     store_identity: u64,
     operation: TestGcControlOperation,
     injected_error: Option<ObjStoreError>,
+    injected_failures_remaining: Option<Arc<AtomicU64>>,
+    minimum_update_interval: Option<Duration>,
+    last_allowed_update: Option<Arc<Mutex<Option<std::time::Instant>>>>,
     entered: std::sync::mpsc::SyncSender<()>,
     released: Arc<std::sync::atomic::AtomicBool>,
     release_notification: Arc<tokio::sync::Notify>,
@@ -1877,6 +1917,9 @@ impl TestGcControlGate {
                 store_identity,
                 operation,
                 injected_error: None,
+                injected_failures_remaining: None,
+                minimum_update_interval: None,
+                last_allowed_update: None,
                 entered,
                 released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 release_notification: Arc::new(tokio::sync::Notify::new()),
@@ -1889,8 +1932,35 @@ impl TestGcControlGate {
         store_identity: u64,
         error: ObjStoreError,
     ) -> (Self, std::sync::mpsc::Receiver<()>) {
-        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::UpdateError);
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::MutationError);
         gate.injected_error = Some(error);
+        (gate, entered)
+    }
+
+    fn throttled_mutations(
+        store_identity: u64,
+        failures: u64,
+    ) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::MutationError);
+        gate.injected_error = Some(ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "429 Too Many Requests: <Code>SlowDown</Code>".into(),
+        });
+        gate.injected_failures_remaining = Some(Arc::new(AtomicU64::new(failures)));
+        (gate, entered)
+    }
+
+    fn rate_limited_mutations(
+        store_identity: u64,
+        interval: Duration,
+    ) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::MutationError);
+        gate.injected_error = Some(ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "429 Too Many Requests: <Code>SlowDown</Code>".into(),
+        });
+        gate.minimum_update_interval = Some(interval);
+        gate.last_allowed_update = Some(Arc::new(Mutex::new(None)));
         (gate, entered)
     }
 
@@ -1910,14 +1980,43 @@ impl TestGcControlGate {
         }
         loop {
             if self.released.load(Ordering::Acquire) {
-                return self.injected_error.clone();
+                return self.next_error();
             }
             let notified = self.release_notification.notified();
             if self.released.load(Ordering::Acquire) {
-                return self.injected_error.clone();
+                return self.next_error();
             }
             notified.await;
         }
+    }
+
+    fn next_error(&self) -> Option<ObjStoreError> {
+        if let (Some(interval), Some(last_allowed)) =
+            (self.minimum_update_interval, &self.last_allowed_update)
+        {
+            let now = std::time::Instant::now();
+            let mut last_allowed = last_allowed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let window_open = match *last_allowed {
+                Some(last) => now.duration_since(last) >= interval,
+                None => true,
+            };
+            if window_open {
+                *last_allowed = Some(now);
+                return None;
+            }
+            return self.injected_error.clone();
+        }
+        let Some(remaining) = &self.injected_failures_remaining else {
+            return self.injected_error.clone();
+        };
+        remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .ok()
+            .and_then(|_| self.injected_error.clone())
     }
 }
 
@@ -3982,6 +4081,17 @@ impl ObjectArchiveStore {
                     });
                 }
             }
+            if kind == GcLeaseKind::Publisher
+                && loaded.control.active_gc.is_none()
+                && loaded.control.leases.iter().any(|lease| {
+                    lease.lease_id == lease_id
+                        && lease.kind == kind
+                        && lease.fence == loaded.control.fence
+                        && publisher_lease_has_renewal_margin(lease, now_ms, duration_ms)
+                })
+            {
+                return Ok(());
+            }
             let expires_at_ms = now_ms.saturating_add(duration_ms);
             if let Some(lease) = loaded
                 .control
@@ -4074,7 +4184,7 @@ impl ObjectArchiveStore {
             let Some(lease) = loaded
                 .control
                 .leases
-                .iter_mut()
+                .iter()
                 .find(|lease| lease.lease_id == lease_id)
             else {
                 return Err(Error::GcLeaseMissing {
@@ -4085,6 +4195,12 @@ impl ObjectArchiveStore {
                 return Err(Error::InvalidGc(
                     "publisher proof renewal lease kind changed".into(),
                 ));
+            }
+            if loaded.control.active_gc.is_none()
+                && lease.fence == loaded.control.fence
+                && publisher_lease_has_renewal_margin(lease, loaded_at_ms, duration_ms)
+            {
+                return Ok(());
             }
             if prior_hard_deadline.is_none() {
                 let remaining_ms =
@@ -4103,6 +4219,12 @@ impl ObjectArchiveStore {
                 );
                 prior_expires_at_ms = Some(lease.expires_at_ms);
             }
+            let lease = loaded
+                .control
+                .leases
+                .iter_mut()
+                .find(|lease| lease.lease_id == lease_id)
+                .expect("validated Publisher lease remains present");
             let expires_at_ms = loaded_at_ms.saturating_add(duration_ms);
             let next_hard_deadline = loaded_at
                 .checked_add(Duration::from_millis(duration_ms))
@@ -4629,14 +4751,35 @@ impl ObjectArchiveStore {
             leases: Vec::new(),
             active_gc: None,
         };
-        match self
-            .store
-            .create(&self.gc_control_key(), serialize_gc_control(&control)?)
-            .await
-        {
-            Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
+        let bytes = serialize_gc_control(&control)?;
+        for retry in 0..=MAX_GC_CONTROL_THROTTLE_RETRIES {
+            #[cfg(test)]
+            let injected = test_gc_control_gate(
+                self.test_store_identity,
+                TestGcControlOperation::MutationError,
+            )
+            .await;
+            #[cfg(not(test))]
+            let injected: Option<ObjStoreError> = None;
+            let result = match injected {
+                Some(error) => Err(error),
+                None => {
+                    self.store
+                        .create_conditional_once(&self.gc_control_key(), &bytes)
+                        .await
+                }
+            };
+            match result {
+                Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => return Ok(()),
+                Err(error)
+                    if retry < MAX_GC_CONTROL_THROTTLE_RETRIES && gc_control_throttled(&error) =>
+                {
+                    tokio::time::sleep(gc_control_throttle_backoff(&bytes, retry)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
+        unreachable!("bounded GC-control throttle loop always returns")
     }
 
     async fn load_gc_control(&self) -> Result<LoadedGcControl> {
@@ -4659,28 +4802,46 @@ impl ObjectArchiveStore {
     }
 
     async fn update_gc_control(&self, loaded: &LoadedGcControl) -> Result<UpdateVersion> {
-        #[cfg(test)]
-        if let Some(error) = test_gc_control_gate(
-            self.test_store_identity,
-            TestGcControlOperation::UpdateError,
-        )
-        .await
-        {
-            return Err(error.into());
-        }
-        let result = self
-            .store
-            .update(
-                &self.gc_control_key(),
-                serialize_gc_control(&loaded.control)?,
-                loaded.version.clone(),
+        let bytes = serialize_gc_control(&loaded.control)?;
+        for retry in 0..=MAX_GC_CONTROL_THROTTLE_RETRIES {
+            #[cfg(test)]
+            let injected = test_gc_control_gate(
+                self.test_store_identity,
+                TestGcControlOperation::MutationError,
             )
-            .await
-            .map_err(Into::into);
-        #[cfg(test)]
-        let _ =
-            test_gc_control_gate(self.test_store_identity, TestGcControlOperation::Update).await;
-        result
+            .await;
+            #[cfg(not(test))]
+            let injected: Option<ObjStoreError> = None;
+            let result = match injected {
+                Some(error) => Err(error),
+                None => {
+                    self.store
+                        .update_conditional_once(
+                            &self.gc_control_key(),
+                            &bytes,
+                            loaded.version.clone(),
+                        )
+                        .await
+                }
+            };
+            match result {
+                Err(error)
+                    if retry < MAX_GC_CONTROL_THROTTLE_RETRIES && gc_control_throttled(&error) =>
+                {
+                    tokio::time::sleep(gc_control_throttle_backoff(&bytes, retry)).await;
+                }
+                result => {
+                    #[cfg(test)]
+                    let _ = test_gc_control_gate(
+                        self.test_store_identity,
+                        TestGcControlOperation::Update,
+                    )
+                    .await;
+                    return result.map_err(Into::into);
+                }
+            }
+        }
+        unreachable!("bounded GC-control throttle loop always returns")
     }
 
     fn expire_gc_state(&self, control: &mut GcControl, now_ms: u64) {
@@ -6201,6 +6362,152 @@ mod tests {
 
         let loaded = publisher.publish_committed(&[entry()]).await.unwrap();
         assert_eq!(loaded.manifest().tip().index(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_publisher_lease_renewals_do_not_rewrite_gc_control() {
+        let (_dir, _store, archive) = fixture();
+        let duration_ms = 60_000;
+        let now = now_ms();
+        let publisher = archive
+            .open_checkpoint_publisher(
+                "coalesced-renewal",
+                CheckpointPublisherOptions::new(duration_ms),
+            )
+            .await
+            .unwrap();
+
+        let before = archive.load_gc_control().await.unwrap();
+        publisher.renew_at(now).await.unwrap();
+        archive
+            .renew_active_publisher_gc_lease(&publisher.lease_id, duration_ms)
+            .await
+            .unwrap();
+        let after_fresh_renewals = archive.load_gc_control().await.unwrap();
+        assert_eq!(after_fresh_renewals.control, before.control);
+        assert_eq!(after_fresh_renewals.version, before.version);
+
+        let published = publisher.publish_committed(&[entry()]).await.unwrap();
+        assert_eq!(published.manifest().tip().index(), 1);
+        let after_publish = archive.load_gc_control().await.unwrap();
+        assert_eq!(after_publish.control, before.control);
+        assert_eq!(after_publish.version, before.version);
+
+        let mut expiring = after_publish;
+        let lease = expiring
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.lease_id == publisher.lease_id)
+            .unwrap();
+        lease.expires_at_ms = now.saturating_add(duration_ms / PUBLISHER_LEASE_RENEW_DIVISOR);
+        archive.update_gc_control(&expiring).await.unwrap();
+        let before_required_renewal = archive.load_gc_control().await.unwrap();
+
+        publisher.renew_at(now).await.unwrap();
+        let after_required_renewal = archive.load_gc_control().await.unwrap();
+        assert_ne!(
+            after_required_renewal.version,
+            before_required_renewal.version
+        );
+        let renewed = after_required_renewal
+            .control
+            .leases
+            .iter()
+            .find(|lease| lease.lease_id == publisher.lease_id)
+            .unwrap();
+        assert_eq!(renewed.expires_at_ms, now.saturating_add(duration_ms));
+    }
+
+    #[tokio::test]
+    async fn publisher_lease_acquisition_retries_bounded_gc_control_throttling() {
+        let (_dir, _store, archive) = fixture();
+        archive.ensure_gc_control().await.unwrap();
+        let (gate, _entered) =
+            TestGcControlGate::throttled_mutations(archive.test_store_identity, 2);
+        let release = gate.release_guard();
+        let _installed = install_test_gc_control_gate(gate);
+        drop(release);
+
+        let lease = archive
+            .acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-1".into(),
+                now_ms(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|stored| stored.lease_id == lease.lease_id));
+    }
+
+    #[tokio::test]
+    async fn three_publishers_acquire_through_one_shared_mutation_window() {
+        let (_dir, _store, archive) = fixture();
+        let (gate, _entered) = TestGcControlGate::rate_limited_mutations(
+            archive.test_store_identity,
+            Duration::from_millis(50),
+        );
+        let release = gate.release_guard();
+        let _installed = install_test_gc_control_gate(gate);
+        drop(release);
+
+        let first = archive.clone();
+        let second = archive.clone();
+        let third = archive.clone();
+        let (first, second, third) = tokio::join!(
+            first.acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-1".into(),
+                now_ms(),
+                30_000,
+            ),
+            second.acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-2".into(),
+                now_ms(),
+                30_000,
+            ),
+            third.acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-3".into(),
+                now_ms(),
+                30_000,
+            ),
+        );
+        let leases = [first.unwrap(), second.unwrap(), third.unwrap()];
+        let loaded = archive.load_gc_control().await.unwrap();
+        assert!(leases.iter().all(|expected| loaded
+            .control
+            .leases
+            .iter()
+            .any(|actual| actual.lease_id == expected.lease_id)));
+    }
+
+    #[test]
+    fn gc_control_throttle_classifier_is_narrow() {
+        assert!(gc_control_throttled(&ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "429 Too Many Requests".into(),
+        }));
+        assert!(gc_control_throttled(&ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "<Code>SlowDown</Code>".into(),
+        }));
+        assert!(!gc_control_throttled(&ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "connection reset".into(),
+        }));
+        assert!(!gc_control_throttled(&ObjStoreError::Precondition {
+            key: "gc/control.json".into(),
+        }));
     }
 
     #[tokio::test]
