@@ -4753,12 +4753,13 @@ impl ObjectArchiveStore {
                 candidate: None,
             });
         };
+        let suffix_effects = checkpoint_effect_refs_for_suffix(entries, effects, suffix_start)?;
         let mut budget = self.checkpoint_declared_decoded_budget(manifest, limits)?;
         let bytes = encode_segment(&entries[suffix_start..]);
         let record = self.checkpoint_segment_record_with_limits(
             &entries[suffix_start..],
             &bytes,
-            effects,
+            &suffix_effects,
             limits,
         )?;
         let max_decoded_bytes = budget.next_object_limit()?;
@@ -4828,14 +4829,15 @@ impl ObjectArchiveStore {
         let Some(candidate) = prepared.candidate else {
             return Ok(None);
         };
-        if candidate.record.effects != effects {
+        let suffix_start = prepared
+            .suffix_start
+            .expect("prepared append candidate has suffix");
+        let expected_effects = checkpoint_effect_refs_for_suffix(entries, effects, suffix_start)?;
+        if candidate.record.effects != expected_effects {
             return Err(Error::InvalidCheckpoint(
                 "checkpoint QEFX effect references changed before manifest publication".into(),
             ));
         }
-        let suffix_start = prepared
-            .suffix_start
-            .expect("prepared append candidate has suffix");
         self.validate_decoded_entries(&entries[suffix_start..], manifest.tip())?;
         self.verify_checkpoint_effect_refs(&candidate.record.effects)
             .await?;
@@ -5243,6 +5245,7 @@ impl ObjectArchiveStore {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidCheckpoint("checkpoint base index overflow".into()))?;
         let mut expected_hash = base_tip.hash;
+        let mut effect_indices = std::collections::BTreeSet::new();
         for record in &manifest.segments {
             if record.format_version != CHECKPOINT_SEGMENT_FORMAT_VERSION {
                 return Err(Error::UnsupportedFormatVersion {
@@ -5290,6 +5293,16 @@ impl ObjectArchiveStore {
                     "segment {} has invalid size or checksum metadata",
                     record.object_key
                 )));
+            }
+            for effect in &record.effects {
+                if effect.entry_index < record.start_index
+                    || effect.entry_index > record.end_index
+                    || !effect_indices.insert(effect.entry_index)
+                {
+                    return Err(Error::InvalidCheckpoint(
+                        "checkpoint has duplicate or out-of-segment QEFX effect references".into(),
+                    ));
+                }
             }
             ensure_restore_limit(
                 "object encoded bytes",
@@ -5837,6 +5850,41 @@ fn local_publication_suffix_start(
     Ok(Some(0))
 }
 
+fn checkpoint_effect_refs_for_suffix(
+    entries: &[LogEntry],
+    effects: &[CheckpointEffectRecord],
+    suffix_start: usize,
+) -> Result<Vec<CheckpointEffectRecord>> {
+    // The caller may replay an overlapping batch and therefore provide refs
+    // for its already-archived prefix. Validate the complete input first, but
+    // serialize only the exact new suffix in entry-index order.
+    let effects_by_index = effects
+        .iter()
+        .map(|effect| (effect.entry_index, effect))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut suffix_effects = Vec::new();
+    for entry in entries.get(suffix_start..).ok_or_else(|| {
+        Error::InvalidCheckpoint("checkpoint suffix is outside publication batch".into())
+    })? {
+        let is_external_effect = ExternalEffectCommand::decode(&entry.payload).is_ok();
+        match (is_external_effect, effects_by_index.get(&entry.index)) {
+            (true, Some(effect)) => suffix_effects.push((*effect).clone()),
+            (true, None) => {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint QEFX suffix entry has no effect reference".into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint effect reference targets a non-QEFX suffix entry".into(),
+                ));
+            }
+            (false, None) => {}
+        }
+    }
+    Ok(suffix_effects)
+}
+
 fn checkpoint_namespace(identity: &CheckpointIdentity) -> String {
     format!(
         "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}/generation-{:020}",
@@ -6037,7 +6085,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rhiza_core::{ConfigurationState, EntryType, LogAnchor, SnapshotIdentity};
+    use rhiza_core::{
+        ConfigurationState, EntryType, ExternalEffectProfile, LogAnchor, SnapshotIdentity,
+    };
     use rhiza_obj_store::{Error as ObjStoreError, ObjStoreConfig};
 
     const TEST_READER_LEASE_MS: u64 = 60_000;
@@ -8561,6 +8611,80 @@ mod tests {
         (dir, store, archive)
     }
 
+    #[tokio::test]
+    async fn overlapping_qefx_append_attaches_only_new_suffix_effects() {
+        let (_directory, _store, archive) = fixture();
+        let (first, first_chunks) = external_entry(None);
+        let first_effect = archive
+            .publish_verified_qefx_bundle(&first, &first_chunks)
+            .await
+            .unwrap();
+        archive
+            .publish_committed_with_effects(
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&first_effect),
+            )
+            .await
+            .unwrap();
+
+        let (second, second_chunks) = external_entry(Some(&first));
+        let second_effect = archive
+            .publish_verified_qefx_bundle(&second, &second_chunks)
+            .await
+            .unwrap();
+        let before_missing = archive.load_checkpoint().await.unwrap().unwrap();
+        let missing = archive
+            .publish_committed_with_effects(
+                &[first.clone(), second.clone()],
+                std::slice::from_ref(&first_effect),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            Error::InvalidCheckpoint(ref message)
+                if message == "checkpoint QEFX suffix entry has no effect reference"
+        ));
+        let after_missing = archive.load_checkpoint().await.unwrap().unwrap();
+        assert_eq!(after_missing.manifest(), before_missing.manifest());
+        assert_eq!(after_missing.version(), before_missing.version());
+
+        let loaded = archive
+            .publish_committed_with_effects(
+                &[first.clone(), second.clone()],
+                &[second_effect.clone(), first_effect.clone()],
+            )
+            .await
+            .unwrap();
+
+        let segments = loaded.manifest().segments();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].effects(), std::slice::from_ref(&first_effect));
+        assert_eq!(segments[1].effects(), std::slice::from_ref(&second_effect));
+        let effect_indices = segments
+            .iter()
+            .flat_map(|segment| segment.effects())
+            .map(CheckpointEffectRecord::entry_index)
+            .collect::<Vec<_>>();
+        assert_eq!(effect_indices, vec![first.index, second.index]);
+
+        let restored = archive.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(
+            restored.restored().suffix(),
+            &[first.clone(), second.clone()]
+        );
+        for effect in segments.iter().flat_map(|segment| segment.effects()) {
+            archive.restore_checkpoint_effect(effect).await.unwrap();
+        }
+
+        let replayed = archive
+            .publish_committed_with_effects(&[first, second], &[second_effect, first_effect])
+            .await
+            .unwrap();
+        assert_eq!(replayed.manifest(), loaded.manifest());
+        assert_eq!(replayed.version(), loaded.version());
+    }
+
     fn identity() -> CheckpointIdentity {
         CheckpointIdentity::new(
             "cluster-a",
@@ -8616,5 +8740,45 @@ mod tests {
             prev_hash: previous.hash,
             hash,
         }
+    }
+
+    fn external_entry(previous: Option<&LogEntry>) -> (LogEntry, Vec<Vec<u8>>) {
+        let index = previous.map_or(1, |entry| entry.index + 1);
+        let prev_hash = previous.map_or(LogHash::ZERO, |entry| entry.hash);
+        let chunks = vec![format!("external-effect-{index}").into_bytes()];
+        let command = ExternalEffectCommand::from_profile_bytes_and_chunks(
+            "cluster-a",
+            7,
+            3,
+            identity().config_digest(),
+            index,
+            prev_hash,
+            ExternalEffectProfile::sql(format!("sql-profile-{index}").into_bytes()),
+            &chunks,
+        )
+        .unwrap();
+        let payload = command.encode().unwrap();
+        let hash = LogEntry::calculate_hash(
+            "cluster-a",
+            index,
+            7,
+            3,
+            EntryType::Command,
+            prev_hash,
+            &payload,
+        );
+        (
+            LogEntry {
+                cluster_id: "cluster-a".into(),
+                epoch: 7,
+                config_id: 3,
+                index,
+                entry_type: EntryType::Command,
+                payload,
+                prev_hash,
+                hash,
+            },
+            chunks,
+        )
     }
 }
