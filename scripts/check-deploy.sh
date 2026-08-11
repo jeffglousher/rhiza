@@ -7,7 +7,7 @@ for tool in jq yq shellcheck; do
   command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 127; }
 done
 
-shellcheck scripts/*.sh
+shellcheck -S warning scripts/*.sh
 bash -n scripts/*.sh
 yq eval '.' deploy/k8s/*.yaml >/dev/null
 

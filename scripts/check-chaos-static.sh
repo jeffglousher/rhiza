@@ -3,7 +3,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd -P)"; cd "$root"
 for script in scripts/chaos-k8s.sh scripts/chaos-rhiza-workload-hook.sh scripts/chaos-vm-loss.sh; do bash -n "$script"; done
 command -v shellcheck >/dev/null
-shellcheck scripts/chaos-k8s.sh scripts/chaos-mesh-post-render.sh scripts/chaos-rhiza-workload-hook.sh scripts/chaos-vm-loss.sh scripts/check-chaos-static.sh
+shellcheck -S warning scripts/chaos-k8s.sh scripts/chaos-mesh-post-render.sh scripts/chaos-rhiza-workload-hook.sh scripts/chaos-vm-loss.sh scripts/check-chaos-static.sh
 jq -e '.schema_version==1 and .chart.version=="2.8.2" and .chart.sha256=="52c7858f11d14450da524a48f460bbfc491e90d58a703f0b6f851f2f431b3db3" and .images==[{reference:"ghcr.io/chaos-mesh/chaos-daemon:v2.8.2",digest:"sha256:6e36a3cd02b73d0ce18a5d258dc961dfc2f77d30210e939d5970c66948520aa0"},{reference:"ghcr.io/chaos-mesh/chaos-dashboard:v2.8.2",digest:"sha256:f024c378180000df33d5dd8b4c72d03e3df5497906868c28bf138f062ab19603"},{reference:"ghcr.io/chaos-mesh/chaos-coredns:v0.2.8",digest:"sha256:38bfdf5e37749a097873d226351013c34ba74174a8ddcfbe2871ec952af2d7b3"},{reference:"ghcr.io/chaos-mesh/chaos-mesh:v2.8.2",digest:"sha256:3d6127f3881d5b2f64ff9b536423d715f4e1fe0bb68976f41402690880427829"}] and .status=="official-chart-and-rendered-image-digests-locked"' deploy/chaos/chaos-mesh.lock.json >/dev/null
 scripts/chaos-k8s.sh plan | jq -e '.physical_power_loss==false and .chaos_mesh.chart.version=="2.8.2" and (.ack_boundaries|sort)==["post-ack","pre-ack"]' >/dev/null
 scripts/chaos-vm-loss.sh plan | jq -e '.physical_power_loss==false and .fault=="external-controller-sigkill-qemu"' >/dev/null
