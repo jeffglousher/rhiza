@@ -250,15 +250,6 @@ impl RhizaClient {
                 "endpoint must not be empty",
             ));
         }
-        if endpoints
-            .iter()
-            .enumerate()
-            .any(|(index, endpoint)| endpoints[..index].contains(endpoint))
-        {
-            return Err(ClientError::invalid_configuration(
-                "endpoint URLs must be unique",
-            ));
-        }
         let bearer_token = bearer_token.into();
         if bearer_token.is_empty() {
             return Err(ClientError::invalid_configuration(
@@ -284,6 +275,16 @@ impl RhizaClient {
         &self,
         snapshot: &rhiza_tuner::RoutingSnapshot,
     ) -> Result<(), ClientError> {
+        if self
+            .endpoints
+            .iter()
+            .enumerate()
+            .any(|(index, endpoint)| self.endpoints[..index].contains(endpoint))
+        {
+            return Err(ClientError::invalid_configuration(
+                "routing tuner requires unique endpoint URLs",
+            ));
+        }
         if snapshot.endpoints().len() != self.endpoints.len()
             || self
                 .endpoints
@@ -1574,6 +1575,19 @@ mod tests {
                 reordered,
             )
             .is_err());
+
+        let duplicate_client = RhizaClient::new(
+            vec!["http://first".into(), "http://first".into()],
+            "client-secret",
+        )
+        .unwrap();
+        let duplicate_snapshot = routing_snapshot("http://first", "http://second");
+        assert!(duplicate_client
+            .with_routing_tuner(
+                Arc::new(rhiza_tuner::RoutingTuner::new(Default::default())),
+                duplicate_snapshot,
+            )
+            .is_err());
     }
 
     #[cfg(feature = "tuner")]
@@ -2648,7 +2662,7 @@ mod tests {
             vec!["http://duplicate".into(), "http://duplicate".into()],
             "token",
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]

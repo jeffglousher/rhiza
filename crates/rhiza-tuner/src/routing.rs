@@ -340,6 +340,7 @@ struct RoutingCounters {
     plan_execution_mismatches: AtomicU64,
     topology_mismatches: AtomicU64,
     ticket_replays: AtomicU64,
+    observation_admission_shed: AtomicU64,
     kill_switch_fallbacks: AtomicU64,
 }
 
@@ -439,6 +440,13 @@ impl RoutingTuner {
         }
     }
 
+    /// Number of plans forced to static routing because observation capacity was full.
+    pub fn observation_admission_shed_count(&self) -> u64 {
+        self.counters
+            .observation_admission_shed
+            .load(Ordering::Relaxed)
+    }
+
     pub fn plan(
         &self,
         snapshot: &RoutingSnapshot,
@@ -481,8 +489,9 @@ impl RoutingTuner {
         state
             .pending
             .retain(|_, pending| pending.expires_at_ms >= now);
+        let observation_admitted = state.pending.len() < MAX_PENDING_TICKETS;
         let exploration = stage.exploration_enabled();
-        let candidate = if state_available {
+        let candidate = if state_available && observation_admitted {
             select_candidate(
                 &mut state.arms,
                 &eligible_order,
@@ -500,6 +509,7 @@ impl RoutingTuner {
             self.config.canary_basis_points,
         );
         let proposer_applied = state_available
+            && observation_admitted
             && !killed
             && match stage {
                 RolloutStage::ProposerCanary | RolloutStage::HedgeCanary => canary,
@@ -545,25 +555,31 @@ impl RoutingTuner {
                 _ => 0.0,
             }
         };
-        state.next_ticket = state.next_ticket.wrapping_add(1);
-        let id = state.next_ticket;
-        while state.pending.len() >= MAX_PENDING_TICKETS {
-            state.pending.pop_first();
-        }
-        state.pending.insert(
-            id,
-            Pending {
-                identity: snapshot.identity().clone(),
-                topology_generation: snapshot.topology_generation(),
-                correlation_id: correlation_id.into(),
-                first_actual: actual_order[0].clone(),
-                first_model: model_order[0].clone(),
-                stage,
-                applied: proposer_applied,
-                learnable,
-                expires_at_ms: now.saturating_add(self.config.ticket_ttl.as_millis() as u64),
-            },
-        );
+        let id = if observation_admitted {
+            state.next_ticket = state.next_ticket.wrapping_add(1).max(1);
+            let id = state.next_ticket;
+            state.pending.insert(
+                id,
+                Pending {
+                    identity: snapshot.identity().clone(),
+                    topology_generation: snapshot.topology_generation(),
+                    correlation_id: correlation_id.into(),
+                    first_actual: actual_order[0].clone(),
+                    first_model: model_order[0].clone(),
+                    stage,
+                    applied: proposer_applied,
+                    learnable,
+                    expires_at_ms: now.saturating_add(self.config.ticket_ttl.as_millis() as u64),
+                },
+            );
+            id
+        } else {
+            self.counters
+                .observation_admission_shed
+                .fetch_add(1, Ordering::Relaxed);
+            // Zero is reserved for a static plan whose observation was not admitted.
+            0
+        };
         RoutingPlan {
             actual_order,
             model_order,
@@ -591,6 +607,9 @@ impl RoutingTuner {
                 return self.censored(CensorReason::RoutingStateUnavailable);
             }
         };
+        if ticket.id == 0 {
+            return self.censored(CensorReason::ActionNotApplied);
+        }
         let Some(pending) = state.pending.remove(&ticket.id) else {
             return self.censored(CensorReason::UnknownTicket);
         };
@@ -1065,12 +1084,15 @@ mod tests {
 
     #[test]
     fn pending_observation_tickets_are_bounded() {
-        let tuner = RoutingTuner::new(RoutingConfig::default());
+        let tuner = RoutingTuner::with_stage(RoutingConfig::default(), RolloutStage::DefaultOn);
         let snapshot = snapshot(1);
         let first = tuner.plan(&snapshot, request(), "first");
-        for index in 0..(MAX_PENDING_TICKETS + 32) {
+        for index in 1..MAX_PENDING_TICKETS {
             tuner.plan(&snapshot, request(), format!("request-{index}"));
         }
+        let overflow = tuner.plan(&snapshot, request(), "overflow");
+        assert!(!overflow.proposer_applied);
+        assert_eq!(overflow.actual_order, snapshot.static_order());
         assert_eq!(
             tuner.state.lock().unwrap().pending.len(),
             MAX_PENDING_TICKETS
@@ -1081,8 +1103,18 @@ mod tests {
                 &snapshot,
                 trace("first", "a", Duration::from_millis(1)),
             ),
-            ObservationResult::Censored(CensorReason::UnknownTicket),
+            ObservationResult::Updated,
         );
+        assert_eq!(
+            tuner.observe(
+                overflow.ticket,
+                &snapshot,
+                trace("overflow", "a", Duration::from_millis(1)),
+            ),
+            ObservationResult::Censored(CensorReason::ActionNotApplied),
+        );
+        assert_eq!(tuner.observation_admission_shed_count(), 1);
+        assert_eq!(tuner.metrics().ticket_replays, 0);
     }
 
     #[test]

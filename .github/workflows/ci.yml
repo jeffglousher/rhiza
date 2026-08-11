@@ -166,6 +166,12 @@ jobs:
             -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
             -p rhiza-archive -p rhiza-sql -p rhiza-graph -p rhiza-kv -p rhiza-node -p rhizadb \
             -p rhiza-client -p rhiza-cli -p rhiza-tuner
+      - name: Verify legacy tuner rollout feature defaults
+        run: |
+          for feature in shadow proposer-canary hedge-canary default-on; do
+            cargo test --locked -p rhiza-tuner --no-default-features --features "$feature" \
+              rollout::tests::legacy_feature_default_is_preserved --lib
+          done
       - run: cargo test --locked -p rhiza-quepaxa --features test-hooks
       - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
