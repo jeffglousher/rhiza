@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-required_commands=(cargo yq)
+required_commands=(cargo rustup yq)
 for command_name in "${required_commands[@]}"; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "required CI tool is missing: $command_name" >&2
@@ -30,6 +30,12 @@ run() {
 }
 
 run cargo fmt --all -- --check
+run rustup target add --toolchain stable x86_64-pc-windows-msvc
+stable_rustc_path="$(rustup which --toolchain stable rustc)"
+run mkdir -p target
+run "$stable_rustc_path" --edition=2024 --crate-type=lib \
+  --target=x86_64-pc-windows-msvc scripts/check-anchored-fs-portable.rs \
+  -o target/check-anchored-fs-portable.rlib
 run cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc
 run scripts/e2e-fast.sh
 run cargo clippy --locked --all-targets "${package_args[@]}" -- -D warnings

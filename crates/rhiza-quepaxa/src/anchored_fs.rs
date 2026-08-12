@@ -494,6 +494,15 @@ pub(crate) use anchored::AnchoredDir;
         target_pointer_width = "64"
     )
 )))]
+use crate::{Error, Result};
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "64"
+    )
+)))]
 #[derive(Debug)]
 pub(crate) struct AnchoredDir;
 
