@@ -2026,7 +2026,7 @@ impl CheckpointCoordinator {
                 create_runtime_checkpoint_snapshot(runtime, target, target_hash, &configuration)?;
             (target, snapshot, fence)
         };
-        self.flush_runtime_inner(runtime, target, true).await?;
+        self.flush_runtime_inner(runtime, target, false).await?;
         let anchor = snapshot.anchor.clone();
         self.publisher
             .publish_checkpoint_snapshot(anchor.clone(), &snapshot.archive_bytes)
