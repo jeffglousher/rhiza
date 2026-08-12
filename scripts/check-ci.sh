@@ -31,6 +31,7 @@ run() {
 
 run cargo fmt --all -- --check
 run cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc
+run scripts/e2e-fast.sh
 run cargo clippy --locked --all-targets "${package_args[@]}" -- -D warnings
 run cargo test --locked --all-targets "${package_args[@]}"
 run cargo test --locked -p rhiza-node --features graph --lib \
@@ -63,6 +64,7 @@ run bash -n \
   scripts/check-chaos-static.sh \
   scripts/tuner-monitor.sh \
   scripts/check-tuner-monitor-static.sh \
+  scripts/e2e-fast.sh \
   scripts/check-workspace-packages.sh \
   scripts/check-quepaxa-package.sh \
   scripts/check-ci.sh

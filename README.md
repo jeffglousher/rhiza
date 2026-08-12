@@ -707,6 +707,20 @@ and a concurrently referenced old generation can otherwise be lost.
 
 ## Vind E2E
 
+For the normal edit/test loop, run the process-level fast E2E first:
+
+```bash
+scripts/e2e-fast.sh
+```
+
+It runs three real local Recorder servers over postcard-rpc/TCP, performs an
+idempotent write through the public client path, checks retryable Recorder
+`UnknownOutcome`, and verifies that a voter behind a compacted shared
+checkpoint exits so orchestration can rejoin it from the verified snapshot.
+It has a 90-second cold-cache budget and normally completes much faster with a
+warm Cargo target. It intentionally does not build an image or claim
+Kubernetes, GCS, or Chaos Mesh qualification.
+
 The local harness requires Docker, `kubectl`, `vcluster` (vind), `jq`, `yq`, and
 OpenSSL:
 
