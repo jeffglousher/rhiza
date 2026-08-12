@@ -744,9 +744,7 @@ fn protocol_post_failover(
                             return Err(error);
                         };
                         thread::sleep(retry_delay.min(remaining));
-                        retry_delay = retry_delay
-                            .saturating_mul(2)
-                            .min(AMBIGUOUS_WRITE_RETRY_MAX);
+                        retry_delay = retry_delay.saturating_mul(2).min(AMBIGUOUS_WRITE_RETRY_MAX);
                     }
                 }
                 Err(error) => return Err(error),
@@ -1532,7 +1530,11 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 bodies.push(read_request_body(&mut stream));
                 if attempt < 6 {
-                    respond(&mut stream, "503 Service Unavailable", r#"{"error":"retry"}"#);
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        r#"{"error":"retry"}"#,
+                    );
                 } else {
                     respond(&mut stream, "200 OK", r#"{"applied_index":1,"results":[]}"#);
                 }

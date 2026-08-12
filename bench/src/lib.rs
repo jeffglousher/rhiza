@@ -85,9 +85,7 @@ impl Config {
             );
         }
         if self.d1_exact_write && self.endpoints.len() != 1 {
-            return Err(
-                "--d1-exact-write requires exactly one stable Service endpoint".into(),
-            );
+            return Err("--d1-exact-write requires exactly one stable Service endpoint".into());
         }
         if self.table.is_empty()
             || !self
