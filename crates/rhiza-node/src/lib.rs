@@ -78,9 +78,9 @@ use rhiza_quepaxa::{EffectBundleFinalizeRequest, RecorderEffectBundle};
 #[cfg(feature = "sql")]
 use rhiza_sql::{
     encode_put_request, encode_sql_command, restore_snapshot_file, QwalEffectManifestV4,
-    RecoverySnapshot, RequestConflict, RequestOutcome, SqlBatchMember, SqlCommand,
-    SqlCommandResult, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
-    VerifiedQwalEffectBundleV4, MAX_QWAL_V3_RECEIPTS, MAX_SQL_STATEMENTS,
+    RecoverySnapshot, RequestOutcome, SqlBatchMember, SqlCommand, SqlCommandResult, SqlQueryResult,
+    SqlStatement, SqlValue, SqliteStateMachine, VerifiedQwalEffectBundleV4, MAX_QWAL_V3_RECEIPTS,
+    MAX_SQL_STATEMENTS,
 };
 #[cfg(not(feature = "sql"))]
 type SqlCommandResult = ();
@@ -2613,12 +2613,17 @@ impl HttpRecorderClient {
         let outcome = loop {
             match context.check() {
                 Ok(()) => {}
-                Err(_) if mutating => return Err(rhiza_quepaxa::Error::UnknownOutcome),
+                Err(rhiza_quepaxa::Error::RpcCancelled) if mutating => {
+                    return Err(http_mutation_unknown("http_context_cancelled"));
+                }
+                Err(rhiza_quepaxa::Error::RpcDeadlineExceeded) if mutating => {
+                    return Err(http_mutation_unknown("http_context_deadline"));
+                }
                 Err(error) => return Err(error),
             }
             let Some(remaining) = context.remaining() else {
                 return Err(if mutating {
-                    rhiza_quepaxa::Error::UnknownOutcome
+                    http_mutation_unknown("http_context_deadline")
                 } else {
                     rhiza_quepaxa::Error::RpcDeadlineExceeded
                 });
@@ -2628,7 +2633,7 @@ impl HttpRecorderClient {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(if mutating {
-                        rhiza_quepaxa::Error::UnknownOutcome
+                        http_mutation_unknown("http_worker_disconnect")
                     } else {
                         rhiza_quepaxa::Error::Io("recorder HTTP worker closed".into())
                     });
@@ -2646,14 +2651,14 @@ impl HttpRecorderClient {
             }
             HttpCall::Transport(error) => {
                 return Err(if mutating {
-                    rhiza_quepaxa::Error::UnknownOutcome
+                    http_mutation_unknown("http_transport")
                 } else {
                     rhiza_quepaxa::Error::Io(error)
                 });
             }
             HttpCall::Decode(error) => {
                 return Err(if mutating {
-                    rhiza_quepaxa::Error::UnknownOutcome
+                    http_mutation_unknown("http_decode_or_envelope")
                 } else {
                     rhiza_quepaxa::Error::Decode(error)
                 });
@@ -2661,18 +2666,11 @@ impl HttpRecorderClient {
         };
         if wire.version != RECORDER_WIRE_VERSION {
             return Err(if mutating {
-                rhiza_quepaxa::Error::UnknownOutcome
+                http_mutation_unknown("http_decode_or_envelope")
             } else {
                 rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into())
             });
         }
-        let envelope_mismatch = || {
-            if mutating {
-                rhiza_quepaxa::Error::UnknownOutcome
-            } else {
-                rhiza_quepaxa::Error::Decode("recorder HTTP status/envelope mismatch".into())
-            }
-        };
         let result = match wire.body {
             RecorderV2Result::Ok(value) if status == StatusCode::OK => Ok(value),
             RecorderV2Result::Rejected(reason) if status == StatusCode::CONFLICT => {
@@ -2690,14 +2688,29 @@ impl HttpRecorderClient {
             {
                 Err(recorder_error_from_wire(error))
             }
-            _ => Err(envelope_mismatch()),
+            _ if mutating => return Err(http_mutation_unknown("http_decode_or_envelope")),
+            _ => Err(rhiza_quepaxa::Error::Decode(
+                "recorder HTTP status/envelope mismatch".into(),
+            )),
         };
         if mutating {
-            result.map_err(preserve_mutation_outcome)
+            result.map_err(|error| {
+                let error = preserve_mutation_outcome(error);
+                if matches!(error, rhiza_quepaxa::Error::UnknownOutcome) {
+                    http_mutation_unknown("http_server_wire")
+                } else {
+                    error
+                }
+            })
         } else {
             result
         }
     }
+}
+
+fn http_mutation_unknown(source: &'static str) -> rhiza_quepaxa::Error {
+    eprintln!("node recorder unknown outcome source={source} mutating=true");
+    rhiza_quepaxa::Error::UnknownOutcome
 }
 
 impl RecorderRpc for HttpRecorderClient {
@@ -3654,7 +3667,7 @@ fn classify_pending_request(
     if members[canonical].payload == members[index].payload {
         Ok(Some(canonical))
     } else {
-        Err(NodeError::InvalidRequest(format!(
+        Err(NodeError::RequestConflict(format!(
             "request id {request_id:?} was reused with another command in the same writer batch"
         )))
     }
@@ -5212,13 +5225,11 @@ async fn coordinate_write(
             "durability confirmation is unavailable",
             None,
         ),
-        Err(_) => client_error_response(
+        Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "write_outcome_unknown",
-            true,
-            "write was admitted but its durable outcome was not observed before the response deadline; retry the same request id",
-            None,
-        ),
+            Json(ClientErrorResponse::ambiguous_mutation()),
+        )
+            .into_response(),
     }
 }
 
@@ -6169,7 +6180,6 @@ fn node_error_response(error: NodeError) -> Response {
         NodeError::InvalidSqlStatement {
             statement_index, ..
         } => (StatusCode::BAD_REQUEST, Some(*statement_index)),
-        #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, None),
         NodeError::PreconditionFailed(_) => (StatusCode::CONFLICT, None),
         NodeError::SnapshotRequired(_)
@@ -6201,12 +6211,15 @@ fn node_error_response(error: NodeError) -> Response {
         status,
         classification.code(),
         classification.retryable(),
-        node_error_message(status),
+        node_error_message(&error, status),
         statement_index,
     )
 }
 
-fn node_error_message(status: StatusCode) -> &'static str {
+fn node_error_message(error: &NodeError, status: StatusCode) -> &'static str {
+    if matches!(error, NodeError::Unavailable(message) if message == AMBIGUOUS_MUTATION_MESSAGE) {
+        return AMBIGUOUS_MUTATION_MESSAGE;
+    }
     match status {
         StatusCode::BAD_REQUEST => "request could not be processed",
         StatusCode::CONFLICT => "request conflicts with current state",
@@ -7185,8 +7198,7 @@ pub enum NodeError {
     },
     Contention(String),
     WinnerLimitExceeded,
-    #[cfg(feature = "sql")]
-    RequestConflict(RequestConflict),
+    RequestConflict(String),
     InvalidRequest(String),
     #[cfg(feature = "sql")]
     InvalidSqlStatement {
@@ -7195,6 +7207,13 @@ pub enum NodeError {
     },
     PreconditionFailed(String),
     Fatal(String),
+}
+
+const AMBIGUOUS_MUTATION_MESSAGE: &str =
+    "mutation outcome is ambiguous; retry only the identical request_id and payload";
+
+fn ambiguous_mutation_error() -> NodeError {
+    NodeError::Unavailable(AMBIGUOUS_MUTATION_MESSAGE.into())
 }
 
 impl fmt::Display for NodeError {
@@ -7235,8 +7254,9 @@ impl fmt::Display for NodeError {
             ),
             Self::Contention(message) => write!(f, "node contention: {message}"),
             Self::WinnerLimitExceeded => write!(f, "foreign winner retry limit exceeded"),
-            #[cfg(feature = "sql")]
-            Self::RequestConflict(conflict) => conflict.fmt(f),
+            Self::RequestConflict(conflict) => {
+                write!(f, "request id reused with different payload: {conflict}")
+            }
             Self::InvalidRequest(message) => write!(f, "invalid request: {message}"),
             #[cfg(feature = "sql")]
             Self::InvalidSqlStatement {
@@ -7260,10 +7280,12 @@ impl NodeError {
             Self::InvalidRequest(_) => ("invalid_request", false),
             #[cfg(feature = "sql")]
             Self::InvalidSqlStatement { .. } => ("invalid_request", false),
-            #[cfg(feature = "sql")]
             Self::RequestConflict(_) => ("request_conflict", false),
             Self::PreconditionFailed(_) => ("precondition_failed", false),
             Self::SnapshotRequired(_) => ("snapshot_required", false),
+            Self::Unavailable(message) if message == AMBIGUOUS_MUTATION_MESSAGE => {
+                ("ambiguous_mutation", true)
+            }
             Self::Unavailable(_) => ("unavailable", true),
             Self::OutcomeUnknown(_) => ("write_outcome_unknown", true),
             Self::StartupCancelled { .. } => ("unavailable", true),
@@ -7334,6 +7356,17 @@ pub struct ClientErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+}
+
+impl ClientErrorResponse {
+    fn ambiguous_mutation() -> Self {
+        Self {
+            code: "ambiguous_mutation".into(),
+            retryable: true,
+            message: AMBIGUOUS_MUTATION_MESSAGE.into(),
+            statement_index: None,
+        }
+    }
 }
 
 #[cfg(feature = "sql")]
@@ -8906,6 +8939,31 @@ pub struct NodeRuntime {
     _data_root_lock: fs::File,
 }
 
+#[derive(Clone, Copy)]
+enum ConsensusDiagnostic {
+    ReceiptBackedMutation,
+    MaterializerInspect,
+    ReadBarrierInspect,
+    ReadBarrierPropose,
+    Other,
+}
+
+impl ConsensusDiagnostic {
+    const fn fields(self) -> (&'static str, &'static str, Option<bool>) {
+        match self {
+            Self::ReceiptBackedMutation => (
+                "receipt_backed_mutation_propose",
+                "mutating_propose",
+                Some(true),
+            ),
+            Self::MaterializerInspect => ("materializer_inspect", "read_inspect", Some(false)),
+            Self::ReadBarrierInspect => ("read_barrier", "read_inspect", Some(false)),
+            Self::ReadBarrierPropose => ("read_barrier", "mutating_propose", Some(true)),
+            Self::Other => ("other", "unknown", None),
+        }
+    }
+}
+
 #[cfg(feature = "sql")]
 struct PreparedExternalSqlBundleResolution {
     consensus: Arc<ThreeNodeConsensus>,
@@ -9351,7 +9409,13 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| {
+                    self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    )
+                })?;
             self.persist_entry(&entry, slot, last_hash)?;
             if let Some(record) = self.check_graph_request(command.request_id(), &payload)? {
                 return Ok(GraphMutationOutcome::from_record(record));
@@ -9495,7 +9559,13 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| {
+                    self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    )
+                })?;
             self.persist_entry(&entry, slot, last_hash)?;
             if let Some(record) = self.check_kv_request(command.request_id(), &payload)? {
                 return Ok(KvMutationOutcome::from_record(record));
@@ -10128,7 +10198,11 @@ impl NodeRuntime {
                         }
                         continue 'sql_batches;
                     }
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    );
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10162,7 +10236,11 @@ impl NodeRuntime {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    );
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10597,7 +10675,11 @@ impl NodeRuntime {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    );
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10799,7 +10881,11 @@ impl NodeRuntime {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    );
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10914,9 +11000,12 @@ impl NodeRuntime {
                 (command.request_id(), members[*index].payload.as_slice())
             })
             .collect::<Vec<_>>();
-        let lookups = kv
-            .check_requests(&requests)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+        let lookups = kv.check_requests(&requests).map_err(|error| match error {
+            rhiza_kv::Error::RequestConflict { .. } => {
+                NodeError::RequestConflict(error.to_string())
+            }
+            other => NodeError::InvalidRequest(other.to_string()),
+        })?;
         if lookups.len() != indices.len() {
             return Err(self.latch(NodeError::Invariant(
                 "KV bulk receipt lookup returned a misaligned result vector".into(),
@@ -10925,11 +11014,14 @@ impl NodeRuntime {
         Ok(indices
             .iter()
             .copied()
-            .zip(
-                lookups.into_iter().map(|lookup| {
-                    lookup.map_err(|error| NodeError::InvalidRequest(error.to_string()))
-                }),
-            )
+            .zip(lookups.into_iter().map(|lookup| {
+                lookup.map_err(|error| match error {
+                    rhiza_kv::Error::RequestConflict { .. } => {
+                        NodeError::RequestConflict(error.to_string())
+                    }
+                    other => NodeError::InvalidRequest(other.to_string()),
+                })
+            }))
             .collect())
     }
 
@@ -11022,7 +11114,13 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| {
+                    self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    )
+                })?;
             let sql_result = self.persist_sql_entry_profiled(
                 &entry,
                 slot,
@@ -11082,7 +11180,7 @@ impl NodeRuntime {
                 return Err(NodeError::ResourceExhausted(message));
             }
             if let rhiza_sql::Error::RequestConflict(conflict) = error {
-                return Err(NodeError::RequestConflict(conflict));
+                return Err(NodeError::RequestConflict(conflict.to_string()));
             }
             let message = error.to_string();
             let statement_index = first_invalid_sql_statement(command, |prefix| {
@@ -11137,7 +11235,13 @@ impl NodeRuntime {
             .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
         self.consensus
             .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
-            .map_err(|error| self.map_consensus_error(error))?;
+            .map_err(|error| {
+                self.map_consensus_error_at(
+                    error,
+                    ConsensusDiagnostic::ReceiptBackedMutation,
+                    Some(intended_slot),
+                )
+            })?;
         Ok(payload)
     }
 
@@ -11198,7 +11302,13 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| {
+                    self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    )
+                })?;
             self.persist_sql_entry_profiled(
                 &entry,
                 slot,
@@ -11247,7 +11357,9 @@ impl NodeRuntime {
     #[cfg(feature = "sql")]
     fn map_sql_batch_member_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
-            rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
+            rhiza_sql::Error::RequestConflict(conflict) => {
+                NodeError::RequestConflict(conflict.to_string())
+            }
             rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_sql::Error::InvalidCommand(message) | rhiza_sql::Error::Sqlite(message) => {
                 NodeError::InvalidSqlStatement {
@@ -11342,8 +11454,13 @@ impl NodeRuntime {
         match self
             .consensus
             .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-            .map_err(|error| self.map_consensus_error(error))?
-        {
+            .map_err(|error| {
+                self.map_consensus_error_at(
+                    error,
+                    ConsensusDiagnostic::MaterializerInspect,
+                    Some(slot),
+                )
+            })? {
             DecisionInspection::Committed(entry) => {
                 self.persist_entry(&entry, slot, last_hash)?;
                 Ok(true)
@@ -12155,8 +12272,13 @@ impl NodeRuntime {
                 match self
                     .consensus
                     .inspect_context_read_fence_at(&self.consensus_context(), slot, last_hash)
-                    .map_err(|error| self.map_consensus_error(error))?
-                {
+                    .map_err(|error| {
+                        self.map_consensus_error_at(
+                            error,
+                            ConsensusDiagnostic::ReadBarrierInspect,
+                            Some(slot),
+                        )
+                    })? {
                     CertifiedDecisionInspection::Committed(certified) => {
                         DecisionInspection::Committed(certified.entry)
                     }
@@ -12167,7 +12289,13 @@ impl NodeRuntime {
             } else {
                 self.consensus
                     .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-                    .map_err(|error| self.map_consensus_error(error))?
+                    .map_err(|error| {
+                        self.map_consensus_error_at(
+                            error,
+                            ConsensusDiagnostic::ReadBarrierInspect,
+                            Some(slot),
+                        )
+                    })?
             };
             match inspection {
                 DecisionInspection::Committed(entry) => {
@@ -12194,8 +12322,13 @@ impl NodeRuntime {
                                 slot,
                                 last_hash,
                             )
-                            .map_err(|error| self.map_consensus_error(error))?
-                        {
+                            .map_err(|error| {
+                                self.map_consensus_error_at(
+                                    error,
+                                    ConsensusDiagnostic::ReadBarrierInspect,
+                                    Some(slot),
+                                )
+                            })? {
                             CertifiedDecisionInspection::Committed(certified) => {
                                 DecisionInspection::Committed(certified.entry)
                             }
@@ -12208,7 +12341,13 @@ impl NodeRuntime {
                     } else {
                         self.consensus
                             .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-                            .map_err(|error| self.map_consensus_error(error))?
+                            .map_err(|error| {
+                                self.map_consensus_error_at(
+                                    error,
+                                    ConsensusDiagnostic::ReadBarrierInspect,
+                                    Some(slot),
+                                )
+                            })?
                     };
                     match re_inspection {
                         DecisionInspection::Committed(entry) => {
@@ -12230,7 +12369,13 @@ impl NodeRuntime {
                                     last_hash,
                                     Command::new(CommandKind::ReadBarrier, Vec::new()),
                                 )
-                                .map_err(|error| self.map_consensus_error(error))?;
+                                .map_err(|error| {
+                                    self.map_consensus_error_at(
+                                        error,
+                                        ConsensusDiagnostic::ReadBarrierPropose,
+                                        Some(slot),
+                                    )
+                                })?;
                             self.persist_entry(&entry, slot, last_hash)?;
                         }
                         DecisionInspection::Unavailable => {
@@ -12280,7 +12425,12 @@ impl NodeRuntime {
         };
         graph
             .check_request(request_id, payload)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))
+            .map_err(|error| match error {
+                rhiza_graph::Error::RequestConflict { .. } => {
+                    NodeError::RequestConflict(error.to_string())
+                }
+                other => NodeError::InvalidRequest(other.to_string()),
+            })
     }
 
     #[cfg(feature = "kv")]
@@ -12301,7 +12451,12 @@ impl NodeRuntime {
             });
         };
         kv.check_request(request_id, payload)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))
+            .map_err(|error| match error {
+                rhiza_kv::Error::RequestConflict { .. } => {
+                    NodeError::RequestConflict(error.to_string())
+                }
+                other => NodeError::InvalidRequest(other.to_string()),
+            })
     }
 
     fn ensure_materialized_tip(&self) -> Result<(LogIndex, LogHash), NodeError> {
@@ -12629,7 +12784,9 @@ impl NodeRuntime {
     #[cfg(feature = "sql")]
     fn map_sqlite_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
-            rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
+            rhiza_sql::Error::RequestConflict(conflict) => {
+                NodeError::RequestConflict(conflict.to_string())
+            }
             rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_sql::Error::InvalidCommand(message)
                 if message == "external SQL batch produced no successful member" =>
@@ -12689,6 +12846,25 @@ impl NodeRuntime {
     }
 
     fn map_consensus_error(&self, error: rhiza_quepaxa::Error) -> NodeError {
+        self.map_consensus_error_at(error, ConsensusDiagnostic::Other, None)
+    }
+
+    fn map_consensus_error_at(
+        &self,
+        error: rhiza_quepaxa::Error,
+        diagnostic: ConsensusDiagnostic,
+        slot: Option<LogIndex>,
+    ) -> NodeError {
+        if matches!(&error, rhiza_quepaxa::Error::UnknownOutcome) {
+            let (origin, operation, mutation_started) = diagnostic.fields();
+            eprintln!(
+                "node consensus unknown outcome origin={} slot={} operation={} mutation_started={}",
+                origin,
+                slot.map_or_else(|| "unknown".to_owned(), |slot| slot.to_string()),
+                operation,
+                mutation_started.map_or("unknown".to_owned(), |started| started.to_string()),
+            );
+        }
         match error {
             rhiza_quepaxa::Error::NoQuorum
             | rhiza_quepaxa::Error::ProposeFailed
@@ -12702,7 +12878,22 @@ impl NodeRuntime {
             // idempotent Recorder mutation. The next operation revisits the
             // same consensus slot and reconciles the durable result; a lost
             // reply is not contradictory storage evidence and must not make
-            // the whole runtime permanently fatal.
+            // the whole runtime permanently fatal. Receipt-backed mutations
+            // surface this as a retryable ambiguous mutation to the caller.
+            rhiza_quepaxa::Error::UnknownOutcome
+                if matches!(diagnostic, ConsensusDiagnostic::ReceiptBackedMutation) =>
+            {
+                ambiguous_mutation_error()
+            }
+            rhiza_quepaxa::Error::UnknownOutcome
+                if matches!(
+                    diagnostic,
+                    ConsensusDiagnostic::MaterializerInspect
+                        | ConsensusDiagnostic::ReadBarrierInspect
+                ) =>
+            {
+                self.latch(NodeError::Reconciliation(error.to_string()))
+            }
             rhiza_quepaxa::Error::UnknownOutcome => NodeError::OutcomeUnknown(error.to_string()),
             rhiza_quepaxa::Error::EffectBundleConflict
             | rhiza_quepaxa::Error::EffectBundleInvalid(_)
@@ -12968,9 +13159,9 @@ mod tests {
     use axum::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
 
     use rhiza_core::{
-        Command, CommandKind, ConfigurationState, EntryType, ErrorCategory, ErrorClassification,
-        ExecutionProfile, ExternalEffectCommand, LogAnchor, LogEntry, LogHash, RecoveryAnchor,
-        SnapshotIdentity, StoredCommand,
+        ClusterId, Command, CommandKind, ConfigId, ConfigurationState, EntryType, Epoch,
+        ErrorCategory, ErrorClassification, ExecutionProfile, ExternalEffectCommand, LogAnchor,
+        LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
@@ -12978,8 +13169,9 @@ mod tests {
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
     use rhiza_quepaxa::{
-        AcceptedValue, DecisionProof, Membership, Proposal, ProposalPriority, RecordRequest,
-        RecordSummary, RecorderFileStore, RecorderRpc, RecorderSummary, ThreeNodeConsensus,
+        AcceptedValue, DecisionProof, EffectBundleBinding, Membership, Proposal, ProposalPriority,
+        RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc, RecorderRpcContext,
+        RecorderSummary, ThreeNodeConsensus,
     };
     #[cfg(all(feature = "sql", unix))]
     use std::os::unix::fs::PermissionsExt;
@@ -13011,11 +13203,11 @@ mod tests {
     use super::{
         client_authenticated, next_sync_flush_retry, post,
         retain_peer_permit_until_response_body_complete, retryable_sync_flush_error,
-        run_read_operation, sql_query_http_response, valid_recorder_record, Body, DurabilityError,
-        Duration, FileLogStore, HeaderMap, Instant, Json, NodeError, ReadConsistency, Request,
-        Response, Router, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler,
-        MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL,
-        VERSION_HEADER,
+        run_read_operation, sql_query_http_response, valid_recorder_record, Body,
+        ConsensusDiagnostic, DurabilityError, Duration, FileLogStore, HeaderMap, Instant, Json,
+        NodeError, ReadConsistency, Request, Response, Router, SqlCommand, SqlQueryResponse,
+        SqlStatement, SqlValue, SqlWriteProfiler, AMBIGUOUS_MUTATION_MESSAGE, MAX_COMMAND_BYTES,
+        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
     };
 
     struct PendingThenDataBody {
@@ -13051,6 +13243,141 @@ mod tests {
         recorder: RecorderFileStore,
         started: mpsc::SyncSender<()>,
         gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    /// Test-only recorder wrapper for the receipt-boundary replay case: a
+    /// certified install becomes durable, but its acknowledgement is lost.
+    struct PersistThenUnknownInstallRecorder {
+        inner: RecorderFileStore,
+        remaining_unknown_installs: Arc<AtomicUsize>,
+        remaining_unknown_inspections: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for PersistThenUnknownInstallRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            context.check()?;
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner.install_decision_proof(proof, membership)?;
+            if self
+                .remaining_unknown_installs
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            Ok(())
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            context.check()?;
+            if self
+                .remaining_unknown_inspections
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            self.inner.inspect_record_summary(slot)
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: ClusterId,
+            epoch: Epoch,
+            config_id: ConfigId,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            context.check()?;
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: ClusterId,
+            epoch: Epoch,
+            config_id: ConfigId,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner.store_command_for(
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner
+                .stage_effect_bundle_chunk(&binding, &manifest_command, ordinal, &chunk)
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner
+                .finalize_staged_effect_bundle(&binding, manifest_command)
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            context.check()?;
+            self.inner.fetch_effect_bundle_manifest(&binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            context.check()?;
+            self.inner.fetch_effect_bundle_chunk(&binding, ordinal)
+        }
     }
 
     #[derive(Clone)]
@@ -14262,6 +14589,12 @@ mod tests {
                 true,
             ),
             (
+                NodeError::Unavailable(AMBIGUOUS_MUTATION_MESSAGE.into()),
+                "ambiguous_mutation",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+            (
                 NodeError::ResourceExhausted("result too large".into()),
                 "resource_exhausted",
                 ErrorCategory::ResourceExhausted,
@@ -14282,6 +14615,156 @@ mod tests {
             assert_eq!(classification.category(), category);
             assert_eq!(classification.retryable(), retryable);
         }
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn only_external_mutation_unknown_outcomes_are_ambiguous_and_nonfatal() {
+        let (_dir, runtime) = sql_test_runtime();
+        let external = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::ReceiptBackedMutation,
+            Some(1),
+        );
+        assert_eq!(external.classification().code(), "ambiguous_mutation");
+        assert_eq!(
+            external.classification().category(),
+            ErrorCategory::Unavailable
+        );
+        assert!(external.classification().retryable());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let (_dir, runtime) = sql_test_runtime();
+        let internal = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::MaterializerInspect,
+            Some(1),
+        );
+        assert!(matches!(internal, NodeError::Reconciliation(_)));
+        assert!(!runtime.is_ready());
+        assert!(runtime.is_fatal());
+
+        let (_dir, runtime) = sql_test_runtime();
+        let read_barrier = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::ReadBarrierInspect,
+            Some(1),
+        );
+        assert!(matches!(read_barrier, NodeError::Reconciliation(_)));
+        assert!(!runtime.is_ready());
+        assert!(runtime.is_fatal());
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn receipt_boundary_replays_the_recovered_command_before_reproposing_the_later_request() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:sql:receipt-boundary-replay",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:sql:receipt-boundary-replay",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "receipt-boundary-replay",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        // A's proof reaches every recorder, but both the proof installation
+        // acknowledgement and its immediate inspection are made ambiguous.
+        // The following distinct request must first install A's recovered
+        // command and only then re-propose its own effect at the next slot.
+        remaining_unknown_installs.store(3, Ordering::Release);
+        remaining_unknown_inspections.store(3, Ordering::Release);
+        let original = SqlCommand {
+            request_id: "original".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE replay_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                    .into(),
+                parameters: vec![],
+            }],
+        };
+        let original_error = runtime.execute_sql(original.clone()).unwrap_err();
+        assert_eq!(original_error.classification().code(), "ambiguous_mutation");
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+
+        let later = SqlCommand {
+            request_id: "later".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE later_items(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        let later_response = runtime.execute_sql(later).unwrap();
+        assert_eq!(later_response.applied_index, 2);
+
+        let original_response = runtime.execute_sql(original.clone()).unwrap();
+        assert_eq!(original_response.applied_index, 1);
+        assert_ne!(original_response, later_response);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+
+        let reused_with_different_payload = SqlCommand {
+            request_id: original.request_id,
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE must_not_replace_original(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        assert!(matches!(
+            runtime.execute_sql(reused_with_different_payload),
+            Err(NodeError::RequestConflict(_))
+        ));
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
     }
 
     #[cfg(feature = "sql")]
@@ -14341,6 +14824,13 @@ mod tests {
                 None,
             ),
             (
+                NodeError::Unavailable(AMBIGUOUS_MUTATION_MESSAGE.into()),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "ambiguous_mutation",
+                true,
+                None,
+            ),
+            (
                 NodeError::Storage("disk failed".into()),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
@@ -14366,6 +14856,7 @@ mod tests {
                 "request could not be processed"
                     | "request conflicts with current state"
                     | "service is temporarily unavailable"
+                    | AMBIGUOUS_MUTATION_MESSAGE
                     | "internal server error"
             ));
         }
@@ -15390,7 +15881,7 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
         assert!(matches!(
             results[2],
-            Err(super::NodeError::InvalidRequest(_))
+            Err(super::NodeError::RequestConflict(_))
         ));
         assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -15412,7 +15903,7 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
         assert!(matches!(
             results[2],
-            Err(super::NodeError::InvalidRequest(_))
+            Err(super::NodeError::RequestConflict(_))
         ));
         assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -15616,8 +16107,12 @@ mod tests {
         );
         assert!(matches!(
             retry_results[1],
-            Err(NodeError::InvalidRequest(_))
+            Err(NodeError::RequestConflict(_))
         ));
+        let conflict = retry_results[1].as_ref().unwrap_err().classification();
+        assert_eq!(conflict.code(), "request_conflict");
+        assert_eq!(conflict.category(), ErrorCategory::Conflict);
+        assert!(!conflict.retryable());
         let new_anchors = new_results
             .iter()
             .map(|result| {
@@ -17142,7 +17637,7 @@ mod tests {
         .unwrap();
 
         let first = runtime.mutate_graph(command.clone()).unwrap_err();
-        assert!(matches!(first, NodeError::OutcomeUnknown(_)));
+        assert_eq!(first.classification().code(), "ambiguous_mutation");
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
 

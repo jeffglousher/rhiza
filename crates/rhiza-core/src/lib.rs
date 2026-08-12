@@ -50,6 +50,7 @@ impl ErrorClassification {
             "unauthorized" => ErrorCategory::Authentication,
             "request_conflict" | "precondition_failed" => ErrorCategory::Conflict,
             "unavailable"
+            | "ambiguous_mutation"
             | "durability_unavailable"
             | "write_timeout"
             | "write_outcome_unknown"
@@ -1945,6 +1946,7 @@ mod tests {
             ("request_conflict", ErrorCategory::Conflict, false),
             ("precondition_failed", ErrorCategory::Conflict, false),
             ("unavailable", ErrorCategory::Unavailable, true),
+            ("ambiguous_mutation", ErrorCategory::Unavailable, true),
             ("durability_unavailable", ErrorCategory::Unavailable, true),
             ("write_timeout", ErrorCategory::Unavailable, true),
             ("write_outcome_unknown", ErrorCategory::Unavailable, true),

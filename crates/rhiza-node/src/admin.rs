@@ -1165,7 +1165,6 @@ fn node_admin_status(error: &NodeError) -> (StatusCode, AdminErrorCode) {
         NodeError::PreconditionFailed(_) | NodeError::ConfigurationTransition { .. } => {
             (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed)
         }
-        #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed),
         NodeError::Unavailable(_)
         | NodeError::OutcomeUnknown(_)
@@ -2171,6 +2170,19 @@ mod tests {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 AdminErrorCode::Internal
+            )
+        );
+    }
+
+    #[test]
+    fn request_conflict_keeps_the_established_admin_precondition_mapping() {
+        assert_eq!(
+            node_admin_status(&NodeError::RequestConflict(
+                "same id, different payload".into()
+            )),
+            (
+                axum::http::StatusCode::CONFLICT,
+                AdminErrorCode::PreconditionFailed
             )
         );
     }

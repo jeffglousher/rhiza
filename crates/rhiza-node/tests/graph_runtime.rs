@@ -8,10 +8,10 @@ use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, node_router_with_limits,
     CheckpointCoordinator, ClientErrorResponse, DurabilityMode, GraphCommandResultV1,
-    GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphValueDto, GraphValueV1,
-    NodeConfig, NodeRuntime, PeerConfig, ReadConsistency, GRAPH_GET_DOCUMENT_PATH,
-    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_GRAPH_MAX_ROWS, MAX_HTTP_BODY_BYTES,
-    PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+    GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphMutationResultDto,
+    GraphValueDto, GraphValueV1, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
+    GRAPH_DELETE_DOCUMENT_PATH, GRAPH_GET_DOCUMENT_PATH, GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH,
+    MAX_GRAPH_MAX_ROWS, MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
@@ -151,12 +151,108 @@ async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
         }),
     )
     .await;
-    assert_eq!(conflict.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_client_error(
+        conflict,
+        reqwest::StatusCode::CONFLICT,
+        "request_conflict",
+        false,
+    )
+    .await;
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_delete_is_receipted_idempotent_conflict_fenced_and_read_barrier_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        NodeRuntime::open(
+            graph_http_config(dir.path()),
+            consensus(dir.path(), "delete-recorders"),
+            &[],
+        )
+        .unwrap(),
+    );
+    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
+    let client = reqwest::Client::new();
+    let put = serde_json::json!({
+        "request_id": "put-document-1",
+        "id": "document-1",
+        "value": {"type": "string", "value": "hello"},
+    });
+    assert!(post_graph_put(&client, addr, &put)
+        .await
+        .status()
+        .is_success());
+
+    let delete = serde_json::json!({"request_id": "delete-document-1", "id": "document-1"});
+    let first = post_graph_delete(&client, addr, &delete).await;
+    assert!(first.status().is_success());
+    let first = first.json::<GraphMutationResponse>().await.unwrap();
+    assert_eq!(
+        first.result,
+        GraphMutationResultDto::DeleteDocument { existed: true }
+    );
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(first.applied_index)
+    );
+
+    let retry = post_graph_delete(&client, addr, &delete).await;
+    assert!(retry.status().is_success());
+    let retry = retry.json::<GraphMutationResponse>().await.unwrap();
+    assert_eq!(retry, first);
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(first.applied_index)
+    );
+
+    let conflict = post_graph_delete(
+        &client,
+        addr,
+        &serde_json::json!({"request_id": "delete-document-1", "id": "document-2"}),
+    )
+    .await;
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(
         conflict.json::<ClientErrorResponse>().await.unwrap().code,
-        "invalid_request"
+        "request_conflict"
     );
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(first.applied_index)
+    );
+
+    let read = client
+        .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"id": "document-1", "consistency": "read_barrier"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(read.status().is_success());
+    let read = read.json::<GraphGetDocumentResponse>().await.unwrap();
+    assert_eq!(read.value, None);
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (first.applied_index, first.hash)
+    );
+
+    let missing = serde_json::json!({"request_id": "delete-document-2", "id": "missing"});
+    let missing_first = post_graph_delete(&client, addr, &missing).await;
+    assert!(missing_first.status().is_success());
+    let missing_first = missing_first.json::<GraphMutationResponse>().await.unwrap();
+    assert_eq!(
+        missing_first.result,
+        GraphMutationResultDto::DeleteDocument { existed: false }
+    );
+    let missing_retry = post_graph_delete(&client, addr, &missing).await;
+    assert!(missing_retry.status().is_success());
+    assert_eq!(
+        missing_retry.json::<GraphMutationResponse>().await.unwrap(),
+        missing_first
+    );
     server.abort();
 }
 
@@ -815,10 +911,11 @@ async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outco
             .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let server_runtime = Arc::clone(&runtime);
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            node_router_with_checkpoint_and_limits(runtime, recorder, coordinator, 1, 8),
+            node_router_with_checkpoint_and_limits(server_runtime, recorder, coordinator, 1, 8),
         )
         .await
         .unwrap();
@@ -835,10 +932,9 @@ async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outco
     let first = post_graph_put(&client, addr, &body).await;
 
     assert_eq!(first.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        first.json::<ClientErrorResponse>().await.unwrap().code,
-        "write_outcome_unknown"
-    );
+    let first = first.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(first.code, "ambiguous_mutation");
+    assert!(first.retryable);
     let read = client
         .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
@@ -863,6 +959,31 @@ async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outco
     assert_eq!(
         retry.result,
         rhiza_node::GraphMutationResultDto::PutDocument { created: true }
+    );
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(retry.applied_index)
+    );
+    let conflict = post_graph_put(
+        &client,
+        addr,
+        &serde_json::json!({
+            "request_id": "request-1",
+            "id": "document-1",
+            "value": {"type": "string", "value": "changed"}
+        }),
+    )
+    .await;
+    assert_client_error(
+        conflict,
+        reqwest::StatusCode::CONFLICT,
+        "request_conflict",
+        false,
+    )
+    .await;
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(retry.applied_index)
     );
     server.abort();
 }
@@ -926,6 +1047,21 @@ async fn post_graph_put(
 ) -> reqwest::Response {
     client
         .post(format!("http://{addr}{GRAPH_PUT_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn post_graph_delete(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    body: &serde_json::Value,
+) -> reqwest::Response {
+    client
+        .post(format!("http://{addr}{GRAPH_DELETE_DOCUMENT_PATH}"))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth("client-token")
         .json(body)

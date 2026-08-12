@@ -889,6 +889,7 @@ fn check_operation_context(
         Err(Error::RpcCancelled | Error::RpcDeadlineExceeded)
             if mutation_started.load(Ordering::Acquire) =>
         {
+            eprintln!("quepaxa unknown outcome source=control_context mutation_started=true");
             Err(Error::UnknownOutcome)
         }
         result => result,
@@ -908,6 +909,7 @@ where
         Err(Error::RpcCancelled | Error::RpcDeadlineExceeded)
             if mutation_started.load(Ordering::Acquire) =>
         {
+            eprintln!("quepaxa unknown outcome source=control_context mutation_started=true");
             Err(Error::UnknownOutcome)
         }
         result => result,
@@ -1929,6 +1931,8 @@ pub struct RecorderFileStore {
     recent_slots: Arc<Mutex<Vec<DurableSlotSnapshot>>>,
     wal: Arc<Mutex<RecorderWal>>,
     seal_fault: Arc<Mutex<Option<SealFaultPoint>>>,
+    #[cfg(test)]
+    checkpoint_barrier: Arc<Mutex<Option<CheckpointBarrier>>>,
     _root_lock: Arc<fs::File>,
     effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
     staged_effect_pins: Arc<Mutex<HashMap<LogHash, EffectBundleGcPin>>>,
@@ -1946,6 +1950,50 @@ const RECORDER_WAL_SOFT_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 const RECORDER_WAL_HARD_FRAME_LIMIT: u64 = 1_024;
 #[cfg(test)]
 const RECORDER_WAL_HARD_FRAME_LIMIT: u64 = 32;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct CheckpointBarrier {
+    entered: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    released: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+impl CheckpointBarrier {
+    fn new(entered: std::sync::mpsc::Sender<()>) -> Self {
+        Self {
+            entered: Arc::new(Mutex::new(Some(entered))),
+            released: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn wait(&self) {
+        let entered = lock_unpoison(&self.entered).take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        let (state, released) = &*self.released;
+        let mut released_state = lock_unpoison(state);
+        while !*released_state {
+            released_state = released
+                .wait(released_state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let (state, released) = &*self.released;
+        *lock_unpoison(state) = true;
+        released.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CheckpointBarrier {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WalCheckpoint {
@@ -2885,6 +2933,8 @@ impl RecorderFileStore {
                 recent_slots: Arc::new(Mutex::new(Vec::new())),
                 wal: Arc::new(Mutex::new(RecorderWal::default())),
                 seal_fault: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                checkpoint_barrier: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
@@ -2944,6 +2994,8 @@ impl RecorderFileStore {
                 recent_slots: Arc::new(Mutex::new(Vec::new())),
                 wal: Arc::new(Mutex::new(RecorderWal::default())),
                 seal_fault: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                checkpoint_barrier: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
@@ -3224,6 +3276,9 @@ impl RecorderFileStore {
             .sync
             .lock()
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        if recovered_hash == LogHash::ZERO {
+            return Err(Error::Rejected(RejectReason::InvalidTransition));
+        }
         self.recover_intent()?;
         let current = self.configuration_state()?;
         let predecessor = current
@@ -4993,7 +5048,7 @@ impl RecorderFileStore {
         head: &RecordedHeadProvenance,
         command: Option<(LogHash, &StoredCommand)>,
     ) -> Result<()> {
-        let should_checkpoint = {
+        let (_hard_frame_limit_reached, should_checkpoint) = {
             let wal = self
                 .wal
                 .lock()
@@ -5003,9 +5058,16 @@ impl RecorderFileStore {
                     "recorder WAL is unavailable after an I/O failure".into(),
                 ));
             }
-            wal.frame_count >= RECORDER_WAL_HARD_FRAME_LIMIT
-                || wal.byte_count >= RECORDER_WAL_SOFT_BYTE_LIMIT
+            let hard_frame_limit_reached = wal.frame_count >= RECORDER_WAL_HARD_FRAME_LIMIT;
+            (
+                hard_frame_limit_reached,
+                hard_frame_limit_reached || wal.byte_count >= RECORDER_WAL_SOFT_BYTE_LIMIT,
+            )
         };
+        #[cfg(test)]
+        if _hard_frame_limit_reached {
+            self.wait_at_automatic_hard_frame_checkpoint();
+        }
         if should_checkpoint {
             self.checkpoint_wal_unlocked()?;
         }
@@ -5227,6 +5289,25 @@ impl RecorderFileStore {
     }
 
     #[cfg(test)]
+    fn pause_next_automatic_hard_frame_checkpoint(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+    ) -> CheckpointBarrier {
+        let barrier = CheckpointBarrier::new(entered);
+        let mut armed = lock_unpoison(&self.checkpoint_barrier);
+        assert!(armed.is_none(), "only one checkpoint barrier");
+        *armed = Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    fn wait_at_automatic_hard_frame_checkpoint(&self) {
+        if let Some(barrier) = lock_unpoison(&self.checkpoint_barrier).take() {
+            barrier.wait();
+        }
+    }
+
+    #[cfg(test)]
     fn wal_stats(&self) -> Result<(u64, u64, u64)> {
         self.wal
             .lock()
@@ -5238,6 +5319,16 @@ impl RecorderFileStore {
                 )
             })
             .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))
+    }
+
+    #[cfg(test)]
+    fn wal_path(&self) -> PathBuf {
+        self.root.join(Self::WAL_FILE)
+    }
+
+    #[cfg(test)]
+    fn recorded_head_path(&self) -> PathBuf {
+        self.root.join(Self::RECORDED_HEAD_FILE)
     }
 }
 
@@ -6205,12 +6296,23 @@ impl ControlJob {
 }
 
 fn recorder_rpc<T>(operation: RecorderRpcOperation, call: impl FnOnce() -> Result<T>) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).unwrap_or_else(|_| {
-        Err(match operation {
-            RecorderRpcOperation::Mutating => Error::UnknownOutcome,
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(Err(Error::UnknownOutcome)) if matches!(operation, RecorderRpcOperation::ReadOnly) => {
+            Err(Error::ProposeFailed)
+        }
+        Ok(Err(Error::UnknownOutcome)) => {
+            eprintln!("quepaxa unknown outcome source=control_rpc_return mutating=true");
+            Err(Error::UnknownOutcome)
+        }
+        Ok(result) => result,
+        Err(_) => Err(match operation {
+            RecorderRpcOperation::Mutating => {
+                eprintln!("quepaxa unknown outcome source=control_rpc_panic mutating=true");
+                Error::UnknownOutcome
+            }
             RecorderRpcOperation::ReadOnly => Error::ProposeFailed,
-        })
-    })
+        }),
+    }
 }
 
 #[derive(Clone)]
@@ -8283,9 +8385,17 @@ impl ThreeNodeConsensus {
         prev_hash: LogHash,
         command: Command,
     ) -> Result<LogEntry> {
-        self.propose_stored_at_until(slot, prev_hash, stored_command(command)?, &context, || {
-            context.check()
-        })
+        let result = self.propose_stored_at_until(
+            slot,
+            prev_hash,
+            stored_command(command)?,
+            &context,
+            || context.check(),
+        );
+        if matches!(&result, Err(Error::UnknownOutcome)) {
+            eprintln!("quepaxa unknown outcome source=consensus_propose_unknown slot={slot} mutating=true");
+        }
+        result
     }
 
     pub fn propose_stop_at(
@@ -8489,7 +8599,13 @@ impl ThreeNodeConsensus {
                         .value
                         .as_ref()
                         .ok_or(Error::Rejected(RejectReason::InvalidCertificate))?;
-                    self.ensure_predecessor(slot, prev_hash, value.prev_hash)?;
+                    self.ensure_predecessor(
+                        "proposal_decision",
+                        slot,
+                        prev_hash,
+                        value.prev_hash,
+                        value,
+                    )?;
                     let command = if self.command_matches_value(slot, value, &offered_command) {
                         offered_command.clone()
                     } else {
@@ -8847,9 +8963,19 @@ impl ThreeNodeConsensus {
                 CertifiedDecisionInspection::Empty
                 | CertifiedDecisionInspection::Pending
                 | CertifiedDecisionInspection::Unavailable,
-            ) => Err(Error::UnknownOutcome),
+            ) => {
+                eprintln!(
+                    "quepaxa unknown outcome source=post_mutation_reconcile slot={slot} mutation_started=true"
+                );
+                Err(Error::UnknownOutcome)
+            }
             Err(error) if Self::is_control_safety_error(&error) => Err(error),
-            Err(_) => Err(Error::UnknownOutcome),
+            Err(_) => {
+                eprintln!(
+                    "quepaxa unknown outcome source=post_mutation_reconcile slot={slot} mutation_started=true"
+                );
+                Err(Error::UnknownOutcome)
+            }
         }
     }
 
@@ -9583,7 +9709,13 @@ impl ThreeNodeConsensus {
         proof: DecisionProof,
     ) -> Result<CertifiedDecisionInspection> {
         let decision = certificate_from_proof(&proof)?;
-        self.ensure_predecessor(slot, prev_hash, decision.value.prev_hash)?;
+        self.ensure_predecessor(
+            "certified_inspection",
+            slot,
+            prev_hash,
+            decision.value.prev_hash,
+            &decision.value,
+        )?;
         let Some(command) =
             self.fetch_verified_value_with_budget(budget, slot, &decision.value, mutation_started)?
         else {
@@ -10240,11 +10372,21 @@ impl ThreeNodeConsensus {
 
     fn ensure_predecessor(
         &self,
+        source: &'static str,
         slot: Slot,
-        actual_prev_hash: LogHash,
         expected_prev_hash: LogHash,
+        actual_prev_hash: LogHash,
+        value: &AcceptedValue,
     ) -> Result<()> {
-        if actual_prev_hash != expected_prev_hash {
+        if expected_prev_hash != actual_prev_hash {
+            eprintln!(
+                "quepaxa predecessor conflict source={source} slot={slot} expected_prev_hash={} actual_prev_hash={} config_digest={} command_hash={} entry_hash={}",
+                expected_prev_hash.to_hex(),
+                actual_prev_hash.to_hex(),
+                self.config_digest.to_hex(),
+                value.command_hash.to_hex(),
+                value.entry_hash.to_hex(),
+            );
             return Err(Error::ChainConflict {
                 slot,
                 expected_prev_hash,
@@ -12907,7 +13049,7 @@ mod tests {
         ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
         RecordedHeadProvenance, RecorderEffectBundle, RecorderFileStore, RecorderPostPreflightHook,
         RecorderPreflight, RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState,
-        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, Slot,
+        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, SingleNodeState, Slot,
         ThreeNodeConsensus, RECORDER_POST_PREFLIGHT_HOOK, STORAGE_GENERATION_FILE,
         STORAGE_GENERATION_FINGERPRINT,
     };
@@ -16637,7 +16779,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_late_unknown_overrides_a_frozen_quorum_candidate() {
+    fn proof_late_read_unknown_does_not_override_a_frozen_quorum_candidate() {
         let _blocking = lock_blocking_control_tests();
         let (started_tx, started_rx) = mpsc::sync_channel(3);
         let early = Arc::new((Mutex::new(false), Condvar::new()));
@@ -16696,7 +16838,7 @@ mod tests {
         release_gate(&late);
         assert_eq!(
             result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Err(Error::UnknownOutcome)
+            Ok(None)
         );
         caller.join().unwrap();
         assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
@@ -16839,7 +16981,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_late_unknown_overrides_a_frozen_empty_candidate() {
+    fn summary_late_read_unknown_is_unavailable_not_empty() {
         let _blocking = lock_blocking_control_tests();
         let (entered_tx, entered_rx) = mpsc::sync_channel(3);
         let early = Arc::new((Mutex::new(false), Condvar::new()));
@@ -16899,7 +17041,7 @@ mod tests {
         release_gate(&late);
         assert_eq!(
             result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Err(Error::UnknownOutcome)
+            Err(Error::ProposeFailed)
         );
         caller.join().unwrap();
     }
@@ -18429,7 +18571,7 @@ mod tests {
             assert!(consensus.control_workers.iter().all(ControlWorker::is_idle));
         };
 
-        run(Err(Error::UnknownOutcome), Error::UnknownOutcome);
+        run(Err(Error::UnknownOutcome), Error::RpcDeadlineExceeded);
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
         run(
             Ok(Some(test_decision_proof(&membership))),
@@ -18847,6 +18989,7 @@ mod tests {
     struct PersistThenUnknownInstallFileStore {
         inner: RecorderFileStore,
         persist: bool,
+        remaining_unknown_inspections: AtomicUsize,
     }
 
     impl RecorderRpc for PersistThenUnknownInstallFileStore {
@@ -18878,6 +19021,15 @@ mod tests {
             slot: Slot,
         ) -> super::Result<Option<RecordSummary>> {
             context.check()?;
+            if self
+                .remaining_unknown_inspections
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(Error::UnknownOutcome);
+            }
             self.inner.inspect_record_summary(slot)
         }
 
@@ -21298,6 +21450,177 @@ mod tests {
         assert_eq!(generation, 3);
         assert_eq!(through_sequence, super::RECORDER_WAL_HARD_FRAME_LIMIT * 2);
         assert_eq!(frames, 1);
+    }
+
+    #[test]
+    fn automatic_hard_frame_checkpoint_timeout_is_unknown_and_recovers_once() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let roots = ["n1", "n2", "n3"].map(|recorder_id| root.path().join(recorder_id));
+        let stores = roots
+            .iter()
+            .zip(["n1", "n2", "n3"])
+            .map(|(root, recorder_id)| {
+                RecorderFileStore::new_with_membership(
+                    root,
+                    recorder_id,
+                    "cluster",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request = |slot: Slot, command: StoredCommand| RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot,
+            step: 4,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "writer",
+                slot,
+                AcceptedValue::from_command("cluster", slot, 1, 1, LogHash::ZERO, &command),
+            ),
+            command: Some(command),
+        };
+
+        for store in &stores {
+            for slot in 1..=super::RECORDER_WAL_HARD_FRAME_LIMIT {
+                store
+                    .record_proposal(request(
+                        slot,
+                        StoredCommand::new(
+                            EntryType::Command,
+                            format!("checkpoint-timeout-fill-{slot}").into_bytes(),
+                        ),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let recorders = stores
+            .iter()
+            .zip(["n1", "n2", "n3"])
+            .map(|(store, recorder_id)| {
+                (
+                    recorder_id.into(),
+                    Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let barriers = stores
+            .iter()
+            .map(|store| store.pause_next_automatic_hard_frame_checkpoint(entered_tx.clone()))
+            .collect::<Vec<_>>();
+        drop(entered_tx);
+        let crossing_slot = super::RECORDER_WAL_HARD_FRAME_LIMIT + 1;
+        let crossing_command =
+            StoredCommand::new(EntryType::Command, b"checkpoint-timeout".to_vec());
+        let requests = (0..3)
+            .map(|_| request(crossing_slot, crossing_command.clone()))
+            .collect::<Vec<_>>();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let caller = {
+            let consensus = Arc::clone(&consensus);
+            thread::spawn(move || {
+                let context = RecorderRpcContext::with_timeout(Duration::from_millis(300));
+                let mutation_started = AtomicBool::new(false);
+                let result = consensus.record_broadcast_with_context(
+                    requests,
+                    context.clone(),
+                    &mutation_started,
+                );
+                result_tx.send((result, context.check())).unwrap();
+            })
+        };
+
+        for _ in 0..3 {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (Err(Error::UnknownOutcome), Err(Error::RpcDeadlineExceeded)),
+            "an admitted mutation stalled before automatic checkpoint completion has no definite receipt"
+        );
+        caller.join().unwrap();
+        for barrier in &barriers {
+            barrier.release();
+        }
+        // The released checkpoint persists every pending slot and command to
+        // the effect root before replying, so allow bounded fsync time.
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(5)));
+        let inspect = |store: &RecorderFileStore| {
+            let configuration = store.configuration_state().unwrap();
+            assert_eq!(configuration.membership(), Some(&membership));
+            assert_eq!(store.wal_stats().unwrap(), (2, 32, 1));
+            assert_eq!(
+                store.fetch_command(crossing_command.hash()).unwrap(),
+                Some(crossing_command.clone())
+            );
+            let state = store.load(crossing_slot).unwrap();
+            assert_eq!(
+                state
+                    .isr
+                    .first_current()
+                    .unwrap()
+                    .value
+                    .as_ref()
+                    .unwrap()
+                    .command_hash,
+                crossing_command.hash()
+            );
+            let wal = std::fs::read(store.wal_path()).unwrap();
+            let (frame, end) = super::decode_wal_frame(&wal, 0).unwrap().unwrap();
+            assert_eq!(end, wal.len());
+            assert_eq!(frame.sequence, crossing_slot);
+            let (head, _, checkpoint) = super::decode_recorded_head(
+                &std::fs::read(store.recorded_head_path()).unwrap(),
+                "cluster",
+                1,
+                &configuration,
+            )
+            .unwrap();
+            assert_eq!(checkpoint, store.wal_checkpoint().unwrap());
+            assert_eq!(
+                head,
+                RecordedHeadProvenance::SlotBacked {
+                    slot: super::RECORDER_WAL_HARD_FRAME_LIMIT
+                }
+            );
+            assert_eq!(
+                *store.recorded_head.lock().unwrap(),
+                RecordedHeadProvenance::SlotBacked {
+                    slot: crossing_slot
+                }
+            );
+            (state, configuration)
+        };
+        let live = stores.iter().map(inspect).collect::<Vec<_>>();
+
+        drop(consensus);
+        drop(barriers);
+        drop(stores);
+        for ((root, recorder_id), expected) in roots.iter().zip(["n1", "n2", "n3"]).zip(live) {
+            let reopened = RecorderFileStore::new_with_membership(
+                root,
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            assert_eq!(inspect(&reopened), expected);
+        }
     }
 
     proptest! {
@@ -23881,6 +24204,7 @@ mod tests {
                         Box::new(PersistThenUnknownInstallFileStore {
                             inner: store.clone(),
                             persist: true,
+                            remaining_unknown_inspections: AtomicUsize::new(0),
                         }) as Box<dyn RecorderRpc>,
                     )
                 })
@@ -23917,6 +24241,160 @@ mod tests {
                 .all(|worker| !worker.state.quarantined.load(Ordering::Acquire)),
             "an immediately drained lost response must not quarantine a reusable control worker"
         );
+    }
+
+    #[test]
+    fn ambiguous_post_admission_retry_recovers_the_original_slot_before_a_later_offer() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(PersistThenUnknownInstallFileStore {
+                            inner: store.clone(),
+                            persist: true,
+                            remaining_unknown_inspections: AtomicUsize::new(1),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let original = StoredCommand::new(EntryType::Command, b"original".to_vec());
+        assert_eq!(
+            consensus.propose_stored_at(
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+                original.clone(),
+            ),
+            Err(Error::UnknownOutcome),
+        );
+
+        let recovered = consensus
+            .propose_stored_at(
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+                StoredCommand::new(EntryType::Command, b"later".to_vec()),
+            )
+            .expect("the retry must recover the prior certified slot");
+        assert_eq!(recovered.entry_type, original.entry_type);
+        assert_eq!(recovered.payload, original.payload);
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn certified_inspection_rejects_a_certified_predecessor_that_differs_from_the_local_tip() {
+        let _blocking = lock_blocking_control_tests();
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores = ["n1", "n2", "n3"].map(|recorder_id| {
+            RecorderFileStore::new_with_membership(
+                root.path().join(recorder_id),
+                recorder_id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap()
+        });
+        let seed = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let first = seed
+            .propose_stored_at(
+                RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+                1,
+                LogHash::ZERO,
+                StoredCommand::new(EntryType::Command, b"first".to_vec()),
+            )
+            .unwrap();
+        seed.propose_stored_at(
+            RecorderRpcContext::with_timeout(Duration::from_secs(1)),
+            2,
+            first.hash,
+            StoredCommand::new(EntryType::Command, b"second".to_vec()),
+        )
+        .unwrap();
+        drop(seed);
+
+        let recovering = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "n2",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .zip(stores.iter())
+                .map(|(recorder_id, store)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(store.clone()) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        *recovering.sequential_tip.lock().unwrap() = SingleNodeState {
+            next_index: 2,
+            last_hash: LogHash::ZERO,
+        };
+
+        assert_eq!(
+            recovering
+                .recover_decided_next(&RecorderRpcContext::with_timeout(Duration::from_secs(1),)),
+            Err(Error::ChainConflict {
+                slot: 2,
+                expected_prev_hash: LogHash::ZERO,
+                actual_prev_hash: first.hash,
+            }),
+            "certified_inspection must fail closed before acknowledging or advancing slot 2"
+        );
+        assert_eq!(
+            *recovering.sequential_tip.lock().unwrap(),
+            SingleNodeState {
+                next_index: 2,
+                last_hash: LogHash::ZERO,
+            },
+            "the conflicting certified predecessor must not advance the local recovery tip"
+        );
+        assert!(recovering.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
     #[test]
@@ -23976,6 +24454,7 @@ mod tests {
                         Box::new(PersistThenUnknownInstallFileStore {
                             inner: store.clone(),
                             persist: false,
+                            remaining_unknown_inspections: AtomicUsize::new(0),
                         }) as Box<dyn RecorderRpc>,
                     )
                 })
@@ -24618,9 +25097,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_late_unknown_or_invalid_evidence_beats_a_frozen_command() {
+    fn fetch_late_read_unknown_does_not_override_a_frozen_command() {
         let _blocking = lock_blocking_control_tests();
-        let run = |late_reply: super::Result<Option<StoredCommand>>, expected: Error| {
+        let run = |late_reply: super::Result<Option<StoredCommand>>,
+                   expected: super::Result<Option<StoredCommand>>| {
             let command = StoredCommand::new(EntryType::Command, b"fetch-proof".to_vec());
             let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
             let (entered_tx, entered_rx) = mpsc::sync_channel(3);
@@ -24683,18 +25163,24 @@ mod tests {
             release_gate(&late);
             assert_eq!(
                 result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-                Err(expected)
+                expected
             );
             caller.join().unwrap();
             assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
         };
-        run(Err(Error::UnknownOutcome), Error::UnknownOutcome);
+        run(
+            Err(Error::UnknownOutcome),
+            Ok(Some(StoredCommand::new(
+                EntryType::Command,
+                b"fetch-proof".to_vec(),
+            ))),
+        );
         run(
             Ok(Some(StoredCommand::new(
                 EntryType::Command,
                 b"wrong-hash".to_vec(),
             ))),
-            Error::CommandHashMismatch,
+            Err(Error::CommandHashMismatch),
         );
     }
 
@@ -24851,7 +25337,10 @@ mod tests {
             Ok(ReadFenceSlotState::Occupied { summary: None }),
             Ok(CertifiedDecisionInspection::Empty),
         );
-        run(Err(Error::UnknownOutcome), Err(Error::UnknownOutcome));
+        run(
+            Err(Error::UnknownOutcome),
+            Ok(CertifiedDecisionInspection::Empty),
+        );
     }
 
     #[test]
@@ -25968,6 +26457,22 @@ mod tests {
         );
         assert!(n2_mutated.load(Ordering::Acquire));
         assert!(n3_mutated.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn returned_unknown_outcome_is_definite_for_reads_and_ambiguous_for_mutations() {
+        assert_eq!(
+            super::recorder_rpc(super::RecorderRpcOperation::ReadOnly, || {
+                Err::<(), _>(Error::UnknownOutcome)
+            }),
+            Err(Error::ProposeFailed)
+        );
+        assert_eq!(
+            super::recorder_rpc(super::RecorderRpcOperation::Mutating, || {
+                Err::<(), _>(Error::UnknownOutcome)
+            }),
+            Err(Error::UnknownOutcome)
+        );
     }
 
     #[test]

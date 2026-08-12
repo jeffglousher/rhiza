@@ -75,7 +75,7 @@ async fn sync_retry_returns_original_outcome_after_archive_recovers() {
     assert_client_error(
         first,
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "write_outcome_unknown",
+        "ambiguous_mutation",
         true,
         None,
     )
