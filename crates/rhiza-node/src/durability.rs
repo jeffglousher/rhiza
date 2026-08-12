@@ -2,6 +2,7 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::sync::atomic::AtomicU8;
 use std::{
     error::Error,
     fmt, fs,
@@ -53,10 +54,16 @@ const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const SYNC_COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SYNC_RECOVERY_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const SYNC_RECOVERY_RETRY_MAX: Duration = Duration::from_secs(1);
-#[cfg(feature = "sql")]
 const ONLINE_QEFX_GC_INTERVAL: Duration = Duration::from_millis(250);
+const ONLINE_QEFX_GC_RETRY_MAX: Duration = Duration::from_secs(30);
 #[cfg(feature = "sql")]
 const ONLINE_QEFX_GC_REMOVAL_BUDGET: usize = 1;
+const QEFX_GC_PHASE_REMOTE: u8 = 0;
+#[cfg_attr(not(feature = "sql"), allow(dead_code))]
+const QEFX_GC_PHASE_LOCAL: u8 = 1;
+const QEFX_GC_PHASE_CANCELLED: u8 = 2;
+#[cfg_attr(not(feature = "sql"), allow(dead_code))]
+const QEFX_GC_PHASE_DONE: u8 = 3;
 #[cfg(feature = "sql")]
 const MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES: usize = 128 * 1024 * 1024;
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
@@ -101,6 +108,92 @@ fn retryable_sync_recovery_error(error: &DurabilityError) -> bool {
 
 fn next_sync_recovery_retry(current: Duration) -> Duration {
     current.saturating_mul(2).min(SYNC_RECOVERY_RETRY_MAX)
+}
+
+fn next_qefx_gc_retry(current: Duration) -> Duration {
+    current.saturating_mul(2).min(ONLINE_QEFX_GC_RETRY_MAX)
+}
+
+struct QefxGcSchedule {
+    next_attempt: Instant,
+    retry_delay: Duration,
+    last_error: Option<String>,
+}
+
+impl QefxGcSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_attempt: now,
+            retry_delay: ONLINE_QEFX_GC_INTERVAL,
+            last_error: None,
+        }
+    }
+
+    fn succeeded(&mut self) -> bool {
+        let recovered = self.last_error.take().is_some();
+        self.retry_delay = ONLINE_QEFX_GC_INTERVAL;
+        self.next_attempt = Instant::now()
+            .checked_add(ONLINE_QEFX_GC_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        recovered
+    }
+
+    fn failed(&mut self, error: String) -> bool {
+        let changed = self.last_error.as_deref() != Some(error.as_str());
+        if changed {
+            self.last_error = Some(error);
+        }
+        self.next_attempt = Instant::now()
+            .checked_add(self.retry_delay)
+            .unwrap_or_else(Instant::now);
+        self.retry_delay = next_qefx_gc_retry(self.retry_delay);
+        changed
+    }
+}
+
+struct QefxGcTask {
+    phase: Arc<AtomicU8>,
+    handle: tokio::task::JoinHandle<Result<(), DurabilityError>>,
+}
+
+impl QefxGcTask {
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    fn spawn<F, Fut>(run: F) -> Self
+    where
+        F: FnOnce(Arc<AtomicU8>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), DurabilityError>> + Send + 'static,
+    {
+        let phase = Arc::new(AtomicU8::new(QEFX_GC_PHASE_REMOTE));
+        let task_phase = Arc::clone(&phase);
+        let handle = tokio::spawn(async move {
+            let result = run(Arc::clone(&task_phase)).await;
+            task_phase.store(QEFX_GC_PHASE_DONE, Ordering::Release);
+            result
+        });
+        Self { phase, handle }
+    }
+
+    async fn shutdown(self) -> Result<(), DurabilityError> {
+        let cancelled_before_local = self
+            .phase
+            .compare_exchange(
+                QEFX_GC_PHASE_REMOTE,
+                QEFX_GC_PHASE_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled_before_local {
+            self.handle.abort();
+        }
+        match self.handle.await {
+            Ok(_) => Ok(()),
+            Err(error) if cancelled_before_local && error.is_cancelled() => Ok(()),
+            Err(error) => Err(DurabilityError::SnapshotVerification(format!(
+                "QEFX GC task lifecycle became uncertain during shutdown: {error}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1268,10 +1361,9 @@ impl CheckpointCoordinator {
         let coordinator =
             Self::open_with_holder_and_options(store, mode, holder, publisher_options).await?;
         coordinator.attach_local_recorder(recorder)?;
-        #[cfg(feature = "sql")]
-        coordinator
-            .retry_pending_qefx_gc_at(_data_dir.as_ref())
-            .await?;
+        // A pending QEFX GC record is post-durability maintenance, never a
+        // startup gate. The background supervisor retries it asynchronously
+        // after runtime readiness; an exact record remains fsynced meanwhile.
         Ok(coordinator)
     }
 
@@ -1664,10 +1756,17 @@ impl CheckpointCoordinator {
     }
 
     #[cfg(feature = "sql")]
-    async fn retry_pending_qefx_gc_at(&self, data_dir: &Path) -> Result<(), DurabilityError> {
-        let _maintenance = self.qefx_gc_maintenance.lock().await;
-        let Some(pending) = load_pending_qefx_gc(data_dir)? else {
-            return Ok(());
+    async fn retry_pending_qefx_gc_at(
+        &self,
+        data_dir: &Path,
+        phase: &AtomicU8,
+    ) -> Result<(), DurabilityError> {
+        let pending = {
+            let _maintenance = self.qefx_gc_maintenance.lock().await;
+            let Some(pending) = load_pending_qefx_gc(data_dir)? else {
+                return Ok(());
+            };
+            pending
         };
         let Some(recorder) = self
             .local_recorder
@@ -1701,6 +1800,17 @@ impl CheckpointCoordinator {
                 "pending QEFX GC evidence no longer matches the visible checkpoint".into(),
             ));
         }
+        if phase
+            .compare_exchange(
+                QEFX_GC_PHASE_REMOTE,
+                QEFX_GC_PHASE_LOCAL,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
         let outcome = tokio::task::spawn_blocking(move || {
             recorder.advance_effect_bundle_gc_anchor_bounded(
                 &certificate,
@@ -1715,7 +1825,8 @@ impl CheckpointCoordinator {
             ))
         })?;
         if outcome.is_ok_and(|outcome| outcome.sweep_complete) {
-            clear_pending_qefx_gc(data_dir)?;
+            let _maintenance = self.qefx_gc_maintenance.lock().await;
+            clear_pending_qefx_gc_if_unchanged(data_dir, &pending)?;
         }
         Ok(())
     }
@@ -1910,8 +2021,8 @@ impl CheckpointCoordinator {
             .unwrap_or_else(Instant::now);
         let mut recovery_retry_at = None;
         let mut recovery_retry_delay = SYNC_RECOVERY_RETRY_INITIAL;
-        #[cfg(feature = "sql")]
-        let mut next_qefx_gc = now;
+        let mut qefx_gc_schedule = QefxGcSchedule::new(now);
+        let mut qefx_gc_task = None::<QefxGcTask>;
         tokio::pin!(shutdown);
         loop {
             let heartbeat_at = if matches!(self.mode, DurabilityMode::Sync) {
@@ -1925,10 +2036,44 @@ impl CheckpointCoordinator {
             }
             #[cfg(feature = "sql")]
             {
-                wake_at = wake_at.min(next_qefx_gc);
+                if qefx_gc_task.is_none() {
+                    wake_at = wake_at.min(qefx_gc_schedule.next_attempt);
+                }
             }
             tokio::select! {
-                () = &mut shutdown => return Ok(()),
+                () = &mut shutdown => {
+                    if let Some(task) = qefx_gc_task.take() {
+                        task.shutdown().await?;
+                    }
+                    return Ok(());
+                },
+                qefx_result = async {
+                    match qefx_gc_task.as_mut() {
+                        Some(task) => Some((&mut task.handle).await),
+                        None => std::future::pending().await,
+                    }
+                }, if qefx_gc_task.is_some() => {
+                    qefx_gc_task = None;
+                    let result = match qefx_result.expect("guarded QEFX GC task exists") {
+                        Ok(result) => result,
+                        Err(error) => Err(DurabilityError::SnapshotVerification(format!(
+                            "QEFX GC maintenance task failed: {error}"
+                        ))),
+                    };
+                    match result {
+                        Ok(()) => {
+                            if qefx_gc_schedule.succeeded() {
+                                eprintln!("QEFX GC maintenance resumed");
+                            }
+                        }
+                        Err(error) => {
+                            let error = error.to_string();
+                            if qefx_gc_schedule.failed(error.clone()) {
+                                eprintln!("QEFX GC maintenance deferred: {error}");
+                            }
+                        }
+                    }
+                },
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {
                     let now = Instant::now();
                     let durability_unavailable =
@@ -1938,20 +2083,19 @@ impl CheckpointCoordinator {
                     }
                     let recovery_due = recovery_retry_at.is_some_and(|deadline| now >= deadline);
                     #[cfg(feature = "sql")]
-                    if now >= next_qefx_gc {
+                    if now >= qefx_gc_schedule.next_attempt && qefx_gc_task.is_none() {
                         // GC is post-durability maintenance. It runs on the
-                        // blocking pool in a one-object slice and never changes
-                        // Sync health; failures retain the fsynced pending record
-                        // for an exact later retry.
-                        if let Err(error) = self
-                            .retry_pending_qefx_gc_at(runtime.config.data_dir())
-                            .await
-                        {
-                            eprintln!("QEFX GC maintenance deferred: {error}");
-                        }
-                        next_qefx_gc = Instant::now()
-                            .checked_add(ONLINE_QEFX_GC_INTERVAL)
-                            .unwrap_or_else(Instant::now);
+                        // blocking pool in a one-object slice and never blocks
+                        // the durability supervisor or changes Sync health.
+                        // Failures retain the fsynced pending record for an
+                        // exact, exponentially backed-off retry.
+                        let coordinator = Arc::clone(&self);
+                        let data_dir = runtime.config.data_dir().clone();
+                        qefx_gc_task = Some(QefxGcTask::spawn(move |phase| async move {
+                            coordinator
+                                .retry_pending_qefx_gc_at(&data_dir, &phase)
+                                .await
+                        }));
                     }
                     if matches!(self.mode, DurabilityMode::Sync)
                         && (recovery_due || now >= next_publisher_lease_renewal)
@@ -4361,22 +4505,32 @@ fn is_owned_recovery_directory(
     expected_role: RepairArtifactRole,
     expected_identity: &RecoveryArtifactIdentity,
 ) -> Result<bool, DurabilityError> {
+    Ok(
+        read_valid_recovery_artifact_ownership(path, allowed_children, expected_role)?
+            .is_some_and(|ownership| ownership.identity == *expected_identity),
+    )
+}
+
+fn read_valid_recovery_artifact_ownership(
+    path: &Path,
+    allowed_children: &[&str],
+    expected_role: RepairArtifactRole,
+) -> Result<Option<RepairArtifactOwnership>, DurabilityError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(false);
+        return Ok(None);
     }
     let owner = path.join(REPAIR_ARTIFACT_OWNER_FILE);
     let Some(owner_bytes) = read_bounded_regular_file(&owner, 16384)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Ok(ownership) = serde_json::from_slice::<RepairArtifactOwnership>(&owner_bytes) else {
-        return Ok(false);
+        return Ok(None);
     };
     if ownership.role != expected_role
-        || ownership.identity != *expected_identity
         || path.file_name().and_then(|name| name.to_str()) != Some(ownership.name.as_str())
     {
-        return Ok(false);
+        return Ok(None);
     }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -4390,10 +4544,32 @@ fn is_owned_recovery_directory(
             || metadata.file_type().is_symlink()
             || !metadata.is_dir()
         {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(ownership))
+}
+
+fn recovery_artifact_cleanup_identity_matches(
+    actual: &RecoveryArtifactIdentity,
+    expected: &RecoveryArtifactIdentity,
+) -> bool {
+    match (actual, expected) {
+        (
+            RecoveryArtifactIdentity::Restore(actual),
+            RecoveryArtifactIdentity::Restore(expected),
+        ) => {
+            actual.cluster_id == expected.cluster_id
+                && actual.node_id == expected.node_id
+                && actual.execution_profile == expected.execution_profile
+                && actual.epoch == expected.epoch
+                && actual.config_id == expected.config_id
+                && actual.recovery_generation == expected.recovery_generation
+            // checkpoint_index/checkpoint_hash deliberately differ across a
+            // later verified checkpoint for the same recovery generation.
+        }
+        _ => actual == expected,
+    }
 }
 
 fn collect_owned_recovery_artifacts(
@@ -4429,7 +4605,11 @@ fn collect_owned_recovery_artifacts(
         let Some((allowed_children, role)) = artifact else {
             continue;
         };
-        if !is_owned_recovery_directory(&entry.path(), allowed_children, role, identity)? {
+        let ownership =
+            read_valid_recovery_artifact_ownership(&entry.path(), allowed_children, role)?;
+        if !ownership.is_some_and(|ownership| {
+            recovery_artifact_cleanup_identity_matches(&ownership.identity, identity)
+        }) {
             return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
         }
         cleanup.push(entry.path());
@@ -4832,6 +5012,18 @@ fn clear_pending_qefx_gc(data_dir: &Path) -> Result<(), DurabilityError> {
 }
 
 #[cfg(feature = "sql")]
+fn clear_pending_qefx_gc_if_unchanged(
+    data_dir: &Path,
+    expected: &PendingQefxGc,
+) -> Result<bool, DurabilityError> {
+    if load_pending_qefx_gc(data_dir)?.as_ref() != Some(expected) {
+        return Ok(false);
+    }
+    clear_pending_qefx_gc(data_dir)?;
+    Ok(true)
+}
+
+#[cfg(feature = "sql")]
 fn load_pending_qefx_gc(data_dir: &Path) -> Result<Option<PendingQefxGc>, DurabilityError> {
     let path = data_dir.join(PENDING_QEFX_GC_FILE);
     let metadata = match fs::symlink_metadata(&path) {
@@ -5145,6 +5337,8 @@ mod tests {
     use rhiza_quepaxa::ThreeNodeConsensus;
     #[cfg(feature = "sql")]
     use rhiza_sql::{encode_put_request, SqliteStateMachine};
+    #[cfg(feature = "sql")]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::{
         collections::BTreeMap,
         fs,
@@ -6155,6 +6349,94 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sql")]
+    #[test]
+    fn completed_old_qefx_gc_cannot_clear_a_newer_pending_record() {
+        let root = tempfile::tempdir().unwrap();
+        let record = |through_slot| super::PendingQefxGc {
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::digest(&[b"config"]).to_hex(),
+            through_slot,
+            checkpoint_hash: LogHash::digest(&[b"tip", &through_slot.to_be_bytes()]).to_hex(),
+            manifest_digest: LogHash::digest(&[b"manifest", &through_slot.to_be_bytes()]).to_hex(),
+        };
+        let old = record(11);
+        let newer = record(12);
+        super::persist_pending_qefx_gc(root.path(), &old).unwrap();
+        super::persist_pending_qefx_gc(root.path(), &newer).unwrap();
+
+        assert!(!super::clear_pending_qefx_gc_if_unchanged(root.path(), &old).unwrap());
+        assert_eq!(
+            super::load_pending_qefx_gc(root.path()).unwrap(),
+            Some(newer.clone())
+        );
+        assert!(super::clear_pending_qefx_gc_if_unchanged(root.path(), &newer).unwrap());
+        assert_eq!(super::load_pending_qefx_gc(root.path()).unwrap(), None);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn qefx_gc_shutdown_cancels_remote_work_before_local_mutation() {
+        let local_started = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&local_started);
+        let task = super::QefxGcTask::spawn(move |_phase| async move {
+            std::future::pending::<()>().await;
+            observed.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), task.shutdown())
+            .await
+            .expect("remote QEFX GC must cancel within the shutdown bound")
+            .expect("remote cancellation must reap the QEFX GC task");
+        assert!(!local_started.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn qefx_gc_shutdown_drains_an_admitted_local_mutation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_completed = Arc::clone(&completed);
+        let task = super::QefxGcTask::spawn(move |phase| async move {
+            phase
+                .compare_exchange(
+                    super::QEFX_GC_PHASE_REMOTE,
+                    super::QEFX_GC_PHASE_LOCAL,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .expect("test local mutation admission must win");
+            task_entered.notify_one();
+            task_release.notified().await;
+            task_completed.store(true, Ordering::Release);
+            Ok(())
+        });
+        entered.notified().await;
+
+        let mut shutdown = tokio::spawn(task.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must not report drain while an admitted local mutation is active"
+        );
+        assert!(!completed.load(Ordering::Acquire));
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), shutdown)
+            .await
+            .expect("shutdown must finish after the admitted local mutation")
+            .expect("shutdown task must not panic")
+            .expect("local QEFX GC must be fully drained");
+        assert!(completed.load(Ordering::Acquire));
+    }
+
     #[test]
     fn rejoin_artifact_cleanup_removes_only_owned_stale_stage_and_quarantine() {
         let root = tempfile::tempdir().unwrap();
@@ -6182,6 +6464,81 @@ mod tests {
         super::cleanup_owned_recovery_artifacts(root.path(), &identity).unwrap();
         assert!(!stage.exists());
         assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn rejoin_artifact_cleanup_accepts_an_older_checkpoint_from_the_same_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint_identity = CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"node-test-config"]),
+            7,
+        );
+        let prior = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &checkpoint_identity,
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(4, LogHash::digest(&[b"prior-checkpoint"])),
+        ));
+        let expected = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &checkpoint_identity,
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(9, LogHash::digest(&[b"current-checkpoint"])),
+        ));
+        let quarantine = root.path().join(".rebuildable-quarantine-4242-3");
+        std::fs::create_dir_all(quarantine.join("sqlite")).unwrap();
+        write_repair_artifact_ownership(&quarantine, RepairArtifactRole::Quarantine, &prior)
+            .unwrap();
+
+        super::cleanup_owned_recovery_artifacts(root.path(), &expected).unwrap();
+
+        assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn rejoin_artifact_cleanup_rejects_a_different_config_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let current_checkpoint = LogAnchor::new(9, LogHash::digest(&[b"current-checkpoint"]));
+        let foreign = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                2,
+                LogHash::digest(&[b"foreign-config"]),
+                7,
+            ),
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(4, LogHash::digest(&[b"prior-checkpoint"])),
+        ));
+        let expected = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                LogHash::digest(&[b"node-test-config"]),
+                7,
+            ),
+            "node-1",
+            ExecutionProfile::Sqlite,
+            current_checkpoint,
+        ));
+        let quarantine = root.path().join(".rebuildable-quarantine-4242-4");
+        std::fs::create_dir_all(quarantine.join("sqlite")).unwrap();
+        write_repair_artifact_ownership(&quarantine, RepairArtifactRole::Quarantine, &foreign)
+            .unwrap();
+        let owner = quarantine.join(super::REPAIR_ARTIFACT_OWNER_FILE);
+        let before = std::fs::read(&owner).unwrap();
+
+        assert!(matches!(
+            super::cleanup_owned_recovery_artifacts(root.path(), &expected),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert_eq!(std::fs::read(owner).unwrap(), before);
+        assert!(quarantine.join("sqlite").is_dir());
     }
 
     #[test]
@@ -6528,6 +6885,23 @@ mod tests {
         .unwrap();
 
         std::fs::write(target.join("kv/data.redb"), b"corrupt").unwrap();
+        let prior_quarantine = target.join(".rebuildable-quarantine-4242-9");
+        std::fs::create_dir_all(prior_quarantine.join("kv")).unwrap();
+        let prior_identity = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &identity,
+            "node-1",
+            ExecutionProfile::Kv,
+            LogAnchor::new(
+                checkpoint_root.compacted().index().saturating_sub(1),
+                LogHash::digest(&[b"prior-checkpoint-root"]),
+            ),
+        ));
+        write_repair_artifact_ownership(
+            &prior_quarantine,
+            RepairArtifactRole::Quarantine,
+            &prior_identity,
+        )
+        .unwrap();
         assert!(validate_local_recovery_view(
             &target,
             &identity,
@@ -6549,6 +6923,7 @@ mod tests {
             RestoreCompletionMarker::new("identity.json", b"identity-fixture").unwrap(),
         )
         .unwrap();
+        assert!(!prior_quarantine.exists());
         assert_eq!(
             std::fs::read(target.join("recorder/sentinel")).unwrap(),
             b"keep-me"
@@ -6727,6 +7102,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qefx_gc_retry_backoff_is_bounded_away_from_the_hot_poll_interval() {
+        let mut delay = super::ONLINE_QEFX_GC_INTERVAL;
+        for _ in 0..16 {
+            let next = super::next_qefx_gc_retry(delay);
+            assert!(next >= delay);
+            assert!(next <= super::ONLINE_QEFX_GC_RETRY_MAX);
+            delay = next;
+        }
+        assert_eq!(delay, super::ONLINE_QEFX_GC_RETRY_MAX);
+    }
+
     #[tokio::test]
     async fn coordinator_startup_uses_one_loaded_restore_when_archive_advances() {
         let root = tempfile::tempdir().unwrap();
@@ -6785,6 +7172,59 @@ mod tests {
             .unwrap();
         assert_eq!(tip, CheckpointTip::new(1, entry.hash));
         assert_eq!(stale.cached_checkpoint().await.manifest().tip(), &tip);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn coordinator_startup_defers_valid_stale_qefx_gc_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = rhiza_quepaxa::Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, membership.digest(), 1);
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            identity,
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let data_dir = root.path().join("node");
+        let pending = super::PendingQefxGc {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest().to_hex(),
+            through_slot: 0,
+            checkpoint_hash: LogHash::ZERO.to_hex(),
+            manifest_digest: LogHash::digest(&[b"stale-visible-manifest"]).to_hex(),
+        };
+        super::persist_pending_qefx_gc(&data_dir, &pending).unwrap();
+        let recorder = rhiza_quepaxa::RecorderFileStore::new_with_membership(
+            data_dir.join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+
+        let coordinator = CheckpointCoordinator::open_with_holder_options_local_state(
+            archive,
+            DurabilityMode::Sync,
+            "node-1",
+            CheckpointPublisherOptions::default(),
+            recorder,
+            &data_dir,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(coordinator.health(), DurabilityHealth::Available);
+        assert_eq!(
+            super::load_pending_qefx_gc(&data_dir).unwrap(),
+            Some(pending)
+        );
     }
 
     #[tokio::test]

@@ -7112,7 +7112,7 @@ async fn prepare_standard(
                     .check("rejoin recovery-view restore")
                     .map_err(startup_error)?;
                 eprintln!(
-                    "local recovery view is not trustworthy ({view_error}); quarantining rebuildable state and restoring the verified checkpoint"
+                    "local recovery view is not trustworthy ({view_error}); attempting an identity-bound quarantine and verified checkpoint restore"
                 );
                 let expected = capture_checkpoint_restore_state_for_ha(
                     config,
@@ -7144,7 +7144,7 @@ async fn prepare_standard(
                     )
                     .map_err(|restore_error| {
                         fail(format!(
-                            "rebuildable local recovery view was quarantined but verified checkpoint restore failed: {restore_error}"
+                            "rebuildable local recovery view could not be quarantined and restored from the verified checkpoint: {restore_error}"
                         ))
                     })?;
                     #[cfg(test)]
