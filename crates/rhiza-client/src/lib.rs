@@ -35,16 +35,17 @@ pub mod wire {
 
     #[cfg(feature = "graph")]
     pub use rhiza_node::{
-        GraphColumnDto, GraphDeleteDocumentRequest, GraphMutationResponse, GraphPutDocumentRequest,
-        GraphQueryParameterDto, GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto,
-        GraphResultValueDto,
+        GraphColumnDto, GraphDeleteDocumentRequest, GraphGetDocumentRequest,
+        GraphGetDocumentResponse, GraphMutationResponse, GraphMutationResultDto,
+        GraphPutDocumentRequest, GraphQueryParameterDto, GraphQueryRequest, GraphQueryResponse,
+        GraphQueryStatementDto, GraphResultValueDto,
     };
 
     #[cfg(feature = "kv")]
     pub use rhiza_node::{
         KvBatchMemberRequest, KvBatchMemberResponse, KvBatchRequest, KvBatchResponse,
-        KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvPutRequest,
-        KvScanEntryDto, KvScanRequest, KvScanResponse,
+        KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvMutationResultDto,
+        KvPutRequest, KvScanEntryDto, KvScanRequest, KvScanResponse,
     };
 }
 
@@ -179,6 +180,19 @@ impl RhizaClient {
     ) -> Result<wire::GraphMutationResponse, ClientError> {
         self.json_request(rhiza_node::GRAPH_DELETE_DOCUMENT_PATH, &request, true)
             .await
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn graph_get_document(
+        &self,
+        request: wire::GraphGetDocumentRequest,
+    ) -> Result<wire::GraphGetDocumentResponse, ClientError> {
+        self.json_request(
+            rhiza_node::GRAPH_GET_DOCUMENT_PATH,
+            &request,
+            read_can_hedge(request.consistency),
+        )
+        .await
     }
 
     #[cfg(feature = "kv")]
@@ -1174,12 +1188,112 @@ fn safe_transport_detail(error: reqwest::Error) -> String {
 mod kv_tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+    use axum::{
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Json, Router,
+    };
     use rhiza_core::LogHash;
 
     use super::{wire::*, RhizaClient};
 
     type CapturedScan = Arc<Mutex<Option<(HeaderMap, KvScanRequest)>>>;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<(HeaderMap, String)>>>);
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, task)
+    }
+
+    fn put_request() -> KvPutRequest {
+        KvPutRequest {
+            request_id: "kv-request-1".into(),
+            key: "a2V5".into(),
+            value: "dmFsdWU=".into(),
+        }
+    }
+
+    fn mutation_response() -> Json<KvMutationResponse> {
+        Json(KvMutationResponse {
+            applied_index: 7,
+            hash: LogHash::ZERO,
+            result: rhiza_node::KvMutationResultDto::Put { replaced: false },
+        })
+    }
+
+    #[tokio::test]
+    async fn kv_put_recovers_ambiguous_mutation_with_the_identical_request() {
+        let first = Captured::default();
+        let first_app = Router::new()
+            .route(
+                rhiza_node::KV_PUT_PATH,
+                post(
+                    |State(captured): State<Captured>, headers: HeaderMap, body: String| async move {
+                        captured.0.lock().unwrap().push((headers, body));
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "code": "ambiguous_mutation",
+                                "retryable": true,
+                                "message": "retry only the identical request_id and payload",
+                            })),
+                        )
+                    },
+                ),
+            )
+            .with_state(first.clone());
+        let (first_endpoint, first_server) = serve(first_app).await;
+
+        let second = Captured::default();
+        let second_app = Router::new()
+            .route(
+                rhiza_node::KV_PUT_PATH,
+                post(
+                    |State(captured): State<Captured>, headers: HeaderMap, body: String| async move {
+                        captured.0.lock().unwrap().push((headers, body));
+                        mutation_response()
+                    },
+                ),
+            )
+            .with_state(second.clone());
+        let (second_endpoint, second_server) = serve(second_app).await;
+
+        let response = RhizaClient::new([first_endpoint, second_endpoint], "client-secret")
+            .unwrap()
+            .kv_put(put_request())
+            .await
+            .unwrap();
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(response.applied_index, 7);
+        let first = first.0.lock().unwrap();
+        let second = second.0.lock().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].1, serde_json::to_string(&put_request()).unwrap());
+        assert_eq!(first[0].1, second[0].1);
+        for header in [
+            "authorization",
+            "content-type",
+            "accept",
+            rhiza_node::VERSION_HEADER,
+        ] {
+            assert_eq!(first[0].0.get(header), second[0].0.get(header), "{header}");
+        }
+        assert_eq!(first[0].0["authorization"], "Bearer client-secret");
+        assert_eq!(
+            first[0].0[rhiza_node::VERSION_HEADER],
+            rhiza_node::PROTOCOL_VERSION
+        );
+    }
 
     #[tokio::test]
     async fn kv_scan_sends_the_typed_request_with_auth() {
@@ -1230,6 +1344,195 @@ mod kv_tests {
         );
         assert_eq!(request.prefix.as_deref(), Some("/w=="));
         assert_eq!(request.limit, Some(10));
+    }
+}
+
+#[cfg(all(test, feature = "graph"))]
+mod graph_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Json, Router,
+    };
+    use rhiza_core::LogHash;
+
+    use super::{wire::*, RhizaClient};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<(HeaderMap, String)>>>);
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, task)
+    }
+
+    fn put_request() -> GraphPutDocumentRequest {
+        GraphPutDocumentRequest {
+            request_id: "graph-request-1".into(),
+            id: "document-1".into(),
+            value: rhiza_node::GraphValueDto::String("hello".into()),
+        }
+    }
+
+    fn mutation_response() -> Json<GraphMutationResponse> {
+        Json(GraphMutationResponse {
+            applied_index: 7,
+            hash: LogHash::ZERO,
+            result: GraphMutationResultDto::PutDocument { created: true },
+        })
+    }
+
+    #[tokio::test]
+    async fn graph_put_sends_the_public_route_schema_and_recovers_ambiguous_mutation() {
+        let first = Captured::default();
+        let first_app = Router::new()
+            .route(
+                rhiza_node::GRAPH_PUT_DOCUMENT_PATH,
+                post(
+                    |State(captured): State<Captured>, headers: HeaderMap, body: String| async move {
+                        captured.0.lock().unwrap().push((headers, body));
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "code": "ambiguous_mutation",
+                                "retryable": true,
+                                "message": "retry only the identical request_id and payload",
+                            })),
+                        )
+                    },
+                ),
+            )
+            .with_state(first.clone());
+        let (first_endpoint, first_server) = serve(first_app).await;
+
+        let second = Captured::default();
+        let second_app = Router::new()
+            .route(
+                rhiza_node::GRAPH_PUT_DOCUMENT_PATH,
+                post(
+                    |State(captured): State<Captured>, headers: HeaderMap, body: String| async move {
+                        captured.0.lock().unwrap().push((headers, body));
+                        mutation_response()
+                    },
+                ),
+            )
+            .with_state(second.clone());
+        let (second_endpoint, second_server) = serve(second_app).await;
+
+        let response = RhizaClient::new([first_endpoint, second_endpoint], "client-secret")
+            .unwrap()
+            .graph_put_document(put_request())
+            .await
+            .unwrap();
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(response.applied_index, 7);
+        let first = first.0.lock().unwrap();
+        let second = second.0.lock().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].1, serde_json::to_string(&put_request()).unwrap());
+        assert_eq!(first[0].1, second[0].1);
+        for header in [
+            "authorization",
+            "content-type",
+            "accept",
+            rhiza_node::VERSION_HEADER,
+        ] {
+            assert_eq!(first[0].0.get(header), second[0].0.get(header), "{header}");
+        }
+        assert_eq!(first[0].0["authorization"], "Bearer client-secret");
+        assert_eq!(
+            first[0].0[rhiza_node::VERSION_HEADER],
+            rhiza_node::PROTOCOL_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_get_preserves_read_consistency_for_existing_hedging_policy() {
+        let captured = Captured::default();
+        let app = Router::new()
+            .route(
+                rhiza_node::GRAPH_GET_DOCUMENT_PATH,
+                post(
+                    |State(captured): State<Captured>, headers: HeaderMap, body: String| async move {
+                        captured.0.lock().unwrap().push((headers, body));
+                        Json(GraphGetDocumentResponse {
+                            value: None,
+                            applied_index: 9,
+                            hash: LogHash::ZERO,
+                        })
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let (endpoint, server) = serve(app).await;
+
+        let response = RhizaClient::new([endpoint], "client-secret")
+            .unwrap()
+            .graph_get_document(GraphGetDocumentRequest {
+                id: "document-1".into(),
+                consistency: Some(ReadConsistency::ReadBarrier),
+            })
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(response.applied_index, 9);
+        let captured = captured.0.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].1,
+            r#"{"id":"document-1","consistency":"read_barrier"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_delete_sends_the_typed_mutation_request() {
+        let captured = Captured::default();
+        let app = Router::new()
+            .route(
+                rhiza_node::GRAPH_DELETE_DOCUMENT_PATH,
+                post(
+                    |State(captured): State<Captured>, headers: HeaderMap, body: String| async move {
+                        captured.0.lock().unwrap().push((headers, body));
+                        Json(GraphMutationResponse {
+                            applied_index: 8,
+                            hash: LogHash::ZERO,
+                            result: GraphMutationResultDto::DeleteDocument { existed: true },
+                        })
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let (endpoint, server) = serve(app).await;
+
+        let response = RhizaClient::new([endpoint], "client-secret")
+            .unwrap()
+            .graph_delete_document(GraphDeleteDocumentRequest {
+                request_id: "delete-1".into(),
+                id: "document-1".into(),
+            })
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(response.applied_index, 8);
+        let captured = captured.0.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].1,
+            r#"{"request_id":"delete-1","id":"document-1"}"#
+        );
+        assert_eq!(captured[0].0["accept"], "application/json");
     }
 }
 
@@ -1671,6 +1974,77 @@ mod tests {
         let second = second.0.lock().unwrap();
         assert_eq!(first[0].1, second[0].1);
         assert_eq!(first[0].1, serde_json::to_string(&write_request()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn write_recovers_ambiguous_mutation_with_the_identical_request() {
+        let first = CapturedRequests::default();
+        let first_app =
+            Router::new()
+                .route(
+                    rhiza_node::WRITE_PATH,
+                    post(
+                        |State(captured): State<CapturedRequests>,
+                         headers: HeaderMap,
+                         body: String| async move {
+                            captured.0.lock().unwrap().push((headers, body));
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "code": "ambiguous_mutation",
+                                    "retryable": true,
+                                    "message": "retry only the identical request_id and payload",
+                                })),
+                            )
+                        },
+                    ),
+                )
+                .with_state(first.clone());
+        let (first_endpoint, first_server) = serve(first_app).await;
+
+        let second = CapturedRequests::default();
+        let second_app =
+            Router::new()
+                .route(
+                    rhiza_node::WRITE_PATH,
+                    post(
+                        |State(captured): State<CapturedRequests>,
+                         headers: HeaderMap,
+                         body: String| async move {
+                            captured.0.lock().unwrap().push((headers, body));
+                            write_response(1)
+                        },
+                    ),
+                )
+                .with_state(second.clone());
+        let (second_endpoint, second_server) = serve(second_app).await;
+
+        let response = RhizaClient::new(vec![first_endpoint, second_endpoint], "client-secret")
+            .unwrap()
+            .write(write_request())
+            .await
+            .unwrap();
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(response.applied_index, 1);
+        let first = first.0.lock().unwrap();
+        let second = second.0.lock().unwrap();
+        assert_eq!(first[0].1, second[0].1);
+        assert_eq!(
+            serde_json::from_str::<WriteRequest>(&first[0].1)
+                .unwrap()
+                .request_id,
+            "request-1"
+        );
+        for header in [
+            "authorization",
+            "content-type",
+            "accept",
+            rhiza_node::VERSION_HEADER,
+        ] {
+            assert_eq!(first[0].0.get(header), second[0].0.get(header), "{header}");
+        }
     }
 
     #[tokio::test]
