@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.1
 
 - Makes checkpoint coordinator startup consume one manifest/restore pair, so
   a concurrent peer publication cannot be misclassified as checkpoint
@@ -11,6 +11,17 @@
 - Reports admitted writes whose response deadline expires as
   `write_outcome_unknown`; retrying the same request ID reconciles the exact
   result instead of treating a possibly committed write as a definite timeout.
+- Restarts voters whose local qlog fell behind a compacted shared checkpoint,
+  allowing the identity-bound quarantine and verified checkpoint restore path
+  to rejoin the voter instead of leaving it permanently not ready.
+- Makes the staggered-cluster CLI reuse the exact request ID after an ambiguous
+  write outcome, preserving at-most-once reconciliation during failure tests.
+
+### Release scope
+
+`v0.7.1` publishes GitHub source, SQL/Graph/KV CLI archives, and immutable
+multi-architecture GHCR images. Rust crate versions remain independently
+versioned and are not published by this release.
 
 ## v0.7.0
 
