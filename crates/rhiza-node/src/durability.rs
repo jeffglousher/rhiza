@@ -17,9 +17,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "sql")]
+use rhiza_archive::CheckpointPublicationReceipt;
 use rhiza_archive::{
-    CheckpointIdentity, CheckpointPublicationReceipt, CheckpointPublisher,
-    CheckpointPublisherOptions, CheckpointTip, ObjectArchiveStore, RestoredCheckpoint,
+    CheckpointIdentity, CheckpointPublisher, CheckpointPublisherOptions, CheckpointTip,
+    ObjectArchiveStore, RestoredCheckpoint,
 };
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::SnapshotIdentity;
@@ -2024,17 +2026,7 @@ impl CheckpointCoordinator {
                 create_runtime_checkpoint_snapshot(runtime, target, target_hash, &configuration)?;
             (target, snapshot, fence)
         };
-        // Serialize the exact QEFX effect-certificate transaction with this
-        // manifest rewrite.  In particular, an effect publish cannot capture
-        // the old manifest then fsync that certificate after this snapshot
-        // replaces it at the same log tip.
-        #[cfg(feature = "sql")]
-        let _qefx_maintenance = self.qefx_gc_maintenance.lock().await;
         self.flush_runtime_inner(runtime, target, true).await?;
-        #[cfg(feature = "sql")]
-        if load_pending_qefx_gc(runtime.config.data_dir())?.is_some() {
-            return Err(DurabilityError::CompactionDeferred);
-        }
         let anchor = snapshot.anchor.clone();
         self.publisher
             .publish_checkpoint_snapshot(anchor.clone(), &snapshot.archive_bytes)
@@ -6480,7 +6472,7 @@ mod tests {
 
     #[cfg(feature = "sql")]
     #[tokio::test]
-    async fn pending_qefx_gc_defers_same_tip_compaction_until_exact_record_clears() {
+    async fn pending_qefx_gc_survives_same_tip_compaction_with_immutable_receipt() {
         let root = tempfile::tempdir().unwrap();
         let data_dir = root.path().join("node");
         let config = NodeConfig::new_embedded(
@@ -6622,17 +6614,14 @@ mod tests {
         super::clear_pending_qefx_gc(&data_dir).unwrap();
         super::persist_pending_qefx_gc(&data_dir, &pending).unwrap();
 
-        assert!(matches!(
-            runtime.checkpoint_compact(&coordinator).await,
-            Err(DurabilityError::CompactionDeferred)
-        ));
-        let deferred = archive.load_checkpoint().await.unwrap().unwrap();
-        let deferred_certificate = archive
-            .checkpoint_readback_certificate(&deferred)
+        runtime.checkpoint_compact(&coordinator).await.unwrap();
+        let locally_compacted = archive.load_checkpoint().await.unwrap().unwrap();
+        let locally_compacted_certificate = archive
+            .checkpoint_readback_certificate(&locally_compacted)
             .await
             .unwrap();
-        assert_eq!(
-            deferred_certificate.manifest_digest(),
+        assert_ne!(
+            locally_compacted_certificate.manifest_digest(),
             before_certificate.manifest_digest()
         );
 
@@ -6652,7 +6641,7 @@ mod tests {
                 .await
                 .unwrap()
                 .manifest_digest(),
-            before_certificate.manifest_digest()
+            locally_compacted_certificate.manifest_digest()
         );
 
         // A different voter has no access to this node's pending file and may
