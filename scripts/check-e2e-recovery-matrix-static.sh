@@ -142,6 +142,9 @@ require_literal 'RHIZA_RECOVERY_F1_PROBE_INTERVAL_SECONDS:-10'
 require_literal 'RHIZA_VIND_DIRECT_CLUSTER:-0'
 require_literal 'RHIZA_VIND_SKIP_IMAGE_LOAD:-0'
 require_literal 'RHIZA_VIND_DIRECT_CLUSTER=1 requires RHIZA_VIND_CONTEXT'
+require_literal 'sql|graph|kv) ;;'
+# shellcheck disable=SC2016
+require_literal 'docker build --build-arg "RHIZA_PROFILE=$profile" -t "$image" .'
 require_literal 'rhiza.dev/e2e-run-id'
 require_literal 'recovery-matrix.jsonl'
 require_literal 'rhiza_commit'
@@ -157,7 +160,6 @@ require_literal 'ack_ledger'
 require_literal 'old_pod_uids'
 require_literal 'new_pod_uids'
 require_literal 'ack_sentinel_preserved'
-require_literal 'markers_lost'
 require_literal 'pvc_count'
 require_literal 'failure_write_expected'
 require_literal 'failure_write_actual_detail'
@@ -263,14 +265,15 @@ fi
   exit 1
 }
 require_literal 'matrix_expect_write_no_quorum'
-require_literal '(.code == "write_timeout" or .code == "write_outcome_unknown" or .code == "unavailable")'
+require_literal '(.code == "write_timeout" or .code == "write_outcome_unknown" or
+     .code == "ambiguous_mutation" or .code == "unavailable")'
 require_literal 'write_retry_deadline_seconds=60'
 # The post-restore probe may encounter a short-lived quorum convergence window.
 # It must retry only known retryable HTTP errors, with the original request ID.
 require_literal 'retryable_write_failure'
-require_literal 'HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|unavailable|writes_unavailable)'
-retryable_write_pattern='^write failed: HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|unavailable|writes_unavailable)( |$)'
-for retryable_code in write_timeout write_outcome_unknown unavailable writes_unavailable; do
+require_literal 'HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|ambiguous_mutation|unavailable|writes_unavailable)'
+retryable_write_pattern='^write failed: HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|ambiguous_mutation|unavailable|writes_unavailable)( |$)'
+for retryable_code in write_timeout write_outcome_unknown ambiguous_mutation unavailable writes_unavailable; do
   printf 'write failed: HTTP 503 Service Unavailable code=%s retryable=true\n' "$retryable_code" |
     grep -Eq "$retryable_write_pattern" || {
       echo "retryable write classifier rejected $retryable_code" >&2
@@ -287,7 +290,9 @@ done
 # shellcheck disable=SC2016
 require_literal 'for ((attempt=1; attempt<=60; attempt++)); do'
 # shellcheck disable=SC2016
-require_literal 'client "$pod" write --request-id "$request_id" --key "$key" --value "$value" 2> "$attempt_log"'
+require_literal 'profile_put "$pod" "$key" "$value" "$request_id" 2> "$attempt_log"'
+# shellcheck disable=SC2016
+require_literal_count 'profile_put "$pod" "$key" "$value" "$request_id" 2> "$attempt_log"' 1
 # shellcheck disable=SC2016
 require_literal 'retryable_write_failure "$attempt_log"'
 # shellcheck disable=SC2016
@@ -313,6 +318,28 @@ require_literal 'case "$exit_code" in 7|28)'
 require_literal 'idempotency_boundary_verified'
 require_literal '.node.active_config_id'
 require_literal 'matrix_run_f1_availability_probe'
+require_literal 'matrix_response_is_ambiguous_mutation'
+# shellcheck disable=SC2016
+require_literal '[ "$status" = 503 ]'
+require_literal '.code == "ambiguous_mutation" and .retryable == true'
+# shellcheck disable=SC2016
+require_literal '"$(wc -c < "$body")" -le 65536'
+require_literal 'matrix_service_mutation_response()'
+require_literal 'return 75'
+require_literal 'ambiguous_mutation_retry_exhausted'
+# shellcheck disable=SC2016
+require_literal '[ "$write_status" = 0 ] && break'
+# shellcheck disable=SC2016
+require_literal 'if matrix_service_read "$service_rto_key" "$service_rto_value" read_barrier; then'
+require_literal 'matrix_prepare_delete_request()'
+# shellcheck disable=SC2016
+require_literal 'first="$(matrix_service_mutation_response "$matrix_path" "$matrix_body")"'
+# shellcheck disable=SC2016
+require_literal 'second="$(profile_put "$pod" "$key" "$value" "$put_id")"'
+# shellcheck disable=SC2016
+require_literal 'delete_first="$(matrix_service_mutation_response "$matrix_path" "$matrix_body")"'
+# shellcheck disable=SC2016
+require_literal 'delete_second="$(profile_delete "$pod" "$key" "$delete_id")"'
 # shellcheck disable=SC2016
 require_literal 'failure_probe_interval_seconds="$recovery_f1_probe_interval"'
 # shellcheck disable=SC2016
@@ -335,6 +362,117 @@ require_literal 'k scale statefulset "$name_c1" --replicas="$cell_survivors"'
 require_literal 'k scale statefulset "$name_c1" --replicas=3'
 # shellcheck disable=SC2016
 require_literal '"$BASH" scripts/wait-k8s-statefulset-ready.sh'
+
+[ "$(grep -Fc 'k exec "$pod" -- rhiza' "$script")" -eq 1 ] || {
+  echo "runtime Pod exec must have exactly one approved invocation" >&2
+  exit 1
+}
+# shellcheck disable=SC2016
+grep -Fxq '  k exec "$pod" -- rhiza "$@" --url http://127.0.0.1:8080' "$script" || {
+  echo "runtime Pod exec must use the Rhiza CLI invocation" >&2
+  exit 1
+}
+
+retry_fixture_dir="$(mktemp -d)"
+trap 'rm -rf "$retry_fixture_dir"' EXIT
+target="$retry_fixture_dir"
+# shellcheck disable=SC2034
+matrix_path=/v1/write
+# shellcheck disable=SC2034
+matrix_body='{"request_id":"fixed","key":"key","value":"value"}'
+matrix_prepare_write_request() { :; }
+matrix_service_http() {
+  fixture_call_count=$((fixture_call_count + 1))
+  fixture_paths+=("$1")
+  fixture_bodies+=("$2")
+  # shellcheck disable=SC2034
+  matrix_last_job="fixture-$fixture_call_count"
+  matrix_last_http_status="${fixture_statuses[$((fixture_call_count - 1))]}"
+  matrix_last_http_body="$target/fixture-$fixture_call_count.response"
+  matrix_last_http_raw="$target/fixture-$fixture_call_count.response.raw"
+  printf '%s' "${fixture_bodies_by_attempt[$((fixture_call_count - 1))]}" > "$matrix_last_http_body"
+  printf 'fixture raw %s\n' "$fixture_call_count" > "$matrix_last_http_raw"
+  case "$matrix_last_http_status" in
+    2[0-9][0-9]) cat "$matrix_last_http_body"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+eval "$(awk '
+  /^matrix_response_is_ambiguous_mutation\(\)/,/^matrix_service_write\(\)/ {
+    if (/^matrix_service_write\(\)/) exit
+    print
+  }
+' "$script")"
+run_retry_fixture() {
+  fixture_statuses=("$@")
+  fixture_bodies_by_attempt=("${fixture_fixture_bodies[@]}")
+  fixture_call_count=0
+  fixture_paths=()
+  fixture_bodies=()
+}
+
+fixture_fixture_bodies=(
+  '{"code":"ambiguous_mutation","retryable":true}'
+  '{"ok":true}'
+)
+run_retry_fixture 503 200
+matrix_service_mutation_response /v1/fixture '{"request_id":"fixed"}' > "$target/fixture-output"
+fixture_output="$(< "$target/fixture-output")"
+[ "$fixture_output" = '{"ok":true}' ] &&
+  [ "$fixture_call_count" -eq 2 ] &&
+  [ "${fixture_paths[0]}" = "${fixture_paths[1]}" ] &&
+  [ "${fixture_bodies[0]}" = "${fixture_bodies[1]}" ] || {
+  echo 'matrix exact retry ambiguous->success fixture failed' >&2
+  exit 1
+}
+
+fixture_fixture_bodies=(
+  '{"code":"ambiguous_mutation","retryable":true}'
+  '{"code":"ambiguous_mutation","retryable":true}'
+)
+run_retry_fixture 503 503
+if matrix_service_mutation_response /v1/fixture '{"request_id":"fixed"}' >/dev/null; then
+  echo 'matrix exact retry ambiguous->ambiguous unexpectedly succeeded' >&2
+  exit 1
+else
+  retry_status=$?
+fi
+[ "$fixture_call_count" -eq 2 ] && [ "$retry_status" = 75 ] || exit 1
+
+oversized_fixture_body="$(head -c 65537 /dev/zero | tr '\0' x)"
+[ "$(LC_ALL=C printf '%s' "$oversized_fixture_body" | wc -c | tr -d ' ')" = 65537 ] || exit 1
+for fixture_body in '' 'true' '{not-json' '{"code":"unavailable","retryable":true}' \
+  '{"code":"ambiguous_mutation","retryable":false}' "$oversized_fixture_body"; do
+  fixture_fixture_bodies=("$fixture_body")
+  run_retry_fixture 503
+  if matrix_service_mutation_response /v1/fixture '{"request_id":"fixed"}' >/dev/null; then
+    echo 'matrix non-exact ambiguity fixture unexpectedly succeeded' >&2
+    exit 1
+  fi
+  [ "$fixture_call_count" -eq 1 ] || {
+    echo 'matrix non-exact ambiguity fixture retried' >&2
+    exit 1
+  }
+done
+
+fixture_fixture_bodies=('{"ok":true}')
+run_retry_fixture 200
+matrix_service_mutation_response /v1/fixture '{"request_id":"fixed"}' >/dev/null
+[ "$fixture_call_count" -eq 1 ] || {
+  echo 'matrix successful write fixture retried' >&2
+  exit 1
+}
+
+fixture_fixture_bodies=('{"code":"unavailable","retryable":true}')
+run_retry_fixture 503
+if matrix_service_mutation_response /v1/fixture '{"request_id":"fixed"}' >/dev/null; then
+  echo 'matrix nonambiguous failure fixture unexpectedly succeeded' >&2
+  exit 1
+fi
+[ "$fixture_call_count" -eq 1 ] || {
+  echo 'matrix nonambiguous failure retained attempt evidence or terminal output' >&2
+  exit 1
+}
 
 wait_script="$repo_root/scripts/wait-k8s-statefulset-ready.sh"
 # shellcheck disable=SC2016
