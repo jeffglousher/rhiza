@@ -29,6 +29,8 @@ const DURING: u8 = 1;
 const AFTER: u8 = 2;
 const UNFAULTED: u8 = 3;
 const WORKER_PANIC_DIAGNOSTIC: &str = "benchmark worker panicked; recorded as worker_panic";
+const AMBIGUOUS_WRITE_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const AMBIGUOUS_WRITE_RETRY_MAX: Duration = Duration::from_secs(1);
 
 fn main() {
     let config = match parse_config(env::args().skip(1), |key| env::var(key).ok()) {
@@ -137,6 +139,8 @@ fn run(config: Config) -> Result<(), String> {
             table: config.table,
             setup_skipped: config.skip_setup,
             d1_exact_write: config.d1_exact_write,
+            retry_ambiguous_writes: config.retry_ambiguous_writes,
+            ambiguous_write_retry_timeout_ms: config.ambiguous_write_retry_timeout.as_millis(),
         },
         warmup: warmup.stats.output(config.warmup),
         measurement: MeasurementOutput {
@@ -177,6 +181,7 @@ fn value_ledger(
         "/v1/sql/query",
         json!({"statement":{"sql":format!("SELECT COUNT(*), MIN(value), MAX(value) FROM {} WHERE request_id LIKE ?", config.table),"parameters":[{"type":"text","value":format!("{prefix}%")}]},"consistency":"read_barrier","max_rows":1}),
         "sql_query",
+        false,
     )?;
     let values = response
         .pointer("/rows/0")
@@ -205,6 +210,7 @@ fn count_request_rows(client: &Client, config: &Config, prefix: &str) -> Result<
         "/v1/sql/query",
         json!({"statement":{"sql":format!("SELECT COUNT(*) FROM {} WHERE request_id LIKE ?", config.table),"parameters":[{"type":"text","value":format!("{prefix}%")}]},"consistency":"read_barrier","max_rows":1}),
         "sql_query",
+        false,
     )?;
     response
         .pointer("/rows/0/0/value")
@@ -220,6 +226,7 @@ fn latest_request_id(client: &Client, config: &Config, prefix: &str) -> Result<S
         "/v1/sql/query",
         json!({"statement":{"sql":format!("SELECT request_id FROM {} WHERE request_id LIKE ? ORDER BY request_id DESC LIMIT 1", config.table),"parameters":[{"type":"text","value":format!("{prefix}%")}]},"consistency":"read_barrier","max_rows":1}),
         "sql_query",
+        false,
     )?;
     response
         .pointer("/rows/0/0/value")
@@ -290,6 +297,7 @@ fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), Str
         "/v1/sql/execute",
         body,
         "sql_execute",
+        config.retry_ambiguous_writes,
     )
     .map_err(|error| format!("create benchmark table: {error}"))?;
     let seed_id = BENCH_SEED_ID;
@@ -314,6 +322,7 @@ fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), Str
         "/v1/sql/execute",
         body,
         "sql_execute",
+        config.retry_ambiguous_writes,
     )
     .map_err(|error| format!("insert benchmark seed: {error}"))?;
     let returned_id = response
@@ -653,6 +662,7 @@ fn write_request(client: &Client, config: &Config, request_id: &str) -> Result<(
         "/v1/sql/execute",
         body,
         "sql_execute",
+        config.retry_ambiguous_writes,
     )?;
     let returned_id = response
         .pointer("/results/0/returning/rows/0/0/value")
@@ -680,6 +690,7 @@ fn read_request(client: &Client, config: &Config, request_id: &str) -> Result<()
         "/v1/sql/query",
         body,
         "sql_query",
+        false,
     )?;
     if response.get("columns").is_none() || response.get("rows").is_none() {
         return Err("invalid_sql_query_response".into());
@@ -694,14 +705,55 @@ fn protocol_post_failover(
     path: &str,
     body: Value,
     operation: &str,
+    retry_same_request: bool,
 ) -> Result<Value, String> {
-    let candidates = endpoint_candidates(&config.endpoints, key, path);
-    let last_index = candidates.len().saturating_sub(1);
-    for (index, url) in candidates.into_iter().enumerate() {
-        match protocol_post(client, url, &config.token, body.clone(), operation) {
-            Ok(response) => return Ok(response),
-            Err(error) if index < last_index && retryable_endpoint_error(&error) => continue,
-            Err(error) => return Err(error),
+    let deadline =
+        retry_same_request.then(|| Instant::now() + config.ambiguous_write_retry_timeout);
+    let mut retry_delay = AMBIGUOUS_WRITE_RETRY_INITIAL;
+    loop {
+        let candidates = endpoint_candidates(&config.endpoints, key, path);
+        let last_index = candidates.len().saturating_sub(1);
+        for (index, url) in candidates.into_iter().enumerate() {
+            let attempt_timeout = match deadline {
+                Some(deadline) => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        return Err("timeout".into());
+                    };
+                    config.request_timeout.min(remaining)
+                }
+                None => config.request_timeout,
+            };
+            match protocol_post_with_timeout(
+                client,
+                url,
+                &config.token,
+                body.clone(),
+                operation,
+                attempt_timeout,
+            ) {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if retryable_endpoint_error(&error)
+                        && (index < last_index
+                            || deadline.is_some_and(|deadline| Instant::now() < deadline)) =>
+                {
+                    if index == last_index {
+                        let Some(remaining) = deadline
+                            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                        else {
+                            return Err(error);
+                        };
+                        thread::sleep(retry_delay.min(remaining));
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(AMBIGUOUS_WRITE_RETRY_MAX);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if deadline.is_none() {
+            break;
         }
     }
     Err("connect".into())
@@ -746,15 +798,17 @@ fn validate_read_response(
     }
 }
 
-fn protocol_post(
+fn protocol_post_with_timeout(
     client: &Client,
     url: String,
     token: &str,
     body: Value,
     operation: &str,
+    timeout: Duration,
 ) -> Result<Value, String> {
     let response = client
         .post(url)
+        .timeout(timeout)
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth(token)
         .json(&body)
@@ -1092,6 +1146,8 @@ struct ConfigOutput {
     table: String,
     setup_skipped: bool,
     d1_exact_write: bool,
+    retry_ambiguous_writes: bool,
+    ambiguous_write_retry_timeout_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -1284,6 +1340,7 @@ fn print_usage() {
          Required: --endpoint URL (repeatable, or RHIZA_BENCH_ENDPOINT) and --token TOKEN (or RHIZA_CLIENT_TOKEN)\n\
          Options: --duration 30s --warmup 5s --concurrency 1 --target-rate 100\n\
                   --workload read|write|mixed --write-percent 50 --table rhiza_bench\n\
+                  --retry-ambiguous-writes --ambiguous-write-retry-timeout 60s --d1-exact-write\n\
                   --request-timeout 10s --fault-timeout 5m --skip-setup\n\
                   --fault OFFSET TAG COMMAND"
     );
@@ -1308,9 +1365,10 @@ mod tests {
     use rhiza_bench::{Config, FaultConfig, RateDecision, Workload};
 
     use super::{
-        benchmark_failure, endpoint_candidates, run, run_phase, run_phase_with_startup_delay,
-        setup_table, spawn_fault_hook, spawn_phase_fault_hook, wait_for_rate, write_request_id,
-        FaultWindows, PhaseGate, PhaseResult, BEFORE, WORKER_PANIC_DIAGNOSTIC,
+        benchmark_failure, endpoint_candidates, protocol_post_failover, run, run_phase,
+        run_phase_with_startup_delay, setup_table, spawn_fault_hook, spawn_phase_fault_hook,
+        wait_for_rate, write_request_id, FaultWindows, PhaseGate, PhaseResult, BEFORE,
+        WORKER_PANIC_DIAGNOSTIC,
     };
 
     fn config(endpoint: String) -> Config {
@@ -1328,6 +1386,8 @@ mod tests {
             fault_timeout: Duration::from_secs(1),
             skip_setup: false,
             d1_exact_write: false,
+            retry_ambiguous_writes: false,
+            ambiguous_write_retry_timeout: Duration::from_secs(1),
             fault: None,
         }
     }
@@ -1384,6 +1444,117 @@ mod tests {
                 "http://n3/v1/sql/execute",
             ]
         );
+    }
+
+    fn same_request_is_retried_after_status(status: &'static str) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (attempt, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                bodies.push(read_request_body(&mut stream));
+                if attempt == 0 {
+                    respond(&mut stream, status, r#"{"error":"retry"}"#);
+                } else {
+                    respond(&mut stream, "200 OK", r#"{"applied_index":1,"results":[]}"#);
+                }
+            }
+            bodies
+        });
+        let mut config = config(endpoint);
+        config.retry_ambiguous_writes = true;
+        let body = serde_json::json!({"request_id":"same-id","statements":[]});
+        let response = protocol_post_failover(
+            &Client::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap(),
+            &config,
+            "same-id",
+            "/v1/sql/execute",
+            body,
+            "sql_execute",
+            true,
+        )
+        .unwrap();
+        assert_eq!(response["applied_index"], 1);
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        assert!(bodies[0].contains("same-id"));
+    }
+
+    #[test]
+    fn single_endpoint_retries_identical_write_after_503() {
+        same_request_is_retried_after_status("503 Service Unavailable");
+    }
+
+    #[test]
+    fn single_endpoint_retries_identical_write_after_429() {
+        same_request_is_retried_after_status("429 Too Many Requests");
+    }
+
+    #[test]
+    fn ambiguous_write_retry_respects_its_logical_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_body(&mut stream);
+            thread::sleep(Duration::from_millis(400));
+        });
+        let mut config = config(endpoint);
+        config.request_timeout = Duration::from_secs(2);
+        config.ambiguous_write_retry_timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let result = protocol_post_failover(
+            &Client::builder().build().unwrap(),
+            &config,
+            "same-id",
+            "/v1/sql/execute",
+            serde_json::json!({"request_id":"same-id","statements":[]}),
+            "sql_execute",
+            true,
+        );
+        assert_eq!(result.unwrap_err(), "timeout");
+        assert!(started.elapsed() < Duration::from_millis(300));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ambiguous_write_retry_is_deadline_bounded_not_attempt_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for attempt in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                bodies.push(read_request_body(&mut stream));
+                if attempt < 6 {
+                    respond(&mut stream, "503 Service Unavailable", r#"{"error":"retry"}"#);
+                } else {
+                    respond(&mut stream, "200 OK", r#"{"applied_index":1,"results":[]}"#);
+                }
+            }
+            bodies
+        });
+        let mut config = config(endpoint);
+        config.ambiguous_write_retry_timeout = Duration::from_secs(3);
+        let response = protocol_post_failover(
+            &Client::builder().build().unwrap(),
+            &config,
+            "same-id",
+            "/v1/sql/execute",
+            serde_json::json!({"request_id":"same-id","statements":[]}),
+            "sql_execute",
+            true,
+        )
+        .unwrap();
+        assert_eq!(response["applied_index"], 1);
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 7);
+        assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]
