@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "sql")]
+use rhiza_archive::CheckpointPublicationReceipt;
 use rhiza_archive::{
     CheckpointIdentity, CheckpointPublisher, CheckpointPublisherOptions, CheckpointTip,
     ObjectArchiveStore, RestoredCheckpoint,
@@ -1116,6 +1118,7 @@ pub enum DurabilityError {
         index: LogIndex,
     },
     SnapshotVerification(String),
+    CompactionDeferred,
     PreconditionFailed,
     DataDirNotFresh(PathBuf),
     Archive(rhiza_archive::Error),
@@ -1162,6 +1165,9 @@ impl fmt::Display for DurabilityError {
             }
             Self::SnapshotVerification(message) => {
                 write!(f, "checkpoint snapshot verification failed: {message}")
+            }
+            Self::CompactionDeferred => {
+                write!(f, "checkpoint compaction deferred while QEFX GC is pending")
             }
             Self::PreconditionFailed => write!(f, "checkpoint precondition failed"),
             Self::DataDirNotFresh(path) => write!(
@@ -1230,6 +1236,10 @@ struct PendingQefxGc {
     through_slot: LogIndex,
     checkpoint_hash: String,
     manifest_digest: String,
+    #[serde(default)]
+    receipt_holder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_receipt: Option<Vec<u8>>,
 }
 
 pub struct CheckpointCoordinator {
@@ -1644,7 +1654,7 @@ impl CheckpointCoordinator {
         runtime: &NodeRuntime,
         target_index: LogIndex,
     ) -> Result<CheckpointTip, DurabilityError> {
-        let result = self.flush_runtime_inner(runtime, target_index).await;
+        let result = self.flush_runtime_inner(runtime, target_index, false).await;
         if result.is_err() {
             self.mark_unavailable();
         }
@@ -1655,7 +1665,10 @@ impl CheckpointCoordinator {
         &self,
         runtime: &NodeRuntime,
         target_index: LogIndex,
+        qefx_maintenance_held: bool,
     ) -> Result<CheckpointTip, DurabilityError> {
+        #[cfg(not(feature = "sql"))]
+        let _ = qefx_maintenance_held;
         #[cfg(test)]
         if self
             .injected_flush_unavailable
@@ -1707,6 +1720,15 @@ impl CheckpointCoordinator {
             let effects = self
                 .prepare_external_sql_effect_refs(runtime, &entries)
                 .await?;
+            // An effect publication's manifest certificate and its fsynced
+            // pending-GC record are one exact-evidence transaction. Snapshot
+            // compaction takes this same lock before rewriting the manifest.
+            #[cfg(feature = "sql")]
+            let _maintenance = if !effects.is_empty() && !qefx_maintenance_held {
+                Some(self.qefx_gc_maintenance.lock().await)
+            } else {
+                None
+            };
             self.publication_attempts.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "sql")]
             let published = self
@@ -1717,14 +1739,18 @@ impl CheckpointCoordinator {
             let published = self.publisher.publish_committed(&entries).await?;
             #[cfg(feature = "sql")]
             if !effects.is_empty() {
-                let certificate = self
-                    .store
-                    .checkpoint_readback_certificate(&published)
-                    .await?;
+                // The successful conditional manifest CAS is the durability
+                // linearization point. A concurrent voter may publish a later
+                // generation immediately afterward; that must not invalidate
+                // this immutable receipt or turn a durable write into 503.
+                let publication_receipt = published.publication_receipt()?;
+                let certificate = publication_receipt.certificate();
                 let configuration = runtime
                     .configuration_state()
                     .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
-                let _maintenance = self.qefx_gc_maintenance.lock().await;
+                self.publisher
+                    .publish_receipt_for_loaded(&published)
+                    .await?;
                 persist_pending_qefx_gc(
                     runtime.config.data_dir(),
                     &PendingQefxGc {
@@ -1735,6 +1761,8 @@ impl CheckpointCoordinator {
                         through_slot: certificate.tip().index(),
                         checkpoint_hash: certificate.tip().hash().to_hex(),
                         manifest_digest: certificate.manifest_digest().to_hex(),
+                        receipt_holder: self.publisher.receipt_holder().to_owned(),
+                        publication_receipt: Some(publication_receipt.encode()?),
                     },
                 )?;
             }
@@ -1761,7 +1789,7 @@ impl CheckpointCoordinator {
         data_dir: &Path,
         phase: &AtomicU8,
     ) -> Result<(), DurabilityError> {
-        let pending = {
+        let mut pending = {
             let _maintenance = self.qefx_gc_maintenance.lock().await;
             let Some(pending) = load_pending_qefx_gc(data_dir)? else {
                 return Ok(());
@@ -1780,24 +1808,65 @@ impl CheckpointCoordinator {
         else {
             return Ok(());
         };
-        let loaded = self
-            .store
-            .load_checkpoint()
-            .await?
-            .ok_or(DurabilityError::MissingCheckpoint)?;
-        let certificate = self.store.checkpoint_readback_certificate(&loaded).await?;
+        let receipt = if let Some(encoded) = &pending.publication_receipt {
+            let local = CheckpointPublicationReceipt::decode(encoded)?;
+            let remote = self
+                .store
+                .load_checkpoint_receipt(
+                    &pending.receipt_holder,
+                    local.certificate().manifest_digest(),
+                )
+                .await?;
+            if remote != local {
+                return Err(DurabilityError::SnapshotVerification(
+                    "pending QEFX GC receipt differs from immutable archive evidence".into(),
+                ));
+            }
+            remote
+        } else {
+            // One-time upgrade for the pre-receipt schema. It is safe only
+            // while the currently visible manifest still exactly matches all
+            // legacy evidence; otherwise leave the record untouched and fail.
+            let loaded = self
+                .store
+                .load_checkpoint()
+                .await?
+                .ok_or(DurabilityError::MissingCheckpoint)?;
+            let receipt = loaded.publication_receipt()?;
+            let certificate = receipt.certificate();
+            if certificate.identity().cluster_id() != pending.cluster_id
+                || certificate.identity().epoch() != pending.epoch
+                || certificate.identity().config_id() != pending.config_id
+                || certificate.identity().config_digest().to_hex() != pending.config_digest
+                || certificate.tip().index() != pending.through_slot
+                || certificate.tip().hash().to_hex() != pending.checkpoint_hash
+                || certificate.manifest_digest().to_hex() != pending.manifest_digest
+            {
+                return Err(DurabilityError::SnapshotVerification(
+                    "legacy pending QEFX GC evidence no longer exactly matches the visible checkpoint"
+                        .into(),
+                ));
+            }
+            let mut upgraded = pending.clone();
+            let receipt = loaded.publication_receipt()?;
+            upgraded.receipt_holder = self.publisher.receipt_holder().to_owned();
+            upgraded.publication_receipt = Some(receipt.encode()?);
+            self.publisher.publish_receipt_for_loaded(&loaded).await?;
+            persist_pending_qefx_gc(data_dir, &upgraded)?;
+            pending = upgraded;
+            receipt
+        };
+        let certificate = receipt.certificate();
         let identity_mismatch = certificate.identity().cluster_id() != pending.cluster_id
             || certificate.identity().epoch() != pending.epoch;
-        let visible_tip = certificate.tip().index();
-        let rollback = visible_tip < pending.through_slot;
-        let same_tip_conflict = visible_tip == pending.through_slot
-            && (certificate.identity().config_id() != pending.config_id
-                || certificate.identity().config_digest().to_hex() != pending.config_digest
-                || certificate.tip().hash().to_hex() != pending.checkpoint_hash
-                || certificate.manifest_digest().to_hex() != pending.manifest_digest);
-        if identity_mismatch || rollback || same_tip_conflict {
+        let receipt_mismatch = certificate.identity().config_id() != pending.config_id
+            || certificate.identity().config_digest().to_hex() != pending.config_digest
+            || certificate.tip().index() != pending.through_slot
+            || certificate.tip().hash().to_hex() != pending.checkpoint_hash
+            || certificate.manifest_digest().to_hex() != pending.manifest_digest;
+        if identity_mismatch || receipt_mismatch {
             return Err(DurabilityError::SnapshotVerification(
-                "pending QEFX GC evidence no longer matches the visible checkpoint".into(),
+                "pending QEFX GC record does not match its publication receipt".into(),
             ));
         }
         if phase
@@ -1825,8 +1894,19 @@ impl CheckpointCoordinator {
             ))
         })?;
         if outcome.is_ok_and(|outcome| outcome.sweep_complete) {
-            let _maintenance = self.qefx_gc_maintenance.lock().await;
-            clear_pending_qefx_gc_if_unchanged(data_dir, &pending)?;
+            let cleared = {
+                let _maintenance = self.qefx_gc_maintenance.lock().await;
+                clear_pending_qefx_gc_if_unchanged(data_dir, &pending)?
+            };
+            if cleared {
+                let _ = self
+                    .store
+                    .prune_checkpoint_receipts_through(
+                        &pending.receipt_holder,
+                        pending.through_slot,
+                    )
+                    .await;
+            }
         }
         Ok(())
     }
@@ -1946,7 +2026,7 @@ impl CheckpointCoordinator {
                 create_runtime_checkpoint_snapshot(runtime, target, target_hash, &configuration)?;
             (target, snapshot, fence)
         };
-        self.flush_runtime(runtime, target).await?;
+        self.flush_runtime_inner(runtime, target, false).await?;
         let anchor = snapshot.anchor.clone();
         self.publisher
             .publish_checkpoint_snapshot(anchor.clone(), &snapshot.archive_bytes)
@@ -2167,6 +2247,7 @@ impl CheckpointCoordinator {
                     {
                         match self.checkpoint_compact(&runtime).await {
                             Ok(_) => {}
+                            Err(DurabilityError::CompactionDeferred) => {}
                             Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
                                 let _ = self.publisher.reload().await;
                             }
@@ -4971,11 +5052,20 @@ fn persist_pending_qefx_gc(
             if existing.checkpoint_hash == pending.checkpoint_hash
                 && existing.manifest_digest == pending.manifest_digest
             {
-                return Ok(());
+                match (&existing.publication_receipt, &pending.publication_receipt) {
+                    (None, Some(_)) => {}
+                    (left, right) if left == right => return Ok(()),
+                    _ => {
+                        return Err(DurabilityError::SnapshotVerification(
+                            "pending QEFX GC receipt conflicts at the same checkpoint slot".into(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(DurabilityError::SnapshotVerification(
+                    "pending QEFX GC record conflicts at the same checkpoint slot".into(),
+                ));
             }
-            return Err(DurabilityError::SnapshotVerification(
-                "pending QEFX GC record conflicts at the same checkpoint slot".into(),
-            ));
         }
     }
     let path = data_dir.join(PENDING_QEFX_GC_FILE);
@@ -5031,7 +5121,7 @@ fn load_pending_qefx_gc(data_dir: &Path) -> Result<Option<PendingQefxGc>, Durabi
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4096 {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 32 * 1024 {
         return Err(DurabilityError::SnapshotVerification(
             "pending QEFX GC record is unsafe".into(),
         ));
@@ -6321,6 +6411,8 @@ mod tests {
             through_slot,
             checkpoint_hash: checkpoint_hash.into(),
             manifest_digest: LogHash::digest(&[b"manifest", &through_slot.to_be_bytes()]).to_hex(),
+            receipt_holder: "test-holder".into(),
+            publication_receipt: Some(through_slot.to_be_bytes().to_vec()),
         };
         let newer = record(12, &LogHash::digest(&[b"tip-12"]).to_hex());
         super::persist_pending_qefx_gc(root.path(), &newer).unwrap();
@@ -6361,6 +6453,8 @@ mod tests {
             through_slot,
             checkpoint_hash: LogHash::digest(&[b"tip", &through_slot.to_be_bytes()]).to_hex(),
             manifest_digest: LogHash::digest(&[b"manifest", &through_slot.to_be_bytes()]).to_hex(),
+            receipt_holder: "test-holder".into(),
+            publication_receipt: Some(through_slot.to_be_bytes().to_vec()),
         };
         let old = record(11);
         let newer = record(12);
@@ -6374,6 +6468,300 @@ mod tests {
         );
         assert!(super::clear_pending_qefx_gc_if_unchanged(root.path(), &newer).unwrap());
         assert_eq!(super::load_pending_qefx_gc(root.path()).unwrap(), None);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn pending_qefx_gc_survives_same_tip_compaction_with_immutable_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("node");
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            data_dir.clone(),
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                config.log_initial_configuration().digest(),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let membership = rhiza_quepaxa::Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let local_recorder = rhiza_quepaxa::RecorderFileStore::new_with_membership(
+            root.path().join("gc-recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let coordinator = CheckpointCoordinator::open_with_holder_options_local_state(
+            archive.clone(),
+            DurabilityMode::Sync,
+            "publisher-a",
+            CheckpointPublisherOptions::default(),
+            local_recorder.clone(),
+            &data_dir,
+        )
+        .await
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:sql:cluster-a",
+                "node-1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/node-1"),
+                    root.path().join("recorders/node-2"),
+                    root.path().join("recorders/node-3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+        coordinator.note_committed(committed.applied_index);
+        coordinator
+            .flush_runtime(&runtime, committed.applied_index)
+            .await
+            .unwrap();
+
+        let pending = super::load_pending_qefx_gc(&data_dir).unwrap().unwrap();
+        let before = archive.load_checkpoint().await.unwrap().unwrap();
+        let before_certificate = archive
+            .checkpoint_readback_certificate(&before)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.manifest_digest,
+            before_certificate.manifest_digest().to_hex()
+        );
+
+        let mut corrupt = pending.clone();
+        corrupt.publication_receipt = Some(b"not-a-publication-receipt".to_vec());
+        std::fs::write(
+            data_dir.join(super::PENDING_QEFX_GC_FILE),
+            serde_json::to_vec(&corrupt).unwrap(),
+        )
+        .unwrap();
+        let corrupt_phase = std::sync::atomic::AtomicU8::new(super::QEFX_GC_PHASE_REMOTE);
+        assert!(coordinator
+            .retry_pending_qefx_gc_at(&data_dir, &corrupt_phase)
+            .await
+            .is_err());
+        assert_eq!(local_recorder.effect_bundle_gc_anchor().unwrap(), None);
+        let forged_receipt = serde_json::json!({
+            "identity": {
+                "cluster_id": pending.cluster_id,
+                "epoch": pending.epoch,
+                "config_id": pending.config_id,
+                "config_digest": pending.config_digest,
+                "recovery_generation": 1
+            },
+            "tip": {
+                "index": pending.through_slot + 100,
+                "hash": LogHash::digest(&[b"forged-unpublished-tip"])
+            },
+            "manifest_digest": LogHash::digest(&[b"forged-manifest"]),
+            "object_version": {"e_tag":"forged","version":"forged"}
+        });
+        let mut forged = pending.clone();
+        forged.through_slot += 100;
+        forged.checkpoint_hash = LogHash::digest(&[b"forged-unpublished-tip"]).to_hex();
+        forged.manifest_digest = LogHash::digest(&[b"forged-manifest"]).to_hex();
+        forged.publication_receipt = Some(serde_json::to_vec(&forged_receipt).unwrap());
+        std::fs::write(
+            data_dir.join(super::PENDING_QEFX_GC_FILE),
+            serde_json::to_vec(&forged).unwrap(),
+        )
+        .unwrap();
+        let forged_phase = std::sync::atomic::AtomicU8::new(super::QEFX_GC_PHASE_REMOTE);
+        assert!(coordinator
+            .retry_pending_qefx_gc_at(&data_dir, &forged_phase)
+            .await
+            .is_err());
+        assert_eq!(local_recorder.effect_bundle_gc_anchor().unwrap(), None);
+        let mut mismatched_outer = pending.clone();
+        mismatched_outer.through_slot += 1;
+        std::fs::write(
+            data_dir.join(super::PENDING_QEFX_GC_FILE),
+            serde_json::to_vec(&mismatched_outer).unwrap(),
+        )
+        .unwrap();
+        let mismatch_phase = std::sync::atomic::AtomicU8::new(super::QEFX_GC_PHASE_REMOTE);
+        assert!(coordinator
+            .retry_pending_qefx_gc_at(&data_dir, &mismatch_phase)
+            .await
+            .is_err());
+        assert_eq!(local_recorder.effect_bundle_gc_anchor().unwrap(), None);
+        super::clear_pending_qefx_gc(&data_dir).unwrap();
+        super::persist_pending_qefx_gc(&data_dir, &pending).unwrap();
+
+        runtime.checkpoint_compact(&coordinator).await.unwrap();
+        let locally_compacted = archive.load_checkpoint().await.unwrap().unwrap();
+        let locally_compacted_certificate = archive
+            .checkpoint_readback_certificate(&locally_compacted)
+            .await
+            .unwrap();
+        assert_ne!(
+            locally_compacted_certificate.manifest_digest(),
+            before_certificate.manifest_digest()
+        );
+
+        let mut mismatched = pending.clone();
+        mismatched.manifest_digest = LogHash::digest(&[b"different-manifest"]).to_hex();
+        assert!(matches!(
+            super::persist_pending_qefx_gc(&data_dir, &mismatched),
+            Err(DurabilityError::SnapshotVerification(_))
+        ));
+        assert_eq!(
+            super::load_pending_qefx_gc(&data_dir).unwrap(),
+            Some(pending.clone())
+        );
+        assert_eq!(
+            archive
+                .checkpoint_readback_certificate(&archive.load_checkpoint().await.unwrap().unwrap())
+                .await
+                .unwrap()
+                .manifest_digest(),
+            locally_compacted_certificate.manifest_digest()
+        );
+
+        // A different voter has no access to this node's pending file and may
+        // compact the shared archive at the same tip. The originating voter
+        // must still consume its persisted CAS receipt, not substitute the
+        // newer mutable manifest generation.
+        let publisher_b = archive
+            .open_checkpoint_publisher("publisher-b", CheckpointPublisherOptions::default())
+            .await
+            .unwrap();
+        let configuration = runtime.configuration_state().unwrap();
+        let snapshot = super::create_runtime_checkpoint_snapshot(
+            &runtime,
+            committed.applied_index,
+            committed.hash,
+            &configuration,
+        )
+        .unwrap();
+        publisher_b
+            .publish_checkpoint_snapshot(snapshot.anchor, &snapshot.archive_bytes)
+            .await
+            .unwrap();
+        let compacted = archive.load_checkpoint().await.unwrap().unwrap();
+        let compacted_certificate = archive
+            .checkpoint_readback_certificate(&compacted)
+            .await
+            .unwrap();
+        assert_ne!(
+            compacted_certificate.manifest_digest(),
+            before_certificate.manifest_digest()
+        );
+        let phase = std::sync::atomic::AtomicU8::new(super::QEFX_GC_PHASE_REMOTE);
+        coordinator
+            .retry_pending_qefx_gc_at(&data_dir, &phase)
+            .await
+            .unwrap();
+        assert_eq!(super::load_pending_qefx_gc(&data_dir).unwrap(), None);
+        assert_eq!(
+            local_recorder.effect_bundle_gc_anchor().unwrap(),
+            Some(committed.applied_index)
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn legacy_pending_qefx_gc_upgrades_only_against_the_exact_visible_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = rhiza_quepaxa::Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, membership.digest(), 1),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let entry = LogEntry {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            index: 1,
+            entry_type: EntryType::Noop,
+            payload: Vec::new(),
+            prev_hash: LogHash::ZERO,
+            hash: LogEntry::calculate_hash(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                1,
+                EntryType::Noop,
+                LogHash::ZERO,
+                &[],
+            ),
+        };
+        let published = archive
+            .publish_committed(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        let certificate = published.publication_certificate().unwrap();
+        let data_dir = root.path().join("node");
+        let legacy = serde_json::json!({
+            "cluster_id": certificate.identity().cluster_id(),
+            "epoch": certificate.identity().epoch(),
+            "config_id": certificate.identity().config_id(),
+            "config_digest": certificate.identity().config_digest().to_hex(),
+            "through_slot": certificate.tip().index(),
+            "checkpoint_hash": certificate.tip().hash().to_hex(),
+            "manifest_digest": certificate.manifest_digest().to_hex()
+        });
+        std::fs::create_dir_all(data_dir.join("consensus")).unwrap();
+        std::fs::write(
+            data_dir.join(super::PENDING_QEFX_GC_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let recorder = rhiza_quepaxa::RecorderFileStore::new_with_membership(
+            root.path().join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let coordinator = CheckpointCoordinator::open_with_holder_options_local_state(
+            archive,
+            DurabilityMode::Sync,
+            "legacy-upgrade",
+            CheckpointPublisherOptions::default(),
+            recorder,
+            &data_dir,
+        )
+        .await
+        .unwrap();
+        let phase = std::sync::atomic::AtomicU8::new(super::QEFX_GC_PHASE_REMOTE);
+        coordinator
+            .retry_pending_qefx_gc_at(&data_dir, &phase)
+            .await
+            .unwrap();
+        assert_eq!(super::load_pending_qefx_gc(&data_dir).unwrap(), None);
     }
 
     #[cfg(feature = "sql")]
@@ -7197,6 +7585,8 @@ mod tests {
             through_slot: 0,
             checkpoint_hash: LogHash::ZERO.to_hex(),
             manifest_digest: LogHash::digest(&[b"stale-visible-manifest"]).to_hex(),
+            receipt_holder: "test-holder".into(),
+            publication_receipt: Some(b"invalid-publication-receipt".to_vec()),
         };
         super::persist_pending_qefx_gc(&data_dir, &pending).unwrap();
         let recorder = rhiza_quepaxa::RecorderFileStore::new_with_membership(
