@@ -7183,7 +7183,7 @@ mod tests {
             wait_until_ready(address).await;
         }
         wait_until_ready(&client_addresses[2]).await;
-        let committed = request_write(&WriteArgs {
+        let write = WriteArgs {
             urls: client_addresses
                 .iter()
                 .map(|address| format!("http://{address}"))
@@ -7192,9 +7192,20 @@ mod tests {
             request_id: format!("integration-{recorder_transport:?}"),
             key: "transport".into(),
             value: "committed".into(),
-        })
-        .await
-        .unwrap();
+        };
+        let write_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let committed = loop {
+            match request_write(&write).await {
+                Ok(committed) => break committed,
+                Err(error)
+                    if error.contains("code=write_outcome_unknown")
+                        && tokio::time::Instant::now() < write_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("same-request write retry did not converge: {error}"),
+            }
+        };
         assert!(committed.applied_index > 0);
 
         let _ = first_shutdown.send(());
