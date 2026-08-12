@@ -7965,33 +7965,42 @@ impl ThreeNodeConsensus {
         let mutation_started = AtomicBool::new(false);
         let budget = ControlCallBudget::new(context)
             .map_err(|error| Self::store_context_error(error, &mutation_started))?;
+        let mut cohort: Option<Vec<usize>> = None;
         for (ordinal, chunk) in request.bundle.chunks().iter().enumerate() {
             let ordinal = u16::try_from(ordinal).map_err(|_| {
                 Error::EffectBundleInvalid("effect chunk ordinal exceeds wire limit".into())
             })?;
-            self.mutation_on_quorum_with_budget(
-                &budget,
-                &mutation_started,
-                |index, context, result| ControlJob::StageEffectBundleChunk {
-                    index,
-                    context,
-                    binding: request.bundle.binding.clone(),
-                    manifest_command: request.manifest_command.clone(),
-                    ordinal,
-                    chunk: chunk.clone(),
-                    result,
-                },
-            )?;
+            let stage = |index, context, result| ControlJob::StageEffectBundleChunk {
+                index,
+                context,
+                binding: request.bundle.binding.clone(),
+                manifest_command: request.manifest_command.clone(),
+                ordinal,
+                chunk: chunk.clone(),
+                result,
+            };
+            cohort = Some(match &cohort {
+                Some(cohort) => {
+                    self.mutation_on_cohort_with_budget(&budget, &mutation_started, cohort, stage)?
+                }
+                None => self.mutation_on_quorum_with_budget(&budget, &mutation_started, stage)?,
+            });
         }
-        self.mutation_on_quorum_with_budget(&budget, &mutation_started, |index, context, result| {
-            ControlJob::FinalizeStagedEffectBundle {
+        let cohort = cohort
+            .ok_or_else(|| Error::EffectBundleInvalid("effect bundle contains no chunks".into()))?;
+        self.mutation_on_cohort_with_budget(
+            &budget,
+            &mutation_started,
+            &cohort,
+            |index, context, result| ControlJob::FinalizeStagedEffectBundle {
                 index,
                 context,
                 binding: request.bundle.binding.clone(),
                 manifest_command: request.manifest_command.clone(),
                 result,
-            }
-        })
+            },
+        )
+        .map(|_| ())
     }
 
     /// Resolves a previously quorum-finalized QEFX bundle from any available
@@ -10268,9 +10277,59 @@ impl ThreeNodeConsensus {
             RecorderRpcContext,
             std::sync::mpsc::SyncSender<(usize, Result<()>)>,
         ) -> ControlJob,
-    ) -> Result<()> {
-        check_operation_context(&budget.caller, mutation_started)?;
+    ) -> Result<Vec<usize>> {
         let quorum = quorum_size(self.control_workers.len());
+        self.mutation_on_workers_with_budget(budget, mutation_started, None, quorum, make_job)
+    }
+
+    /// Reuses the exact Recorder cohort which durably acknowledged the first
+    /// chunk. Requiring every member to ACK every later chunk and the manifest
+    /// prevents intersecting per-chunk quorums from finalizing a bundle that
+    /// no quorum member actually stores in full.
+    fn mutation_on_cohort_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
+        cohort: &[usize],
+        make_job: impl Fn(
+            usize,
+            RecorderRpcContext,
+            std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+        ) -> ControlJob,
+    ) -> Result<Vec<usize>> {
+        let quorum = quorum_size(self.control_workers.len());
+        if cohort.len() != quorum
+            || cohort
+                .iter()
+                .any(|index| *index >= self.control_workers.len())
+            || cohort.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::EffectBundleInvalid(
+                "effect bundle Recorder cohort is not an exact quorum".into(),
+            ));
+        }
+        self.mutation_on_workers_with_budget(
+            budget,
+            mutation_started,
+            Some(cohort),
+            cohort.len(),
+            make_job,
+        )
+    }
+
+    fn mutation_on_workers_with_budget(
+        &self,
+        budget: &ControlCallBudget,
+        mutation_started: &AtomicBool,
+        cohort: Option<&[usize]>,
+        required: usize,
+        make_job: impl Fn(
+            usize,
+            RecorderRpcContext,
+            std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+        ) -> ControlJob,
+    ) -> Result<Vec<usize>> {
+        check_operation_context(&budget.caller, mutation_started)?;
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
         let group = ControlCallGroup::new();
@@ -10280,6 +10339,9 @@ impl ThreeNodeConsensus {
         let mut dispatch_error = None;
         let mut store_dispatch_paused = false;
         for (index, worker) in self.control_workers.iter().enumerate() {
+            if cohort.is_some_and(|cohort| cohort.binary_search(&index).is_err()) {
+                continue;
+            }
             if let Err(error) = budget.check_admission() {
                 dispatch_error = Some(Self::store_context_error(error, mutation_started));
                 break;
@@ -10308,7 +10370,7 @@ impl ThreeNodeConsensus {
             .iter()
             .filter(|dispatch| **dispatch == Some(ControlDispatch::Saturated))
             .count();
-        let mut stored = 0;
+        let mut stored = Vec::with_capacity(required);
         let mut received = 0;
         let mut replied = vec![false; total];
         // Direct dispatch failure is part of the final quorum classification,
@@ -10368,7 +10430,7 @@ impl ThreeNodeConsensus {
             };
             if admitted_reply {
                 match result {
-                    Ok(()) => stored += 1,
+                    Ok(()) => stored.push(index),
                     Err(Error::UnknownOutcome) => observed_unknown = true,
                     Err(Error::RpcCancelled | Error::RpcDeadlineExceeded) => {
                         observed_unknown = true;
@@ -10382,8 +10444,9 @@ impl ThreeNodeConsensus {
             }
             if let Some(error) = safety_error.clone() {
                 frozen = Some(Err(error));
-            } else if stored >= quorum {
-                frozen = Some(Ok(()));
+            } else if stored.len() >= required {
+                stored.sort_unstable();
+                frozen = Some(Ok(stored.clone()));
             } else if received == accepted_count {
                 break;
             }
@@ -10411,7 +10474,7 @@ impl ThreeNodeConsensus {
             };
             if admitted_reply {
                 match result {
-                    Ok(()) => stored += 1,
+                    Ok(()) => stored.push(index),
                     Err(Error::UnknownOutcome) => observed_unknown = true,
                     Err(Error::ProposeFailed) => worker_failed = true,
                     Err(error) if Self::is_control_safety_error(&error) => {
@@ -10431,8 +10494,10 @@ impl ThreeNodeConsensus {
         // same content-addressed bytes durably and idempotently at its bound
         // worker.  Thus distinct exact ACKs establish this content-registration
         // quorum even if another admitted delivery is unknown.
-        if stored >= quorum {
-            return Ok(());
+        if stored.len() >= required {
+            stored.sort_unstable();
+            stored.truncate(required);
+            return Ok(stored);
         }
         if received < accepted_count || observed_unknown || !timed_out.is_empty() {
             return Err(Error::UnknownOutcome);
@@ -10442,8 +10507,14 @@ impl ThreeNodeConsensus {
         }
         match frozen {
             Some(result) => result,
-            None if stored >= quorum => Ok(()),
-            None if worker_failed && !control_quorum_reachable(stored, saturated, quorum) => {
+            None if stored.len() >= required => {
+                stored.sort_unstable();
+                stored.truncate(required);
+                Ok(stored)
+            }
+            None if worker_failed
+                && !control_quorum_reachable(stored.len(), saturated, required) =>
+            {
                 Err(Error::ProposeFailed)
             }
             None => Err(Error::NoQuorum),
@@ -10470,6 +10541,7 @@ impl ThreeNodeConsensus {
                 result,
             }
         })
+        .map(|_| ())
     }
 
     fn fetch_verified_value(
@@ -15215,6 +15287,82 @@ mod tests {
         chunk_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
     }
 
+    struct RotatingEffectStageRecorder {
+        recorder_id: &'static str,
+        staged: Arc<Mutex<BTreeSet<u16>>>,
+    }
+
+    struct UnknownLaterEffectStageRecorder {
+        recorder_id: &'static str,
+        staged: Arc<Mutex<BTreeSet<u16>>>,
+        finalized: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for RotatingEffectStageRecorder {
+        fn stage_effect_bundle_chunk(
+            &self,
+            _context: &RecorderRpcContext,
+            _binding: EffectBundleBinding,
+            _manifest_command: StoredCommand,
+            ordinal: u16,
+            _chunk: Vec<u8>,
+        ) -> super::Result<()> {
+            // The first chunk establishes n1+n2 as the exact quorum. The old
+            // implementation dispatched the second chunk to n3 anyway;
+            // asserting n3 remains empty makes that regression deterministic.
+            if self.recorder_id == "n3" && ordinal == 0 {
+                return Err(Error::ProposeFailed);
+            }
+            self.staged.lock().unwrap().insert(ordinal);
+            Ok(())
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            _context: &RecorderRpcContext,
+            _binding: EffectBundleBinding,
+            _manifest_command: StoredCommand,
+        ) -> super::Result<()> {
+            if self.staged.lock().unwrap().iter().copied().eq([0, 1]) {
+                Ok(())
+            } else {
+                Err(Error::EffectBundleInvalid(
+                    "recorder is missing effect chunk".into(),
+                ))
+            }
+        }
+    }
+
+    impl RecorderRpc for UnknownLaterEffectStageRecorder {
+        fn stage_effect_bundle_chunk(
+            &self,
+            _context: &RecorderRpcContext,
+            _binding: EffectBundleBinding,
+            _manifest_command: StoredCommand,
+            ordinal: u16,
+            _chunk: Vec<u8>,
+        ) -> super::Result<()> {
+            if self.recorder_id == "n3" && ordinal == 0 {
+                return Err(Error::ProposeFailed);
+            }
+            if self.recorder_id == "n1" && ordinal == 1 {
+                return Err(Error::UnknownOutcome);
+            }
+            self.staged.lock().unwrap().insert(ordinal);
+            Ok(())
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            _context: &RecorderRpcContext,
+            _binding: EffectBundleBinding,
+            _manifest_command: StoredCommand,
+        ) -> super::Result<()> {
+            self.finalized.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     impl RecorderRpc for ScriptedEffectFetchRecorder {
         fn fetch_effect_bundle_manifest(
             &self,
@@ -15305,6 +15453,87 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn effect_finalize_reuses_the_first_chunk_quorum_for_every_chunk() {
+        let (_membership, bundle, manifest) = effect_fetch_fixture();
+        let staged =
+            std::array::from_fn::<_, 3, _>(|_| Arc::new(Mutex::new(BTreeSet::<u16>::new())));
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "effect-fetch-cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, recorder_id)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(RotatingEffectStageRecorder {
+                            recorder_id,
+                            staged: Arc::clone(&staged[index]),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let request = EffectBundleFinalizeRequest::new(bundle, manifest).unwrap();
+
+        consensus
+            .finalize_effect_bundle_on_quorum(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                &request,
+            )
+            .unwrap();
+
+        assert_eq!(*staged[0].lock().unwrap(), BTreeSet::from([0, 1]));
+        assert_eq!(*staged[1].lock().unwrap(), BTreeSet::from([0, 1]));
+        assert!(staged[2].lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn effect_finalize_preserves_later_cohort_unknown_without_rotating_recorders() {
+        let (_membership, bundle, manifest) = effect_fetch_fixture();
+        let staged =
+            std::array::from_fn::<_, 3, _>(|_| Arc::new(Mutex::new(BTreeSet::<u16>::new())));
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "effect-fetch-cluster",
+            "n1",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, recorder_id)| {
+                    (
+                        recorder_id.into(),
+                        Box::new(UnknownLaterEffectStageRecorder {
+                            recorder_id,
+                            staged: Arc::clone(&staged[index]),
+                            finalized: Arc::clone(&finalized),
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let request = EffectBundleFinalizeRequest::new(bundle, manifest).unwrap();
+
+        assert!(matches!(
+            consensus.finalize_effect_bundle_on_quorum(
+                &RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+                &request,
+            ),
+            Err(Error::UnknownOutcome)
+        ));
+        assert_eq!(*staged[0].lock().unwrap(), BTreeSet::from([0]));
+        assert_eq!(*staged[1].lock().unwrap(), BTreeSet::from([0, 1]));
+        assert!(staged[2].lock().unwrap().is_empty());
+        assert_eq!(finalized.load(Ordering::Relaxed), 0);
     }
 
     #[test]
