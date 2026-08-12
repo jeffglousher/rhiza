@@ -104,8 +104,12 @@ fn retryable_sync_archive_error(error: &rhiza_archive::Error) -> bool {
 }
 
 fn retryable_sync_recovery_error(error: &DurabilityError) -> bool {
-    matches!(error, DurabilityError::Io(_) | DurabilityError::Unavailable)
-        || matches!(error, DurabilityError::Archive(error) if retryable_sync_archive_error(error))
+    matches!(
+        error,
+        DurabilityError::Io(_)
+            | DurabilityError::Unavailable
+            | DurabilityError::LocalMirrorBehindSharedCheckpoint { .. }
+    ) || matches!(error, DurabilityError::Archive(error) if retryable_sync_archive_error(error))
 }
 
 fn next_sync_recovery_retry(current: Duration) -> Duration {
@@ -1107,6 +1111,10 @@ pub enum DurabilityError {
         durable_index: LogIndex,
         local_index: LogIndex,
     },
+    LocalMirrorBehindSharedCheckpoint {
+        durable_index: LogIndex,
+        local_index: LogIndex,
+    },
     SnapshotRequired {
         anchor: Box<RecoveryAnchor>,
     },
@@ -1148,6 +1156,13 @@ impl fmt::Display for DurabilityError {
             } => write!(
                 f,
                 "checkpoint tip {durable_index} is ahead of local qlog tip {local_index}"
+            ),
+            Self::LocalMirrorBehindSharedCheckpoint {
+                durable_index,
+                local_index,
+            } => write!(
+                f,
+                "local qlog tip {local_index} is behind shared checkpoint tip {durable_index} without exact prefix evidence"
             ),
             Self::SnapshotRequired { anchor } => write!(
                 f,
@@ -1655,7 +1670,13 @@ impl CheckpointCoordinator {
         target_index: LogIndex,
     ) -> Result<CheckpointTip, DurabilityError> {
         let result = self.flush_runtime_inner(runtime, target_index, false).await;
-        if result.is_err() {
+        if matches!(
+            result,
+            Err(DurabilityError::LocalLogConflict { .. }
+                | DurabilityError::LocalMirrorBehindSharedCheckpoint { .. })
+        ) {
+            self.lock_state().health = DurabilityHealth::Unavailable;
+        } else if result.is_err() {
             self.mark_unavailable();
         }
         result
@@ -1682,14 +1703,17 @@ impl CheckpointCoordinator {
         let log_state = runtime.log_store().logical_state()?;
         let local_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
         let mut durable_tip = self.durable_tip();
-        if durable_tip.index() > local_index {
-            return Err(DurabilityError::ArchiveAheadOfLocal {
-                durable_index: durable_tip.index(),
-                local_index,
-            });
-        }
         let target_index = target_index.min(local_index);
+        if durable_tip.index() > local_index {
+            let local_tip = log_state
+                .tip
+                .unwrap_or_else(|| LogAnchor::new(0, LogHash::ZERO));
+            durable_tip = self
+                .verify_shared_checkpoint_covers_local_tip(local_tip)
+                .await?;
+        }
         if target_index <= durable_tip.index() {
+            self.mark_durable(durable_tip);
             return Ok(durable_tip);
         }
         if let Some(anchor) = log_state.anchor {
@@ -1781,6 +1805,57 @@ impl CheckpointCoordinator {
                     })?;
         }
         Ok(durable_tip)
+    }
+
+    async fn verify_shared_checkpoint_covers_local_tip(
+        &self,
+        local_tip: LogAnchor,
+    ) -> Result<CheckpointTip, DurabilityError> {
+        let restored = self
+            .store
+            .load_checkpoint_restore()
+            .await?
+            .ok_or(DurabilityError::MissingCheckpoint)?;
+        let shared_tip = *restored.restored().tip();
+        observe_durable_tip(&self.state, shared_tip)?;
+
+        let included_hash = if local_tip.index() == 0 {
+            Some(LogHash::ZERO)
+        } else if let Some(snapshot) = restored.restored().snapshot() {
+            match snapshot
+                .anchor()
+                .compacted()
+                .index()
+                .cmp(&local_tip.index())
+            {
+                std::cmp::Ordering::Equal => Some(snapshot.anchor().compacted().hash()),
+                std::cmp::Ordering::Greater => None,
+                std::cmp::Ordering::Less => restored
+                    .restored()
+                    .suffix()
+                    .iter()
+                    .find(|entry| entry.index == local_tip.index())
+                    .map(|entry| entry.hash),
+            }
+        } else {
+            restored
+                .restored()
+                .suffix()
+                .iter()
+                .find(|entry| entry.index == local_tip.index())
+                .map(|entry| entry.hash)
+        };
+
+        match included_hash {
+            Some(hash) if hash == local_tip.hash() => Ok(shared_tip),
+            Some(_) => Err(DurabilityError::LocalLogConflict {
+                index: local_tip.index(),
+            }),
+            None => Err(DurabilityError::LocalMirrorBehindSharedCheckpoint {
+                durable_index: shared_tip.index(),
+                local_index: local_tip.index(),
+            }),
+        }
     }
 
     #[cfg(feature = "sql")]
@@ -7728,6 +7803,158 @@ mod tests {
             .unwrap();
         assert!(coordinator.write_allowed().is_ok());
         assert_eq!(coordinator.health(), DurabilityHealth::Available);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn shared_checkpoint_ahead_of_local_qlog_satisfies_the_local_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            CheckpointIdentity::new(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                rhiza_quepaxa::Membership::new(["node-1", "node-2", "node-3"])
+                    .unwrap()
+                    .digest(),
+                1,
+            ),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+
+        let open_runtime = |name: &str| {
+            let config = NodeConfig::new_embedded(
+                "cluster-a",
+                "node-1",
+                root.path().join(name),
+                1,
+                1,
+                ["node-1", "node-2", "node-3"],
+            )
+            .unwrap();
+            let consensus = Arc::new(
+                ThreeNodeConsensus::from_recovered_tip(
+                    "rhiza:sql:cluster-a",
+                    "node-1",
+                    1,
+                    1,
+                    [
+                        root.path().join(format!("{name}-recorders/node-1")),
+                        root.path().join(format!("{name}-recorders/node-2")),
+                        root.path().join(format!("{name}-recorders/node-3")),
+                    ],
+                    1,
+                    LogHash::ZERO,
+                )
+                .unwrap(),
+            );
+            NodeRuntime::open(config, consensus, &[]).unwrap()
+        };
+        let ahead = open_runtime("ahead");
+        let lagging = Arc::new(open_runtime("lagging"));
+        let divergent = open_runtime("divergent");
+
+        let ahead_first = ahead.write("request-1", "alpha", "one").unwrap();
+        let lagging_first = lagging.write("request-1", "alpha", "one").unwrap();
+        let divergent_first = divergent.write("request-1", "alpha", "different").unwrap();
+        assert_eq!(lagging_first.applied_index, ahead_first.applied_index);
+        assert_eq!(lagging_first.hash, ahead_first.hash);
+        assert_ne!(divergent_first.hash, ahead_first.hash);
+        let ahead_second = ahead.write("request-2", "beta", "two").unwrap();
+
+        let ahead_coordinator =
+            CheckpointCoordinator::open_with_holder(archive.clone(), DurabilityMode::Sync, "ahead")
+                .await
+                .unwrap();
+        ahead_coordinator.note_committed(ahead_second.applied_index);
+        let shared_tip = ahead_coordinator
+            .flush_runtime(&ahead, ahead_second.applied_index)
+            .await
+            .unwrap();
+        assert!(shared_tip.index() > lagging_first.applied_index);
+        let published = archive.load_checkpoint().await.unwrap().unwrap();
+
+        let lagging_coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive.clone(),
+                DurabilityMode::Sync,
+                "lagging",
+            )
+            .await
+            .unwrap(),
+        );
+        lagging_coordinator.note_committed(lagging_first.applied_index);
+        assert_eq!(
+            lagging_coordinator
+                .flush_runtime(&lagging, lagging_first.applied_index)
+                .await
+                .unwrap(),
+            shared_tip
+        );
+        assert_eq!(lagging_coordinator.health(), DurabilityHealth::Available);
+        assert_eq!(archive.load_checkpoint().await.unwrap().unwrap(), published);
+
+        let divergent_coordinator =
+            CheckpointCoordinator::open_with_holder(archive, DurabilityMode::Sync, "divergent")
+                .await
+                .unwrap();
+        divergent_coordinator.note_committed(divergent_first.applied_index);
+        assert!(matches!(
+            divergent_coordinator
+                .flush_runtime(&divergent, divergent_first.applied_index)
+                .await,
+            Err(DurabilityError::LocalLogConflict { index: 1 })
+        ));
+        assert_eq!(
+            divergent_coordinator.health(),
+            DurabilityHealth::Unavailable
+        );
+
+        let missing = ahead.log_store().read(2).unwrap().unwrap();
+        ahead.checkpoint_compact(&ahead_coordinator).await.unwrap();
+        assert!(matches!(
+            lagging_coordinator
+                .flush_runtime(&lagging, lagging_first.applied_index)
+                .await,
+            Err(DurabilityError::LocalMirrorBehindSharedCheckpoint {
+                durable_index: 2,
+                local_index: 1,
+            })
+        ));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker = tokio::spawn(lagging_coordinator.clone().run_background(
+            lagging.clone(),
+            async move {
+                if !*shutdown_rx.borrow() {
+                    let _ = shutdown_rx.changed().await;
+                }
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut worker)
+                .await
+                .is_err()
+        );
+        lagging.log_store().append(&missing).unwrap();
+        lagging_coordinator.note_committed(2);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if lagging_coordinator.health() == DurabilityHealth::Available
+                    && lagging_coordinator.write_allowed().is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        worker.await.unwrap().unwrap();
     }
 
     #[cfg(feature = "sql")]
