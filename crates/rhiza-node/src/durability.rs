@@ -104,12 +104,8 @@ fn retryable_sync_archive_error(error: &rhiza_archive::Error) -> bool {
 }
 
 fn retryable_sync_recovery_error(error: &DurabilityError) -> bool {
-    matches!(
-        error,
-        DurabilityError::Io(_)
-            | DurabilityError::Unavailable
-            | DurabilityError::LocalMirrorBehindSharedCheckpoint { .. }
-    ) || matches!(error, DurabilityError::Archive(error) if retryable_sync_archive_error(error))
+    matches!(error, DurabilityError::Io(_) | DurabilityError::Unavailable)
+        || matches!(error, DurabilityError::Archive(error) if retryable_sync_archive_error(error))
 }
 
 fn next_sync_recovery_retry(current: Duration) -> Duration {
@@ -7914,7 +7910,6 @@ mod tests {
             DurabilityHealth::Unavailable
         );
 
-        let missing = ahead.log_store().read(2).unwrap().unwrap();
         ahead.checkpoint_compact(&ahead_coordinator).await.unwrap();
         assert!(matches!(
             lagging_coordinator
@@ -7925,8 +7920,8 @@ mod tests {
                 local_index: 1,
             })
         ));
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut worker = tokio::spawn(lagging_coordinator.clone().run_background(
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(lagging_coordinator.clone().run_background(
             lagging.clone(),
             async move {
                 if !*shutdown_rx.borrow() {
@@ -7934,27 +7929,17 @@ mod tests {
                 }
             },
         ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut worker)
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), worker)
                 .await
-                .is_err()
-        );
-        lagging.log_store().append(&missing).unwrap();
-        lagging_coordinator.note_committed(2);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if lagging_coordinator.health() == DurabilityHealth::Available
-                    && lagging_coordinator.write_allowed().is_ok()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        shutdown_tx.send(true).unwrap();
-        worker.await.unwrap().unwrap();
+                .unwrap()
+                .unwrap(),
+            Err(DurabilityError::LocalMirrorBehindSharedCheckpoint {
+                durable_index: 2,
+                local_index: 1,
+            })
+        ));
+        assert!(lagging.log_store().read(2).unwrap().is_none());
     }
 
     #[cfg(feature = "sql")]
