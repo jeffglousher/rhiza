@@ -34,8 +34,9 @@ run cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-
 run scripts/e2e-fast.sh
 run cargo clippy --locked --all-targets "${package_args[@]}" -- -D warnings
 run cargo test --locked --all-targets "${package_args[@]}"
-run cargo test --locked -p rhiza-node --features graph --lib \
-  graph_write_retries_the_same_request_after_unknown_recorder_outcome
+run cargo test --locked -p rhiza-node --features graph --lib -- \
+  graph_write_retries_the_same_request_after_unknown_recorder_outcome \
+  materialize_recovers_a_transient_inspection_unknown_without_latching
 
 for feature in shadow proposer-canary hedge-canary default-on; do
   run cargo test --locked -p rhiza-tuner --no-default-features --features "$feature" \
@@ -51,6 +52,14 @@ done
 for profile_feature in graph kv; do
   run cargo check --locked -p rhiza-client --no-default-features --features "$profile_feature"
   run cargo check --locked -p rhiza-cli --no-default-features --features "$profile_feature"
+done
+
+# Clippy with -D warnings must also pass per profile; cargo check alone misses
+# unreachable-pattern lint failures on profile-only builds.
+for profile_feature in graph kv graph,kv; do
+  run cargo clippy --locked -p rhiza-cli --all-targets \
+    --no-default-features --features "$profile_feature,recorder-postcard-rpc" \
+    -- -D warnings
 done
 
 run cargo test --locked -p rhiza-quepaxa --features test-hooks

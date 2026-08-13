@@ -3677,6 +3677,10 @@ fn classify_pending_request(
             QueuedOperation::Kv(_) => Err(NodeError::KvRequestConflict {
                 request_id: request_id.to_owned(),
             }),
+            // SQL members cannot appear in the graph/kv batch paths; this
+            // arm exists only for SQL-enabled builds where the enum has more
+            // variants than the two profiled ones.
+            #[cfg(feature = "sql")]
             _ => Err(NodeError::InvalidRequest(
                 "request id reused with another command in the same writer batch".into(),
             )),
