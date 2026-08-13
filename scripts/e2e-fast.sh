@@ -27,6 +27,17 @@ run() {
 # avoids Docker, Kubernetes, cloud object storage, and Chaos Mesh while still
 # exercising the two process boundaries that have caused the live failures:
 # three real postcard-rpc/TCP Recorder servers and compacted-checkpoint rejoin.
+#
+# The budget measures test execution only, not compilation. Pre-build the
+# exact test targets so a cold runner (GitHub CI) does not consume the budget
+# with cargo downloads and linking.
+run cargo test --locked -p rhiza-cli --features recorder-postcard-rpc --bin rhiza \
+  --no-run
+run cargo test --locked -p rhiza-node --features sql --lib \
+  --no-run
+
+started_at="$(date +%s)"
+
 run cargo test --locked -p rhiza-cli --features recorder-postcard-rpc --bin rhiza \
   tests::staggered_postcard_rpc_cluster_commits_after_all_recorders_start -- --exact
 run cargo test --locked -p rhiza-node --features sql --lib \
