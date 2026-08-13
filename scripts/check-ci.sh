@@ -42,6 +42,17 @@ for feature in shadow proposer-canary hedge-canary default-on; do
     rollout::tests::legacy_feature_default_is_preserved --lib
 done
 
+# Profile-only builds must compile without the SQL default. Feature-gated
+# variants (e.g. NodeError::RequestConflict) otherwise hide behind the SQL
+# feature and only fail in the graph/kv container profiles.
+for profile_feature in graph kv graph,kv; do
+  run cargo check --locked -p rhiza-node --no-default-features --features "$profile_feature"
+done
+for profile_feature in graph kv; do
+  run cargo check --locked -p rhiza-client --no-default-features --features "$profile_feature"
+  run cargo check --locked -p rhiza-cli --no-default-features --features "$profile_feature"
+done
+
 run cargo test --locked -p rhiza-quepaxa --features test-hooks
 run cargo fmt --manifest-path bench/Cargo.toml -- --check
 run cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings

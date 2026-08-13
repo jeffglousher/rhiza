@@ -3671,8 +3671,7 @@ fn classify_pending_request(
             #[cfg(feature = "graph")]
             QueuedOperation::Graph(_) => Err(NodeError::GraphRequestConflict {
                 request_id: request_id.to_owned(),
-                original_log_index: None,
-                original_log_hash: None,
+                original: None,
             }),
             #[cfg(feature = "kv")]
             QueuedOperation::Kv(_) => Err(NodeError::KvRequestConflict {
@@ -6192,6 +6191,7 @@ fn node_error_response(error: NodeError) -> Response {
         NodeError::InvalidSqlStatement {
             statement_index, ..
         } => (StatusCode::BAD_REQUEST, Some(*statement_index)),
+        #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, None),
         #[cfg(feature = "graph")]
         NodeError::GraphRequestConflict { .. } => (StatusCode::CONFLICT, None),
@@ -7220,8 +7220,7 @@ pub enum NodeError {
     #[cfg(feature = "graph")]
     GraphRequestConflict {
         request_id: String,
-        original_log_index: Option<LogIndex>,
-        original_log_hash: Option<LogHash>,
+        original: Option<LogAnchor>,
     },
     #[cfg(feature = "kv")]
     KvRequestConflict {
@@ -7284,22 +7283,20 @@ impl fmt::Display for NodeError {
             Self::Contention(message) => write!(f, "node contention: {message}"),
             Self::WinnerLimitExceeded => write!(f, "foreign winner retry limit exceeded"),
             #[cfg(feature = "sql")]
-            Self::RequestConflict(conflict) => {
-                write!(f, "request id reused with different payload: {conflict}")
-            }
+            Self::RequestConflict(conflict) => conflict.fmt(f),
             #[cfg(feature = "graph")]
             Self::GraphRequestConflict {
                 request_id,
-                original_log_index,
-                original_log_hash,
-            } => match (original_log_index, original_log_hash) {
-                (Some(index), Some(hash)) => write!(
+                original,
+            } => match original {
+                Some(anchor) => write!(
                     f,
                     "request id reused with a different graph command: {request_id} \
-                     (original qlog {index}/{})",
-                    hash.to_hex(),
+                     (original qlog {}/{})",
+                    anchor.index(),
+                    anchor.hash().to_hex(),
                 ),
-                _ => write!(
+                None => write!(
                     f,
                     "request id reused with a different graph command: {request_id}"
                 ),
@@ -7332,6 +7329,7 @@ impl NodeError {
             Self::InvalidRequest(_) => ("invalid_request", false),
             #[cfg(feature = "sql")]
             Self::InvalidSqlStatement { .. } => ("invalid_request", false),
+            #[cfg(feature = "sql")]
             Self::RequestConflict(_) => ("request_conflict", false),
             #[cfg(feature = "graph")]
             Self::GraphRequestConflict { .. } => ("request_conflict", false),
@@ -12494,8 +12492,7 @@ impl NodeRuntime {
                     original_log_hash,
                 } => NodeError::GraphRequestConflict {
                     request_id,
-                    original_log_index: Some(original_log_index),
-                    original_log_hash: Some(original_log_hash),
+                    original: Some(LogAnchor::new(original_log_index, original_log_hash)),
                 },
                 other => NodeError::InvalidRequest(other.to_string()),
             })
@@ -13244,7 +13241,7 @@ mod tests {
         LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
-    use rhiza_graph::{GraphCommandV1, GraphValueV1};
+    use rhiza_graph::{encode_replicated_graph_command, GraphCommandV1, GraphValueV1};
     #[cfg(feature = "kv")]
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
@@ -14697,7 +14694,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "sql")]
+    #[cfg(feature = "graph")]
     #[test]
     fn materialize_recovers_a_transient_inspection_unknown_without_latching() {
         let root = tempfile::tempdir().unwrap();
@@ -14711,7 +14708,7 @@ mod tests {
                     RecorderFileStore::new_with_membership(
                         root.path().join("recorders").join(node_id),
                         *node_id,
-                        "rhiza:sql:materialize-recovery",
+                        "rhiza:graph:materialize-recovery",
                         1,
                         1,
                         membership.clone(),
@@ -14724,7 +14721,7 @@ mod tests {
         let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
         let consensus = Arc::new(
             ThreeNodeConsensus::from_recorders_with_ids(
-                "rhiza:sql:materialize-recovery",
+                "rhiza:graph:materialize-recovery",
                 "n1",
                 1,
                 1,
@@ -14754,23 +14751,51 @@ mod tests {
             1,
             node_ids,
         )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
         .unwrap();
         let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
 
         // Commit one decision with a definite proof, then make the next
         // inspection ambiguous exactly once on every recorder. The materializer
         // must treat that as transient and recover on the following poll.
-        let command = SqlCommand {
-            request_id: "materialize-1".into(),
-            statements: vec![SqlStatement {
-                sql: "CREATE TABLE recovered_items(id INTEGER PRIMARY KEY)".into(),
-                parameters: vec![],
-            }],
-        };
-        runtime.execute_sql(command).unwrap();
+        let command = GraphCommandV1::put_document(
+            "materialize-1",
+            "document-1",
+            GraphValueV1::String("first".into()),
+        )
+        .unwrap();
+        runtime.mutate_graph(command).unwrap();
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
+
+        // Seed a second decided slot directly on the consensus so the local
+        // materializer tip (1) lags the recorder quorum (2), then make the
+        // first inspection of that slot ambiguous on every voter.
+        let seeded = GraphCommandV1::put_document(
+            "materialize-2",
+            "document-2",
+            GraphValueV1::String("second".into()),
+        )
+        .unwrap();
+        let payload = encode_replicated_graph_command(&seeded).unwrap();
+        let last_hash = runtime
+            .log_store()
+            .read(1)
+            .unwrap()
+            .map(|entry| entry.hash)
+            .unwrap();
+        runtime
+            .consensus()
+            .propose_at(
+                runtime.consensus_context(),
+                2,
+                last_hash,
+                Command::new(CommandKind::Deterministic, payload),
+            )
+            .unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
 
         remaining_unknown_inspections.store(3, Ordering::Release);
         let transient = runtime.materialize_next_decision().unwrap_err();
@@ -14778,23 +14803,18 @@ mod tests {
         assert!(runtime.is_ready(), "transient inspect must not latch");
         assert!(!runtime.is_fatal(), "transient inspect must not latch");
 
-        // The next inspection observes the same tip and reconciles it as
-        // empty once the injected ambiguity is exhausted.
-        assert!(!runtime.materialize_next_decision().unwrap());
+        // The next poll must recover and apply the seeded decision exactly
+        // once, advancing the local tip to the recorder quorum tip.
+        assert!(runtime.materialize_next_decision().unwrap());
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
+        let materializer = runtime.lock_materializer().unwrap();
+        assert_eq!(materializer.applied_tip().unwrap().index(), 2);
+        drop(materializer);
 
-        // A later commit still works: the runtime recovered from the
-        // transient inspection without latching readiness or admission.
-        let later = SqlCommand {
-            request_id: "materialize-2".into(),
-            statements: vec![SqlStatement {
-                sql: "CREATE TABLE later_items(id INTEGER PRIMARY KEY)".into(),
-                parameters: vec![],
-            }],
-        };
-        runtime.execute_sql(later).unwrap();
-        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        // A third poll finds nothing further to apply.
+        assert!(!runtime.materialize_next_decision().unwrap());
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
     }
