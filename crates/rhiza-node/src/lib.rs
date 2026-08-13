@@ -9469,13 +9469,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
                 )
-                .map_err(|error| {
-                    self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    )
-                })?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             self.persist_entry(&entry, slot, last_hash)?;
             if let Some(record) = self.check_graph_request(command.request_id(), &payload)? {
                 return Ok(GraphMutationOutcome::from_record(record));
@@ -9619,13 +9613,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
                 )
-                .map_err(|error| {
-                    self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    )
-                })?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             self.persist_entry(&entry, slot, last_hash)?;
             if let Some(record) = self.check_kv_request(command.request_id(), &payload)? {
                 return Ok(KvMutationOutcome::from_record(record));
@@ -10258,11 +10246,7 @@ impl NodeRuntime {
                         }
                         continue 'sql_batches;
                     }
-                    let error = self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    );
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10296,11 +10280,7 @@ impl NodeRuntime {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    );
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10735,11 +10715,7 @@ impl NodeRuntime {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    );
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10941,11 +10917,7 @@ impl NodeRuntime {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    );
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -11174,13 +11146,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
-                .map_err(|error| {
-                    self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    )
-                })?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             let sql_result = self.persist_sql_entry_profiled(
                 &entry,
                 slot,
@@ -11295,13 +11261,7 @@ impl NodeRuntime {
             .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
         self.consensus
             .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
-            .map_err(|error| {
-                self.map_consensus_error_at(
-                    error,
-                    ConsensusDiagnostic::ReceiptBackedMutation,
-                    Some(intended_slot),
-                )
-            })?;
+            .map_err(|error| self.map_receipt_backed_mutation_error(error, intended_slot))?;
         Ok(payload)
     }
 
@@ -11353,13 +11313,7 @@ impl NodeRuntime {
                 .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
             self.consensus
                 .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
-                .map_err(|error| {
-                    self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    )
-                })?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             let entry = self
                 .consensus
                 .propose_at(
@@ -11368,13 +11322,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
-                .map_err(|error| {
-                    self.map_consensus_error_at(
-                        error,
-                        ConsensusDiagnostic::ReceiptBackedMutation,
-                        Some(slot),
-                    )
-                })?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             self.persist_sql_entry_profiled(
                 &entry,
                 slot,
@@ -12918,6 +12866,22 @@ impl NodeRuntime {
         // ConsensusDiagnostic::ReceiptBackedMutation explicitly so admitted
         // unknowns surface as ambiguous_mutation rather than write_outcome_unknown.
         self.map_consensus_error_at(error, ConsensusDiagnostic::Other, None)
+    }
+
+    /// Maps a consensus error for an admitted, receipt-backed user mutation
+    /// (SQL QEFX, graph, or KV write). The only path that must be used by
+    /// mutating proposal call sites so an admitted unknown is surfaced as a
+    /// retryable ambiguous_mutation instead of a generic write_outcome_unknown.
+    fn map_receipt_backed_mutation_error(
+        &self,
+        error: rhiza_quepaxa::Error,
+        slot: LogIndex,
+    ) -> NodeError {
+        self.map_consensus_error_at(
+            error,
+            ConsensusDiagnostic::ReceiptBackedMutation,
+            Some(slot),
+        )
     }
 
     fn map_consensus_error_at(
@@ -14819,6 +14783,243 @@ mod tests {
 
         // A third poll finds nothing further to apply.
         assert!(!runtime.materialize_next_decision().unwrap());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn read_barrier_recovers_a_transient_inspection_unknown_without_latching() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:graph:read-barrier-recovery",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:read-barrier-recovery",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "read-barrier-recovery",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        runtime
+            .mutate_graph(
+                GraphCommandV1::put_document(
+                    "rb-request-1",
+                    "rb-document",
+                    GraphValueV1::String("committed".into()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        // The first read barrier inspection is ambiguous on every voter. The
+        // read must fail transiently (503-equivalent Unavailable, no latch)
+        // and the caller must be able to retry the same read.
+        remaining_unknown_inspections.store(3, Ordering::Release);
+        let transient = runtime
+            .get_graph_document("rb-document", ReadConsistency::ReadBarrier)
+            .unwrap_err();
+        assert!(matches!(transient, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready(), "transient barrier must not latch");
+        assert!(!runtime.is_fatal(), "transient barrier must not latch");
+
+        let retried = runtime
+            .get_graph_document("rb-document", ReadConsistency::ReadBarrier)
+            .unwrap();
+        assert_eq!(
+            retried.value,
+            Some(GraphValueV1::String("committed".into()))
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_materializer_survives_a_transient_unknown_and_applies_later() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:graph:materializer-supervisor",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:materializer-supervisor",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "materializer-supervisor",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+
+        runtime
+            .mutate_graph(
+                GraphCommandV1::put_document(
+                    "supervisor-request-1",
+                    "supervisor-document",
+                    GraphValueV1::String("first".into()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Seed a second decided slot so the local tip lags the quorum, then
+        // make the first inspection ambiguous on every voter. The supervisor
+        // must survive the transient error and apply the seeded decision on a
+        // later poll without terminating.
+        let seeded = GraphCommandV1::put_document(
+            "supervisor-request-2",
+            "supervisor-document",
+            GraphValueV1::String("second".into()),
+        )
+        .unwrap();
+        let payload = encode_replicated_graph_command(&seeded).unwrap();
+        let last_hash = runtime
+            .log_store()
+            .read(1)
+            .unwrap()
+            .map(|entry| entry.hash)
+            .unwrap();
+        runtime
+            .consensus()
+            .propose_at(
+                runtime.consensus_context(),
+                2,
+                last_hash,
+                Command::new(CommandKind::Deterministic, payload),
+            )
+            .unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+        remaining_unknown_inspections.store(3, Ordering::Release);
+
+        let supervisor = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .run_background_materializer(Duration::from_millis(10), async {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    })
+                    .await
+            })
+        };
+
+        // The supervisor must keep polling through the transient unknown and
+        // apply the seeded decision well within the shutdown horizon.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if runtime.log_store().last_index().unwrap() == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            runtime.log_store().last_index().unwrap(),
+            Some(2),
+            "supervisor must survive the transient unknown and apply the seeded decision"
+        );
+        let materializer = runtime.lock_materializer().unwrap();
+        assert_eq!(materializer.applied_tip().unwrap().index(), 2);
+        drop(materializer);
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let result = supervisor.await.unwrap();
+        assert!(matches!(result, Ok(())));
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
     }

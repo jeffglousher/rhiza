@@ -14,8 +14,6 @@ command -v cargo >/dev/null 2>&1 || {
   exit 69
 }
 
-started_at="$(date +%s)"
-
 run() {
   printf '+ '
   printf '%q ' "$@"

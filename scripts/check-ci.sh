@@ -36,7 +36,9 @@ run cargo clippy --locked --all-targets "${package_args[@]}" -- -D warnings
 run cargo test --locked --all-targets "${package_args[@]}"
 run cargo test --locked -p rhiza-node --features graph --lib -- \
   graph_write_retries_the_same_request_after_unknown_recorder_outcome \
-  materialize_recovers_a_transient_inspection_unknown_without_latching
+  materialize_recovers_a_transient_inspection_unknown_without_latching \
+  read_barrier_recovers_a_transient_inspection_unknown_without_latching \
+  background_materializer_survives_a_transient_unknown_and_applies_later
 
 for feature in shadow proposer-canary hedge-canary default-on; do
   run cargo test --locked -p rhiza-tuner --no-default-features --features "$feature" \
