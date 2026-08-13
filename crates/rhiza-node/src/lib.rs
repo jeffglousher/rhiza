@@ -13239,8 +13239,8 @@ mod tests {
         install_test_startup_persistence_hook, persist_startup_entry, recorder_router,
         recorder_router_with_test_peer_concurrency, recorder_routes, test_http_decode_hook_lock,
         test_startup_effect_hook_lock, ConfigError, HttpRecorderClient, NodeConfig, NodeRuntime,
-        NodeService, PeerConfig, StartupCancellationAuthority, StartupCloseOutcome,
-        StartupIoContext, TestHttpDecodeHook, TestStartupLocalIoHook, TestStartupPersistenceHook,
+        PeerConfig, StartupCancellationAuthority, StartupCloseOutcome, StartupIoContext,
+        TestHttpDecodeHook, TestStartupLocalIoHook, TestStartupPersistenceHook,
         HTTP_RECORDER_MAX_CONCURRENT_WORKERS, MAX_HTTP_BODY_BYTES, RECORDER_FETCH_COMMAND_PATH,
         RECORDER_IDENTITY_PATH, RECORDER_INSPECT_PROOF_PATH, RECORDER_INSTALL_PROOF_PATH,
         RECORDER_PROTOCOL_VERSION, RECORDER_RECORD_PATH, RECORDER_WIRE_VERSION,
@@ -13248,11 +13248,15 @@ mod tests {
     use super::{
         client_authenticated, next_sync_flush_retry, post,
         retain_peer_permit_until_response_body_complete, retryable_sync_flush_error,
-        run_read_operation, sql_query_http_response, valid_recorder_record, Body,
-        ConsensusDiagnostic, DurabilityError, Duration, FileLogStore, HeaderMap, Instant, Json,
-        NodeError, ReadConsistency, Request, Response, Router, SqlCommand, SqlQueryResponse,
-        SqlStatement, SqlValue, SqlWriteProfiler, AMBIGUOUS_MUTATION_MESSAGE, MAX_COMMAND_BYTES,
-        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+        run_read_operation, valid_recorder_record, Body, ConsensusDiagnostic, DurabilityError,
+        Duration, FileLogStore, HeaderMap, Instant, Json, NodeError, ReadConsistency, Request,
+        Response, Router, AMBIGUOUS_MUTATION_MESSAGE, MAX_COMMAND_BYTES, PROTOCOL_VERSION,
+        SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+    };
+    #[cfg(feature = "sql")]
+    use super::{
+        sql_query_http_response, NodeService, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue,
+        SqlWriteProfiler, MAX_SQL_RESPONSE_BYTES,
     };
 
     struct PendingThenDataBody {
@@ -13434,13 +13438,366 @@ mod tests {
         inner: RecorderFileStore,
     }
 
+    /// Signals after a durable local record completes, then lets the caller
+    /// release deferred remote failures. This orders the race in
+    /// `definite_remote_failures_preserve_local_accept_for_same_slot_retry`:
+    /// the local recorder must durably accept before remote failures are
+    /// observed, otherwise quorum-impossible can fire before the local worker
+    /// finishes and the summary assertion becomes order-dependent.
+    #[derive(Clone)]
+    struct RecordGateCoordinator {
+        local_recorded: Arc<(Mutex<bool>, Condvar)>,
+        remote_failure: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecordGateCoordinator {
+        fn new() -> Self {
+            Self {
+                local_recorded: Arc::new((Mutex::new(false), Condvar::new())),
+                remote_failure: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn signal_local_recorded(&self) {
+            let (state, condvar) = &*self.local_recorded;
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            condvar.notify_all();
+        }
+
+        fn wait_for_local_record(&self) {
+            let (state, condvar) = &*self.local_recorded;
+            let mut recorded = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*recorded {
+                recorded = condvar
+                    .wait(recorded)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        fn release_remote_failure(&self) {
+            let (state, condvar) = &*self.remote_failure;
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            condvar.notify_all();
+        }
+
+        /// Returns true when this record was already waiting for the failure
+        /// release (i.e. it was admitted before the local accept completed).
+        /// Returns false when the release had already happened, in which case
+        /// the caller delegates to the inner store.
+        fn wait_for_remote_failure_once(&self) -> bool {
+            let (state, condvar) = &*self.remote_failure;
+            let mut failed = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *failed {
+                return false;
+            }
+            while !*failed {
+                failed = condvar
+                    .wait(failed)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct SignalingLocalRecorder {
+        coordinator: RecordGateCoordinator,
+        inner: RecorderFileStore,
+    }
+
+    impl RecorderRpc for SignalingLocalRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            let summary = RecorderRpc::record(&self.inner, context, request)?;
+            self.coordinator.signal_local_recorded();
+            Ok(summary)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(&self, context: &RecorderRpcContext) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::stage_effect_bundle_chunk(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            )
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::finalize_staged_effect_bundle(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+            )
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+        }
+    }
+
+    /// Defers the first record until the local recorder has durably accepted,
+    /// then fails definitively. Subsequent records (after the coordinator
+    /// released the failure) delegate to the inner store so the same recorder
+    /// can later join a learned proposal.
+    #[derive(Clone)]
+    struct DeferredFailureRecorder {
+        coordinator: RecordGateCoordinator,
+        inner: RecorderFileStore,
+    }
+
+    impl RecorderRpc for DeferredFailureRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            // Records that were already admitted (and are waiting) when the
+            // coordinator releases the failure must fail definitively. Records
+            // that start after the release delegate to the inner store, so the
+            // same recorder can later join a learned proposal.
+            if self.coordinator.wait_for_remote_failure_once() {
+                return Err(rhiza_quepaxa::Error::ProposeFailed);
+            }
+            RecorderRpc::record(&self.inner, context, request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(&self, context: &RecorderRpcContext) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::stage_effect_bundle_chunk(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            )
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::finalize_staged_effect_bundle(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+            )
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+        }
+    }
+
     #[cfg(feature = "graph")]
     #[derive(Clone)]
     struct UnknownAfterFirstRecord {
         first: Arc<AtomicBool>,
         inner: RecorderFileStore,
     }
-
     #[cfg(feature = "graph")]
     impl RecorderRpc for UnknownAfterFirstRecord {
         fn record(
@@ -18468,7 +18825,7 @@ mod tests {
             membership.clone(),
         )
         .unwrap();
-        let remotes_enabled = Arc::new(AtomicBool::new(false));
+        let coordinator = RecordGateCoordinator::new();
         let n2 = RecorderFileStore::new_with_membership(
             dir.path().join("n2"),
             "n2",
@@ -18494,18 +18851,24 @@ mod tests {
                 1,
                 1,
                 vec![
-                    ("n1".into(), Box::new(local.clone()) as Box<dyn RecorderRpc>),
+                    (
+                        "n1".into(),
+                        Box::new(SignalingLocalRecorder {
+                            coordinator: coordinator.clone(),
+                            inner: local.clone(),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
                     (
                         "n2".into(),
-                        Box::new(GatedRecorder {
-                            enabled: Arc::clone(&remotes_enabled),
+                        Box::new(DeferredFailureRecorder {
+                            coordinator: coordinator.clone(),
                             inner: n2.clone(),
                         }),
                     ),
                     (
                         "n3".into(),
-                        Box::new(GatedRecorder {
-                            enabled: Arc::clone(&remotes_enabled),
+                        Box::new(DeferredFailureRecorder {
+                            coordinator: coordinator.clone(),
                             inner: n3.clone(),
                         }),
                     ),
@@ -18514,12 +18877,25 @@ mod tests {
             .unwrap(),
         );
         let offered = Command::new(CommandKind::Deterministic, b"original".to_vec());
-        let first = consensus.propose_at(
-            rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
-            1,
-            LogHash::ZERO,
-            offered.clone(),
-        );
+        // The remote record workers block until the local recorder has durably
+        // accepted, then fail. This orders the race deterministically: quorum
+        // impossibility is only observed after the local accept, so the
+        // summary assertion below cannot race the local worker.
+        let proposer = {
+            let consensus = Arc::clone(&consensus);
+            let offered = offered.clone();
+            std::thread::spawn(move || {
+                consensus.propose_at(
+                    rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+                    1,
+                    LogHash::ZERO,
+                    offered,
+                )
+            })
+        };
+        coordinator.wait_for_local_record();
+        coordinator.release_remote_failure();
+        let first = proposer.join().unwrap();
         assert_eq!(first, Err(rhiza_quepaxa::Error::ProposeFailed));
         assert!(local.inspect_record_summary(1).unwrap().is_some());
 
@@ -18559,7 +18935,6 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_winner.payload, b"foreign");
 
-        remotes_enabled.store(true, Ordering::Release);
         let learned = consensus
             .propose_at(
                 rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),

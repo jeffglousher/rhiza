@@ -39,6 +39,8 @@ run cargo test --locked -p rhiza-node --features graph --lib -- \
   materialize_recovers_a_transient_inspection_unknown_without_latching \
   read_barrier_recovers_a_transient_inspection_unknown_without_latching \
   background_materializer_survives_a_transient_unknown_and_applies_later
+run cargo test --locked -p rhiza-node --features graph --test graph_runtime \
+  http_read_barrier_recovers_after_a_transient_ambiguous_inspection
 
 for feature in shadow proposer-canary hedge-canary default-on; do
   run cargo test --locked -p rhiza-tuner --no-default-features --features "$feature" \

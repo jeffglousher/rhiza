@@ -14,9 +14,78 @@ use rhiza_node::{
     MAX_GRAPH_MAX_ROWS, MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
+use rhiza_quepaxa::{
+    DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
+    RecorderRpcContext, ThreeNodeConsensus,
+};
 
 const CLUSTER_ID: &str = "rhiza:graph:cluster-a";
+
+/// Makes the first `inspect_record_summary` on each recorder ambiguous exactly
+/// once, so an HTTP read barrier recovers on retry at the wire boundary.
+#[derive(Clone)]
+struct OnceInspectAmbiguous {
+    remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    inner: RecorderFileStore,
+}
+
+impl RecorderRpc for OnceInspectAmbiguous {
+    fn record(
+        &self,
+        context: &RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
+        RecorderRpc::record(&self.inner, context, request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        context: &RecorderRpcContext,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+    }
+
+    fn inspect_record_summary(
+        &self,
+        context: &RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        if self
+            .remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(rhiza_quepaxa::Error::UnknownOutcome);
+        }
+        RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+    }
+
+    fn fetch_command_for(
+        &self,
+        context: &RecorderRpcContext,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        RecorderRpc::fetch_command_for(
+            &self.inner,
+            context,
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+        )
+    }
+}
 
 #[test]
 fn graph_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
@@ -1158,4 +1227,93 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
         )
         .unwrap(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
+    let dir = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorders = ["n1", "n2", "n3"].map(|recorder_id| {
+        (
+            recorder_id.to_owned(),
+            Box::new(OnceInspectAmbiguous {
+                remaining: std::sync::Arc::clone(&remaining),
+                inner: RecorderFileStore::new_with_membership(
+                    dir.path().join("http-recorders").join(recorder_id),
+                    recorder_id,
+                    CLUSTER_ID,
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap(),
+            }) as Box<dyn RecorderRpc>,
+        )
+    });
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            CLUSTER_ID,
+            "n1",
+            1,
+            1,
+            recorders.into_iter().collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let runtime =
+        Arc::new(NodeRuntime::open(graph_http_config(dir.path()), consensus, &[]).unwrap());
+    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
+    let client = reqwest::Client::new();
+
+    let put = client
+        .post(format!("http://{addr}{GRAPH_PUT_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({
+            "request_id": "http-rb-1",
+            "id": "http-rb-document",
+            "value": {"type": "string", "value": "committed"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success());
+
+    remaining.store(3, std::sync::atomic::Ordering::Release);
+    let first = client
+        .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"id": "http-rb-document", "consistency": "read_barrier"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "transient ambiguous barrier inspection must surface as HTTP 503"
+    );
+    let first = first.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(first.code, "unavailable");
+    assert!(first.retryable);
+
+    let retried = client
+        .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"id": "http-rb-document", "consistency": "read_barrier"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(retried.status().is_success());
+    let retried = retried.json::<GraphGetDocumentResponse>().await.unwrap();
+    assert_eq!(
+        retried.value,
+        Some(GraphValueDto::String("committed".into()))
+    );
+    assert!(runtime.is_ready());
+    assert!(!runtime.is_fatal());
+
+    server.abort();
 }
