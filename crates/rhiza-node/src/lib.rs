@@ -8999,6 +8999,10 @@ enum ConsensusDiagnostic {
     MaterializerInspect,
     ReadBarrierInspect,
     ReadBarrierPropose,
+    /// Call sites that do not classify their operation. New receipt-backed
+    /// mutation paths must use [`ConsensusDiagnostic::ReceiptBackedMutation`];
+    /// falling back to `Other` silently downgrades an admitted-mutation
+    /// unknown to `write_outcome_unknown` instead of `ambiguous_mutation`.
     Other,
 }
 
@@ -11347,7 +11351,13 @@ impl NodeRuntime {
                 .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
             self.consensus
                 .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| {
+                    self.map_consensus_error_at(
+                        error,
+                        ConsensusDiagnostic::ReceiptBackedMutation,
+                        Some(slot),
+                    )
+                })?;
             let entry = self
                 .consensus
                 .propose_at(
@@ -12902,6 +12912,10 @@ impl NodeRuntime {
     }
 
     fn map_consensus_error(&self, error: rhiza_quepaxa::Error) -> NodeError {
+        // This is the unclassified convenience path (read-only resolution,
+        // configuration transitions). Mutating proposal call sites must pass
+        // ConsensusDiagnostic::ReceiptBackedMutation explicitly so admitted
+        // unknowns surface as ambiguous_mutation rather than write_outcome_unknown.
         self.map_consensus_error_at(error, ConsensusDiagnostic::Other, None)
     }
 
@@ -12922,6 +12936,11 @@ impl NodeRuntime {
             );
         }
         match error {
+            // Bare Cancelled and pre-admission RPC failures are definite
+            // pre-mutation outcomes: no recorder admitted the request, so a
+            // plain retry is safe. Once a mutating RPC is admitted, QuePaxa
+            // normalizes cancellation/deadline into UnknownOutcome, which the
+            // receipt-backed branch below classifies as ambiguous.
             rhiza_quepaxa::Error::NoQuorum
             | rhiza_quepaxa::Error::ProposeFailed
             | rhiza_quepaxa::Error::CommandUnavailable
@@ -14676,6 +14695,108 @@ mod tests {
             assert_eq!(classification.category(), category);
             assert_eq!(classification.retryable(), retryable);
         }
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn materialize_recovers_a_transient_inspection_unknown_without_latching() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:sql:materialize-recovery",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:sql:materialize-recovery",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "materialize-recovery",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        // Commit one decision with a definite proof, then make the next
+        // inspection ambiguous exactly once on every recorder. The materializer
+        // must treat that as transient and recover on the following poll.
+        let command = SqlCommand {
+            request_id: "materialize-1".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE recovered_items(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        runtime.execute_sql(command).unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        remaining_unknown_inspections.store(3, Ordering::Release);
+        let transient = runtime.materialize_next_decision().unwrap_err();
+        assert!(matches!(transient, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready(), "transient inspect must not latch");
+        assert!(!runtime.is_fatal(), "transient inspect must not latch");
+
+        // The next inspection observes the same tip and reconciles it as
+        // empty once the injected ambiguity is exhausted.
+        assert!(!runtime.materialize_next_decision().unwrap());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        // A later commit still works: the runtime recovered from the
+        // transient inspection without latching readiness or admission.
+        let later = SqlCommand {
+            request_id: "materialize-2".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE later_items(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        runtime.execute_sql(later).unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
     }
 
     #[cfg(feature = "sql")]
