@@ -13215,8 +13215,8 @@ mod tests {
     use rhiza_log::LogStore as _;
     use rhiza_quepaxa::{
         AcceptedValue, DecisionProof, EffectBundleBinding, Membership, Proposal, ProposalPriority,
-        RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc, RecorderRpcContext,
-        RecorderSummary, ThreeNodeConsensus,
+        ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
+        RecorderRpc, RecorderRpcContext, RecorderSummary, ThreeNodeConsensus,
     };
     #[cfg(all(feature = "sql", unix))]
     use std::os::unix::fs::PermissionsExt;
@@ -13310,6 +13310,28 @@ mod tests {
         ) -> rhiza_quepaxa::Result<RecordSummary> {
             context.check()?;
             self.inner.record(request)
+        }
+
+        fn supports_context_read_fence(&self) -> bool {
+            true
+        }
+
+        fn observe_read_fence(
+            &self,
+            context: &RecorderRpcContext,
+            request: ReadFenceRequest,
+        ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+            context.check()?;
+            if self
+                .remaining_unknown_inspections
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            RecorderRpc::observe_read_fence(&self.inner, context, request)
         }
 
         fn install_decision_proof(
@@ -13438,23 +13460,21 @@ mod tests {
         inner: RecorderFileStore,
     }
 
-    /// Signals after a durable local record completes, then lets the caller
-    /// release deferred remote failures. This orders the race in
+    /// Coordinates the local-accept ordering in
     /// `definite_remote_failures_preserve_local_accept_for_same_slot_retry`:
-    /// the local recorder must durably accept before remote failures are
-    /// observed, otherwise quorum-impossible can fire before the local worker
-    /// finishes and the summary assertion becomes order-dependent.
+    /// the local recorder durably signals after its first record completes,
+    /// and each remote recorder's first record waits for that signal before
+    /// failing definitively. Whichever order the worker queues run in, the
+    /// local accept is always durable before the remote failure is observed.
     #[derive(Clone)]
     struct RecordGateCoordinator {
         local_recorded: Arc<(Mutex<bool>, Condvar)>,
-        remote_failure: Arc<(Mutex<bool>, Condvar)>,
     }
 
     impl RecordGateCoordinator {
         fn new() -> Self {
             Self {
                 local_recorded: Arc::new((Mutex::new(false), Condvar::new())),
-                remote_failure: Arc::new((Mutex::new(false), Condvar::new())),
             }
         }
 
@@ -13466,42 +13486,21 @@ mod tests {
             condvar.notify_all();
         }
 
-        fn wait_for_local_record(&self) {
+        /// Waits until the local recorder durably accepted, returning false on
+        /// timeout so a test hang cannot outlive the caller deadline.
+        fn wait_for_local_record(&self, timeout: Duration) -> bool {
             let (state, condvar) = &*self.local_recorded;
             let mut recorded = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while !*recorded {
-                recorded = condvar
-                    .wait(recorded)
+                let (guard, result) = condvar
+                    .wait_timeout(recorded, timeout)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-        }
-
-        fn release_remote_failure(&self) {
-            let (state, condvar) = &*self.remote_failure;
-            *state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-            condvar.notify_all();
-        }
-
-        /// Returns true when this record was already waiting for the failure
-        /// release (i.e. it was admitted before the local accept completed).
-        /// Returns false when the release had already happened, in which case
-        /// the caller delegates to the inner store.
-        fn wait_for_remote_failure_once(&self) -> bool {
-            let (state, condvar) = &*self.remote_failure;
-            let mut failed = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *failed {
-                return false;
-            }
-            while !*failed {
-                failed = condvar
-                    .wait(failed)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                recorded = guard;
+                if result.timed_out() {
+                    return false;
+                }
             }
             true
         }
@@ -13645,13 +13644,15 @@ mod tests {
         }
     }
 
-    /// Defers the first record until the local recorder has durably accepted,
-    /// then fails definitively. Subsequent records (after the coordinator
-    /// released the failure) delegate to the inner store so the same recorder
-    /// can later join a learned proposal.
+    /// Fails the first record on this recorder after the local recorder has
+    /// durably accepted. Later records delegate to the inner store so the same
+    /// recorder can join a learned proposal. The failure is bound to the
+    /// recorder's first record call rather than to a wall-clock release, so it
+    /// is deterministic under any worker-queue interleaving.
     #[derive(Clone)]
     struct DeferredFailureRecorder {
         coordinator: RecordGateCoordinator,
+        fail_first_record: Arc<AtomicBool>,
         inner: RecorderFileStore,
     }
 
@@ -13661,11 +13662,15 @@ mod tests {
             context: &RecorderRpcContext,
             request: RecordRequest,
         ) -> rhiza_quepaxa::Result<RecordSummary> {
-            // Records that were already admitted (and are waiting) when the
-            // coordinator releases the failure must fail definitively. Records
-            // that start after the release delegate to the inner store, so the
-            // same recorder can later join a learned proposal.
-            if self.coordinator.wait_for_remote_failure_once() {
+            context.check()?;
+            if self.fail_first_record.swap(false, Ordering::AcqRel) {
+                let remaining = context
+                    .remaining()
+                    .unwrap_or_else(|| Duration::from_secs(5));
+                if !self.coordinator.wait_for_local_record(remaining) {
+                    return Err(rhiza_quepaxa::Error::RpcDeadlineExceeded);
+                }
+                context.check()?;
                 return Err(rhiza_quepaxa::Error::ProposeFailed);
             }
             RecorderRpc::record(&self.inner, context, request)
@@ -15124,6 +15129,11 @@ mod tests {
 
         remaining_unknown_inspections.store(3, Ordering::Release);
         let transient = runtime.materialize_next_decision().unwrap_err();
+        // The first poll may not consume every injected ambiguity (quorum
+        // inspection can stop after enough voters replied). Disarm before the
+        // retry so the second poll is guaranteed to observe the seeded
+        // decision without residual injected unknowns.
+        remaining_unknown_inspections.store(0, Ordering::Release);
         assert!(matches!(transient, NodeError::Unavailable(_)));
         assert!(runtime.is_ready(), "transient inspect must not latch");
         assert!(!runtime.is_fatal(), "transient inspect must not latch");
@@ -15229,6 +15239,9 @@ mod tests {
         assert!(matches!(transient, NodeError::Unavailable(_)));
         assert!(runtime.is_ready(), "transient barrier must not latch");
         assert!(!runtime.is_fatal(), "transient barrier must not latch");
+        // Disarm before the retry: the first barrier may not consume every
+        // injected ambiguity, and the retry must observe the committed value.
+        remaining_unknown_inspections.store(0, Ordering::Release);
 
         let retried = runtime
             .get_graph_document("rb-document", ReadConsistency::ReadBarrier)
@@ -15352,6 +15365,18 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     })
                     .await
+            })
+        };
+
+        // Disarm after the first (transient) poll; the supervisor keeps
+        // polling and the remaining polls must observe the seeded decision.
+        let disarm = {
+            let remaining_unknown_inspections = Arc::clone(&remaining_unknown_inspections);
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                remaining_unknown_inspections.store(0, Ordering::Release);
+                drop(runtime);
             })
         };
 
@@ -18862,6 +18887,7 @@ mod tests {
                         "n2".into(),
                         Box::new(DeferredFailureRecorder {
                             coordinator: coordinator.clone(),
+                            fail_first_record: Arc::new(AtomicBool::new(true)),
                             inner: n2.clone(),
                         }),
                     ),
@@ -18869,6 +18895,7 @@ mod tests {
                         "n3".into(),
                         Box::new(DeferredFailureRecorder {
                             coordinator: coordinator.clone(),
+                            fail_first_record: Arc::new(AtomicBool::new(true)),
                             inner: n3.clone(),
                         }),
                     ),
@@ -18877,25 +18904,17 @@ mod tests {
             .unwrap(),
         );
         let offered = Command::new(CommandKind::Deterministic, b"original".to_vec());
-        // The remote record workers block until the local recorder has durably
-        // accepted, then fail. This orders the race deterministically: quorum
-        // impossibility is only observed after the local accept, so the
-        // summary assertion below cannot race the local worker.
-        let proposer = {
-            let consensus = Arc::clone(&consensus);
-            let offered = offered.clone();
-            std::thread::spawn(move || {
-                consensus.propose_at(
-                    rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
-                    1,
-                    LogHash::ZERO,
-                    offered,
-                )
-            })
-        };
-        coordinator.wait_for_local_record();
-        coordinator.release_remote_failure();
-        let first = proposer.join().unwrap();
+        // Every remote recorder's first record waits for the local durable
+        // accept before failing, so quorum impossibility is only observed
+        // after the local worker finished. Deterministic under any worker
+        // queue interleaving: whichever order n1/n2/n3 run in, the local
+        // summary exists before the failure is reported.
+        let first = consensus.propose_at(
+            rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
+            1,
+            LogHash::ZERO,
+            offered.clone(),
+        );
         assert_eq!(first, Err(rhiza_quepaxa::Error::ProposeFailed));
         assert!(local.inspect_record_summary(1).unwrap().is_some());
 

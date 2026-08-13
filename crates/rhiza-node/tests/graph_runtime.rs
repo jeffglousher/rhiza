@@ -1297,6 +1297,9 @@ async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
     let first = first.json::<ClientErrorResponse>().await.unwrap();
     assert_eq!(first.code, "unavailable");
     assert!(first.retryable);
+    // Disarm before the retry: the first barrier may not consume every
+    // injected ambiguity, and the retry must observe the committed value.
+    remaining.store(0, std::sync::atomic::Ordering::Release);
 
     let retried = client
         .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))

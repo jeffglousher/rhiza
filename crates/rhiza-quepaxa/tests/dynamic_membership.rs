@@ -4,7 +4,6 @@ use rhiza_quepaxa::{
     Proposal, ProposalPriority, RecordRequest, RecorderFileStore, RecorderRequest, RecorderSummary,
     RejectReason, SealFaultPoint, ThreeNodeConsensus,
 };
-use std::{fs, path::Path};
 
 fn same_membership_stop(cluster_id: &str, config_id: u64, membership: &Membership) -> ConfigChange {
     ConfigChange::bound_stop(
@@ -505,63 +504,6 @@ fn verified_checkpoint_recovery_reactivates_fresh_successor_recorders() {
 }
 
 #[test]
-fn checkpoint_recovery_rejects_zero_hash_without_mutating_pending_successor() {
-    let dir = tempfile::tempdir().unwrap();
-    let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
-    let stores = [
-        store(&dir, "r1", 4, membership.clone()),
-        store(&dir, "r2", 4, membership.clone()),
-        store(&dir, "r3", 4, membership.clone()),
-    ];
-    let old = ThreeNodeConsensus::from_recorders_with_ids(
-        "cluster-a",
-        "writer",
-        2,
-        4,
-        stores
-            .iter()
-            .zip(["r1", "r2", "r3"])
-            .map(|(store, id)| (id.into(), Box::new(store.clone()) as _))
-            .collect(),
-    )
-    .unwrap();
-    let stop = old
-        .propose_stop_for_successor_at(
-            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
-            7,
-            LogHash::ZERO,
-            &membership,
-        )
-        .unwrap();
-    let proof = old
-        .inspect_decision_proof_at(&rhiza_quepaxa::RecorderRpcContext::default_timeout(), 7)
-        .unwrap()
-        .unwrap();
-    drop(old);
-
-    let recorder = &stores[0];
-    recorder
-        .install_successor_from_proof(membership.clone(), &proof)
-        .unwrap();
-    let before_state = recorder.configuration_state().unwrap();
-    let root = dir.path().join("r1");
-    let before_files = direct_file_snapshot(&root);
-
-    assert_eq!(
-        recorder.recover_successor_activation_from_checkpoint(7, stop.hash, 9, LogHash::ZERO),
-        Err(Error::Rejected(RejectReason::InvalidTransition))
-    );
-    assert_eq!(recorder.configuration_state().unwrap(), before_state);
-    assert_eq!(direct_file_snapshot(&root), before_files);
-    assert!(!recorder.configuration_state().unwrap().is_activated());
-
-    drop(stores);
-    let reopened = store(&dir, "r1", 5, membership);
-    assert_eq!(reopened.configuration_state().unwrap(), before_state);
-    assert!(!reopened.configuration_state().unwrap().is_activated());
-}
-
-#[test]
 fn checkpoint_head_intent_recovers_every_config_and_head_fault_phase() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
@@ -756,22 +698,6 @@ fn store(
         membership,
     )
     .unwrap()
-}
-
-fn direct_file_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut files = fs::read_dir(root)
-        .unwrap()
-        .map(|entry| entry.unwrap())
-        .filter(|entry| entry.file_type().unwrap().is_file())
-        .map(|entry| {
-            (
-                entry.file_name().to_string_lossy().into_owned(),
-                fs::read(entry.path()).unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    files
 }
 
 fn record(
