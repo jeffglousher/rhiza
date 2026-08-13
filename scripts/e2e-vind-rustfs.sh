@@ -333,6 +333,7 @@ capture_ready_context() {
 cleanup_run() {
   status="$1"
   if [ "$status" -ne 0 ] && [ -n "$context" ]; then
+    capture_failure_diagnostics || true
     k get pods,deployments,statefulsets,jobs,services,persistentvolumeclaims -o wide >&2 || true
     k get events --sort-by=.metadata.creationTimestamp >&2 || true
   fi

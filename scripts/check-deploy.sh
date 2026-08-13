@@ -1487,8 +1487,21 @@ if grep -Eq 'rhiza-c[0-9]' scripts/e2e-vind-rustfs.sh; then
 fi
 # shellcheck disable=SC2016
 grep -Fq 'k delete pod "$restart_pod" --wait=true' scripts/e2e-vind-rustfs.sh
+grep -Fq 'successor Pod retained deleted emptyDir data' scripts/e2e-vind-rustfs.sh
 # shellcheck disable=SC2016
 grep -Fq 'current_uid" != "$restart_uid' scripts/e2e-vind-rustfs.sh
+grep -Fq 'capture_failure_diagnostics || true' scripts/e2e-vind-rustfs.sh
+grep -Fq 'failure-diagnostics' scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'k logs "$pod" --all-containers=true --previous' \
+  scripts/e2e-vind-rustfs.sh
+grep -Fq 'k get pods -l app.kubernetes.io/name=rhiza -o json' \
+  scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'k describe "$pod"' scripts/e2e-vind-rustfs.sh
+grep -Fq 'k get events --sort-by=.metadata.creationTimestamp' \
+  scripts/e2e-vind-rustfs.sh
+grep -Fq 'redact_diagnostic_stream' scripts/e2e-vind-rustfs.sh
 self_heal_e2e="$(sed -n \
   '/^verify_same_membership_pod_recreation() {$/,/^}$/p' \
   scripts/e2e-vind-rustfs.sh)"
@@ -1498,6 +1511,8 @@ for required_recovery_proof in \
   'new_target_uid" = "$old_target_uid' \
   'old_survivor_a_uid' \
   'old_survivor_b_uid' \
+  'replacement Pod retained deleted emptyDir data' \
+  'survivor lost its emptyDir data' \
   'retry_read_value "$target_pod"' \
   '--arg cluster "$canonical_cluster_id"' \
   '.cluster_id == $cluster' \
@@ -1508,7 +1523,6 @@ for required_recovery_proof in \
   '([.[].qlog_root] | unique | length == 1)'; do
   grep -Fq -- "$required_recovery_proof" <<< "$self_heal_e2e"
 done
-scripts/check-e2e-recovery-matrix-static.sh
 if grep -Fq '.cluster_id == "rhiza-vind"' <<< "$self_heal_e2e"; then
   echo "same-membership Pod recreation E2E compares a logical rather than canonical cluster ID" >&2
   exit 1

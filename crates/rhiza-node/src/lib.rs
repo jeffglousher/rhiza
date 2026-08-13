@@ -3667,9 +3667,21 @@ fn classify_pending_request(
     if members[canonical].payload == members[index].payload {
         Ok(Some(canonical))
     } else {
-        Err(NodeError::RequestConflict(format!(
-            "request id {request_id:?} was reused with another command in the same writer batch"
-        )))
+        match &members[index].operation {
+            #[cfg(feature = "graph")]
+            QueuedOperation::Graph(_) => Err(NodeError::GraphRequestConflict {
+                request_id: request_id.to_owned(),
+                original_log_index: None,
+                original_log_hash: None,
+            }),
+            #[cfg(feature = "kv")]
+            QueuedOperation::Kv(_) => Err(NodeError::KvRequestConflict {
+                request_id: request_id.to_owned(),
+            }),
+            _ => Err(NodeError::InvalidRequest(
+                "request id reused with another command in the same writer batch".into(),
+            )),
+        }
     }
 }
 
@@ -6181,8 +6193,13 @@ fn node_error_response(error: NodeError) -> Response {
             statement_index, ..
         } => (StatusCode::BAD_REQUEST, Some(*statement_index)),
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, None),
+        #[cfg(feature = "graph")]
+        NodeError::GraphRequestConflict { .. } => (StatusCode::CONFLICT, None),
+        #[cfg(feature = "kv")]
+        NodeError::KvRequestConflict { .. } => (StatusCode::CONFLICT, None),
         NodeError::PreconditionFailed(_) => (StatusCode::CONFLICT, None),
-        NodeError::SnapshotRequired(_)
+        NodeError::AmbiguousMutation
+        | NodeError::SnapshotRequired(_)
         | NodeError::Unavailable(_)
         | NodeError::OutcomeUnknown(_)
         | NodeError::StartupCancelled { .. }
@@ -6217,7 +6234,7 @@ fn node_error_response(error: NodeError) -> Response {
 }
 
 fn node_error_message(error: &NodeError, status: StatusCode) -> &'static str {
-    if matches!(error, NodeError::Unavailable(message) if message == AMBIGUOUS_MUTATION_MESSAGE) {
+    if matches!(error, NodeError::AmbiguousMutation) {
         return AMBIGUOUS_MUTATION_MESSAGE;
     }
     match status {
@@ -7198,7 +7215,18 @@ pub enum NodeError {
     },
     Contention(String),
     WinnerLimitExceeded,
-    RequestConflict(String),
+    #[cfg(feature = "sql")]
+    RequestConflict(rhiza_sql::RequestConflict),
+    #[cfg(feature = "graph")]
+    GraphRequestConflict {
+        request_id: String,
+        original_log_index: Option<LogIndex>,
+        original_log_hash: Option<LogHash>,
+    },
+    #[cfg(feature = "kv")]
+    KvRequestConflict {
+        request_id: String,
+    },
     InvalidRequest(String),
     #[cfg(feature = "sql")]
     InvalidSqlStatement {
@@ -7206,6 +7234,7 @@ pub enum NodeError {
         message: String,
     },
     PreconditionFailed(String),
+    AmbiguousMutation,
     Fatal(String),
 }
 
@@ -7213,7 +7242,7 @@ const AMBIGUOUS_MUTATION_MESSAGE: &str =
     "mutation outcome is ambiguous; retry only the identical request_id and payload";
 
 fn ambiguous_mutation_error() -> NodeError {
-    NodeError::Unavailable(AMBIGUOUS_MUTATION_MESSAGE.into())
+    NodeError::AmbiguousMutation
 }
 
 impl fmt::Display for NodeError {
@@ -7254,8 +7283,30 @@ impl fmt::Display for NodeError {
             ),
             Self::Contention(message) => write!(f, "node contention: {message}"),
             Self::WinnerLimitExceeded => write!(f, "foreign winner retry limit exceeded"),
+            #[cfg(feature = "sql")]
             Self::RequestConflict(conflict) => {
                 write!(f, "request id reused with different payload: {conflict}")
+            }
+            #[cfg(feature = "graph")]
+            Self::GraphRequestConflict {
+                request_id,
+                original_log_index,
+                original_log_hash,
+            } => match (original_log_index, original_log_hash) {
+                (Some(index), Some(hash)) => write!(
+                    f,
+                    "request id reused with a different graph command: {request_id} \
+                     (original qlog {index}/{})",
+                    hash.to_hex(),
+                ),
+                _ => write!(
+                    f,
+                    "request id reused with a different graph command: {request_id}"
+                ),
+            },
+            #[cfg(feature = "kv")]
+            Self::KvRequestConflict { request_id } => {
+                write!(f, "request id reused with another kv command: {request_id}")
             }
             Self::InvalidRequest(message) => write!(f, "invalid request: {message}"),
             #[cfg(feature = "sql")]
@@ -7267,6 +7318,7 @@ impl fmt::Display for NodeError {
                 "invalid SQL statement at index {statement_index}: {message}"
             ),
             Self::PreconditionFailed(message) => write!(f, "precondition failed: {message}"),
+            Self::AmbiguousMutation => write!(f, "{AMBIGUOUS_MUTATION_MESSAGE}"),
             Self::Fatal(message) => write!(f, "node is fatally unavailable: {message}"),
         }
     }
@@ -7281,11 +7333,13 @@ impl NodeError {
             #[cfg(feature = "sql")]
             Self::InvalidSqlStatement { .. } => ("invalid_request", false),
             Self::RequestConflict(_) => ("request_conflict", false),
+            #[cfg(feature = "graph")]
+            Self::GraphRequestConflict { .. } => ("request_conflict", false),
+            #[cfg(feature = "kv")]
+            Self::KvRequestConflict { .. } => ("request_conflict", false),
             Self::PreconditionFailed(_) => ("precondition_failed", false),
             Self::SnapshotRequired(_) => ("snapshot_required", false),
-            Self::Unavailable(message) if message == AMBIGUOUS_MUTATION_MESSAGE => {
-                ("ambiguous_mutation", true)
-            }
+            Self::AmbiguousMutation => ("ambiguous_mutation", true),
             Self::Unavailable(_) => ("unavailable", true),
             Self::OutcomeUnknown(_) => ("write_outcome_unknown", true),
             Self::StartupCancelled { .. } => ("unavailable", true),
@@ -11001,8 +11055,8 @@ impl NodeRuntime {
             })
             .collect::<Vec<_>>();
         let lookups = kv.check_requests(&requests).map_err(|error| match error {
-            rhiza_kv::Error::RequestConflict { .. } => {
-                NodeError::RequestConflict(error.to_string())
+            rhiza_kv::Error::RequestConflict { request_id } => {
+                NodeError::KvRequestConflict { request_id }
             }
             other => NodeError::InvalidRequest(other.to_string()),
         })?;
@@ -11016,8 +11070,8 @@ impl NodeRuntime {
             .copied()
             .zip(lookups.into_iter().map(|lookup| {
                 lookup.map_err(|error| match error {
-                    rhiza_kv::Error::RequestConflict { .. } => {
-                        NodeError::RequestConflict(error.to_string())
+                    rhiza_kv::Error::RequestConflict { request_id } => {
+                        NodeError::KvRequestConflict { request_id }
                     }
                     other => NodeError::InvalidRequest(other.to_string()),
                 })
@@ -11180,7 +11234,7 @@ impl NodeRuntime {
                 return Err(NodeError::ResourceExhausted(message));
             }
             if let rhiza_sql::Error::RequestConflict(conflict) = error {
-                return Err(NodeError::RequestConflict(conflict.to_string()));
+                return Err(NodeError::RequestConflict(conflict));
             }
             let message = error.to_string();
             let statement_index = first_invalid_sql_statement(command, |prefix| {
@@ -11357,9 +11411,7 @@ impl NodeRuntime {
     #[cfg(feature = "sql")]
     fn map_sql_batch_member_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
-            rhiza_sql::Error::RequestConflict(conflict) => {
-                NodeError::RequestConflict(conflict.to_string())
-            }
+            rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
             rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_sql::Error::InvalidCommand(message) | rhiza_sql::Error::Sqlite(message) => {
                 NodeError::InvalidSqlStatement {
@@ -12426,9 +12478,15 @@ impl NodeRuntime {
         graph
             .check_request(request_id, payload)
             .map_err(|error| match error {
-                rhiza_graph::Error::RequestConflict { .. } => {
-                    NodeError::RequestConflict(error.to_string())
-                }
+                rhiza_graph::Error::RequestConflict {
+                    request_id,
+                    original_log_index,
+                    original_log_hash,
+                } => NodeError::GraphRequestConflict {
+                    request_id,
+                    original_log_index: Some(original_log_index),
+                    original_log_hash: Some(original_log_hash),
+                },
                 other => NodeError::InvalidRequest(other.to_string()),
             })
     }
@@ -12452,8 +12510,8 @@ impl NodeRuntime {
         };
         kv.check_request(request_id, payload)
             .map_err(|error| match error {
-                rhiza_kv::Error::RequestConflict { .. } => {
-                    NodeError::RequestConflict(error.to_string())
+                rhiza_kv::Error::RequestConflict { request_id } => {
+                    NodeError::KvRequestConflict { request_id }
                 }
                 other => NodeError::InvalidRequest(other.to_string()),
             })
@@ -12784,9 +12842,7 @@ impl NodeRuntime {
     #[cfg(feature = "sql")]
     fn map_sqlite_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
-            rhiza_sql::Error::RequestConflict(conflict) => {
-                NodeError::RequestConflict(conflict.to_string())
-            }
+            rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
             rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_sql::Error::InvalidCommand(message)
                 if message == "external SQL batch produced no successful member" =>
@@ -12885,14 +12941,19 @@ impl NodeRuntime {
             {
                 ambiguous_mutation_error()
             }
+            // Internal recovery inspection and read-barrier proposals revisit
+            // the exact same slot on the next poll/request and reconcile the
+            // durable result. A transient unknown must not latch the runtime
+            // into a permanent fatal state.
             rhiza_quepaxa::Error::UnknownOutcome
                 if matches!(
                     diagnostic,
                     ConsensusDiagnostic::MaterializerInspect
                         | ConsensusDiagnostic::ReadBarrierInspect
+                        | ConsensusDiagnostic::ReadBarrierPropose
                 ) =>
             {
-                self.latch(NodeError::Reconciliation(error.to_string()))
+                NodeError::Unavailable("consensus recovery pending".into())
             }
             rhiza_quepaxa::Error::UnknownOutcome => NodeError::OutcomeUnknown(error.to_string()),
             rhiza_quepaxa::Error::EffectBundleConflict
@@ -14589,7 +14650,7 @@ mod tests {
                 true,
             ),
             (
-                NodeError::Unavailable(AMBIGUOUS_MUTATION_MESSAGE.into()),
+                NodeError::AmbiguousMutation,
                 "ambiguous_mutation",
                 ErrorCategory::Unavailable,
                 true,
@@ -14641,9 +14702,9 @@ mod tests {
             ConsensusDiagnostic::MaterializerInspect,
             Some(1),
         );
-        assert!(matches!(internal, NodeError::Reconciliation(_)));
-        assert!(!runtime.is_ready());
-        assert!(runtime.is_fatal());
+        assert!(matches!(internal, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
 
         let (_dir, runtime) = sql_test_runtime();
         let read_barrier = runtime.map_consensus_error_at(
@@ -14651,9 +14712,19 @@ mod tests {
             ConsensusDiagnostic::ReadBarrierInspect,
             Some(1),
         );
-        assert!(matches!(read_barrier, NodeError::Reconciliation(_)));
-        assert!(!runtime.is_ready());
-        assert!(runtime.is_fatal());
+        assert!(matches!(read_barrier, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let (_dir, runtime) = sql_test_runtime();
+        let read_barrier_propose = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::ReadBarrierPropose,
+            Some(1),
+        );
+        assert!(matches!(read_barrier_propose, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
     }
 
     #[cfg(feature = "sql")]
@@ -14824,7 +14895,7 @@ mod tests {
                 None,
             ),
             (
-                NodeError::Unavailable(AMBIGUOUS_MUTATION_MESSAGE.into()),
+                NodeError::AmbiguousMutation,
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "ambiguous_mutation",
                 true,
@@ -15881,7 +15952,7 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
         assert!(matches!(
             results[2],
-            Err(super::NodeError::RequestConflict(_))
+            Err(super::NodeError::GraphRequestConflict { .. })
         ));
         assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -15903,7 +15974,7 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
         assert!(matches!(
             results[2],
-            Err(super::NodeError::RequestConflict(_))
+            Err(super::NodeError::KvRequestConflict { .. })
         ));
         assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -16107,7 +16178,7 @@ mod tests {
         );
         assert!(matches!(
             retry_results[1],
-            Err(NodeError::RequestConflict(_))
+            Err(NodeError::KvRequestConflict { .. })
         ));
         let conflict = retry_results[1].as_ref().unwrap_err().classification();
         assert_eq!(conflict.code(), "request_conflict");

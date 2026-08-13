@@ -1165,8 +1165,18 @@ fn node_admin_status(error: &NodeError) -> (StatusCode, AdminErrorCode) {
         NodeError::PreconditionFailed(_) | NodeError::ConfigurationTransition { .. } => {
             (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed)
         }
+        #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed),
+        #[cfg(feature = "graph")]
+        NodeError::GraphRequestConflict { .. } => {
+            (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed)
+        }
+        #[cfg(feature = "kv")]
+        NodeError::KvRequestConflict { .. } => {
+            (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed)
+        }
         NodeError::Unavailable(_)
+        | NodeError::AmbiguousMutation
         | NodeError::OutcomeUnknown(_)
         | NodeError::StartupCancelled { .. }
         | NodeError::ResourceExhausted(_)
@@ -2174,12 +2184,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kv")]
     #[test]
     fn request_conflict_keeps_the_established_admin_precondition_mapping() {
         assert_eq!(
-            node_admin_status(&NodeError::RequestConflict(
-                "same id, different payload".into()
-            )),
+            node_admin_status(&NodeError::KvRequestConflict {
+                request_id: "same id, different payload".into()
+            }),
             (
                 axum::http::StatusCode::CONFLICT,
                 AdminErrorCode::PreconditionFailed
