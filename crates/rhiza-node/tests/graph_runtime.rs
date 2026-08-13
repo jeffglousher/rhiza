@@ -22,10 +22,13 @@ use rhiza_quepaxa::{
 const CLUSTER_ID: &str = "rhiza:graph:cluster-a";
 
 /// Makes the first `inspect_record_summary` on each recorder ambiguous exactly
-/// once, so an HTTP read barrier recovers on retry at the wire boundary.
+/// once, so an HTTP read barrier recovers on retry at the wire boundary. Each
+/// recorder owns its one-shot flag, so a retry can never observe a residual
+/// injected failure regardless of how many internal inspections the first
+/// request performs.
 #[derive(Clone)]
 struct OnceInspectAmbiguous {
-    remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_first: std::sync::Arc<std::sync::atomic::AtomicBool>,
     inner: RecorderFileStore,
 }
 
@@ -53,13 +56,8 @@ impl RecorderRpc for OnceInspectAmbiguous {
         slot: u64,
     ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         if self
-            .remaining
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
+            .fail_first
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             return Err(rhiza_quepaxa::Error::UnknownOutcome);
         }
@@ -1233,12 +1231,18 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
 async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail_first =
+        ["n1", "n2", "n3"].map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let recorders = ["n1", "n2", "n3"].map(|recorder_id| {
+        let index = match recorder_id {
+            "n1" => 0,
+            "n2" => 1,
+            _ => 2,
+        };
         (
             recorder_id.to_owned(),
             Box::new(OnceInspectAmbiguous {
-                remaining: std::sync::Arc::clone(&remaining),
+                fail_first: std::sync::Arc::clone(&fail_first[index]),
                 inner: RecorderFileStore::new_with_membership(
                     dir.path().join("http-recorders").join(recorder_id),
                     recorder_id,
@@ -1263,6 +1267,11 @@ async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
     );
     let runtime =
         Arc::new(NodeRuntime::open(graph_http_config(dir.path()), consensus, &[]).unwrap());
+    // Arm the one-shot ambiguity only after the runtime finished opening, so
+    // startup inspections are never faulted.
+    for flag in &fail_first {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
     let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
     let client = reqwest::Client::new();
 
@@ -1280,7 +1289,6 @@ async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
         .unwrap();
     assert!(put.status().is_success());
 
-    remaining.store(3, std::sync::atomic::Ordering::Release);
     let first = client
         .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
@@ -1297,9 +1305,12 @@ async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
     let first = first.json::<ClientErrorResponse>().await.unwrap();
     assert_eq!(first.code, "unavailable");
     assert!(first.retryable);
-    // Disarm before the retry: the first barrier may not consume every
-    // injected ambiguity, and the retry must observe the committed value.
-    remaining.store(0, std::sync::atomic::Ordering::Release);
+    // The first request may return once quorum became impossible without
+    // consuming every voter's one-shot flag. Disarm so the retry observes the
+    // committed value deterministically.
+    for flag in &fail_first {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+    }
 
     let retried = client
         .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))

@@ -13666,7 +13666,7 @@ mod tests {
             if self.fail_first_record.swap(false, Ordering::AcqRel) {
                 let remaining = context
                     .remaining()
-                    .unwrap_or_else(|| Duration::from_secs(5));
+                    .ok_or(rhiza_quepaxa::Error::RpcDeadlineExceeded)?;
                 if !self.coordinator.wait_for_local_record(remaining) {
                     return Err(rhiza_quepaxa::Error::RpcDeadlineExceeded);
                 }
