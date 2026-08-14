@@ -44,8 +44,9 @@ use rhiza_node::{
 };
 #[cfg(feature = "graph")]
 use rhiza_node::{
-    GraphDeleteDocumentRequest, GraphMutationResponse, GraphPutDocumentRequest, GraphQueryRequest,
-    GraphQueryResponse, GraphQueryStatementDto, GraphValueDto,
+    GraphDeleteDocumentRequest, GraphGetDocumentRequest, GraphGetDocumentResponse,
+    GraphMutationResponse, GraphPutDocumentRequest, GraphQueryRequest, GraphQueryResponse,
+    GraphQueryStatementDto, GraphValueDto,
 };
 #[cfg(feature = "kv")]
 use rhiza_node::{
@@ -280,6 +281,17 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             },
             Err(error) => fail("graph delete-document", error),
         },
+        #[cfg(feature = "graph")]
+        Command::GraphGetDocument(args) => match request_graph_get_document(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("graph get-document", error.to_string()),
+            },
+            Err(error) => fail("graph get-document", error),
+        },
         #[cfg(feature = "kv")]
         Command::KvGet(args) => match request_kv_get(&args).await {
             Ok(response) => match serde_json::to_string(&response) {
@@ -377,6 +389,8 @@ enum Command {
     GraphPutDocument(GraphPutDocumentArgs),
     #[cfg(feature = "graph")]
     GraphDeleteDocument(GraphDeleteDocumentArgs),
+    #[cfg(feature = "graph")]
+    GraphGetDocument(GraphGetDocumentArgs),
     #[cfg(feature = "kv")]
     KvGet(KvGetArgs),
     #[cfg(feature = "kv")]
@@ -446,6 +460,13 @@ struct GraphDeleteDocumentArgs {
     urls: Vec<String>,
     token: String,
     request: GraphDeleteDocumentRequest,
+}
+
+#[cfg(feature = "graph")]
+struct GraphGetDocumentArgs {
+    urls: Vec<String>,
+    token: String,
+    request: GraphGetDocumentRequest,
 }
 
 #[cfg(feature = "kv")]
@@ -1440,8 +1461,12 @@ fn parse_graph_command(args: impl IntoIterator<Item = String>) -> Result<Command
             .map(Command::GraphPutDocument),
         Some("delete-document") => parse_graph_delete_document(args, |name| env::var(name).ok())
             .map(Command::GraphDeleteDocument),
+        Some("get-document") => parse_graph_get_document(args, |name| env::var(name).ok())
+            .map(Command::GraphGetDocument),
         Some(other) => Err(format!("unknown graph command: {other}")),
-        None => Err("missing graph command: query|put-document|delete-document".into()),
+        None => {
+            Err("missing graph command: query|put-document|delete-document|get-document".into())
+        }
     }
 }
 
@@ -1554,6 +1579,40 @@ fn parse_graph_delete_document(
         request: GraphDeleteDocumentRequest {
             request_id: required_arg(request_id, "--request-id")?,
             id: required_arg(id, "--id")?,
+        },
+    })
+}
+
+#[cfg(feature = "graph")]
+fn parse_graph_get_document(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<GraphGetDocumentArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut id = None;
+    let mut consistency = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--id" => id = Some(next_value(&mut args, "--id")?),
+            "--consistency" => {
+                consistency = Some(parse_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(GraphGetDocumentArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: GraphGetDocumentRequest {
+            id: required_arg(id, "--id")?,
+            consistency,
         },
     })
 }
@@ -4471,6 +4530,16 @@ async fn request_graph_delete_document(
 ) -> Result<GraphMutationResponse, String> {
     remote_client(&args.urls, &args.token)?
         .graph_delete_document(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "graph")]
+async fn request_graph_get_document(
+    args: &GraphGetDocumentArgs,
+) -> Result<GraphGetDocumentResponse, String> {
+    remote_client(&args.urls, &args.token)?
+        .graph_get_document(args.request.clone())
         .await
         .map_err(|error| error.to_string())
 }

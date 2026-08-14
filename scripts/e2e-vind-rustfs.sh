@@ -54,8 +54,8 @@ diagnostic_secrets=()
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
 case "$profile" in
-  sql) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
 for tool in docker kubectl jq yq openssl; do require "$tool"; done
 [ "$direct_cluster" = 1 ] || require vcluster
@@ -364,7 +364,7 @@ if [ "$skip_build" = 1 ]; then
   docker image inspect "$image" >/dev/null 2>&1 \
     || die "RHIZA_VIND_SKIP_BUILD=1 requires existing local image: $image"
 else
-  docker build -t "$image" .
+  docker build --build-arg "RHIZA_PROFILE=$profile" -t "$image" .
 fi
 resolved_image="$(docker image inspect --format '{{.Id}}' "$image")"
 [ -n "$resolved_image" ] || die "cannot resolve Rhiza image ID: $image"
@@ -423,10 +423,6 @@ peer_tokens="$(jq -cn \
   --arg third "$(openssl rand -hex 24)" \
   '[$first, $second, $third]')"
 [ "$(jq 'unique | length' <<< "$peer_tokens")" = 3 ] || die "peer tokens must be unique"
-diagnostic_secrets=("$client_token" "$admin_token" "$tail_token")
-while IFS= read -r peer_token; do
-  diagnostic_secrets+=("$peer_token")
-done < <(jq -r '.[]' <<< "$peer_tokens")
 k create secret generic rhiza-auth \
   --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" \
@@ -481,6 +477,12 @@ make_bundle 2 "$target/config-c2-draft.json"
 name_c1="rhiza-${profile}-c1"
 name_c2="rhiza-${profile}-c2"
 client_service="rhiza-${profile}-client"
+if [ "$profile" = sql ]; then
+  matrix_http_default_target="$client_service"
+else
+  matrix_http_default_target="${name_c1}-0.${name_c1}"
+fi
+matrix_http_target="$matrix_http_default_target"
 jq -e '[.members[].token] | unique | length == 3' \
   "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
 jq -se '(.[0].members | map(.token)) == (.[1].members | map(.token))' \
@@ -508,7 +510,8 @@ verify_marker_helper "$name_c1"
 fresh_capture_live_image_provenance
 
 client() {
-  pod="$1"; shift
+  local pod="$1"
+  shift
   k exec "$pod" -- rhiza "$@" --url http://127.0.0.1:8080
 }
 client_http() {
@@ -557,7 +560,8 @@ client_http() {
   cat "$response"
 }
 matrix_service_http() {
-  path="$1" body="$2"
+  local path="$1" body="$2"
+  local request_id job manifest response raw_response succeeded failed attempt
   request_id="$(date +%s)-$$-${RANDOM}"
   job="rhiza-${profile}-matrix-${request_id}"
   matrix_last_job="$job"
@@ -578,7 +582,7 @@ matrix_service_http() {
     -e 's|__PATH__|/|g' \
     -e 's|__AUTH_SECRET__|rhiza-auth|g' \
     deploy/k8s/rhiza-admin-job.yaml > "$manifest"
-  export RHIZA_E2E_HTTP_SERVICE="${matrix_http_target:-$client_service}"
+  export RHIZA_E2E_HTTP_SERVICE="$matrix_http_target"
   matrix_last_http_target="$RHIZA_E2E_HTTP_SERVICE"
   matrix_last_http_raw="$raw_response"
   export RHIZA_E2E_HTTP_PATH="$path" RHIZA_E2E_HTTP_BODY="$body"
@@ -752,28 +756,85 @@ matrix_run_no_quorum_safety_probe() {
       write_classification:$write,read_classification:$read}]')"
 }
 matrix_prepare_write_request() {
-  key="$1" value="$2" request_id="$3"
-  matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$key" --arg value "$value" \
-    '{request_id:$request_id,key:$key,value:$value}')"
-  matrix_path=/v1/write
+  local key="$1" value="$2" request_id="$3"
+  case "$profile" in
+    sql)
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$key" --arg value "$value" \
+        '{request_id:$request_id,key:$key,value:$value}')"
+      matrix_path=/v1/write
+      ;;
+    graph)
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg id "$key" --arg value "$value" \
+        '{request_id:$request_id,id:$id,value:{type:"string",value:$value}}')"
+      matrix_path=/v1/graph/documents/put
+      ;;
+    kv)
+      matrix_body="$(jq -cn --arg request_id "$request_id" \
+        --arg key "$(profile_key "$key")" --arg value "$(profile_key "$value")" \
+        '{request_id:$request_id,key:$key,value:$value}')"
+      matrix_path=/v1/kv/put
+      ;;
+  esac
+}
+matrix_response_is_ambiguous_mutation() {
+  local status="$1" body="$2"
+  [ "$status" = 503 ] &&
+    [ -f "$body" ] &&
+    [ "$(wc -c < "$body")" -le 65536 ] &&
+    jq -e -s 'length == 1 and (.[0] | type == "object" and
+      .code == "ambiguous_mutation" and .retryable == true)' "$body" >/dev/null 2>&1
 }
 matrix_service_write_response() {
   matrix_prepare_write_request "$1" "$2" "$3"
-  matrix_service_http "$matrix_path" "$matrix_body"
+  matrix_service_mutation_response "$matrix_path" "$matrix_body"
+}
+matrix_service_mutation_response() {
+  local path="$1" body="$2" first_status first_body
+  if matrix_service_http "$path" "$body"; then
+    return 0
+  fi
+  first_status="$matrix_last_http_status"
+  first_body="$matrix_last_http_body"
+  matrix_response_is_ambiguous_mutation "$first_status" "$first_body" || return 1
+  if matrix_service_http "$path" "$body"; then
+    return 0
+  fi
+  return 75
 }
 matrix_service_write() {
   matrix_service_write_response "$1" "$2" "$3" >/dev/null
 }
 matrix_prepare_read_request() {
-  key="$1" expected="$2" consistency="$3"
-  matrix_body="$(jq -cn --arg key "$key" --arg consistency "$consistency" \
-    '{key:$key,consistency:$consistency}')"
-  matrix_path=/v1/read
-  # shellcheck disable=SC2016
-  matrix_read_filter='.value == $expected'
-  matrix_encoded_expected="$expected"
+  local key="$1" expected="$2" consistency="$3"
+  case "$profile" in
+    sql)
+      matrix_body="$(jq -cn --arg key "$key" --arg consistency "$consistency" \
+        '{key:$key,consistency:$consistency}')"
+      matrix_path=/v1/read
+      # shellcheck disable=SC2016
+      matrix_read_filter='.value == $expected'
+      matrix_encoded_expected="$expected"
+      ;;
+    graph)
+      matrix_body="$(jq -cn --arg id "$key" --arg consistency "$consistency" \
+        '{id:$id,consistency:$consistency}')"
+      matrix_path=/v1/graph/documents/get
+      # shellcheck disable=SC2016
+      matrix_read_filter='.value == {type:"string",value:$expected} and (.applied_index | type == "number") and (.hash | type == "array" and length == 32)'
+      matrix_encoded_expected="$expected"
+      ;;
+    kv)
+      matrix_body="$(jq -cn --arg key "$(profile_key "$key")" --arg consistency "$consistency" \
+        '{key:$key,consistency:$consistency}')"
+      matrix_path=/v1/kv/get
+      # shellcheck disable=SC2016
+      matrix_read_filter='.value == $expected and (.applied_index | type == "number") and (.hash | type == "array" and length == 32)'
+      matrix_encoded_expected="$(profile_key "$expected")"
+      ;;
+  esac
 }
 matrix_service_read() {
+  local matrix_read_response
   matrix_prepare_read_request "$1" "$2" "$3"
   if ! matrix_read_response="$(matrix_service_http "$matrix_path" "$matrix_body")"; then
     return 1
@@ -784,7 +845,8 @@ matrix_service_read() {
 matrix_expect_write_no_quorum() {
   [ "$matrix_last_http_status" = 503 ] || return 1
   jq -e '.retryable == true and
-    (.code == "write_timeout" or .code == "write_outcome_unknown" or .code == "unavailable")' \
+    (.code == "write_timeout" or .code == "write_outcome_unknown" or
+     .code == "ambiguous_mutation" or .code == "unavailable")' \
     "$matrix_last_http_body" >/dev/null
 }
 matrix_last_http_failure_detail() {
@@ -801,13 +863,18 @@ matrix_expect_read_barrier_unavailable() {
     "$matrix_last_http_body" >/dev/null
 }
 matrix_expect_f2_read_barrier_timeout() {
-  local survivor="${name_c1}-0" survivor_ready endpoint_count exit_code
+  local survivor="${name_c1}-0" survivor_ready endpoint_service endpoint_count exit_code
   [ -z "$matrix_last_http_status" ] || return 1
   [ "$matrix_last_http_target" = "${survivor}.${name_c1}" ] || return 1
   survivor_ready="$(k get pod "$survivor" \
     -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')" || return 1
   [ "$survivor_ready" = True ] || return 1
-  endpoint_count="$(k get endpoints "$client_service" -o json |
+  if [ "$profile" = sql ]; then
+    endpoint_service="$client_service"
+  else
+    endpoint_service="$name_c1"
+  fi
+  endpoint_count="$(k get endpoints "$endpoint_service" -o json |
     jq --arg survivor "$survivor" '
       [.subsets[]?.addresses[]?] as $addresses |
       if ($addresses | length) == 1 and $addresses[0].targetRef.name == $survivor
@@ -842,7 +909,7 @@ matrix_expect_read_quorum_unavailable() {
     unset matrix_http_target
     return 1
   fi
-  unset matrix_http_target
+  matrix_http_target="$matrix_http_default_target"
   if matrix_expect_read_barrier_unavailable; then
     matrix_last_read_failure_kind=unavailable
     return 0
@@ -855,14 +922,21 @@ matrix_expect_read_quorum_unavailable() {
 }
 matrix_expect_zero_endpoint_transport_failure() {
   local path="$1" body="$2" endpoint_count exit_code attempt
-  endpoint_count=-1
-  for ((attempt=1; attempt<=15; attempt++)); do
-    endpoint_count="$(k get endpoints "$client_service" -o json |
-      jq '[.subsets[]?.addresses[]?] | length')" || return 1
-    [ "$endpoint_count" != 0 ] || break
-    sleep 1
-  done
-  [ "$endpoint_count" = 0 ] || return 1
+  if [ "$profile" = sql ]; then
+    endpoint_count=-1
+    for ((attempt=1; attempt<=15; attempt++)); do
+      endpoint_count="$(k get endpoints "$client_service" -o json |
+        jq '[.subsets[]?.addresses[]?] | length')" || return 1
+      [ "$endpoint_count" != 0 ] || break
+      sleep 1
+    done
+    [ "$endpoint_count" = 0 ] || return 1
+  else
+    [ "$matrix_http_target" = "${name_c1}-0.${name_c1}" ] || return 1
+    endpoint_count="$(k get statefulset "$name_c1" -o jsonpath='{.spec.replicas}')" || return 1
+    [ "$endpoint_count" = 0 ] || return 1
+    matrix_wait_pod_absent "${name_c1}-0" || return 1
+  fi
   if matrix_service_http "$path" "$body" >/dev/null; then
     return 1
   fi
@@ -871,7 +945,12 @@ matrix_expect_zero_endpoint_transport_failure() {
     jq -er 'if (.items | length) == 1 then
       .items[0].status.containerStatuses[0].state.terminated.exitCode else empty end')" \
     || return 1
-  case "$exit_code" in 7|28) return 0;; *) return 1;; esac
+  if [ "$profile" = sql ]; then
+    case "$exit_code" in 7|28) return 0;; *) return 1;; esac
+  fi
+  [ "$exit_code" = 6 ] || return 1
+  grep -Eq "^curl: \(6\) Could not resolve host: ${name_c1}-0\\.${name_c1}$" \
+    "$matrix_last_http_raw"
 }
 matrix_expect_write_zero_endpoint_failure() {
   matrix_prepare_write_request "$1" "$2" "$3"
@@ -896,8 +975,69 @@ matrix_expect_read_zero_endpoint_failure() {
 retryable_write_failure() {
   local attempt_log="$1"
   grep -Eq \
-    '^write failed: HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|unavailable|writes_unavailable)( |$)' \
+    '^(write|graph put-document|kv put) failed: HTTP 503 Service Unavailable code=(write_timeout|write_outcome_unknown|ambiguous_mutation|unavailable|writes_unavailable)( |$)' \
     "$attempt_log"
+}
+profile_key() {
+  case "$profile" in
+    kv) printf '%s' "$1" | openssl base64 -A ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+profile_graph_value() {
+  jq -cn --arg value "$1" '{type:"string",value:$value}'
+}
+profile_put() {
+  local pod="$1" key="$2" value="$3" request_id="$4"
+  case "$profile" in
+    sql) client "$pod" write --request-id "$request_id" --key "$key" --value "$value" ;;
+    graph)
+      client "$pod" graph put-document --request-id "$request_id" --id "$key" \
+        --value-json "$(profile_graph_value "$value")"
+      ;;
+    kv)
+      client "$pod" kv put --request-id "$request_id" \
+        --key-base64 "$(profile_key "$key")" --value-base64 "$(profile_key "$value")"
+      ;;
+  esac
+}
+profile_get() {
+  local pod="$1" key="$2" consistency="$3" expected="${4-}"
+  case "$profile" in
+    sql) client "$pod" read --key "$key" --consistency "$consistency" --expect "$expected" ;;
+    graph) client "$pod" graph get-document --id "$key" --consistency "$consistency" ;;
+    kv) client "$pod" kv get --key-base64 "$(profile_key "$key")" --consistency "$consistency" ;;
+  esac
+}
+profile_delete() {
+  local pod="$1" key="$2" request_id="$3"
+  case "$profile" in
+    graph) client "$pod" graph delete-document --request-id "$request_id" --id "$key" ;;
+    kv) client "$pod" kv delete --request-id "$request_id" --key-base64 "$(profile_key "$key")" ;;
+    *) die "profile_delete is only valid for graph|kv" ;;
+  esac
+}
+matrix_prepare_delete_request() {
+  local key="$1" request_id="$2"
+  case "$profile" in
+    graph)
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg id "$key" '{request_id:$request_id,id:$id}')"
+      matrix_path=/v1/graph/documents/delete
+      ;;
+    kv)
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$(profile_key "$key")" '{request_id:$request_id,key:$key}')"
+      matrix_path=/v1/kv/delete
+      ;;
+    *) die "matrix_prepare_delete_request is only valid for graph|kv" ;;
+  esac
+}
+profile_response_has_value() {
+  local response="$1" value="$2"
+  case "$profile" in
+    sql) return 0 ;;
+    graph) jq -e --arg value "$value" '.value == {type:"string",value:$value} and (.applied_index | type == "number") and (.hash | type == "array" and length == 32)' <<< "$response" >/dev/null ;;
+    kv) jq -e --arg value "$(profile_key "$value")" '.value == $value and (.applied_index | type == "number") and (.hash | type == "array" and length == 32)' <<< "$response" >/dev/null ;;
+  esac
 }
 write_value() {
   local pod="$1" key="$2" value="$3" request_id="$4"
@@ -909,7 +1049,7 @@ write_value() {
 
   for ((attempt=1; attempt<=60; attempt++)); do
     attempt_log="$(mktemp "$write_attempt_dir/write.XXXXXX")"
-    if client "$pod" write --request-id "$request_id" --key "$key" --value "$value" 2> "$attempt_log"; then
+    if profile_put "$pod" "$key" "$value" "$request_id" 2> "$attempt_log"; then
       return 0
     fi
     if ! retryable_write_failure "$attempt_log"; then
@@ -927,7 +1067,8 @@ write_value() {
 }
 read_value_consistency() {
   pod="$1" key="$2" expected="$3" consistency="$4"
-  client "$pod" read --key "$key" --consistency "$consistency" --expect "$expected"
+  response="$(profile_get "$pod" "$key" "$consistency" "$expected")" || return 1
+  profile_response_has_value "$response" "$expected"
 }
 read_value() {
   read_value_consistency "$1" "$2" "$3" read_barrier
@@ -941,6 +1082,52 @@ retry_read_value() {
     [ "$attempt" -lt 60 ] || return 1
     sleep 1
   done
+}
+verify_profile_mutation_contract() {
+  local pod="$1" key="profile-contract-${run_id}" value="value with spaces and \"quotes\"" \
+    altered="different payload" put_id="profile-put-${run_id}" delete_id="profile-delete-${run_id}"
+  local first second get_response delete_first delete_second missing delete_operation
+  [ "$profile" = sql ] && return 0
+  case "$profile" in graph) delete_operation=delete_document;; kv) delete_operation=delete;; esac
+
+  matrix_prepare_write_request "$key" "$value" "$put_id"
+  first="$(matrix_service_mutation_response "$matrix_path" "$matrix_body")"
+  jq -e '(.applied_index | type == "number") and (.hash | type == "array" and length == 32)' <<< "$first" >/dev/null
+  second="$(profile_put "$pod" "$key" "$value" "$put_id")"
+  jq -e --argjson first "$first" '$first == .' <<< "$second" >/dev/null \
+    || die "exact profile put replay changed its receipt"
+  matrix_prepare_write_request "$key" "$altered" "$put_id"
+  if matrix_service_http "$matrix_path" "$matrix_body" > /dev/null; then
+    die "same request_id with different profile put payload was accepted"
+  fi
+  if [ "$matrix_last_http_status" != 409 ] ||
+    ! jq -e '.code == "request_conflict" and .retryable == false' \
+      "$matrix_last_http_body" >/dev/null; then
+    die "profile put conflict was not non-retryable request_conflict"
+  fi
+  get_response="$(profile_get "$pod" "$key" read_barrier)"
+  profile_response_has_value "$get_response" "$value" || {
+    die "profile read_barrier did not return the committed value and lineage"
+  }
+
+  matrix_prepare_delete_request "$key" "$delete_id"
+  delete_first="$(matrix_service_mutation_response "$matrix_path" "$matrix_body")"
+  jq -e --arg operation "$delete_operation" \
+    '(.applied_index | type == "number") and (.hash | type == "array" and length == 32) and
+    .result.operation == $operation and .result.existed == true' \
+    <<< "$delete_first" >/dev/null \
+    || die "profile delete did not report an existing document/key"
+  delete_second="$(profile_delete "$pod" "$key" "$delete_id")"
+  jq -e --argjson first "$delete_first" '$first == .' <<< "$delete_second" >/dev/null \
+    || die "exact profile delete replay changed its receipt or advanced the tip"
+  get_response="$(profile_get "$pod" "$key" read_barrier)"
+  jq -e '.value == null and (.applied_index | type == "number") and (.hash | type == "array" and length == 32)' \
+    <<< "$get_response" >/dev/null || die "profile delete remained visible after a read_barrier"
+  matrix_prepare_delete_request "missing-${key}" "profile-missing-delete-${run_id}"
+  missing="$(matrix_service_mutation_response "$matrix_path" "$matrix_body")"
+  jq -e --arg operation "$delete_operation" \
+    '.result.operation == $operation and .result.existed == false' <<< "$missing" >/dev/null \
+    || die "profile missing delete did not report existed=false"
 }
 verify_same_membership_pod_recreation() {
   local target_pod survivor_a survivor_b
@@ -1004,10 +1191,10 @@ verify_same_membership_pod_recreation() {
         "$target/pod-recreation-status-0.json" \
         "$target/pod-recreation-status-1.json" \
         "$target/pod-recreation-status-2.json")" &&
-      jq -e --arg cluster "$canonical_cluster_id" --argjson digest "$expected_digest" '
+      jq -e --arg cluster "$canonical_cluster_id" --arg profile "$profile" --argjson digest "$expected_digest" '
       length == 3 and all(.[];
         .cluster_id == $cluster and
-        .execution_profile == "sql" and
+        .execution_profile == $profile and
         .epoch == 1 and
         .recovery_generation == 2 and
         .members == ["node-1", "node-2", "node-3"] and
@@ -1061,10 +1248,10 @@ matrix_emit_cell() {
     --arg failure_read_barrier_expected "$cell_read_expected" \
     --arg failure_read_barrier_actual "$cell_read_actual" \
     --arg failure_read_barrier_actual_detail "$cell_read_actual_detail" \
-    --arg survivor_local_read "$cell_local_read" \
-    --argjson ack_sentinel_preserved "$cell_ack_preserved" \
-    --argjson markers_lost "$cell_markers_lost" \
-    --argjson pvc_count "$cell_pvc_count" \
+     --arg survivor_local_read "$cell_local_read" \
+     --argjson ack_sentinel_preserved "$cell_ack_preserved" \
+     --argjson markers_lost "$cell_markers_lost" \
+     --argjson pvc_count "$cell_pvc_count" \
     --argjson ack_ledger "$cell_ack_ledger" \
     --argjson idempotency_boundary_verified "$cell_idempotency_verified" \
     --argjson auto_recovery_attempted "$cell_auto_recovery_attempted" \
@@ -1225,13 +1412,13 @@ run_recovery_matrix_cell() {
   cell_read_actual_detail=not_run
   cell_local_read=not_applicable
   cell_ack_preserved=false
+  cell_markers_lost=false
   cell_ack_ledger='[]'
   cell_idempotency_verified=null
   cell_auto_recovery_attempted=false
   cell_auto_recovery_succeeded=false
   cell_operator_dr=false
   cell_checkpoint_root=null
-  cell_markers_lost=false
   cell_pvc_count=null
   cell_tips_equal=false
   cell_tips='[]'
@@ -1260,7 +1447,7 @@ run_recovery_matrix_cell() {
   local service_rto_key="matrix-service-rto-${cell_id}-${run_id}"
   local service_rto_value="service-restored-${cell_id}"
   local service_rto_request_id="service-rto-${cell_id}-${run_id}"
-  local first_response second_response remaining_timeout uid_survivors
+  local first_response second_response remaining_timeout uid_survivors write_status
 
   write_value "${name_c1}-0" "$ack_key" "$ack_value" "ack-${cell_id}-${run_id}" \
     || matrix_fail setup ack_sentinel_write_failed
@@ -1389,16 +1576,28 @@ run_recovery_matrix_cell() {
   cell_recovery_deadline=$((SECONDS + recovery_timeout))
   while true; do
     if first_response="$(matrix_service_write_response \
-      "$service_rto_key" "$service_rto_value" "$service_rto_request_id")" \
-      && matrix_service_read "$service_rto_key" "$service_rto_value" read_barrier; then
-      matrix_ledger_append "$service_rto_key" "$service_rto_value" \
-        "$service_rto_request_id" "$first_response"
+      "$service_rto_key" "$service_rto_value" "$service_rto_request_id")"; then
+      write_status=0
+    else
+      write_status=$?
+    fi
+    [ "$write_status" != 75 ] ||
+      matrix_fail service_recovery ambiguous_mutation_retry_exhausted
+    [ "$write_status" = 0 ] && break
+    [ "$SECONDS" -lt "$cell_recovery_deadline" ] \
+      || matrix_fail service_recovery recovery_deadline_exceeded
+    sleep 1
+  done
+  while true; do
+    if matrix_service_read "$service_rto_key" "$service_rto_value" read_barrier; then
       break
     fi
     [ "$SECONDS" -lt "$cell_recovery_deadline" ] \
       || matrix_fail service_recovery recovery_deadline_exceeded
     sleep 1
   done
+  matrix_ledger_append "$service_rto_key" "$service_rto_value" \
+    "$service_rto_request_id" "$first_response"
   cell_service_rto=$(($(date +%s) - cell_release_epoch))
 
   cell_phase=full_recovery
@@ -1529,6 +1728,7 @@ if [ "$profile" = sql ]; then
     --sql 'INSERT INTO users(id, name) VALUES (?1, ?2)' \
     --params-json '[{"type":"integer","value":2},{"type":"text","value":"suffix"}]'
 fi
+verify_profile_mutation_contract "${name_c1}-0"
 for ordinal in 0 1 2; do
   read_value "${name_c1}-$ordinal" suffix replayed
   marker_seed "${name_c1}-$ordinal"

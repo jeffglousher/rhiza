@@ -8,15 +8,82 @@ use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, node_router_with_limits,
     CheckpointCoordinator, ClientErrorResponse, DurabilityMode, GraphCommandResultV1,
-    GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphValueDto, GraphValueV1,
-    NodeConfig, NodeRuntime, PeerConfig, ReadConsistency, GRAPH_GET_DOCUMENT_PATH,
-    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_GRAPH_MAX_ROWS, MAX_HTTP_BODY_BYTES,
-    PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+    GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphMutationResultDto,
+    GraphValueDto, GraphValueV1, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
+    GRAPH_DELETE_DOCUMENT_PATH, GRAPH_GET_DOCUMENT_PATH, GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH,
+    MAX_GRAPH_MAX_ROWS, MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
+use rhiza_quepaxa::{
+    DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
+    RecorderRpcContext, ThreeNodeConsensus,
+};
 
 const CLUSTER_ID: &str = "rhiza:graph:cluster-a";
+
+/// Makes the first `inspect_record_summary` on each recorder ambiguous exactly
+/// once, so an HTTP read barrier recovers on retry at the wire boundary. Each
+/// recorder owns its one-shot flag, so a retry can never observe a residual
+/// injected failure regardless of how many internal inspections the first
+/// request performs.
+#[derive(Clone)]
+struct OnceInspectAmbiguous {
+    fail_first: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inner: RecorderFileStore,
+}
+
+impl RecorderRpc for OnceInspectAmbiguous {
+    fn record(
+        &self,
+        context: &RecorderRpcContext,
+        request: RecordRequest,
+    ) -> rhiza_quepaxa::Result<RecordSummary> {
+        RecorderRpc::record(&self.inner, context, request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        context: &RecorderRpcContext,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+    }
+
+    fn inspect_record_summary(
+        &self,
+        context: &RecorderRpcContext,
+        slot: u64,
+    ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        if self
+            .fail_first
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(rhiza_quepaxa::Error::UnknownOutcome);
+        }
+        RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+    }
+
+    fn fetch_command_for(
+        &self,
+        context: &RecorderRpcContext,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        RecorderRpc::fetch_command_for(
+            &self.inner,
+            context,
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+        )
+    }
+}
 
 #[test]
 fn graph_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
@@ -151,12 +218,108 @@ async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
         }),
     )
     .await;
-    assert_eq!(conflict.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_client_error(
+        conflict,
+        reqwest::StatusCode::CONFLICT,
+        "request_conflict",
+        false,
+    )
+    .await;
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_delete_is_receipted_idempotent_conflict_fenced_and_read_barrier_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        NodeRuntime::open(
+            graph_http_config(dir.path()),
+            consensus(dir.path(), "delete-recorders"),
+            &[],
+        )
+        .unwrap(),
+    );
+    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
+    let client = reqwest::Client::new();
+    let put = serde_json::json!({
+        "request_id": "put-document-1",
+        "id": "document-1",
+        "value": {"type": "string", "value": "hello"},
+    });
+    assert!(post_graph_put(&client, addr, &put)
+        .await
+        .status()
+        .is_success());
+
+    let delete = serde_json::json!({"request_id": "delete-document-1", "id": "document-1"});
+    let first = post_graph_delete(&client, addr, &delete).await;
+    assert!(first.status().is_success());
+    let first = first.json::<GraphMutationResponse>().await.unwrap();
+    assert_eq!(
+        first.result,
+        GraphMutationResultDto::DeleteDocument { existed: true }
+    );
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(first.applied_index)
+    );
+
+    let retry = post_graph_delete(&client, addr, &delete).await;
+    assert!(retry.status().is_success());
+    let retry = retry.json::<GraphMutationResponse>().await.unwrap();
+    assert_eq!(retry, first);
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(first.applied_index)
+    );
+
+    let conflict = post_graph_delete(
+        &client,
+        addr,
+        &serde_json::json!({"request_id": "delete-document-1", "id": "document-2"}),
+    )
+    .await;
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(
         conflict.json::<ClientErrorResponse>().await.unwrap().code,
-        "invalid_request"
+        "request_conflict"
     );
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(first.applied_index)
+    );
+
+    let read = client
+        .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"id": "document-1", "consistency": "read_barrier"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(read.status().is_success());
+    let read = read.json::<GraphGetDocumentResponse>().await.unwrap();
+    assert_eq!(read.value, None);
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (first.applied_index, first.hash)
+    );
+
+    let missing = serde_json::json!({"request_id": "delete-document-2", "id": "missing"});
+    let missing_first = post_graph_delete(&client, addr, &missing).await;
+    assert!(missing_first.status().is_success());
+    let missing_first = missing_first.json::<GraphMutationResponse>().await.unwrap();
+    assert_eq!(
+        missing_first.result,
+        GraphMutationResultDto::DeleteDocument { existed: false }
+    );
+    let missing_retry = post_graph_delete(&client, addr, &missing).await;
+    assert!(missing_retry.status().is_success());
+    assert_eq!(
+        missing_retry.json::<GraphMutationResponse>().await.unwrap(),
+        missing_first
+    );
     server.abort();
 }
 
@@ -815,10 +978,11 @@ async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outco
             .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let server_runtime = Arc::clone(&runtime);
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            node_router_with_checkpoint_and_limits(runtime, recorder, coordinator, 1, 8),
+            node_router_with_checkpoint_and_limits(server_runtime, recorder, coordinator, 1, 8),
         )
         .await
         .unwrap();
@@ -835,10 +999,9 @@ async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outco
     let first = post_graph_put(&client, addr, &body).await;
 
     assert_eq!(first.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        first.json::<ClientErrorResponse>().await.unwrap().code,
-        "write_outcome_unknown"
-    );
+    let first = first.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(first.code, "ambiguous_mutation");
+    assert!(first.retryable);
     let read = client
         .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
@@ -863,6 +1026,31 @@ async fn graph_sync_checkpoint_outage_reports_unknown_and_retries_original_outco
     assert_eq!(
         retry.result,
         rhiza_node::GraphMutationResultDto::PutDocument { created: true }
+    );
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(retry.applied_index)
+    );
+    let conflict = post_graph_put(
+        &client,
+        addr,
+        &serde_json::json!({
+            "request_id": "request-1",
+            "id": "document-1",
+            "value": {"type": "string", "value": "changed"}
+        }),
+    )
+    .await;
+    assert_client_error(
+        conflict,
+        reqwest::StatusCode::CONFLICT,
+        "request_conflict",
+        false,
+    )
+    .await;
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(retry.applied_index)
     );
     server.abort();
 }
@@ -926,6 +1114,21 @@ async fn post_graph_put(
 ) -> reqwest::Response {
     client
         .post(format!("http://{addr}{GRAPH_PUT_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn post_graph_delete(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    body: &serde_json::Value,
+) -> reqwest::Response {
+    client
+        .post(format!("http://{addr}{GRAPH_DELETE_DOCUMENT_PATH}"))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth("client-token")
         .json(body)
@@ -1022,4 +1225,109 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
         )
         .unwrap(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_read_barrier_recovers_after_a_transient_ambiguous_inspection() {
+    let dir = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let fail_first =
+        ["n1", "n2", "n3"].map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let recorders = ["n1", "n2", "n3"].map(|recorder_id| {
+        let index = match recorder_id {
+            "n1" => 0,
+            "n2" => 1,
+            _ => 2,
+        };
+        (
+            recorder_id.to_owned(),
+            Box::new(OnceInspectAmbiguous {
+                fail_first: std::sync::Arc::clone(&fail_first[index]),
+                inner: RecorderFileStore::new_with_membership(
+                    dir.path().join("http-recorders").join(recorder_id),
+                    recorder_id,
+                    CLUSTER_ID,
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap(),
+            }) as Box<dyn RecorderRpc>,
+        )
+    });
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            CLUSTER_ID,
+            "n1",
+            1,
+            1,
+            recorders.into_iter().collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let runtime =
+        Arc::new(NodeRuntime::open(graph_http_config(dir.path()), consensus, &[]).unwrap());
+    // Arm the one-shot ambiguity only after the runtime finished opening, so
+    // startup inspections are never faulted.
+    for flag in &fail_first {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
+    let client = reqwest::Client::new();
+
+    let put = client
+        .post(format!("http://{addr}{GRAPH_PUT_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({
+            "request_id": "http-rb-1",
+            "id": "http-rb-document",
+            "value": {"type": "string", "value": "committed"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success());
+
+    let first = client
+        .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"id": "http-rb-document", "consistency": "read_barrier"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "transient ambiguous barrier inspection must surface as HTTP 503"
+    );
+    let first = first.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(first.code, "unavailable");
+    assert!(first.retryable);
+    // The first request may return once quorum became impossible without
+    // consuming every voter's one-shot flag. Disarm so the retry observes the
+    // committed value deterministically.
+    for flag in &fail_first {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    let retried = client
+        .post(format!("http://{addr}{GRAPH_GET_DOCUMENT_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"id": "http-rb-document", "consistency": "read_barrier"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(retried.status().is_success());
+    let retried = retried.json::<GraphGetDocumentResponse>().await.unwrap();
+    assert_eq!(
+        retried.value,
+        Some(GraphValueDto::String("committed".into()))
+    );
+    assert!(runtime.is_ready());
+    assert!(!runtime.is_fatal());
+
+    server.abort();
 }

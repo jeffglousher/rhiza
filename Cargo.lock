@@ -2038,10 +2038,12 @@ dependencies = [
  "reqwest",
  "rhiza-core",
  "rhiza-node",
+ "rhiza-quepaxa",
  "rhiza-sql",
  "rhiza-tuner",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]

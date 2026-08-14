@@ -27,3 +27,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 axum.workspace = true
+rhiza-quepaxa = { version = "0.3.0", path = "../rhiza-quepaxa" }
+tempfile.workspace = true

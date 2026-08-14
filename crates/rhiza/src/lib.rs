@@ -1955,12 +1955,7 @@ mod tests {
         release.release();
         let outcome = owned.await.unwrap();
         assert!(
-            outcome.is_ok()
-                || matches!(
-                    outcome,
-                    Err(Error::Node(NodeError::OutcomeUnknown(ref message)))
-                        if message == "QuePaxa recorder RPC outcome is unknown; recover recorder state"
-                ),
+            outcome.is_ok() || matches!(outcome, Err(Error::Node(NodeError::AmbiguousMutation))),
             "the owned proposal must resolve to its exact success or mutation-unknown outcome: {outcome:?}"
         );
         assert!(matches!(
@@ -2148,8 +2143,7 @@ mod tests {
             assert!(
                 matches!(
                     owned_outcome,
-                    Err(Error::Node(NodeError::OutcomeUnknown(ref message)))
-                        if message == "QuePaxa recorder RPC outcome is unknown; recover recorder state"
+                    Err(Error::Node(NodeError::AmbiguousMutation))
                 ),
                 "owned operation {iteration} must report the exact shutdown mutation-indeterminate result: {owned_outcome:?}"
             );
