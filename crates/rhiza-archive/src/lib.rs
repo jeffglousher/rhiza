@@ -4011,9 +4011,7 @@ impl ObjectArchiveStore {
     }
 
     pub async fn execute_gc(&self, plan_hash: &str, now_ms: u64) -> Result<GcExecutionReport> {
-        if let Some(report) = self.load_gc_report(plan_hash).await? {
-            return Ok(report);
-        }
+        let existing_report = self.load_gc_report(plan_hash).await?;
         let plan_bytes = self.store.get(&self.gc_plan_key(plan_hash)).await?;
         let plan: GcPlan = deserialize_json(&plan_bytes)?;
         let actual_hash = hash_gc_plan(&plan)?;
@@ -4023,28 +4021,33 @@ impl ObjectArchiveStore {
                 actual: actual_hash,
             });
         }
+        if let Some(report) = existing_report {
+            self.validate_gc_report(&plan, &report)?;
+            self.clear_gc_barrier(&plan).await?;
+            return Ok(report);
+        }
         if now_ms < plan.not_before_ms {
             return Err(Error::GcBarrierBusy {
                 until_ms: plan.not_before_ms,
             });
         }
         if let Err(error) = self.acquire_gc_barrier(&plan, now_ms).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
         if let Err(error) = self.enter_delete_phase(&plan, now_ms).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
         if let Err(error) = self.fence_gc_root(&plan).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
         if let Err(error) = self.retire_plan_generations(&plan, now_ms).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
 
         let mut results = Vec::with_capacity(plan.candidates.len());
         for candidate in &plan.candidates {
             if let Err(error) = self.validate_gc_fence(&plan, now_ms).await {
-                return self.gc_report_after_stale(plan_hash, error).await;
+                return self.gc_report_after_stale(&plan, error).await;
             }
             let known = match candidate.reason {
                 GcCandidateReason::SupersededRecoveryGeneration => {
@@ -4116,21 +4119,59 @@ impl ObjectArchiveStore {
                 .ok_or_else(|| Error::InvalidGc("execution report disappeared".into()))?,
             Err(error) => return Err(error.into()),
         };
+        self.validate_gc_report(&plan, &report)?;
         self.clear_gc_barrier(&plan).await?;
         Ok(report)
     }
 
     async fn gc_report_after_stale(
         &self,
-        plan_hash: &str,
+        plan: &GcPlan,
         error: Error,
     ) -> Result<GcExecutionReport> {
         if matches!(error, Error::GcPlanStale { .. }) {
-            if let Some(report) = self.load_gc_report(plan_hash).await? {
+            if let Some(report) = self.load_gc_report(plan.plan_hash()).await? {
+                self.validate_gc_report(plan, &report)?;
                 return Ok(report);
             }
         }
         Err(error)
+    }
+
+    fn validate_gc_report(&self, plan: &GcPlan, report: &GcExecutionReport) -> Result<()> {
+        if report.format_version != GC_FORMAT_VERSION {
+            return Err(Error::InvalidGc(
+                "execution report format version mismatch".into(),
+            ));
+        }
+        if report.plan_hash != plan.plan_hash {
+            return Err(Error::GcPlanHashMismatch {
+                expected: plan.plan_hash.clone(),
+                actual: report.plan_hash.clone(),
+            });
+        }
+        if report.fence != execution_fence(plan) {
+            return Err(Error::InvalidGc(
+                "execution report fence does not match the plan".into(),
+            ));
+        }
+        if report.results.len() != plan.candidates.len() {
+            return Err(Error::InvalidGc(
+                "execution report candidates do not match the plan".into(),
+            ));
+        }
+        for (candidate, evidence) in plan.candidates.iter().zip(&report.results) {
+            if evidence.format_version != GC_FORMAT_VERSION
+                || evidence.plan_hash != plan.plan_hash
+                || evidence.key != candidate.key
+                || evidence.version != candidate.version
+            {
+                return Err(Error::InvalidGc(
+                    "execution report candidates do not match the plan".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn gc_plan_key(&self, plan_hash: &str) -> String {
@@ -4847,6 +4888,7 @@ impl ObjectArchiveStore {
             if active.operation_id != plan.operation_id
                 || active.plan_hash != plan.plan_hash
                 || active.fence != execution_fence(plan)
+                || active.root != plan.root
             {
                 return Err(Error::GcPlanStale {
                     message: "GC barrier changed before completion".into(),
@@ -7385,6 +7427,333 @@ mod tests {
         drop(release);
         assert!(restore.await.unwrap().unwrap().is_some());
         archive.abort_gc(&plan.operation_id).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_restore_blocks_then_reuses_the_same_gc_plan_after_release() {
+        let (_dir, store, archive) = fixture();
+        let root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            3,
+        );
+        let root = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            root_identity.clone(),
+        );
+        archive.publish_committed(&[entry()]).await.unwrap();
+        root.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        root.set_gc_root(root_identity.clone(), now.saturating_sub(1))
+            .await
+            .unwrap();
+        let plan = root
+            .plan_gc(
+                GcPolicy::new("reader-load-blocks-gc", root_identity.clone(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let alternate = root
+            .plan_gc(
+                GcPolicy::new(
+                    "reader-load-blocks-gc-alternate",
+                    root_identity.clone(),
+                    0,
+                    0,
+                    0,
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(plan.swept_generations.contains(&identity()));
+        assert!(!plan.candidates.is_empty());
+
+        let object_key = archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .segments()[0]
+            .object_key()
+            .to_owned();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, object_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(entered, "Reader restore did not reach the object gate").await;
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|lease| lease.kind == GcLeaseKind::Reader));
+
+        let blocked = root.execute_gc(plan.plan_hash(), now).await;
+        let control = root.load_gc_control().await.unwrap();
+        let active = control
+            .control
+            .active_gc
+            .as_ref()
+            .expect("blocked GC must retain its draining barrier");
+        assert!(matches!(blocked, Err(Error::GcBarrierBusy { .. })));
+        assert_eq!(active.phase, GcBarrierPhase::Draining);
+        assert_eq!(active.fence, execution_fence(&plan));
+        assert_eq!(active.plan_hash, plan.plan_hash());
+        assert!(matches!(
+            archive
+                .acquire_gc_lease(
+                    GcLeaseKind::Reader,
+                    "late-reader",
+                    now,
+                    TEST_READER_LEASE_MS
+                )
+                .await,
+            Err(Error::GcBarrierActive { .. })
+        ));
+        assert!(matches!(
+            root.execute_gc(alternate.plan_hash(), now).await,
+            Err(Error::GcBarrierActive { .. })
+        ));
+        assert!(root
+            .load_gc_report(plan.plan_hash())
+            .await
+            .unwrap()
+            .is_none());
+        for candidate in &plan.candidates {
+            assert!(store.get(&candidate.key).await.is_ok());
+        }
+
+        drop(release);
+        let restored = restore.await.unwrap().unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&entry()));
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .is_empty());
+
+        let report = root.execute_gc(plan.plan_hash(), now).await.unwrap();
+        assert_eq!(report.results().len(), plan.candidates.len());
+        assert!(report
+            .results()
+            .iter()
+            .all(|evidence| evidence.outcome == GcDeleteOutcome::Deleted));
+        assert_eq!(
+            root.load_gc_report(plan.plan_hash()).await.unwrap(),
+            Some(report)
+        );
+        assert!(root
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_none());
+        for candidate in &plan.candidates {
+            assert!(matches!(
+                store.get(&candidate.key).await,
+                Err(ObjStoreError::NotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            archive.load_checkpoint_restore().await,
+            Err(Error::GenerationRetired { .. })
+        ));
+        assert_eq!(
+            root.load_checkpoint_restore()
+                .await
+                .unwrap()
+                .unwrap()
+                .restored()
+                .suffix(),
+            std::slice::from_ref(&entry())
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_gc_retry_from_reopened_archive_clears_matching_barrier() {
+        let (_dir, store, archive) = fixture();
+        let root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            3,
+        );
+        let root = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            root_identity.clone(),
+        );
+        archive.publish_committed(&[entry()]).await.unwrap();
+        root.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        root.set_gc_root(root_identity.clone(), now.saturating_sub(1))
+            .await
+            .unwrap();
+        let plan = root
+            .plan_gc(
+                GcPolicy::new("reported-gc-retry", root_identity.clone(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let alternate = root
+            .plan_gc(
+                GcPolicy::new(
+                    "reported-gc-retry-alternate",
+                    root_identity.clone(),
+                    0,
+                    0,
+                    0,
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+
+        root.acquire_gc_barrier(&plan, now).await.unwrap();
+        root.enter_delete_phase(&plan, now).await.unwrap();
+        root.fence_gc_root(&plan).await.unwrap();
+        root.retire_plan_generations(&plan, now).await.unwrap();
+        let (gate, _entered) = TestGcControlGate::failing_update(
+            root.test_store_identity,
+            ObjStoreError::Transport {
+                key: "gc/control.json".into(),
+                message: "injected report-clear failure".into(),
+            },
+        );
+        let release = gate.release_guard();
+        let installed = install_test_gc_control_gate(gate);
+        drop(release);
+        assert!(matches!(
+            root.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::ObjectStore(ObjStoreError::Transport { .. }))
+        ));
+        let report = root
+            .load_gc_report(plan.plan_hash())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.results().len(), plan.candidates.len());
+        assert!(root
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_some());
+        drop(installed);
+
+        let reopened =
+            ObjectArchiveStore::new_checkpoint_for_single_process(store.clone(), root_identity);
+        let report_key = root.gc_report_key(plan.plan_hash());
+        let mut invalid_format = report.clone();
+        invalid_format.format_version += 1;
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&invalid_format).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::InvalidGc(message)) if message == "execution report format version mismatch"
+        ));
+        assert!(reopened
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_some());
+
+        let mut mismatched_candidate = report.clone();
+        mismatched_candidate.results[0].key.push('x');
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&mismatched_candidate).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::InvalidGc(message)) if message == "execution report candidates do not match the plan"
+        ));
+
+        let mut duplicated_candidate = report.clone();
+        duplicated_candidate
+            .results
+            .push(duplicated_candidate.results[0].clone());
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&duplicated_candidate).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::InvalidGc(message)) if message == "execution report candidates do not match the plan"
+        ));
+
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&report).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(alternate.plan_hash(), now).await,
+            Err(Error::GcBarrierActive { .. })
+        ));
+        assert_eq!(
+            reopened.execute_gc(plan.plan_hash(), now).await.unwrap(),
+            report
+        );
+        assert!(reopened
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_none());
+        for candidate in &plan.candidates {
+            assert!(matches!(
+                store.get(&candidate.key).await,
+                Err(ObjStoreError::NotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            archive.load_checkpoint_restore().await,
+            Err(Error::GenerationRetired { .. })
+        ));
+        assert!(reopened.load_checkpoint_restore().await.unwrap().is_some());
     }
 
     #[tokio::test(start_paused = true)]
