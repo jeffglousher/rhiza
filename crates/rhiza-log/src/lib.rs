@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     fmt, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -20,6 +21,8 @@ pub const QLOG_FRAME_MAGIC: [u8; 4] = *b"QFRM";
 pub const QLOG_FOOTER_MAGIC: [u8; 4] = *b"QEND";
 pub const OPEN_SEGMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const OPEN_SEGMENT_MAX_ENTRIES: usize = 4096;
+/// Maximum encoded size of a crash-recovery control intent.
+pub const CONTROL_INTENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Format-stable decoded accounting reserved per qlog entry in addition to
 /// encoded object bytes and repeated cluster identity bytes.
 ///
@@ -48,6 +51,10 @@ const COMPACT_INTENT_MAGIC: [u8; 4] = *b"QCMP";
 const COMPACT_INTENT_VERSION: u16 = 1;
 const COMPACT_INTENT_PREVIOUS_ANCHOR: u16 = 1;
 const COMPACT_INTENT_REPLACEMENT: u16 = 2;
+// A canonical `{start:020}-{end:020}.qlog` name is 46 bytes plus its u16
+// length. Replacement names need at least that plus the shortest `.tmp` name.
+const CANONICAL_OLD_SEGMENT_WIRE_BYTES: usize = 48;
+const MIN_REPLACEMENT_WIRE_BYTES: usize = 54;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -2379,12 +2386,183 @@ fn read_state_hash(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<LogHa
     Ok(value)
 }
 
-fn recover_compact_intent(dir: &Path) -> Result<()> {
-    let path = dir.join(COMPACT_INTENT_FILE_NAME);
-    if !path.exists() {
+fn read_control_intent(path: &Path) -> Result<Vec<u8>> {
+    let path_before = fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
+    validate_control_intent_metadata(&path_before)?;
+    let mut file = open_control_intent_no_follow(path)?;
+    let opened_before = file
+        .metadata()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    validate_control_intent_metadata(&opened_before)?;
+    ensure_same_control_intent(path, &path_before, &file)?;
+    let expected_len = usize::try_from(opened_before.len())
+        .map_err(|_| Error::Decode("control intent length does not fit memory".into()))?;
+    ensure_control_intent_len(expected_len)?;
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_len)
+        .map_err(|error| Error::Decode(format!("control intent allocation failed: {error}")))?;
+    (&mut file)
+        .take((CONTROL_INTENT_MAX_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::Io(error.to_string()))?;
+    ensure_control_intent_len(bytes.len())?;
+
+    let opened_after = file
+        .metadata()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let path_after = fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
+    validate_control_intent_metadata(&path_after)?;
+    ensure_same_control_intent(path, &path_after, &file)?;
+    if opened_before.len() != opened_after.len() || opened_after.len() != bytes.len() as u64 {
+        return Err(Error::Decode("control intent changed while reading".into()));
+    }
+    Ok(bytes)
+}
+
+fn validate_control_intent_metadata(metadata: &fs::Metadata) -> Result<()> {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::Decode("control intent is not a regular file".into()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::Decode("control intent is a reparse point".into()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_control_intent_no_follow(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Error::Io(error.to_string()))
+}
+
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+#[cfg(windows)]
+fn open_control_intent_no_follow(path: &Path) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| Error::Io(error.to_string()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_control_intent_no_follow(_path: &Path) -> Result<fs::File> {
+    Err(Error::Io(
+        "control intent no-follow open is unsupported on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn ensure_same_control_intent(
+    _path: &Path,
+    path_metadata: &fs::Metadata,
+    opened: &fs::File,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = opened
+        .metadata()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    if path_metadata.dev() == opened.dev() && path_metadata.ino() == opened.ino() {
         return Ok(());
     }
-    let bytes = fs::read(path).map_err(|err| Error::Io(err.to_string()))?;
+    Err(Error::Decode("control intent path identity changed".into()))
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileIdInfo {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+const _: [(); 24] = [(); std::mem::size_of::<WindowsFileIdInfo>()];
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetFileInformationByHandleEx(
+        file: *mut std::ffi::c_void,
+        information_class: i32,
+        information: *mut std::ffi::c_void,
+        information_size: u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_control_intent_identity(file: &fs::File) -> Result<WindowsFileIdInfo> {
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_ID_INFO_CLASS: i32 = 18;
+    let mut information = std::mem::MaybeUninit::<WindowsFileIdInfo>::zeroed();
+    let information_size = u32::try_from(std::mem::size_of::<WindowsFileIdInfo>())
+        .expect("Windows FILE_ID_INFO size fits in u32");
+    // SAFETY: `file` owns a valid handle, and the output buffer exactly
+    // describes one FILE_ID_INFO requested by FileIdInfo.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ID_INFO_CLASS,
+            information.as_mut_ptr().cast(),
+            information_size,
+        )
+    };
+    if result == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error().to_string()));
+    }
+    // SAFETY: success initializes the complete FILE_ID_INFO output structure.
+    Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(windows)]
+fn ensure_same_control_intent(
+    path: &Path,
+    _path_metadata: &fs::Metadata,
+    opened: &fs::File,
+) -> Result<()> {
+    let path = open_control_intent_no_follow(path)?;
+    let path_identity = windows_control_intent_identity(&path)?;
+    let opened_identity = windows_control_intent_identity(opened)?;
+    if path_identity.volume_serial_number == opened_identity.volume_serial_number
+        && path_identity.file_id == opened_identity.file_id
+    {
+        return Ok(());
+    }
+    Err(Error::Decode("control intent path identity changed".into()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ensure_same_control_intent(
+    _path: &Path,
+    _path_metadata: &fs::Metadata,
+    _opened: &fs::File,
+) -> Result<()> {
+    Err(Error::Decode(
+        "control intent path identity cannot be proven on this platform".into(),
+    ))
+}
+
+fn recover_compact_intent(dir: &Path) -> Result<()> {
+    let path = dir.join(COMPACT_INTENT_FILE_NAME);
+    let bytes = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error.to_string())),
+        Ok(_) => read_control_intent(&path)?,
+    };
     let intent = decode_compact_intent(&bytes)?;
     apply_compact_intent(dir, &intent, &mut |_| Ok(()))
 }
@@ -2563,10 +2741,11 @@ fn truncate_suffix_with_hook(
 
 fn recover_truncate_intent(dir: &Path) -> Result<()> {
     let path = dir.join(TRUNCATE_INTENT_FILE_NAME);
-    if !path.exists() {
-        return Ok(());
-    }
-    let bytes = fs::read(&path).map_err(|err| Error::Io(err.to_string()))?;
+    let bytes = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error.to_string())),
+        Ok(_) => read_control_intent(&path)?,
+    };
     let intent = decode_truncate_intent(&bytes)?;
     apply_truncate_intent(dir, &intent, &mut |_| Ok(()))
 }
@@ -2648,8 +2827,22 @@ fn apply_truncate_intent(
 }
 
 fn encode_truncate_intent(intent: &TruncateIntent) -> Result<Vec<u8>> {
+    let encoded_len = intent
+        .old_segment_names
+        .iter()
+        .try_fold(16_usize, |total, name| checked_intent_name_len(total, name))?;
+    let encoded_len = match &intent.replacement {
+        Some(replacement) => checked_intent_name_len(
+            checked_intent_name_len(encoded_len, &replacement.temp_name)?,
+            &replacement.final_name,
+        )?,
+        None => encoded_len,
+    };
+    ensure_control_intent_len(encoded_len)?;
     validate_truncate_intent(intent)?;
     let mut out = Vec::new();
+    out.try_reserve_exact(encoded_len)
+        .map_err(|error| Error::Decode(format!("truncate intent allocation failed: {error}")))?;
     out.extend_from_slice(&TRUNCATE_INTENT_MAGIC);
     put_u16(&mut out, TRUNCATE_INTENT_VERSION);
     put_u16(
@@ -2672,10 +2865,16 @@ fn encode_truncate_intent(intent: &TruncateIntent) -> Result<Vec<u8>> {
     }
     let crc = crc32c(&out);
     put_u32(&mut out, crc);
+    if out.len() != encoded_len {
+        return Err(Error::Decode(
+            "truncate intent preflight length mismatch".into(),
+        ));
+    }
     Ok(out)
 }
 
 fn decode_truncate_intent(bytes: &[u8]) -> Result<TruncateIntent> {
+    ensure_control_intent_len(bytes.len())?;
     if bytes.len() < 16 || bytes.get(..4) != Some(TRUNCATE_INTENT_MAGIC.as_slice()) {
         return Err(Error::Decode("invalid truncate intent magic".into()));
     }
@@ -2690,9 +2889,19 @@ fn decode_truncate_intent(bytes: &[u8]) -> Result<TruncateIntent> {
     if flags & !TRUNCATE_INTENT_REPLACEMENT != 0 {
         return Err(Error::Decode("invalid truncate intent flags".into()));
     }
-    let count = read_u32(bytes, 8)? as usize;
+    let count = usize::try_from(read_u32(bytes, 8)?)
+        .map_err(|_| Error::Decode("truncate intent segment count overflow".into()))?;
     let mut cursor = 12;
-    let mut old_segment_names = Vec::with_capacity(count);
+    preflight_intent_count(
+        count,
+        crc_offset - cursor,
+        flags & TRUNCATE_INTENT_REPLACEMENT != 0,
+        "truncate",
+    )?;
+    let mut old_segment_names = Vec::new();
+    old_segment_names
+        .try_reserve_exact(count)
+        .map_err(|error| Error::Decode(format!("truncate intent allocation failed: {error}")))?;
     for _ in 0..count {
         old_segment_names.push(read_intent_name(bytes, &mut cursor, crc_offset)?);
     }
@@ -2716,6 +2925,32 @@ fn decode_truncate_intent(bytes: &[u8]) -> Result<TruncateIntent> {
 }
 
 fn encode_compact_intent(intent: &CompactIntent) -> Result<Vec<u8>> {
+    let anchor = encode_anchor(&intent.anchor)?;
+    let previous_anchor = intent
+        .previous_anchor
+        .as_ref()
+        .map(encode_anchor)
+        .transpose()?;
+    let mut encoded_len = 20_usize
+        .checked_add(anchor.len())
+        .ok_or_else(|| Error::Decode("compact intent length overflow".into()))?;
+    if let Some(previous) = &previous_anchor {
+        encoded_len = encoded_len
+            .checked_add(4)
+            .and_then(|total| total.checked_add(previous.len()))
+            .ok_or_else(|| Error::Decode("compact intent length overflow".into()))?;
+    }
+    encoded_len = intent
+        .old_segment_names
+        .iter()
+        .try_fold(encoded_len, |total, name| {
+            checked_intent_name_len(total, name)
+        })?;
+    if let Some(replacement) = &intent.replacement {
+        encoded_len = checked_intent_name_len(encoded_len, &replacement.temp_name)?;
+        encoded_len = checked_intent_name_len(encoded_len, &replacement.final_name)?;
+    }
+    ensure_control_intent_len(encoded_len)?;
     validate_compact_intent(intent)?;
     let mut flags = 0;
     if intent.previous_anchor.is_some() {
@@ -2725,6 +2960,8 @@ fn encode_compact_intent(intent: &CompactIntent) -> Result<Vec<u8>> {
         flags |= COMPACT_INTENT_REPLACEMENT;
     }
     let mut out = Vec::new();
+    out.try_reserve_exact(encoded_len)
+        .map_err(|error| Error::Decode(format!("compact intent allocation failed: {error}")))?;
     out.extend_from_slice(&COMPACT_INTENT_MAGIC);
     put_u16(&mut out, COMPACT_INTENT_VERSION);
     put_u16(&mut out, flags);
@@ -2733,13 +2970,9 @@ fn encode_compact_intent(intent: &CompactIntent) -> Result<Vec<u8>> {
         u32::try_from(intent.old_segment_names.len())
             .map_err(|_| Error::Decode("too many compact segments".into()))?,
     );
-    put_blob(&mut out, &encode_anchor(&intent.anchor)?, "compact anchor")?;
-    if let Some(previous) = &intent.previous_anchor {
-        put_blob(
-            &mut out,
-            &encode_anchor(previous)?,
-            "compact previous anchor",
-        )?;
+    put_blob(&mut out, &anchor, "compact anchor")?;
+    if let Some(previous) = &previous_anchor {
+        put_blob(&mut out, previous, "compact previous anchor")?;
     }
     for name in &intent.old_segment_names {
         put_intent_name(&mut out, name)?;
@@ -2750,10 +2983,16 @@ fn encode_compact_intent(intent: &CompactIntent) -> Result<Vec<u8>> {
     }
     let crc = crc32c(&out);
     put_u32(&mut out, crc);
+    if out.len() != encoded_len {
+        return Err(Error::Decode(
+            "compact intent preflight length mismatch".into(),
+        ));
+    }
     Ok(out)
 }
 
 fn decode_compact_intent(bytes: &[u8]) -> Result<CompactIntent> {
+    ensure_control_intent_len(bytes.len())?;
     if bytes.len() < 20 || bytes.get(..4) != Some(COMPACT_INTENT_MAGIC.as_slice()) {
         return Err(Error::Decode("invalid compact intent magic".into()));
     }
@@ -2768,7 +3007,8 @@ fn decode_compact_intent(bytes: &[u8]) -> Result<CompactIntent> {
     if flags & !(COMPACT_INTENT_PREVIOUS_ANCHOR | COMPACT_INTENT_REPLACEMENT) != 0 {
         return Err(Error::Decode("invalid compact intent flags".into()));
     }
-    let count = read_u32(bytes, 8)? as usize;
+    let count = usize::try_from(read_u32(bytes, 8)?)
+        .map_err(|_| Error::Decode("compact intent segment count overflow".into()))?;
     let mut cursor = 12;
     let anchor = decode_anchor(read_blob(bytes, &mut cursor, crc_offset, "compact anchor")?)?;
     let previous_anchor = if flags & COMPACT_INTENT_PREVIOUS_ANCHOR != 0 {
@@ -2781,7 +3021,16 @@ fn decode_compact_intent(bytes: &[u8]) -> Result<CompactIntent> {
     } else {
         None
     };
-    let mut old_segment_names = Vec::with_capacity(count);
+    preflight_intent_count(
+        count,
+        crc_offset - cursor,
+        flags & COMPACT_INTENT_REPLACEMENT != 0,
+        "compact",
+    )?;
+    let mut old_segment_names = Vec::new();
+    old_segment_names
+        .try_reserve_exact(count)
+        .map_err(|error| Error::Decode(format!("compact intent allocation failed: {error}")))?;
     for _ in 0..count {
         old_segment_names.push(read_intent_name(bytes, &mut cursor, crc_offset)?);
     }
@@ -2823,16 +3072,11 @@ fn validate_compact_intent(intent: &CompactIntent) -> Result<()> {
             ));
         }
     }
-    for (position, name) in intent.old_segment_names.iter().enumerate() {
-        validate_closed_segment_name(name)?;
-        if intent.old_segment_names[..position].contains(name) {
-            return Err(Error::Decode("duplicate compact segment name".into()));
-        }
-    }
+    let old_segment_names = validate_intent_names(&intent.old_segment_names, "compact")?;
     if let Some(replacement) = &intent.replacement {
         validate_temp_name(&replacement.temp_name)?;
         validate_closed_segment_name(&replacement.final_name)?;
-        if intent.old_segment_names.contains(&replacement.final_name) {
+        if old_segment_names.contains(replacement.final_name.as_str()) {
             return Err(Error::Decode(
                 "compact replacement overlaps old segment name".into(),
             ));
@@ -2858,20 +3102,71 @@ fn validate_truncate_intent(intent: &TruncateIntent) -> Result<()> {
     if intent.old_segment_names.is_empty() {
         return Err(Error::Decode("truncate intent has no old segments".into()));
     }
-    for (position, name) in intent.old_segment_names.iter().enumerate() {
-        validate_closed_segment_name(name)?;
-        if intent.old_segment_names[..position].contains(name) {
-            return Err(Error::Decode("duplicate truncate segment name".into()));
-        }
-    }
+    let old_segment_names = validate_intent_names(&intent.old_segment_names, "truncate")?;
     if let Some(replacement) = &intent.replacement {
         validate_temp_name(&replacement.temp_name)?;
         validate_closed_segment_name(&replacement.final_name)?;
-        if intent.old_segment_names.contains(&replacement.final_name) {
+        if old_segment_names.contains(replacement.final_name.as_str()) {
             return Err(Error::Decode(
                 "truncate replacement overlaps old segment name".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_intent_names<'a>(names: &'a [String], operation: &str) -> Result<HashSet<&'a str>> {
+    let mut unique = HashSet::new();
+    unique
+        .try_reserve(names.len())
+        .map_err(|error| Error::Decode(format!("{operation} intent allocation failed: {error}")))?;
+    for name in names {
+        validate_closed_segment_name(name)?;
+        if !unique.insert(name.as_str()) {
+            return Err(Error::Decode(format!("duplicate {operation} segment name")));
+        }
+    }
+    Ok(unique)
+}
+
+fn ensure_control_intent_len(actual: usize) -> Result<()> {
+    if actual > CONTROL_INTENT_MAX_BYTES {
+        return Err(Error::Decode(format!(
+            "control intent exceeds {CONTROL_INTENT_MAX_BYTES} byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_intent_name_len(total: usize, name: &str) -> Result<usize> {
+    u16::try_from(name.len())
+        .map_err(|_| Error::Decode("truncate intent name is too long".into()))?;
+    total
+        .checked_add(2)
+        .and_then(|total| total.checked_add(name.len()))
+        .ok_or_else(|| Error::Decode("control intent length overflow".into()))
+}
+
+fn preflight_intent_count(
+    count: usize,
+    remaining: usize,
+    has_replacement: bool,
+    operation: &str,
+) -> Result<()> {
+    let required = count
+        .checked_mul(CANONICAL_OLD_SEGMENT_WIRE_BYTES)
+        .and_then(|bytes| {
+            bytes.checked_add(if has_replacement {
+                MIN_REPLACEMENT_WIRE_BYTES
+            } else {
+                0
+            })
+        })
+        .ok_or_else(|| Error::Decode(format!("{operation} intent segment count overflow")))?;
+    if required > remaining {
+        return Err(Error::Decode(format!(
+            "{operation} intent segment count exceeds encoded bytes"
+        )));
     }
     Ok(())
 }
@@ -3357,6 +3652,182 @@ mod tests {
 
         assert!(FileLogStore::open(&dir, "cluster-a", 1, 1).is_err());
         assert_eq!(fs::read(victim).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn control_intent_reader_is_exactly_bounded_and_rejects_non_regular_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TRUNCATE_INTENT_FILE_NAME);
+        fs::write(&path, vec![0_u8; CONTROL_INTENT_MAX_BYTES]).unwrap();
+        assert_eq!(
+            read_control_intent(&path).unwrap().len(),
+            CONTROL_INTENT_MAX_BYTES
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        assert!(matches!(
+            read_control_intent(&path),
+            Err(Error::Decode(message)) if message.contains("byte limit")
+        ));
+        assert!(matches!(
+            decode_truncate_intent(&vec![0_u8; CONTROL_INTENT_MAX_BYTES + 1]),
+            Err(Error::Decode(message)) if message.contains("byte limit")
+        ));
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            read_control_intent(&path),
+            Err(Error::Decode(message)) if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn oversized_persisted_intent_fails_recovery_without_mutating_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = chain(&[b"one", b"two", b"three", b"four"]);
+        drop(segmented_store(dir.path(), &entries));
+        let segments_before = closed_segment_bytes(dir.path());
+        fs::write(
+            dir.path().join(TRUNCATE_INTENT_FILE_NAME),
+            vec![0_u8; CONTROL_INTENT_MAX_BYTES + 1],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            FileLogStore::open(dir.path(), "cluster-a", 1, 1),
+            Err(Error::Decode(message)) if message.contains("byte limit")
+        ));
+        assert_eq!(closed_segment_bytes(dir.path()), segments_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_intent_reader_rejects_a_symlink_without_reading_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let intent = dir.path().join(TRUNCATE_INTENT_FILE_NAME);
+        fs::write(&target, b"not-an-intent").unwrap();
+        symlink(&target, &intent).unwrap();
+
+        assert!(matches!(
+            read_control_intent(&intent),
+            Err(Error::Decode(message)) if message.contains("not a regular file")
+        ));
+        assert_eq!(fs::read(target).unwrap(), b"not-an-intent");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_intent_windows_handle_identity_accepts_the_same_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TRUNCATE_INTENT_FILE_NAME);
+        fs::write(&path, b"intent").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let opened = open_control_intent_no_follow(&path).unwrap();
+
+        ensure_same_control_intent(&path, &metadata, &opened).unwrap();
+    }
+
+    #[test]
+    fn intent_decoder_rejects_a_crc_valid_impossible_count_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&TRUNCATE_INTENT_MAGIC);
+        put_u16(&mut bytes, TRUNCATE_INTENT_VERSION);
+        put_u16(&mut bytes, 0);
+        put_u32(&mut bytes, u32::MAX);
+        let crc = crc32c(&bytes);
+        put_u32(&mut bytes, crc);
+
+        assert!(matches!(
+            decode_truncate_intent(&bytes),
+            Err(Error::Decode(message)) if message.contains("count")
+        ));
+    }
+
+    #[test]
+    fn intent_encoding_is_bounded_preserves_order_and_rejects_duplicates() {
+        let names = [
+            segment_file_name(IndexRange::new(1, 1).unwrap()),
+            segment_file_name(IndexRange::new(2, 2).unwrap()),
+        ];
+        assert_eq!(names[0].len() + 2, CANONICAL_OLD_SEGMENT_WIRE_BYTES);
+        let intent = TruncateIntent {
+            old_segment_names: names.to_vec(),
+            replacement: None,
+        };
+        assert_eq!(
+            encode_truncate_intent(&TruncateIntent {
+                old_segment_names: vec![names[0].clone()],
+                replacement: None,
+            })
+            .unwrap(),
+            encode_unchecked_test_intent(&names[0])
+        );
+        let truncate_fixture = encode_truncate_intent(&TruncateIntent {
+            old_segment_names: vec![names[0].clone()],
+            replacement: None,
+        })
+        .unwrap();
+        assert_eq!(truncate_fixture.len(), 64);
+        assert_eq!(
+            LogHash::digest(&[&truncate_fixture]),
+            LogHash::from_bytes([
+                0xa2, 0x26, 0xed, 0x69, 0x67, 0x4c, 0x02, 0x52, 0x8c, 0x2c, 0xf1, 0x6e, 0xeb, 0x93,
+                0xe7, 0xf5, 0x7b, 0x9a, 0xdd, 0x92, 0x52, 0x80, 0x2c, 0x8b, 0x4c, 0xa2, 0xa6, 0x1a,
+                0x3d, 0x6c, 0x2c, 0x25,
+            ])
+        );
+        let entries = chain(&[b"one"]);
+        let compact_fixture = encode_compact_intent(&CompactIntent {
+            previous_anchor: None,
+            anchor: recovery_anchor(&entries[0]),
+            old_segment_names: vec![names[0].clone()],
+            replacement: None,
+        })
+        .unwrap();
+        assert_eq!(compact_fixture.len(), 287);
+        assert_eq!(
+            LogHash::digest(&[&compact_fixture]),
+            LogHash::from_bytes([
+                0x7e, 0x00, 0xa5, 0xeb, 0x57, 0xe8, 0x8f, 0x42, 0x6f, 0x87, 0xc2, 0xa4, 0xd6, 0xc6,
+                0x4f, 0xaa, 0xd5, 0x87, 0x09, 0x25, 0x5a, 0x3a, 0x5d, 0xbb, 0xad, 0x11, 0x40, 0x9c,
+                0xfc, 0xfd, 0xc4, 0x38,
+            ])
+        );
+        assert_eq!(
+            decode_truncate_intent(&encode_truncate_intent(&intent).unwrap()).unwrap(),
+            intent
+        );
+
+        let duplicate = TruncateIntent {
+            old_segment_names: vec![names[0].clone(), names[0].clone()],
+            replacement: None,
+        };
+        assert!(matches!(
+            encode_truncate_intent(&duplicate),
+            Err(Error::Decode(message)) if message.contains("duplicate truncate")
+        ));
+
+        let over_limit_count =
+            (CONTROL_INTENT_MAX_BYTES - 16) / CANONICAL_OLD_SEGMENT_WIRE_BYTES + 1;
+        let oversized = TruncateIntent {
+            old_segment_names: (1..=over_limit_count as u64)
+                .map(|index| segment_file_name(IndexRange::new(index, index).unwrap()))
+                .collect(),
+            replacement: None,
+        };
+        assert!(matches!(
+            encode_truncate_intent(&oversized),
+            Err(Error::Decode(message)) if message.contains("byte limit")
+        ));
     }
 
     fn inject_truncate_crash(store: &FileLogStore, from: LogIndex, crash_phase: TruncatePhase) {
