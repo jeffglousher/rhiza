@@ -15532,6 +15532,11 @@ mod tests {
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
         assert_eq!(runtime.log_store().last_index().unwrap(), None);
+        // A quorum inspection can stop before consuming every injected
+        // ambiguity. Disarm before the distinct request so it deterministically
+        // recovers A before proposing the later command.
+        remaining_unknown_installs.store(0, Ordering::Release);
+        remaining_unknown_inspections.store(0, Ordering::Release);
 
         let later = SqlCommand {
             request_id: "later".into(),
