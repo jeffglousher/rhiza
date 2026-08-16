@@ -92,6 +92,7 @@ run bash -n \
   scripts/check-bench-rhiza-hiqlite-steady-static.sh \
   scripts/check-power-loss-durability-static.sh \
   scripts/check-chaos-static.sh \
+  scripts/check-e2e-recovery-matrix-static.sh \
   scripts/tuner-monitor.sh \
   scripts/check-tuner-monitor-static.sh \
   scripts/e2e-fast.sh \
@@ -107,6 +108,7 @@ run scripts/check-chaos-static.sh
 run scripts/check-storage-format-compatibility.sh
 run scripts/check-tuner-monitor-static.sh
 run scripts/check-deploy.sh
+run scripts/check-e2e-recovery-matrix-static.sh
 run scripts/check-workspace-packages.sh
 if git diff --quiet --ignore-submodules -- && git diff --cached --quiet --ignore-submodules --; then
   run scripts/check-quepaxa-package.sh
