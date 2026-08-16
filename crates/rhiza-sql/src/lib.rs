@@ -3788,18 +3788,24 @@ fn validate_qwal_identity(
     identity: &ControlIdentity,
     configuration: &ConfigurationState,
 ) -> Result<()> {
-    if effect.cluster_id != identity.cluster_id()
-        || effect.epoch != identity.epoch()
-        || effect.configuration_id != configuration.config_id()
-        || effect.recovery_generation != identity.recovery_generation()
-        || effect.materializer_fingerprint != identity.materializer_fingerprint().to_hex()
-        || effect.base_state != identity.user_state()
-    {
-        return Err(Error::InvalidEntry(
-            "QWAL effect identity or materializer fingerprint mismatch".into(),
-        ));
-    }
-    Ok(())
+    let field = if effect.cluster_id != identity.cluster_id() {
+        "cluster_id"
+    } else if effect.epoch != identity.epoch() {
+        "epoch"
+    } else if effect.configuration_id != configuration.config_id() {
+        "configuration_id"
+    } else if effect.recovery_generation != identity.recovery_generation() {
+        "recovery_generation"
+    } else if effect.materializer_fingerprint != identity.materializer_fingerprint().to_hex() {
+        "materializer_fingerprint"
+    } else if effect.base_state != identity.user_state() {
+        "base_state"
+    } else {
+        return Ok(());
+    };
+    Err(Error::InvalidEntry(format!(
+        "QWAL effect identity mismatch: {field}"
+    )))
 }
 
 fn encode_qwal_snapshot(snapshot: &QwalSnapshotV3) -> Result<Vec<u8>> {
@@ -4634,6 +4640,73 @@ fn sql_query_error(error: rusqlite::Error) -> Error {
 
 fn io_error(error: std::io::Error) -> Error {
     Error::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod qwal_identity_tests {
+    use super::*;
+
+    #[test]
+    fn qwal_identity_reports_the_first_static_mismatch() {
+        let state = StateIdentityV3 {
+            page_size: 4096,
+            page_count: 1,
+            state_root: LogHash::ZERO,
+        };
+        let configuration = ConfigurationState::active(7, LogHash::ZERO);
+        let identity = ControlIdentity::new(
+            "cluster-a",
+            "node-a",
+            3,
+            configuration.clone(),
+            2,
+            LogHash::digest(&[b"fingerprint"]),
+            state,
+        );
+        let effect = QwalEnvelopeV3 {
+            cluster_id: "cluster-a".into(),
+            epoch: 3,
+            configuration_id: 7,
+            recovery_generation: 2,
+            base_index: 0,
+            base_hash: LogHash::ZERO,
+            base_state: state,
+            target_state: state,
+            materializer_fingerprint: identity.materializer_fingerprint().to_hex(),
+            receipts: Vec::new(),
+            pages: Vec::new(),
+        };
+        let assert_field = |effect: QwalEnvelopeV3, field| {
+            assert!(matches!(
+                validate_qwal_identity(&effect, &identity, &configuration),
+                Err(Error::InvalidEntry(message)) if message == format!("QWAL effect identity mismatch: {field}")
+            ));
+        };
+        for field in [
+            "cluster_id",
+            "epoch",
+            "configuration_id",
+            "recovery_generation",
+            "materializer_fingerprint",
+            "base_state",
+        ] {
+            let mut changed = effect.clone();
+            match field {
+                "cluster_id" => changed.cluster_id.push('!'),
+                "epoch" => changed.epoch += 1,
+                "configuration_id" => changed.configuration_id += 1,
+                "recovery_generation" => changed.recovery_generation += 1,
+                "materializer_fingerprint" => changed.materializer_fingerprint.push('!'),
+                "base_state" => changed.base_state.state_root = LogHash::digest(&[b"other-state"]),
+                _ => unreachable!(),
+            }
+            assert_field(changed, field);
+        }
+        let mut changed = effect;
+        changed.cluster_id.push('!');
+        changed.base_state.state_root = LogHash::digest(&[b"other-state"]);
+        assert_field(changed, "cluster_id");
+    }
 }
 
 #[cfg(test)]
