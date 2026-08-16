@@ -25,12 +25,10 @@ frontier. Decision proofs do not necessarily retain command bodies, so a proof
 alone cannot always answer a later command fetch. At WAL rotation, checkpoint
 creation clones and rewrites active state synchronously.
 
-The deterministic slot-513 regression demonstrates the resulting cliff:
-`RECORDER_WAL_HARD_FRAME_LIMIT` is 1,024 frames and the exercised mutation
-uses two frames, so slot 513 first crosses that limit. Its synchronous
-checkpoint work occurs on the admitted recorder path. See
-`RecorderFileStore`, `RECORDER_WAL_HARD_FRAME_LIMIT`, and the checkpoint
-rotation tests in `crates/rhiza-quepaxa/src/lib.rs`.
+One observed design motivation is the 1,024-frame WAL hard limit. This document
+does not claim a tracked deterministic slot-513 regression or timing result.
+See `RecorderFileStore` and
+`RECORDER_WAL_HARD_FRAME_LIMIT` in `crates/rhiza-quepaxa/src/lib.rs`.
 
 ## Definitions
 
@@ -77,7 +75,7 @@ artifacts remain the tail representation.
 `DecisionProof` is per-slot evidence; it is not this frontier certificate. The
 certificate is an irreducible future protocol proof: an exact-configuration
 quorum of durable, monotonic frontier attestations. QuePaxa recorder protocol
-owns validation; it binds `E`, `C`, `F`, digest, and quorum, with exact
+owns validation; it binds `E`, `C`, `F`, digest, and quorum, with strict
 extension, conflict, and install rules. This authorizes only the model, not a
 type, API, encoding, or format change.
 
@@ -93,8 +91,8 @@ type, API, encoding, or format change.
    `(E, C, F_a, D_a)`. A recorder validates exact context, digest, and quorum,
    then durably establishes the candidate `(F_a, D_a)` as its local attested
    fence (or atomically verifies that exact fence) before it installs `F_c`.
-   Thus `F_c <= F_a` always holds. It installs only an extension of its existing
-   certified fact; base publication and GC are permitted only afterwards.
+   Thus `F_c <= F_a` always holds. It installs only a strictly later certified
+   fact; base publication and GC are permitted only afterwards.
 4. **Publish conceptual base.** Future encoding must first durably write all
    referenced immutable tail/base material, then atomically publish the one
    base record/marker, and only then permit deletion. A crash before publication
@@ -145,7 +143,7 @@ lease nor a new subsystem.
 
 The implementation and model must establish:
 
-1. agreement; valid proof installation; certificate soundness, uniqueness, and
+1. agreement; valid proof installation; certificate soundness and strict
    extension;
 2. configuration isolation, a single active configuration, and safe successor
    transition;
@@ -177,7 +175,7 @@ Timing and filesystem-specific claims remain outside this model.
 | Case | Required observation |
 | --- | --- |
 | gap before a high decided slot | `F_a` does not jump over the gap |
-| equivalent/conflicting certificates | equivalent extends idempotently; conflict fails closed |
+| equal/conflicting certificates | only a strictly later exact certificate advances; equal or conflicting candidates fail closed |
 | crash at each base-publication seam | recover old base+WAL or complete published base; never mixed authority |
 | GC with active tail or activation/pending reference | all referenced bodies/artifacts remain protected |
 | old mutation/proof install | `slot < F_a` rejects deterministically |
