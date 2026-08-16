@@ -1,7 +1,7 @@
 use rhiza_core::{
-    ConfigId, Epoch, ExternalEffectCommand, LogEntry, LogHash, LogIndex, RecoveryAnchor, Snapshot,
-    SnapshotManifest, MAX_EXTERNAL_EFFECT_BYTES, MAX_EXTERNAL_EFFECT_CHUNKS,
-    RECOVERY_ANCHOR_FORMAT_VERSION,
+    CheckpointGcAnchor, ConfigId, Epoch, ExternalEffectCommand, LogAnchor, LogEntry, LogHash,
+    LogIndex, RecoveryAnchor, Snapshot, SnapshotManifest, MAX_EXTERNAL_EFFECT_BYTES,
+    MAX_EXTERNAL_EFFECT_CHUNKS, RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 use rhiza_log::{
     decode_segment_for_cluster_bounded, encode_segment, SegmentFile,
@@ -1143,17 +1143,6 @@ pub struct LoadedCheckpointManifest {
     version: UpdateVersion,
 }
 
-/// Evidence returned only after a checkpoint manifest has been read back from
-/// object storage. `manifest_digest` is the hash of the canonical manifest
-/// bytes; no parallel certificate codec is introduced.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointReadbackCertificate {
-    identity: CheckpointIdentity,
-    tip: CheckpointTip,
-    manifest_digest: LogHash,
-    object_generation: UpdateVersion,
-}
-
 const MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES: usize = 16 * 1024;
 
 /// A bounded, durable encoding of the immutable result of one successful
@@ -1206,31 +1195,18 @@ impl CheckpointPublicationReceipt {
         Ok(receipt)
     }
 
-    pub fn certificate(&self) -> CheckpointReadbackCertificate {
-        CheckpointReadbackCertificate {
-            identity: self.identity.clone(),
-            tip: self.tip,
-            manifest_digest: self.manifest_digest,
-            object_generation: self.object_version.clone().into(),
-        }
-    }
-}
-
-impl CheckpointReadbackCertificate {
-    pub const fn identity(&self) -> &CheckpointIdentity {
-        &self.identity
-    }
-
-    pub const fn tip(&self) -> &CheckpointTip {
-        &self.tip
-    }
-
-    pub const fn manifest_digest(&self) -> LogHash {
-        self.manifest_digest
-    }
-
-    pub const fn object_generation(&self) -> &UpdateVersion {
-        &self.object_generation
+    pub fn gc_anchor(&self) -> Result<CheckpointGcAnchor> {
+        CheckpointGcAnchor::new(
+            self.identity.cluster_id(),
+            self.identity.epoch(),
+            self.identity.config_id(),
+            self.identity.config_digest(),
+            LogAnchor::new(self.tip.index(), self.tip.hash()),
+            self.manifest_digest,
+        )
+        .ok_or_else(|| {
+            Error::InvalidCheckpoint("checkpoint publication receipt is incomplete".into())
+        })
     }
 }
 
@@ -1246,8 +1222,8 @@ impl LoadedCheckpointManifest {
     /// Returns immutable evidence for the exact manifest generation whose
     /// conditional create/update completed. A later valid manifest generation
     /// cannot invalidate this successful CAS receipt.
-    pub fn publication_certificate(&self) -> Result<CheckpointReadbackCertificate> {
-        Ok(self.publication_receipt()?.certificate())
+    pub fn publication_gc_anchor(&self) -> Result<CheckpointGcAnchor> {
+        self.publication_receipt()?.gc_anchor()
     }
 
     pub fn publication_receipt(&self) -> Result<CheckpointPublicationReceipt> {
@@ -2181,10 +2157,10 @@ async fn test_gc_control_gate(
 }
 
 impl ObjectArchiveStore {
-    pub async fn checkpoint_readback_certificate(
+    pub async fn checkpoint_readback_gc_anchor(
         &self,
         expected: &LoadedCheckpointManifest,
-    ) -> Result<CheckpointReadbackCertificate> {
+    ) -> Result<CheckpointGcAnchor> {
         let actual = self.load_checkpoint().await?.ok_or_else(|| {
             Error::InvalidCheckpoint("checkpoint disappeared before GC certificate readback".into())
         })?;
@@ -2193,7 +2169,7 @@ impl ObjectArchiveStore {
                 "checkpoint changed before GC certificate readback".into(),
             ));
         }
-        actual.publication_certificate()
+        actual.publication_gc_anchor()
     }
     pub fn new(store: ObjStore, cluster_id: impl Into<String>) -> Result<Self> {
         if !store.supports_strong_cross_process_cas() {
@@ -2415,16 +2391,14 @@ impl ObjectArchiveStore {
         published: &LoadedCheckpointManifest,
     ) -> Result<CheckpointPublicationReceipt> {
         let receipt = published.publication_receipt()?;
-        let certificate = receipt.certificate();
         let identity = self.checkpoint_identity()?;
-        if certificate.identity() != identity {
+        if receipt.identity != *identity {
             return Err(Error::InvalidCheckpoint(
                 "checkpoint receipt identity differs from this archive".into(),
             ));
         }
         let bytes = receipt.encode()?;
-        let key =
-            checkpoint_publication_receipt_key(identity, holder, certificate.manifest_digest())?;
+        let key = checkpoint_publication_receipt_key(identity, holder, receipt.manifest_digest)?;
         match self.store.create(&key, &bytes).await {
             Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
             Err(error) => return Err(error.into()),
@@ -2461,9 +2435,7 @@ impl ObjectArchiveStore {
             )
             .await?;
         let receipt = CheckpointPublicationReceipt::decode(&bytes)?;
-        if receipt.certificate().identity() != identity
-            || receipt.certificate().manifest_digest() != manifest_digest
-        {
+        if receipt.identity != *identity || receipt.manifest_digest != manifest_digest {
             return Err(Error::InvalidCheckpoint(
                 "checkpoint publication receipt binding differs".into(),
             ));
@@ -2494,12 +2466,12 @@ impl ObjectArchiveStore {
                 )
                 .await?;
             let receipt = CheckpointPublicationReceipt::decode(&bytes)?;
-            if receipt.certificate().identity() != identity {
+            if receipt.identity != *identity {
                 return Err(Error::InvalidCheckpoint(
                     "checkpoint receipt cleanup found a foreign identity".into(),
                 ));
             }
-            if receipt.certificate().tip().index() <= through_slot {
+            if receipt.tip.index() <= through_slot {
                 self.store
                     .delete_exact(metadata.key(), metadata.version())
                     .await?;
@@ -7899,6 +7871,7 @@ mod tests {
             .unwrap();
         let encoded = published.publication_receipt().unwrap().encode().unwrap();
         let publication_receipt = CheckpointPublicationReceipt::decode(&encoded).unwrap();
+        assert_eq!(publication_receipt.encode().unwrap(), encoded);
         let publisher = archive
             .open_checkpoint_publisher("receipt-test", CheckpointPublisherOptions::default())
             .await
@@ -7910,11 +7883,12 @@ mod tests {
         let receipt = archive
             .load_checkpoint_receipt(
                 publisher.receipt_holder(),
-                publication_receipt.certificate().manifest_digest(),
+                publication_receipt.gc_anchor().unwrap().manifest_digest(),
             )
             .await
             .unwrap()
-            .certificate();
+            .gc_anchor()
+            .unwrap();
 
         let second = next_entry(&first);
         let later = archive
@@ -7922,12 +7896,25 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(receipt.identity(), published.manifest().identity());
-        assert_eq!(receipt.tip(), published.manifest().tip());
-        assert_ne!(receipt.tip(), later.manifest().tip());
-        assert_ne!(receipt.object_generation(), later.version());
+        assert_eq!(
+            receipt.cluster_id(),
+            published.manifest().identity().cluster_id()
+        );
+        assert_eq!(receipt.epoch(), published.manifest().identity().epoch());
+        assert_eq!(
+            receipt.config_id(),
+            published.manifest().identity().config_id()
+        );
+        assert_eq!(
+            receipt.config_digest(),
+            published.manifest().identity().config_digest()
+        );
+        assert_eq!(receipt.tip().index(), published.manifest().tip().index());
+        assert_eq!(receipt.tip().hash(), published.manifest().tip().hash());
+        assert_ne!(receipt.tip().index(), later.manifest().tip().index());
+        assert_ne!(published.version(), later.version());
         assert!(matches!(
-            archive.checkpoint_readback_certificate(&published).await,
+            archive.checkpoint_readback_gc_anchor(&published).await,
             Err(Error::InvalidCheckpoint(message))
                 if message == "checkpoint changed before GC certificate readback"
         ));

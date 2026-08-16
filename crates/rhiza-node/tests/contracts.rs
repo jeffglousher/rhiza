@@ -26,14 +26,13 @@ use rhiza_node::{
 };
 use rhiza_quepaxa::{
     CertifiedDecisionInspection, DecisionProof, EffectBundleBinding, EffectBundleFinalizeRequest,
-    FixedMembership, IsrState, Membership, ReadFenceRequest, ReadFenceSlotState, RecordRequest,
-    RecordSummary, RecorderEffectBundle, RecorderFileStore, RecorderRpc, RecorderRpcContext,
-    ThreeNodeConsensus,
+    IsrState, Membership, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
+    RecorderEffectBundle, RecorderFileStore, RecorderRpc, RecorderRpcContext, ThreeNodeConsensus,
 };
 use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine};
 
 fn test_config_digest() -> LogHash {
-    FixedMembership::new(["node-1", "node-2", "node-3"])
+    Membership::new(["node-1", "node-2", "node-3"])
         .unwrap()
         .digest()
 }

@@ -194,9 +194,10 @@ throughput/latency testing on the target ext4/XFS/CSI stack.
 
 ## Current-format policy
 
-The minimum supported Rust version is 1.89. This crate is unreleased and makes
-no API, persisted-layout, or mixed-binary compatibility promise. Recorder
-persistence and decision proofs accept only the exact current format. Their
-fixed magic and format identity are corruption and type-safety fences, not
-migration negotiation. HTTP or other wire protocols belong to the embedding
-application and are not part of this crate.
+The minimum supported Rust version is 1.89. Recorder persistence and decision
+proofs accept only their exact current format; adjacent N/N+1 and mixed-binary
+compatibility are not implemented. Their fixed magic and format identity are
+corruption and type-safety fences, not migration negotiation. The canonical
+artifact inventory and design-only release policy are in the workspace
+[persisted-format baseline](../../docs/storage-format-compatibility.md); HTTP
+or other wire protocols belong to the embedding application.

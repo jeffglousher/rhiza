@@ -1,5 +1,16 @@
 #![doc = include_str!("../README.md")]
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+use libc::O_NOFOLLOW;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(any(
@@ -27,8 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rhiza_archive::CheckpointReadbackCertificate;
-use rhiza_core::canonical_membership_digest;
+use rhiza_core::{canonical_membership_digest, CheckpointGcAnchor};
 
 pub use rhiza_core::{
     ClusterId, Command, CommandKind, ConfigChange, ConfigId, EntryType, Epoch, ExternalEffectChunk,
@@ -751,18 +761,6 @@ fn validate_replicated_command_size(command: &StoredCommand) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     ChainConflict {
@@ -973,8 +971,6 @@ impl Membership {
         })
     }
 }
-
-pub type FixedMembership = Membership;
 
 pub trait Consensus {
     fn propose(&self, context: RecorderRpcContext, command: Command) -> Result<LogEntry>;
@@ -1240,8 +1236,6 @@ pub struct AcceptedSummary {
     pub value: AcceptedValue,
 }
 
-pub type ProposalSummary = AcceptedSummary;
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DecisionCertificate {
     pub slot: Slot,
@@ -1270,7 +1264,7 @@ impl DecisionCertificate {
         self.validate_for(config_id, membership)
     }
 
-    pub fn validate(&self, membership: &FixedMembership) -> std::result::Result<(), RejectReason> {
+    pub fn validate(&self, membership: &Membership) -> std::result::Result<(), RejectReason> {
         if self.config_digest != membership.digest() {
             return Err(RejectReason::WrongConfig);
         }
@@ -1313,8 +1307,6 @@ impl DecisionCertificate {
         Ok(())
     }
 }
-
-pub type DecisionRecord = DecisionCertificate;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RecorderSummary {
@@ -2842,8 +2834,12 @@ impl RecorderFileStore {
         if recorder_id.is_empty() {
             return Err(Error::EmptyRecorderIdentity);
         }
-        let effect_root_anchor = Arc::new(prepare_fresh_recorder_root(&root)?);
-        ensure_storage_generation(&effect_root_anchor)?;
+        let effect_root_anchor = Arc::new(
+            prepare_fresh_recorder_root(&root)
+                .map_err(|error| recorder_init_error("recorder root preparation", error))?,
+        );
+        ensure_storage_generation(&effect_root_anchor)
+            .map_err(|error| recorder_init_error("recorder storage generation", error))?;
         effect_root_anchor.verify_path(&root)?;
         if current_recorder_layout(&root)? {
             return Self::open_existing_root(
@@ -2866,7 +2862,9 @@ impl RecorderFileStore {
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(Error::RecorderRootLocked(root));
             }
-            Err(fs::TryLockError::Error(err)) => return Err(Error::Io(err.to_string())),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(Error::Io(format!("recorder root lock: {error}")));
+            }
         }
         Ok((
             Self {
@@ -3882,28 +3880,28 @@ impl RecorderFileStore {
         self.load_effect_bundle_unlocked(binding).map(Some)
     }
 
-    /// Persists a monotonic, archive-readback-certified GC anchor and then
+    /// Persists a monotonic, archive-readback GC anchor and then
     /// removes only finalized manifests at or below that anchor. The anchor is
     /// fsynced before any deletion, so a crash yields either the old complete
     /// set or a valid superset of the new swept set; it never creates a hole
     /// below an unpersisted certificate.
     pub fn advance_effect_bundle_gc_anchor(
         &self,
-        certificate: &CheckpointReadbackCertificate,
+        anchor: &CheckpointGcAnchor,
         protected_pins: &[EffectBundleGcPin],
     ) -> Result<EffectBundleGcOutcome> {
-        self.advance_effect_bundle_gc_anchor_bounded(certificate, protected_pins, usize::MAX)
+        self.advance_effect_bundle_gc_anchor_bounded(anchor, protected_pins, usize::MAX)
     }
 
     /// Advances the durable anchor while limiting destructive maintenance work.
     ///
     /// The anchor is always published before deletion. Callers may retry the
-    /// exact certificate until `sweep_complete`; each call removes at most
+    /// exact anchor until `sweep_complete`; each call removes at most
     /// `max_removals` manifests and chunks, respectively. This keeps online
     /// Recorder RPC admission from being monopolized by a directory-wide GC.
     pub fn advance_effect_bundle_gc_anchor_bounded(
         &self,
-        certificate: &CheckpointReadbackCertificate,
+        anchor: &CheckpointGcAnchor,
         protected_pins: &[EffectBundleGcPin],
         max_removals: usize,
     ) -> Result<EffectBundleGcOutcome> {
@@ -3918,9 +3916,8 @@ impl RecorderFileStore {
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
         self.recover_intent()?;
         self.effect_root_anchor.verify_path(&self.root)?;
-        self.validate_effect_bundle_gc_certificate(certificate)?;
-        let identity = certificate.identity();
-        let tip = certificate.tip();
+        self.validate_effect_bundle_gc_anchor(anchor)?;
+        let tip = anchor.tip();
         let mut all_pins = protected_pins.to_vec();
         all_pins.extend(
             self.staged_effect_pins
@@ -3933,7 +3930,7 @@ impl RecorderFileStore {
         let protected = self.effect_bundle_gc_protected(&all_pins)?;
         let previous = self.load_effect_bundle_gc_anchor_unlocked()?;
         if let Some(previous) = &previous {
-            if previous.cluster_id != identity.cluster_id() || previous.epoch != identity.epoch() {
+            if previous.cluster_id != anchor.cluster_id() || previous.epoch != anchor.epoch() {
                 return Err(Error::EffectBundleInvalid(
                     "effect GC anchor cluster or epoch does not match this certificate".into(),
                 ));
@@ -3945,7 +3942,7 @@ impl RecorderFileStore {
             }
             if tip.index() == previous.through_slot
                 && (previous.tip_hash != tip.hash()
-                    || previous.manifest_digest != certificate.manifest_digest())
+                    || previous.manifest_digest != anchor.manifest_digest())
             {
                 return Err(Error::EffectBundleInvalid(
                     "effect GC anchor retry has different checkpoint evidence".into(),
@@ -3953,19 +3950,19 @@ impl RecorderFileStore {
             }
         }
 
-        if previous.as_ref().is_none_or(|anchor| {
-            anchor.through_slot != tip.index()
-                || anchor.tip_hash != tip.hash()
-                || anchor.manifest_digest != certificate.manifest_digest()
+        if previous.as_ref().is_none_or(|previous| {
+            previous.through_slot != tip.index()
+                || previous.tip_hash != tip.hash()
+                || previous.manifest_digest != anchor.manifest_digest()
         }) {
             self.effect_root_anchor.atomic_write(
                 EFFECT_BUNDLE_GC_ANCHOR_FILE,
                 &encode_effect_bundle_gc_anchor(&EffectBundleGcAnchor {
-                    cluster_id: identity.cluster_id().into(),
-                    epoch: identity.epoch(),
+                    cluster_id: anchor.cluster_id().into(),
+                    epoch: anchor.epoch(),
                     through_slot: tip.index(),
                     tip_hash: tip.hash(),
-                    manifest_digest: certificate.manifest_digest(),
+                    manifest_digest: anchor.manifest_digest(),
                 })?,
             )?;
             self.effect_root_anchor.sync()?;
@@ -3996,20 +3993,16 @@ impl RecorderFileStore {
             .map(|anchor| anchor.through_slot))
     }
 
-    fn validate_effect_bundle_gc_certificate(
-        &self,
-        certificate: &CheckpointReadbackCertificate,
-    ) -> Result<()> {
+    fn validate_effect_bundle_gc_anchor(&self, anchor: &CheckpointGcAnchor) -> Result<()> {
         let configuration = self.configuration_state()?;
-        let identity = certificate.identity();
-        let tip = certificate.tip();
-        if identity.cluster_id() != self.cluster_id
-            || identity.epoch() != self.epoch
-            || identity.config_id() != configuration.config_id
-            || identity.config_digest() != configuration.config_digest
+        let tip = anchor.tip();
+        if anchor.cluster_id() != self.cluster_id
+            || anchor.epoch() != self.epoch
+            || anchor.config_id() != configuration.config_id
+            || anchor.config_digest() != configuration.config_digest
             || tip.index() == 0
             || tip.hash() == LogHash::ZERO
-            || certificate.manifest_digest() == LogHash::ZERO
+            || anchor.manifest_digest() == LogHash::ZERO
         {
             return Err(Error::EffectBundleInvalid(
                 "effect GC certificate is not a certified checkpoint for this recorder".into(),
@@ -5287,7 +5280,7 @@ pub struct ThreeNodeConsensus {
     epoch: Epoch,
     config_id: ConfigId,
     config_digest: LogHash,
-    membership: FixedMembership,
+    membership: Membership,
     recorders: Vec<Arc<dyn RecorderRpc>>,
     record_workers: Vec<RecordWorker>,
     control_workers: Vec<ControlWorker>,
@@ -7734,7 +7727,7 @@ impl ThreeNodeConsensus {
         self.config_id
     }
 
-    pub const fn membership(&self) -> &FixedMembership {
+    pub const fn membership(&self) -> &Membership {
         &self.membership
     }
 
@@ -7884,7 +7877,7 @@ impl ThreeNodeConsensus {
         recorders.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let (recorder_ids, recorders): (Vec<_>, Vec<_>) = recorders.into_iter().unzip();
         let recorders: Vec<Arc<dyn RecorderRpc>> = recorders.into_iter().map(Arc::from).collect();
-        let membership = FixedMembership::from_members(recorder_ids)?;
+        let membership = Membership::from_members(recorder_ids)?;
         let config_digest = membership.digest();
         let record_workers = membership
             .members()
@@ -12121,7 +12114,7 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File> {
         target_os = "netbsd",
         target_os = "dragonfly"
     ))]
-    options.custom_flags(O_NOFOLLOW_FLAG);
+    options.custom_flags(O_NOFOLLOW);
     options
         .open(path)
         .map_err(|error| Error::Io(error.to_string()))
@@ -12137,9 +12130,20 @@ fn prepare_fresh_recorder_root(root: &Path) -> Result<anchored_fs::AnchoredDir> 
     match fs::create_dir(root) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(Error::Io(error.to_string())),
+        Err(error) => {
+            return Err(Error::Io(format!(
+                "recorder root directory create: {error}"
+            )))
+        }
     }
     anchored_fs::AnchoredDir::open(root)
+}
+
+fn recorder_init_error(operation: &str, error: Error) -> Error {
+    match error {
+        Error::Io(message) => Error::Io(format!("{operation}: {message}")),
+        error => error,
+    }
 }
 
 /// Clean-install-only recorder generation gate. A nonempty root without this
@@ -21129,6 +21133,24 @@ mod tests {
         assert!(!current_recorder_layout(&root).unwrap());
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
         RecorderFileStore::new_with_membership(&root, "n1", "cluster", 1, 1, membership).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_recorder_root_io_identifies_the_nonsecret_operation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let root = parent.path().join("recorder");
+        symlink(target.path(), &root).unwrap();
+        let error = prepare_fresh_recorder_root(&root).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Io(message)
+                if message.starts_with("recorder root open: ")
+                    && !message.contains(&root.display().to_string())
+        ));
     }
 
     #[cfg(unix)]

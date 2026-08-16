@@ -7361,8 +7361,6 @@ impl NodeError {
     }
 }
 
-pub type RuntimeError = NodeError;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeConfigurationStatus {
