@@ -426,7 +426,7 @@ fn anchor(entry: &LogEntry, bytes: &[u8]) -> RecoveryAnchor {
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        ConfigurationState::active(3, LogHash::ZERO),
+        ConfigurationState::active(3, identity(3).config_digest()),
         3,
         LogAnchor::new(entry.index, entry.hash),
         SnapshotIdentity::new(
@@ -446,7 +446,7 @@ fn anchor_for_fingerprint(
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        ConfigurationState::active(3, LogHash::ZERO),
+        ConfigurationState::active(3, identity(3).config_digest()),
         3,
         LogAnchor::new(entry.index, entry.hash),
         SnapshotIdentity::new(
@@ -468,5 +468,8 @@ async fn age_generation(store: &ObjStore, generation: u64) {
 }
 
 fn generation_prefix(generation: u64) -> String {
-    format!("rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003/generation-{generation:020}")
+    format!(
+        "rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003-digest-{}/generation-{generation:020}",
+        identity(generation).config_digest().to_hex()
+    )
 }

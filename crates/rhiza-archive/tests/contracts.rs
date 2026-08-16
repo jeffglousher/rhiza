@@ -542,9 +542,10 @@ async fn snapshot_base_restores_snapshot_and_exact_tail() {
         CheckpointBase::Snapshot(_)
     ));
     let snapshot_key = advanced.manifest().base().snapshot().unwrap().object_key();
-    assert!(snapshot_key.contains(
-        "rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003/generation-00000000000000000004/snapshots/00000000000000000002-"
-    ));
+    assert!(snapshot_key.contains(&format!(
+        "rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003-digest-{}/generation-00000000000000000004/snapshots/00000000000000000002-",
+        checkpoint_identity().config_digest().to_hex()
+    )));
     assert!(snapshot_key.ends_with(&format!(
         "-{}-{}.snapshot",
         LogHash::digest(&[bytes]).to_hex(),
@@ -567,17 +568,18 @@ async fn snapshot_anchor_round_trips_configuration_state() {
     archive.publish_committed(&committed).await.unwrap();
     let bytes = b"snapshot-at-stop";
     let compacted = LogAnchor::new(1, committed[0].hash);
+    let config_digest = checkpoint_identity().config_digest();
     let stop_change = ConfigChange::bound_stop(
         "cluster-a",
         3,
-        LogHash::from_bytes([7; 32]),
+        config_digest,
         4,
         vec!["node-a".into(), "node-b".into(), "node-c".into()],
     )
     .unwrap();
     let configuration = ConfigurationState::stopped(
         3,
-        LogHash::from_bytes([7; 32]),
+        config_digest,
         compacted,
         StopBinding::Bound {
             successor: stop_change.successor().expect("bound stop").clone(),
@@ -1215,7 +1217,7 @@ fn recovery_anchor(index: u64, hash: LogHash, bytes: &[u8], snapshot_id: &str) -
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        ConfigurationState::active(3, LogHash::ZERO),
+        ConfigurationState::active(3, checkpoint_identity().config_digest()),
         4,
         LogAnchor::new(index, hash),
         SnapshotIdentity::new(
@@ -1237,7 +1239,7 @@ fn recovery_anchor_for_fingerprint(
     RecoveryAnchor::new(
         "cluster-a",
         7,
-        ConfigurationState::active(3, LogHash::ZERO),
+        ConfigurationState::active(3, checkpoint_identity().config_digest()),
         4,
         LogAnchor::new(index, hash),
         SnapshotIdentity::new(

@@ -22,13 +22,12 @@ use rhiza_obj_store::{
 use serde::{Deserialize, Serialize};
 
 pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_SEGMENT_FORMAT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_CAS_ATTEMPTS: usize = 16;
 const CHECKPOINT_RESTORE_LIMITS: CheckpointRestoreLimits = CheckpointRestoreLimits {
-    // Version 2 manifests written before compact QEFX references can be just
-    // over 1 MiB at the default compaction boundary. Keep one bounded
-    // transition window so those manifests can be read and compacted.
+    // Compact QEFX manifests can exceed 1 MiB at the default compaction
+    // boundary, so keep a bounded 2 MiB manifest ceiling.
     manifest_encoded_bytes: 2 * 1024 * 1024,
     segment_count: 256,
     object_count: 257,
@@ -3200,11 +3199,12 @@ impl ObjectArchiveStore {
         if source_identity.cluster_id != target_identity.cluster_id
             || source_identity.epoch != target_identity.epoch
             || source_identity.config_id != target_identity.config_id
+            || source_identity.config_digest != target_identity.config_digest
             || source_identity.recovery_generation.checked_add(1)
                 != Some(target_identity.recovery_generation)
         {
             return Err(Error::InvalidCheckpoint(
-                "recovery-generation roll requires the same cluster/epoch/config and generation + 1"
+                "recovery-generation roll requires the same cluster/epoch/config identity and generation + 1"
                     .into(),
             ));
         }
@@ -5767,6 +5767,13 @@ impl ObjectArchiveStore {
                 anchor.config_id(),
             ));
         }
+        if anchor.configuration_state().digest() != identity.config_digest() {
+            return Err(checkpoint_identity_mismatch(
+                "config_digest",
+                identity.config_digest().to_hex(),
+                anchor.configuration_state().digest().to_hex(),
+            ));
+        }
         if anchor.recovery_generation() != identity.recovery_generation() {
             return Err(checkpoint_identity_mismatch(
                 "recovery_generation",
@@ -6020,6 +6027,13 @@ fn validate_checkpoint_identity(
             "config_id",
             expected.config_id,
             actual.config_id,
+        ));
+    }
+    if expected.config_digest != actual.config_digest {
+        return Err(checkpoint_identity_mismatch(
+            "config_digest",
+            expected.config_digest.to_hex(),
+            actual.config_digest.to_hex(),
         ));
     }
     if expected.recovery_generation != actual.recovery_generation {
@@ -6277,8 +6291,12 @@ fn checkpoint_effect_refs_for_suffix(
 
 fn checkpoint_namespace(identity: &CheckpointIdentity) -> String {
     format!(
-        "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}/generation-{:020}",
-        identity.cluster_id, identity.epoch, identity.config_id, identity.recovery_generation
+        "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}-digest-{}/generation-{:020}",
+        identity.cluster_id,
+        identity.epoch,
+        identity.config_id,
+        identity.config_digest.to_hex(),
+        identity.recovery_generation
     )
 }
 
@@ -7949,7 +7967,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"target-membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             compacted,
             SnapshotIdentity::new(
@@ -8773,7 +8791,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             LogAnchor::new(3, LogHash::digest(&[b"tip"])),
             SnapshotIdentity::new(
@@ -8918,7 +8936,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             LogAnchor::new(first.index, first.hash),
             SnapshotIdentity::new(
@@ -9126,7 +9144,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             LogAnchor::new(first.index, first.hash),
             SnapshotIdentity::new(
@@ -9749,6 +9767,90 @@ mod tests {
             LogHash::digest(&[b"archive-test-config"]),
             1,
         )
+    }
+
+    #[test]
+    fn checkpoint_digest_qualifies_namespace_and_manifest_identity() {
+        let expected = identity();
+        let different = CheckpointIdentity::new(
+            expected.cluster_id(),
+            expected.epoch(),
+            expected.config_id(),
+            LogHash::digest(&[b"different-membership"]),
+            expected.recovery_generation(),
+        );
+        assert_ne!(
+            checkpoint_namespace(&expected),
+            checkpoint_namespace(&different)
+        );
+        assert!(checkpoint_namespace(&expected).contains(&expected.config_digest().to_hex()));
+
+        let (_directory, _store, archive) = fixture();
+        let manifest = CheckpointManifest::new(different);
+        assert_eq!(manifest.format_version(), 3);
+        assert!(matches!(
+            archive.validate_checkpoint_manifest(&manifest),
+            Err(Error::CheckpointIdentityMismatch {
+                field: "config_digest",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_v3_never_falls_back_to_the_legacy_namespace() {
+        let (_directory, store, archive) = fixture();
+        archive.initialize_checkpoint().await.unwrap();
+        let legacy = "rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003/generation-00000000000000000001/manifest.json";
+        assert!(matches!(
+            store.get(legacy).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_anchor_rejects_same_config_id_with_different_digest() {
+        let (_directory, _store, archive) = fixture();
+        let anchor = RecoveryAnchor::new(
+            "cluster-a",
+            7,
+            ConfigurationState::active(3, LogHash::digest(&[b"different-membership"])),
+            1,
+            LogAnchor::new(0, LogHash::ZERO),
+            SnapshotIdentity::new(
+                "snapshot",
+                LogHash::digest(&[b"snapshot"]),
+                8,
+                LogHash::digest(&[b"executor"]),
+            ),
+        );
+        assert!(matches!(
+            archive.validate_recovery_anchor(&anchor),
+            Err(Error::CheckpointIdentityMismatch {
+                field: "config_digest",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_rejects_same_config_id_with_different_digest() {
+        let (_directory, store, source) = fixture();
+        let target = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store,
+            CheckpointIdentity::new(
+                "cluster-a",
+                7,
+                3,
+                LogHash::digest(&[b"different-membership"]),
+                2,
+            ),
+        );
+        assert!(matches!(
+            source.roll_recovery_generation(&target).await,
+            Err(Error::InvalidCheckpoint(message))
+                if message.contains("same cluster/epoch/config identity")
+        ));
     }
 
     fn entry() -> LogEntry {
