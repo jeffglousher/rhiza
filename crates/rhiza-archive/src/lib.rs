@@ -3347,56 +3347,48 @@ impl ObjectArchiveStore {
             tip: source.manifest.tip,
         };
         target.validate_checkpoint_manifest(&manifest)?;
-        target
-            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
-            .await?;
-        if let Some(existing) = target.load_checkpoint_unleased().await? {
-            return if existing.manifest == manifest {
-                target.register_generation(now_ms()).await?;
-                Ok(existing)
-            } else {
-                Err(Error::CheckpointTargetConflict)
-            };
-        }
-        let target_manifest_key = target.checkpoint_manifest_key()?;
-        let version = match target
-            .store
-            .create(
-                &target_manifest_key,
-                serialize_checkpoint_manifest(&manifest)?,
-            )
-            .await
-        {
-            Ok(version) => version,
-            Err(ObjStoreError::AlreadyExists { .. }) => {
-                let existing = target.load_checkpoint_unleased().await?.ok_or_else(|| {
-                    Error::InvalidCheckpoint("target manifest disappeared after create".into())
-                })?;
-                return if existing.manifest == manifest {
-                    target.register_generation(now_ms()).await?;
-                    Ok(existing)
-                } else {
-                    Err(Error::CheckpointTargetConflict)
-                };
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let source_after = self.load_checkpoint_unleased().await?;
-        if source_after.as_ref() != Some(&source) {
-            let published_version: ObjectVersion = version.clone().into();
-            if !target
-                .store
-                .delete_exact(&target_manifest_key, &published_version)
-                .await?
-            {
-                return Err(Error::CheckpointTargetConflict);
-            }
+        let source_at_publish = self.load_checkpoint_unleased().await?;
+        if source_at_publish.as_ref() != Some(&source) {
             return Err(Error::InvalidCheckpoint(
                 "source checkpoint changed during copy".into(),
             ));
         }
+        target
+            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+            .await?;
+        let published = if let Some(existing) = target.load_checkpoint_unleased().await? {
+            if existing.manifest != manifest {
+                return Err(Error::CheckpointTargetConflict);
+            }
+            existing
+        } else {
+            let target_manifest_key = target.checkpoint_manifest_key()?;
+            match target
+                .store
+                .create(
+                    &target_manifest_key,
+                    serialize_checkpoint_manifest(&manifest)?,
+                )
+                .await
+            {
+                Ok(version) => LoadedCheckpointManifest { manifest, version },
+                Err(ObjStoreError::AlreadyExists { .. }) => {
+                    let existing = target.load_checkpoint_unleased().await?.ok_or_else(|| {
+                        Error::InvalidCheckpoint("target manifest disappeared after create".into())
+                    })?;
+                    if existing.manifest != manifest {
+                        return Err(Error::CheckpointTargetConflict);
+                    }
+                    existing
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        target
+            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+            .await?;
         target.register_generation(now_ms()).await?;
-        Ok(LoadedCheckpointManifest { manifest, version })
+        Ok(published)
     }
 
     async fn create_verified_checkpoint_object(
@@ -9579,6 +9571,207 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn recovery_roll_rejects_a_source_change_before_its_publish_boundary() {
+        let (_source_directory, _source_store, source) = fixture();
+        let first = entry();
+        let second = next_entry(&first);
+        let source_checkpoint = source
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let copied_key = checkpoint_segment_key(
+            target.checkpoint_identity().unwrap(),
+            source_checkpoint.manifest().segments()[0].start_index(),
+            source_checkpoint.manifest().segments()[0].end_index(),
+        );
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::after_create(target.test_store_identity, copied_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(entered, "recovery roll did not copy its immutable object").await;
+
+        source
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        drop(release);
+        assert!(matches!(
+            copy.await.unwrap(),
+            Err(Error::InvalidCheckpoint(message))
+                if message == "source checkpoint changed during copy"
+        ));
+        assert!(target.load_checkpoint_unleased().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_source_reread_is_the_manifest_publish_boundary() {
+        let (_source_directory, _source_store, source) = fixture();
+        let first = entry();
+        let second = next_entry(&first);
+        let source_checkpoint = source
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let copied_key = checkpoint_segment_key(
+            target.checkpoint_identity().unwrap(),
+            source_checkpoint.manifest().segments()[0].start_index(),
+            source_checkpoint.manifest().segments()[0].end_index(),
+        );
+        let (object_gate, object_entered, _object_cancelled) =
+            TestCheckpointDownloadGate::after_create(target.test_store_identity, copied_key);
+        let _installed_object = install_test_checkpoint_download_gate(object_gate.clone());
+        let object_release = object_gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(
+            object_entered,
+            "recovery roll did not copy its immutable object",
+        )
+        .await;
+
+        let (manifest_gate, manifest_entered, _manifest_cancelled) =
+            TestCheckpointManifestGate::new(target.test_store_identity);
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let manifest_release = manifest_gate.release_guard();
+        drop(object_release);
+        wait_for_test_gate(
+            manifest_entered,
+            "recovery roll did not reach the target manifest CAS",
+        )
+        .await;
+        source
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        drop(manifest_release);
+
+        let copied = copy.await.unwrap().unwrap();
+        assert_eq!(copied.manifest().tip(), source_checkpoint.manifest().tip());
+        let restored = target.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&first));
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_is_idempotent_for_the_same_target_manifest() {
+        let (_source_directory, _source_store, source) = fixture();
+        source.publish_committed(&[entry()]).await.unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+
+        let first = source.roll_recovery_generation(&target).await.unwrap();
+        let repeated = source.roll_recovery_generation(&target).await.unwrap();
+        assert_eq!(repeated, first);
+        assert_eq!(
+            target
+                .load_gc_control()
+                .await
+                .unwrap()
+                .control
+                .generations
+                .iter()
+                .filter(|entry| entry.identity == *target.checkpoint_identity().unwrap())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_retries_an_unregistered_manifest_after_lease_loss() {
+        let (_source_directory, _source_store, source) = fixture();
+        let source_checkpoint = source.publish_committed(&[entry()]).await.unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let source_segment = &source_checkpoint.manifest().segments()[0];
+        let copied_key = checkpoint_segment_key(
+            target.checkpoint_identity().unwrap(),
+            source_segment.start_index(),
+            source_segment.end_index(),
+        );
+        let (object_gate, object_entered, _object_cancelled) =
+            TestCheckpointDownloadGate::after_create(target.test_store_identity, copied_key);
+        let _installed_object = install_test_checkpoint_download_gate(object_gate.clone());
+        let object_release = object_gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(
+            object_entered,
+            "recovery roll did not copy its immutable object",
+        )
+        .await;
+
+        let (manifest_gate, manifest_entered, _manifest_cancelled) =
+            TestCheckpointManifestGate::new(target.test_store_identity);
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let manifest_release = manifest_gate.release_guard();
+        drop(object_release);
+        wait_for_test_gate(
+            manifest_entered,
+            "recovery roll did not reach the target manifest CAS",
+        )
+        .await;
+        let mut control = target.load_gc_control().await.unwrap();
+        let publisher = control
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.kind == GcLeaseKind::Publisher)
+            .expect("paused recovery roll must hold its target Publisher lease");
+        publisher.expires_at_ms = 0;
+        control.control.fence += 1;
+        target.update_gc_control(&control).await.unwrap();
+        drop(manifest_release);
+        assert!(matches!(
+            copy.await.unwrap(),
+            Err(Error::GcLeaseMissing { .. })
+        ));
+
+        let published = target.load_checkpoint_unleased().await.unwrap().unwrap();
+        assert!(!target
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .generations
+            .iter()
+            .any(|entry| entry.identity == *target.checkpoint_identity().unwrap()));
+        let retried = source.roll_recovery_generation(&target).await.unwrap();
+        assert_eq!(retried, published);
+        assert!(target
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .generations
+            .iter()
+            .any(|entry| entry.identity == *target.checkpoint_identity().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_rejects_a_different_target_manifest_without_overwrite() {
+        let (_source_directory, _source_store, source) = fixture();
+        source.publish_committed(&[entry()]).await.unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let existing = target.initialize_checkpoint().await.unwrap();
+
+        assert!(matches!(
+            source.roll_recovery_generation(&target).await,
+            Err(Error::CheckpointTargetConflict)
+        ));
+        assert_eq!(
+            target.load_checkpoint_unleased().await.unwrap(),
+            Some(existing)
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, ObjStore, ObjectArchiveStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = ObjStore::new(ObjStoreConfig::Local {
@@ -9588,6 +9781,19 @@ mod tests {
         let archive =
             ObjectArchiveStore::new_checkpoint_for_single_process(store.clone(), identity());
         (dir, store, archive)
+    }
+
+    fn recovery_roll_target() -> (tempfile::TempDir, ObjStore, ObjectArchiveStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let target = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            CheckpointIdentity::new("cluster-a", 7, 3, identity().config_digest(), 2),
+        );
+        (directory, store, target)
     }
 
     #[tokio::test]
