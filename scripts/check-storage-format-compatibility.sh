@@ -12,7 +12,7 @@ fail() {
 }
 
 count_exact() {
-    rg -Fxc -- "$2" "$1" 2>/dev/null || true
+    awk -v line="$2" '$0 == line { count++ } END { print count + 0 }' "$1"
 }
 
 require_exact_once() {
@@ -44,12 +44,44 @@ require_row() {
 }
 
 const_version() {
-    line=$(rg -m1 -o "(pub )?const $2: [^=]+ = [0-9]+" "$repo_root/$1") || fail "missing source constant: $1:$2"
-    printf '%s\n' "$line" | awk '{ print $NF }'
+    awk -v name="$2" '
+        {
+            field = $1 == "pub" ? $3 : $2
+            sub(/:$/, "", field)
+            if (($1 == "const" || ($1 == "pub" && $2 == "const")) && field == name && $NF ~ /^[0-9]+;$/) {
+                sub(/;$/, "", $NF)
+                print $NF
+                count++
+            }
+        }
+        END { if (count != 1) exit 1 }
+    ' "$repo_root/$1" || fail "missing source constant: $1:$2"
+}
+
+byte_magic() {
+    awk -v name="$2" '
+        {
+            field = $1 == "pub" ? $3 : $2
+            sub(/:$/, "", field)
+            if (($1 == "const" || ($1 == "pub" && $2 == "const")) && field == name && match($0, /b"[^"]*"/)) {
+                print substr($0, RSTART + 2, RLENGTH - 3)
+                count++
+            }
+        }
+        END { if (count != 1) exit 1 }
+    ' "$repo_root/$1" || fail "missing source magic: $1:$2"
 }
 
 code() {
     printf '%s%s%s' "\`" "$1" "\`"
+}
+
+version_token() {
+    printf '%s v%s' "$(code "$1")" "$2"
+}
+
+source_contains() {
+    grep -F -- "$2" "$repo_root/$1" >/dev/null 2>&1 || fail "source anchor changed: $1:$2"
 }
 
 validate() {
@@ -61,16 +93,16 @@ validate() {
     require_exact_once "$file" '| --- | --- | --- | --- | --- |'
     [ "$(row_count "$file")" = 19 ] || fail "expected 19 canonical rows"
 
-    require_row "$file" 'Qlog segments' 'rhiza-log' "$(code '<qlog>/{start}-{end}.qlog')" "\`QLOG\` v$qlog_version" 'reject mismatch before replay'
-    require_row "$file" 'Qlog compaction controls' 'rhiza-log' "$(code '.truncate-intent')" "\`QANC\` v$anchor_version" 'fails closed'
-    require_row "$file" 'Replicated command/effect payloads' 'rhiza-core' "$(code 'qlog/recorder/checkpoint payload')" 'QEFX\0\x01' 'Canonical bounded decode'
+    require_row "$file" 'Qlog segments' 'rhiza-log' "$(code '<qlog>/{start}-{end}.qlog')" "$qlog_token" 'reject mismatch before replay'
+    require_row "$file" 'Qlog compaction controls' 'rhiza-log' "$(code '.truncate-intent')" "$truncate_token" "$compact_token" "$anchor_token" 'fails closed'
+    require_row "$file" 'Replicated command/effect payloads' 'rhiza-core' "$(code 'qlog/recorder/checkpoint payload')" "$qefx_token" 'Canonical bounded decode'
     require_row "$file" 'Recorder generation and lock' 'rhiza-quepaxa' "$(code '.rhiza-storage-generation')" 'clean-v1' 'reject open/install'
     require_row "$file" 'Recorder decision state' 'rhiza-quepaxa' "$(code 'recorder.wal')" "\`QWAL\` v$recorder_wal_version" 'conflict fails closed'
     require_row "$file" 'Recorder configuration/commands' 'rhiza-quepaxa' "$(code 'configuration.rec')" "\`QCON\` v$configuration_version" 'content-hash checks'
-    require_row "$file" 'Recorder effects and GC fence' 'rhiza-quepaxa' "$(code '.effect-bundle-gc-anchor.rec')" "\`QEGC\` v1" 'unsafe deletion fails closed'
+    require_row "$file" 'Recorder effects and GC fence' 'rhiza-quepaxa' "$(code '.effect-bundle-gc-anchor.rec')" "$qegc_token" 'unsafe deletion fails closed'
     require_row "$file" 'SQL materialization and control' 'rhiza-sql' "$(code '.rhiza-control.sqlite')" "\`QCTL\` schema v$sql_control_version" 'install snapshot rather than auto-migrate'
-    require_row "$file" 'KV materialization' 'rhiza-kv' "$(code '<data>/kv/data.redb')" "\`RHKS\` v1" 'replay continuity'
-    require_row "$file" 'Graph materialization' 'rhiza-graph' "$(code '<data>/ladybug/graph.lbug')" "\`RHGS\` v1" 'checked before use'
+    require_row "$file" 'KV materialization' 'rhiza-kv' "$(code '<data>/kv/data.redb')" "$kv_snapshot_token" 'replay continuity'
+    require_row "$file" 'Graph materialization' 'rhiza-graph' "$(code '<data>/ladybug/graph.lbug')" "$graph_snapshot_token" 'checked before use'
     require_row "$file" 'Archive history' 'rhiza-archive' "$(code 'rhiza/{cluster}/archive/manifest.json')" "Archive v$archive_version" 'CAS publication'
     require_row "$file" 'Checkpoint generation' 'rhiza-archive' "$(code 'rhiza/{cluster}/checkpoints/epoch-{e}/config-{c}/generation-{g}/manifest.json')" "Checkpoint v$checkpoint_version" 'before install'
     require_row "$file" 'Checkpoint publication receipts' 'rhiza-archive' "$(code 'receipts/{holder-hash}/{manifest-digest}.json')" 'same-slot evidence conflicts'
@@ -81,18 +113,39 @@ validate() {
     require_row "$file" 'Completion markers' 'rhiza-node' "$(code '<data-dir>/<portable-marker-name>')" 'caller-supplied validated portable relative name' 'receipt hash bind marker'
     require_row "$file" 'Admin operation ledger' 'rhiza-node' "$(code '<data>/admin-operations-v1.json')" 'deny_unknown_fields' '503 unavailable'
 
-    rg -F -- 'pub const QLOG_FORMAT_VERSION' "$repo_root/crates/rhiza-log/src/lib.rs" >/dev/null || fail 'qlog source anchor changed'
-    rg -F -- 'const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";' "$repo_root/crates/rhiza-quepaxa/src/lib.rs" >/dev/null || fail 'recorder WAL source anchor changed'
-    rg -F -- 'pub const CHECKPOINT_FORMAT_VERSION' "$repo_root/crates/rhiza-archive/src/lib.rs" >/dev/null || fail 'checkpoint source anchor changed'
-    rg -F -- 'const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";' "$repo_root/crates/rhiza-node/src/durability.rs" >/dev/null || fail 'restore source anchor changed'
-    rg -F -- 'join("admin-operations-v1.json")' "$repo_root/crates/rhiza-node/src/admin.rs" >/dev/null || fail 'admin ledger source anchor changed'
+    source_contains crates/rhiza-log/src/lib.rs 'pub const QLOG_FORMAT_VERSION'
+    source_contains crates/rhiza-quepaxa/src/lib.rs 'const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";'
+    source_contains crates/rhiza-archive/src/lib.rs 'pub const CHECKPOINT_FORMAT_VERSION'
+    source_contains crates/rhiza-node/src/durability.rs 'const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";'
+    source_contains crates/rhiza-node/src/admin.rs 'join("admin-operations-v1.json")'
 }
 
 qlog_version=$(const_version crates/rhiza-log/src/lib.rs QLOG_FORMAT_VERSION)
+qlog_magic=$(byte_magic crates/rhiza-log/src/lib.rs QLOG_MAGIC)
+qlog_token=$(version_token "$qlog_magic" "$qlog_version")
+truncate_magic=$(byte_magic crates/rhiza-log/src/lib.rs TRUNCATE_INTENT_MAGIC)
+truncate_version=$(const_version crates/rhiza-log/src/lib.rs TRUNCATE_INTENT_VERSION)
+truncate_token=$(version_token "$truncate_magic" "$truncate_version")
+compact_magic=$(byte_magic crates/rhiza-log/src/lib.rs COMPACT_INTENT_MAGIC)
+compact_version=$(const_version crates/rhiza-log/src/lib.rs COMPACT_INTENT_VERSION)
+compact_token=$(version_token "$compact_magic" "$compact_version")
+anchor_magic=$(byte_magic crates/rhiza-log/src/lib.rs ANCHOR_MAGIC)
 anchor_version=$(const_version crates/rhiza-log/src/lib.rs ANCHOR_VERSION)
+anchor_token=$(version_token "$anchor_magic" "$anchor_version")
+qefx_magic=$(byte_magic crates/rhiza-core/src/lib.rs EXTERNAL_EFFECT_COMMAND_MAGIC)
+qefx_token=$(code "$qefx_magic")
 recorder_wal_version=$(const_version crates/rhiza-quepaxa/src/lib.rs RECORDER_WAL_VERSION)
 configuration_version=$(const_version crates/rhiza-quepaxa/src/lib.rs CONFIGURATION_STATE_VERSION)
+qegc_magic=$(byte_magic crates/rhiza-quepaxa/src/lib.rs EFFECT_BUNDLE_GC_ANCHOR_MAGIC)
+qegc_version=$(const_version crates/rhiza-quepaxa/src/lib.rs EFFECT_BUNDLE_GC_ANCHOR_VERSION)
+qegc_token=$(version_token "$qegc_magic" "$qegc_version")
 sql_control_version=$(const_version crates/rhiza-sql/src/control.rs CONTROL_SCHEMA_VERSION)
+kv_snapshot_magic=$(byte_magic crates/rhiza-kv/src/lib.rs SNAPSHOT_WIRE_MAGIC)
+kv_snapshot_version=$(const_version crates/rhiza-kv/src/lib.rs SNAPSHOT_WIRE_VERSION)
+kv_snapshot_token=$(version_token "$kv_snapshot_magic" "$kv_snapshot_version")
+graph_snapshot_magic=$(byte_magic crates/rhiza-graph/src/lib.rs SNAPSHOT_WIRE_MAGIC)
+graph_snapshot_version=$(const_version crates/rhiza-graph/src/lib.rs SNAPSHOT_WIRE_VERSION)
+graph_snapshot_token=$(version_token "$graph_snapshot_magic" "$graph_snapshot_version")
 archive_version=$(const_version crates/rhiza-archive/src/lib.rs ARCHIVE_FORMAT_VERSION)
 checkpoint_version=$(const_version crates/rhiza-archive/src/lib.rs CHECKPOINT_FORMAT_VERSION)
 gc_version=$(const_version crates/rhiza-archive/src/lib.rs GC_FORMAT_VERSION)
@@ -105,11 +158,31 @@ if (validate "$missing_row") >/dev/null 2>&1; then
     fail 'negative test accepted a missing required row'
 fi
 
-wrong_version="$tmp/wrong-version.md"
-old_qlog=$(printf '%s v%s' "\`QLOG\`" "$qlog_version")
-awk -v old="$old_qlog" -v new='`QLOG` v999' '{ sub(old, new); print }' "$contract_file" > "$wrong_version"
-if (validate "$wrong_version") >/dev/null 2>&1; then
-    fail 'negative test accepted a changed source-backed version'
-fi
+negative_token() {
+    name=$1
+    old=$2
+    changed="$tmp/$name.md"
+    awk -v old="$old" '
+        !replaced && index($0, old) {
+            print substr($0, 1, index($0, old) - 1) "`BROKEN` v999" substr($0, index($0, old) + length(old))
+            replaced = 1
+            next
+        }
+        { print }
+        END { if (!replaced) exit 1 }
+    ' "$contract_file" > "$changed" || fail "negative fixture is missing source-backed token: $name"
+    if (validate "$changed") >/dev/null 2>&1; then
+        fail "negative test accepted changed source-backed token: $name"
+    fi
+}
 
-printf '%s\n' 'storage-format compatibility contract: ok (missing-row and version negative tests passed)'
+negative_token qlog "$qlog_token"
+negative_token truncate "$truncate_token"
+negative_token compact "$compact_token"
+negative_token anchor "$anchor_token"
+negative_token qefx "$qefx_token"
+negative_token qegc "$qegc_token"
+negative_token kv-snapshot "$kv_snapshot_token"
+negative_token graph-snapshot "$graph_snapshot_token"
+
+printf '%s\n' 'storage-format compatibility contract: ok (missing-row and source-token negative tests passed)'
