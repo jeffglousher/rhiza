@@ -5078,42 +5078,67 @@ impl RecorderFileStore {
                 std::mem::take(&mut wal.commands),
             )
         };
-        let next_checkpoint = WalCheckpoint {
-            generation: checkpoint
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| Error::Io("recorder WAL generation exhausted".into()))?,
-            through_sequence: next_sequence - 1,
+        let materialized = (|| -> Result<WalCheckpoint> {
+            let next_checkpoint = WalCheckpoint {
+                generation: checkpoint
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Io("recorder WAL generation exhausted".into()))?,
+                through_sequence: next_sequence
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::Io("recorder WAL sequence is invalid".into()))?,
+            };
+            for (hash, command) in &commands {
+                self.effect_root_anchor
+                    .atomic_write(&Self::command_name(*hash), &encode_stored_command(command))?;
+            }
+            for (slot, bytes) in &slots {
+                self.effect_root_anchor
+                    .atomic_write(&Self::slot_name(*slot), bytes)?;
+            }
+            let configuration = self.configuration_state()?;
+            let head = self
+                .recorded_head
+                .lock()
+                .map_err(|_| Error::Io("recorder head lock poisoned".into()))?
+                .clone();
+            self.effect_root_anchor.atomic_write(
+                Self::CONFIGURATION_FILE,
+                &encode_configuration_state(&configuration)?,
+            )?;
+            self.effect_root_anchor.atomic_write(
+                Self::RECORDED_HEAD_FILE,
+                &encode_recorded_head(
+                    &self.cluster_id,
+                    self.epoch,
+                    &configuration,
+                    &head,
+                    &[],
+                    next_checkpoint,
+                )?,
+            )?;
+            Ok(next_checkpoint)
+        })();
+        let next_checkpoint = match materialized {
+            Ok(next_checkpoint) => next_checkpoint,
+            Err(error) => {
+                let mut wal = self
+                    .wal
+                    .lock()
+                    .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+                if slots.iter().any(|(slot, bytes)| {
+                    matches!(wal.slots.get(slot), Some(existing) if existing != bytes)
+                }) || commands.iter().any(|(hash, command)| {
+                    matches!(wal.commands.get(hash), Some(existing) if existing != command)
+                }) {
+                    wal.failed = true;
+                    return Err(Error::Io("recorder WAL checkpoint rollback conflict".into()));
+                }
+                wal.slots.extend(slots);
+                wal.commands.extend(commands);
+                return Err(error);
+            }
         };
-        for (hash, command) in &commands {
-            self.effect_root_anchor
-                .atomic_write(&Self::command_name(*hash), &encode_stored_command(command))?;
-        }
-        for (slot, bytes) in &slots {
-            self.effect_root_anchor
-                .atomic_write(&Self::slot_name(*slot), bytes)?;
-        }
-        let configuration = self.configuration_state()?;
-        let head = self
-            .recorded_head
-            .lock()
-            .map_err(|_| Error::Io("recorder head lock poisoned".into()))?
-            .clone();
-        self.effect_root_anchor.atomic_write(
-            Self::CONFIGURATION_FILE,
-            &encode_configuration_state(&configuration)?,
-        )?;
-        self.effect_root_anchor.atomic_write(
-            Self::RECORDED_HEAD_FILE,
-            &encode_recorded_head(
-                &self.cluster_id,
-                self.epoch,
-                &configuration,
-                &head,
-                &[],
-                next_checkpoint,
-            )?,
-        )?;
         if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
             if let Ok(mut wal) = self.wal.lock() {
                 wal.failed = true;
@@ -21320,6 +21345,57 @@ mod tests {
         assert_eq!(generation, 3);
         assert_eq!(through_sequence, super::RECORDER_WAL_HARD_FRAME_LIMIT * 2);
         assert_eq!(frames, 1);
+    }
+
+    #[test]
+    fn wal_checkpoint_restores_unmaterialized_entries_after_cache_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"checkpoint-rollback".to_vec());
+        let command_hash = command.hash();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: Some(command.clone()),
+            })
+            .unwrap();
+
+        let command_path = store.command_path(command_hash);
+        std::fs::create_dir(&command_path).unwrap();
+        assert!(matches!(store.checkpoint_wal_unlocked(), Err(Error::Io(_))));
+        std::fs::remove_dir(&command_path).unwrap();
+
+        assert_eq!(store.load(8).unwrap().isr.step(), 4);
+        assert_eq!(
+            store.fetch_command(command_hash).unwrap(),
+            Some(command.clone())
+        );
+        store.checkpoint_wal_unlocked().unwrap();
+        assert_eq!(store.wal_stats().unwrap(), (2, 1, 0));
+        drop(store);
+
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(reopened.wal_stats().unwrap(), (2, 1, 0));
+        assert_eq!(reopened.load(8).unwrap().isr.step(), 4);
+        assert_eq!(reopened.fetch_command(command_hash).unwrap(), Some(command));
     }
 
     proptest! {
