@@ -2085,6 +2085,7 @@ dependencies = [
 name = "rhiza-log"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "proptest",
  "rhiza-core",
  "tempfile",

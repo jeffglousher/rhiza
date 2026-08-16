@@ -58,6 +58,29 @@ const_version() {
     ' "$repo_root/$1" || fail "missing source constant: $1:$2"
 }
 
+const_product() {
+    awk -v name="$2" '
+        {
+            field = $1 == "pub" ? $3 : $2
+            sub(/:$/, "", field)
+            if (($1 == "const" || ($1 == "pub" && $2 == "const")) && field == name) {
+                expression = $0
+                sub(/^[^=]*=[[:space:]]*/, "", expression)
+                sub(/;[[:space:]]*$/, "", expression)
+                gsub(/[[:space:]_]/, "", expression)
+                count++
+            }
+        }
+        END {
+            if (count != 1 || expression !~ /^[0-9]+(\*[0-9]+)*$/) exit 1
+            factors = split(expression, factor, "\\*")
+            value = 1
+            for (i = 1; i <= factors; i++) value *= factor[i]
+            printf "%.0f\n", value
+        }
+    ' "$repo_root/$1" || fail "missing source constant product: $1:$2"
+}
+
 byte_magic() {
     awk -v name="$2" '
         {
@@ -98,7 +121,7 @@ validate() {
     [ "$(row_count "$file")" = 19 ] || fail "expected 19 canonical rows"
 
     require_row "$file" 'Qlog segments' 'rhiza-log' "$(code '<qlog>/{start}-{end}.qlog')" "$qlog_token" 'reject mismatch before replay'
-    require_row "$file" 'Qlog compaction controls' 'rhiza-log' "$(code '.truncate-intent')" "$truncate_token" "$compact_token" "$anchor_token" 'fails closed'
+    require_row "$file" 'Qlog compaction controls' 'rhiza-log' "$(code '.truncate-intent')" "$truncate_token" "$compact_token" "$anchor_token" "$(code 'CONTROL_INTENT_MAX_BYTES') = $control_intent_max_bytes bytes (8 MiB)" 'fails closed'
     require_row "$file" 'Replicated command/effect payloads' 'rhiza-core' "$(code 'qlog/recorder/checkpoint payload')" "$qefx_token" 'Canonical bounded decode'
     require_row "$file" 'Recorder generation and lock' 'rhiza-quepaxa' "$(code '.rhiza-storage-generation')" 'clean-v1' 'reject open/install'
     require_row "$file" 'Recorder decision state' 'rhiza-quepaxa' "$(code 'recorder.wal')" "\`QWAL\` v$recorder_wal_version" 'conflict fails closed'
@@ -136,6 +159,7 @@ compact_token=$(version_token "$compact_magic" "$compact_version")
 anchor_magic=$(byte_magic crates/rhiza-log/src/lib.rs ANCHOR_MAGIC)
 anchor_version=$(const_version crates/rhiza-log/src/lib.rs ANCHOR_VERSION)
 anchor_token=$(version_token "$anchor_magic" "$anchor_version")
+control_intent_max_bytes=$(const_product crates/rhiza-log/src/lib.rs CONTROL_INTENT_MAX_BYTES)
 qefx_magic=$(byte_magic crates/rhiza-core/src/lib.rs EXTERNAL_EFFECT_COMMAND_MAGIC)
 qefx_token=$(code "$qefx_magic")
 recorder_wal_version=$(const_version crates/rhiza-quepaxa/src/lib.rs RECORDER_WAL_VERSION)
@@ -196,6 +220,7 @@ negative_token qlog "$qlog_token"
 negative_token truncate "$truncate_token"
 negative_token compact "$compact_token"
 negative_token anchor "$anchor_token"
+negative_token control-intent-bound "$(code 'CONTROL_INTENT_MAX_BYTES') = $control_intent_max_bytes bytes (8 MiB)"
 negative_token qefx "$qefx_token"
 negative_token qegc "$qegc_token"
 negative_token kv-snapshot "$kv_snapshot_token"
