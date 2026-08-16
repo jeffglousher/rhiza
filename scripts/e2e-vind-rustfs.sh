@@ -1967,8 +1967,18 @@ RHIZA_RECOVERY_GENERATION=2 \
 report="$target/gc-report.json"
 RHIZA_RECOVERY_GENERATION=2 RHIZA_GC_CONFIRM_PLAN_HASH="$plan_hash" \
   scripts/gc-k8s.sh apply "$successor" "$plan_hash" > "$report"
-jq -e --arg hash "$plan_hash" '.plan_hash == $hash and (.results | length > 0)' \
-  "$report" >/dev/null
+jq -e --arg hash "$plan_hash" --slurpfile plan "$plan" '
+  .plan_hash == $hash and
+  (.results |
+    type == "array" and
+    length > 0 and
+    length == ($plan[0].candidates | length) and
+    all(.[]; .plan_hash == $hash and .outcome == "deleted") and
+    ([.[] | {key, version}] | sort_by(.key, (.version | tojson))) ==
+      ([$plan[0].candidates[] | {key, version}] | sort_by(.key, (.version | tojson)))
+  )
+' "$report" >/dev/null ||
+  die "GC report does not exactly cover planned candidates with deleted outcomes"
 
 k scale statefulset "$name_c2" --replicas=3 >/dev/null
 "$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2

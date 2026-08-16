@@ -85,7 +85,8 @@ rm -rf "$df_fixture"
 private_mode_fixture="$(mktemp -d)"
 private_mode() {
   local path="$1" expected="$2" mode
-  mode="$(stat -f '%Lp' "$path")" || return 1
+  mode="$(stat -f '%Lp' "$path" 2>/dev/null)" ||
+    mode="$(stat -c '%a' "$path")" || return 1
   [ "$mode" = "$expected" ]
 }
 (
@@ -359,6 +360,41 @@ require_literal "image_provenance_verified:true,bucket_inventory_path:\$bucket_i
 require_literal "expected_manifest_ids:\$expected_manifest_ids,expected_config_id:\$expected_config_id"
 require_literal "matched_live_config_id:\$matched_live_config_id,live_rhiza_image_ids:\$live_rhiza_image_ids"
 require_literal 's3api list-objects-v2 --bucket rhiza --output json'
+require_literal 'length > 0 and'
+require_literal 'length == ($plan[0].candidates | length)'
+require_literal 'all(.[]; .plan_hash == $hash and .outcome == "deleted")'
+require_literal '[.[] | {key, version}] | sort_by(.key, (.version | tojson))'
+require_literal '[$plan[0].candidates[] | {key, version}] | sort_by(.key, (.version | tojson))'
+
+gc_fixture="$(mktemp -d)"
+printf '%s\n' '{"candidates":[{"key":"a","version":"1"},{"key":"b","version":"2"}]}' \
+  > "$gc_fixture/plan.json"
+gc_report_matches_plan() {
+  jq -e --arg hash plan --slurpfile plan "$gc_fixture/plan.json" '
+    .plan_hash == $hash and
+    (.results |
+      type == "array" and
+      length > 0 and
+      length == ($plan[0].candidates | length) and
+      all(.[]; .plan_hash == $hash and .outcome == "deleted") and
+      ([.[] | {key, version}] | sort_by(.key, (.version | tojson))) ==
+        ([$plan[0].candidates[] | {key, version}] | sort_by(.key, (.version | tojson)))
+    )
+  ' "$1" >/dev/null
+}
+printf '%s\n' '{"plan_hash":"plan","results":[{"plan_hash":"plan","key":"b","version":"2","outcome":"deleted"},{"plan_hash":"plan","key":"a","version":"1","outcome":"deleted"}]}' \
+  > "$gc_fixture/report.json"
+gc_report_matches_plan "$gc_fixture/report.json" || {
+  echo "GC report fixture rejected exact candidate coverage" >&2
+  exit 1
+}
+printf '%s\n' '{"plan_hash":"plan","results":[{"plan_hash":"plan","key":"a","version":"1","outcome":"deleted"},{"plan_hash":"plan","key":"a","version":"1","outcome":"already_missing"}]}' \
+  > "$gc_fixture/report.json"
+if gc_report_matches_plan "$gc_fixture/report.json"; then
+  echo "GC report fixture accepted duplicate or non-deleted result" >&2
+  exit 1
+fi
+rm -rf "$gc_fixture"
 
 # A one-shot F2/F3 sample cannot detect a later spontaneous quorum. This
 # deterministic fixture injects success only at the middle sample and proves
