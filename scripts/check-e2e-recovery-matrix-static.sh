@@ -24,6 +24,90 @@ require_literal_count() {
 
 bash -n "$script"
 
+require_literal 'umask 077'
+umask_line="$(grep -n '^umask 077$' "$script" | cut -d: -f1)"
+target_line="$(grep -n 'mkdir -p "\$target"' "$script" | head -1 | cut -d: -f1)"
+build_line="$(grep -n 'docker build --load --build-arg' "$script" | head -1 | cut -d: -f1)"
+disk_guard_line="$(grep -n '^require_one_gib_free "\$target"$' "$script" | cut -d: -f1)"
+[ -n "$umask_line" ] && [ -n "$target_line" ] && [ "$umask_line" -lt "$target_line" ] || {
+  echo "recovery artifacts must set umask 077 before creating the target" >&2
+  exit 1
+}
+require_literal 'require_one_gib_free() {'
+require_literal 'local target_root="${1-}" candidate parent available_kib'
+require_literal '*) candidate="$repo_root/$target_root" ;'
+require_literal '[ ! -L "$candidate" ] || die "target filesystem ancestor must not be a symlink"'
+require_literal 'df -Pk "$candidate" | awk '
+require_literal '[ "$available_kib" -ge 1048576 ]'
+[ -n "$disk_guard_line" ] && [ -n "$build_line" ] &&
+  [ "$disk_guard_line" -lt "$target_line" ] && [ "$disk_guard_line" -lt "$build_line" ] || {
+  echo "recovery disk guard must run before target creation and Docker build" >&2
+  exit 1
+}
+df_fixture="$(mktemp -d)"
+trap 'rm -rf "$df_fixture"' EXIT
+printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\\n" "$2" > "$DF_CALL_PATH"' 'case "$DF_FIXTURE" in' \
+  '  full) printf "%s\\n" "Filesystem 1024-blocks Used Available Capacity Mounted on" "/dev/mock 2000000 100000 1048576 9% /";;' \
+  '  below) printf "%s\\n" "Filesystem 1024-blocks Used Available Capacity Mounted on" "/dev/mock 2000000 100000 1048575 9% /";;' \
+  '  malformed) printf "%s\\n" "Filesystem 1024-blocks Used Available Capacity Mounted on" "/dev/mock 2000000 100000 unknown 9% /";;' \
+  '  *) exit 2;;' 'esac' > "$df_fixture/df"
+chmod 700 "$df_fixture/df"
+mkdir -p "$df_fixture/repo" "$df_fixture/absolute" "$df_fixture/nested"
+eval "$(awk '
+  /^require_one_gib_free\(\) \{/ { capture = 1 }
+  capture { print }
+  capture && /^}$/ { exit }
+' "$script")"
+run_disk_guard_fixture() {
+  local mode="$1" target_value="$2" root_value="$3" expected_path="$4" call_path
+  call_path="$df_fixture/call-$mode-$$"
+  (
+    die() { exit 1; }
+    repo_root="$root_value"
+    export DF_FIXTURE="$mode" DF_CALL_PATH="$call_path"
+    PATH="$df_fixture:$PATH"
+    require_one_gib_free "$target_value"
+  ) || return 1
+  [ "$(cat "$call_path")" = "$expected_path" ]
+}
+run_disk_guard_fixture full 'target/rhiza-e2e/sql/run' "$df_fixture/repo" "$df_fixture/repo" &&
+  run_disk_guard_fixture full "$df_fixture/absolute/missing/run" "$df_fixture/repo" "$df_fixture/absolute" &&
+  run_disk_guard_fixture full "$df_fixture/nested/a/b" "$df_fixture/repo" "$df_fixture/nested" || {
+  echo "disk guard did not select the target filesystem ancestor" >&2
+  exit 1
+}
+if run_disk_guard_fixture below 'target/run' "$df_fixture/repo" "$df_fixture/repo" ||
+  run_disk_guard_fixture malformed 'target/run' "$df_fixture/repo" "$df_fixture/repo"; then
+  echo "disk guard accepted below-limit or malformed fixture" >&2
+  exit 1
+fi
+rm -rf "$df_fixture"
+private_mode_fixture="$(mktemp -d)"
+private_mode() {
+  local path="$1" expected="$2" mode
+  mode="$(stat -f '%Lp' "$path" 2>/dev/null)" ||
+    mode="$(stat -c '%a' "$path")" || return 1
+  [ "$mode" = "$expected" ]
+}
+(
+  umask 077
+  mkdir "$private_mode_fixture/artifacts"
+  : > "$private_mode_fixture/artifacts/config-c1.json"
+)
+private_mode "$private_mode_fixture/artifacts" 700 &&
+  private_mode "$private_mode_fixture/artifacts/config-c1.json" 600 || {
+  echo "secret-file mode fixture is not private" >&2
+  exit 1
+}
+for mode in 640 604; do
+  chmod "$mode" "$private_mode_fixture/artifacts/config-c1.json"
+  if private_mode "$private_mode_fixture/artifacts/config-c1.json" 600; then
+    echo "secret-file mode fixture accepted group/world-readable artifact" >&2
+    exit 1
+  fi
+done
+rm -rf "$private_mode_fixture"
+
 # vcluster may create image.tar.gz in its current directory. Keep that generated
 # artifact under the run target so source-freeze checks never see repository drift.
 # shellcheck disable=SC2016
@@ -94,13 +178,63 @@ require_literal 'RHIZA_E2E_RECOVERY_MATRIX:-0'
 require_literal 'RHIZA_E2E_RECOVERY_MATRIX_ONLY:-0'
 require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER:-0'
 require_literal 'RHIZA_RECOVERY_FORBIDDEN_SENTINEL:-'
-require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_E2E_RECOVERY_MATRIX=1'
-require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_E2E_RECOVERY_MATRIX_ONLY=1'
 require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_VIND_DIRECT_CLUSTER=0'
 require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_VIND_REUSE_EXISTING=0'
-require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires exactly one failure cell'
-require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires exactly one hold cell'
 require_literal 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_RECOVERY_FORBIDDEN_SENTINEL'
+require_literal 'if [ "$recovery_matrix" = 1 ]; then'
+require_literal '[ "$recovery_matrix_only" = 1 ] || die "fresh recovery matrix must be matrix-only"'
+require_literal 'fresh recovery matrix requires exactly one failure cell'
+require_literal 'fresh recovery matrix requires exactly one hold cell'
+if grep -Fq 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_E2E_RECOVERY_MATRIX=1' "$script" ||
+  grep -Fq 'RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_E2E_RECOVERY_MATRIX_ONLY=1' "$script"; then
+  echo "fresh full lifecycle must not require the recovery matrix" >&2
+  exit 1
+fi
+fresh_matrix_is_valid() {
+  local matrix="$1" only="$2" fresh="$3" direct="$4" reuse="$5" failures="$6" holds="$7" sentinel="$8"
+  [ "$only" = 0 ] || [ "$matrix" = 1 ] || return 1
+  [ "$fresh" = 0 ] && return 0
+  [ "$direct" = 0 ] && [ "$reuse" = 0 ] && [ -n "$sentinel" ] || return 1
+  [ "$matrix" = 0 ] || {
+    [ "$only" = 1 ] && [ "$failures" = 1 ] && [ "$holds" = 1 ]
+  }
+}
+if ! fresh_matrix_is_valid 0 0 0 0 0 3 3 '' ||
+  ! fresh_matrix_is_valid 1 0 0 0 0 3 3 '' ||
+  ! fresh_matrix_is_valid 1 1 0 0 0 3 3 '' ||
+  ! fresh_matrix_is_valid 0 0 1 0 0 3 3 sentinel ||
+  ! fresh_matrix_is_valid 1 1 1 0 0 1 1 sentinel; then
+  echo "fresh recovery accepted environment fixture failed" >&2
+  exit 1
+fi
+for rejected in \
+  '0 1 0 0 0 3 3 sentinel' \
+  '1 0 1 0 0 1 1 sentinel' \
+  '1 1 1 1 0 1 1 sentinel' \
+  '1 1 1 0 1 1 1 sentinel' \
+  '1 1 1 0 0 2 1 sentinel' \
+  '1 1 1 0 0 1 2 sentinel'; do
+  read -r matrix only fresh direct reuse failures holds sentinel <<< "$rejected"
+  if fresh_matrix_is_valid "$matrix" "$only" "$fresh" "$direct" "$reuse" "$failures" "$holds" "$sentinel"; then
+    echo "fresh recovery accepted invalid environment fixture: $rejected" >&2
+    exit 1
+  fi
+done
+if fresh_matrix_is_valid 0 0 1 0 0 3 3 ''; then
+  echo "fresh recovery accepted missing sentinel fixture" >&2
+  exit 1
+fi
+fresh_inventory_line="$(grep -n '^fresh_capture_empty_bucket_inventory$' "$script" | cut -d: -f1)"
+fresh_absence_line="$(grep -n '^fresh_assert_prebootstrap_absence$' "$script" | cut -d: -f1)"
+fresh_image_line="$(grep -n '^fresh_capture_live_image_provenance$' "$script" | cut -d: -f1)"
+fresh_cell_line="$(grep -n '^fresh_capture_cell_isolation$' "$script" | cut -d: -f1)"
+matrix_branch_line="$(grep -n '^if \[ "\$recovery_matrix" = 1 \]; then$' "$script" | tail -1 | cut -d: -f1)"
+for fresh_line in "$fresh_inventory_line" "$fresh_absence_line" "$fresh_image_line" "$fresh_cell_line"; do
+  [ -n "$fresh_line" ] && [ -n "$matrix_branch_line" ] && [ "$fresh_line" -lt "$matrix_branch_line" ] || {
+    echo "fresh isolation must run before the optional recovery matrix" >&2
+    exit 1
+  }
+done
 require_literal 'fresh_assert_prebootstrap_absence() {'
 require_literal 'fresh_verify_forbidden_sentinel() {'
 require_literal 'fresh_capture_cell_isolation() {'
@@ -144,7 +278,11 @@ require_literal 'RHIZA_VIND_SKIP_IMAGE_LOAD:-0'
 require_literal 'RHIZA_VIND_DIRECT_CLUSTER=1 requires RHIZA_VIND_CONTEXT'
 require_literal 'sql|graph|kv) ;;'
 # shellcheck disable=SC2016
-require_literal 'docker build --build-arg "RHIZA_PROFILE=$profile" -t "$image" .'
+require_literal 'docker build --load --build-arg "RHIZA_PROFILE=$profile" -t "$image" .'
+if grep -Fq "docker build --build-arg \"RHIZA_PROFILE=\$profile\" -t \"\$image\" ." "$script"; then
+  echo "recovery image build must load the just-built local tag" >&2
+  exit 1
+fi
 require_literal 'rhiza.dev/e2e-run-id'
 require_literal 'recovery-matrix.jsonl'
 require_literal 'rhiza_commit'
@@ -199,14 +337,64 @@ require_literal 'matrix_expect_zero_endpoint_transport_failure'
 require_literal 'fresh_capture_empty_bucket_inventory() {'
 require_literal 'fresh_capture_live_image_provenance() {'
 require_literal 'normalize_image_id() {'
+require_literal 'docker_save_config_digest() {'
+require_literal 'docker image save "$image" | tar -xOf - manifest.json | jq -er '
+require_literal 'if type != "array" or length != 1 or (.[0].Config | type) != "string" then'
+require_literal 'test("^blobs/sha256/[0-9a-f]{64}$")'
+require_literal 'test("^[0-9a-f]{64}[.]json$")'
+if grep -Fq 'RepoTags' "$script"; then
+  echo "recovery image provenance must not depend on RepoTags" >&2
+  exit 1
+fi
 require_literal "value=\"\${value#containerd://}\""
 require_literal "value=\"\${value#docker-pullable://}\""
-require_literal 'fresh isolation live voter image IDs do not match built Docker image ID'
+require_literal 'jq -n -e --argjson live "$normalized_live_json" --arg expected "$expected_rhiza_config_id" '
+if grep -Fq 'jq -e --argjson live "$normalized_live_json" --arg expected "$expected_rhiza_config_id" ' "$script"; then
+  echo "fresh image identity comparison must not read stdin" >&2
+  exit 1
+fi
+require_literal 'fresh isolation live voter image ID does not match built Docker config ID'
 require_literal 'fresh isolation RustFS bucket is not empty before bootstrap'
 require_literal "node_uid:\$node_uid,rustfs_uid:\$rustfs_uid"
 require_literal "image_provenance_verified:true,bucket_inventory_path:\$bucket_inventory_path"
-require_literal "expected_image_ids:\$expected_image_ids,matched_image_id:\$matched_image_id,live_rhiza_image_ids:\$live_rhiza_image_ids"
+require_literal "expected_manifest_ids:\$expected_manifest_ids,expected_config_id:\$expected_config_id"
+require_literal "matched_live_config_id:\$matched_live_config_id,live_rhiza_image_ids:\$live_rhiza_image_ids"
 require_literal 's3api list-objects-v2 --bucket rhiza --output json'
+require_literal 'length > 0 and'
+require_literal 'length == ($plan[0].candidates | length)'
+require_literal 'all(.[]; .plan_hash == $hash and .outcome == "deleted")'
+require_literal '[.[] | {key, version}] | sort_by(.key, (.version | tojson))'
+require_literal '[$plan[0].candidates[] | {key, version}] | sort_by(.key, (.version | tojson))'
+
+gc_fixture="$(mktemp -d)"
+printf '%s\n' '{"candidates":[{"key":"a","version":"1"},{"key":"b","version":"2"}]}' \
+  > "$gc_fixture/plan.json"
+gc_report_matches_plan() {
+  jq -e --arg hash plan --slurpfile plan "$gc_fixture/plan.json" '
+    .plan_hash == $hash and
+    (.results |
+      type == "array" and
+      length > 0 and
+      length == ($plan[0].candidates | length) and
+      all(.[]; .plan_hash == $hash and .outcome == "deleted") and
+      ([.[] | {key, version}] | sort_by(.key, (.version | tojson))) ==
+        ([$plan[0].candidates[] | {key, version}] | sort_by(.key, (.version | tojson)))
+    )
+  ' "$1" >/dev/null
+}
+printf '%s\n' '{"plan_hash":"plan","results":[{"plan_hash":"plan","key":"b","version":"2","outcome":"deleted"},{"plan_hash":"plan","key":"a","version":"1","outcome":"deleted"}]}' \
+  > "$gc_fixture/report.json"
+gc_report_matches_plan "$gc_fixture/report.json" || {
+  echo "GC report fixture rejected exact candidate coverage" >&2
+  exit 1
+}
+printf '%s\n' '{"plan_hash":"plan","results":[{"plan_hash":"plan","key":"a","version":"1","outcome":"deleted"},{"plan_hash":"plan","key":"a","version":"1","outcome":"already_missing"}]}' \
+  > "$gc_fixture/report.json"
+if gc_report_matches_plan "$gc_fixture/report.json"; then
+  echo "GC report fixture accepted duplicate or non-deleted result" >&2
+  exit 1
+fi
+rm -rf "$gc_fixture"
 
 # A one-shot F2/F3 sample cannot detect a later spontaneous quorum. This
 # deterministic fixture injects success only at the middle sample and proves
@@ -258,6 +446,50 @@ portable_digest=sha256:0123456789abcdef
 [ "$(portable_image_normalize "docker://$portable_digest")" = "$portable_digest" ] || exit 1
 if [ "$(portable_image_normalize 'containerd://sha256:different')" = "$portable_digest" ]; then
   echo "image identity fixture accepted a different digest" >&2
+  exit 1
+fi
+manifest_config_digest() {
+  jq -er '
+    if type != "array" or length != 1 or (.[0].Config | type) != "string" then
+      error("expected exactly one Docker save manifest config")
+    else .[0].Config end |
+    if test("^blobs/sha256/[0-9a-f]{64}$") then
+      "sha256:" + ltrimstr("blobs/sha256/")
+    elif test("^[0-9a-f]{64}[.]json$") then
+      "sha256:" + rtrimstr(".json")
+    else error("invalid Docker save manifest config") end
+  '
+}
+config_hex=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+for config in "blobs/sha256/$config_hex" "$config_hex.json"; do
+  printf '[{"Config":"%s"}]\n' "$config" | manifest_config_digest |
+    grep -Fx "sha256:$config_hex" >/dev/null || {
+      echo "Docker save manifest config fixture rejected $config" >&2
+      exit 1
+    }
+done
+for manifest in '[{}]' '[{"Config":"sha256:not-a-config"}]' \
+  "[{\"Config\":\"blobs/sha256/$config_hex\"},{\"Config\":\"blobs/sha256/$config_hex\"}]"; do
+  if printf '%s\n' "$manifest" | manifest_config_digest >/dev/null 2>&1; then
+    echo "Docker save manifest config fixture accepted malformed, missing, or multiple records" >&2
+    exit 1
+  fi
+done
+if { false | manifest_config_digest; } >/dev/null 2>&1; then
+  echo "Docker save manifest config pipeline masked an upstream failure" >&2
+  exit 1
+fi
+identity_live='["sha256:0123456789abcdef"]'
+identity_expected='sha256:0123456789abcdef'
+jq -n -e --argjson live "$identity_live" --arg expected "$identity_expected" '
+  ($live | length == 1) and ($live[0] == $expected)' < /dev/null >/dev/null || {
+  echo "fresh image identity fixture must match without stdin" >&2
+  exit 1
+}
+if jq -n -e --argjson live "$identity_live" \
+  --arg expected 'sha256:different' '
+    ($live | length == 1) and ($live[0] == $expected)' < /dev/null >/dev/null; then
+  echo "fresh image identity fixture accepted a mismatched digest" >&2
   exit 1
 fi
 [ "$(grep -Fc "matrix_run_no_quorum_safety_probe \"\$probe_sequence\"" "$script")" -eq 1 ] || {
