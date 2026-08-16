@@ -15513,10 +15513,9 @@ mod tests {
         .unwrap();
         let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
 
-        // A's proof reaches every recorder, but both the proof installation
-        // acknowledgement and its immediate inspection are made ambiguous.
-        // The following distinct request must first install A's recovered
-        // command and only then re-propose its own effect at the next slot.
+        // A's proof reaches every recorder, but its installation
+        // acknowledgement is lost. Inspection ambiguity may be consumed by
+        // recovery and is disarmed before the later distinct request.
         remaining_unknown_installs.store(3, Ordering::Release);
         remaining_unknown_inspections.store(3, Ordering::Release);
         let original = SqlCommand {
@@ -15532,6 +15531,11 @@ mod tests {
         assert!(runtime.is_ready());
         assert!(!runtime.is_fatal());
         assert_eq!(runtime.log_store().last_index().unwrap(), None);
+        // A quorum inspection can stop before consuming every injected
+        // ambiguity. Disarm before the distinct request so it deterministically
+        // recovers A before proposing the later command.
+        remaining_unknown_installs.store(0, Ordering::Release);
+        remaining_unknown_inspections.store(0, Ordering::Release);
 
         let later = SqlCommand {
             request_id: "later".into(),
