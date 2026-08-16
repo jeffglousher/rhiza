@@ -162,7 +162,11 @@ negative_token() {
     name=$1
     old=$2
     changed="$tmp/$name.md"
-    awk -v old="$old" '
+    awk '
+        BEGIN {
+            old = ARGV[1]
+            ARGV[1] = ""
+        }
         !replaced && index($0, old) {
             print substr($0, 1, index($0, old) - 1) "`BROKEN` v999" substr($0, index($0, old) + length(old))
             replaced = 1
@@ -170,7 +174,7 @@ negative_token() {
         }
         { print }
         END { if (!replaced) exit 1 }
-    ' "$contract_file" > "$changed" || fail "negative fixture is missing source-backed token: $name"
+    ' "$old" "$contract_file" > "$changed" || fail "negative fixture is missing source-backed token: $name"
     if (validate "$changed") >/dev/null 2>&1; then
         fail "negative test accepted changed source-backed token: $name"
     fi
