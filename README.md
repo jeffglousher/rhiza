@@ -41,6 +41,11 @@ The protected registry workflow publishes the engine dependency crates before
 `examples/basic-app-server` are not crates.io products; the CLI is distributed
 as profile-specific GitHub Release binaries and OCI images.
 
+The pre-publication boundary is documented in the
+[public API and wire baseline](docs/public-api-compatibility.md) and the single
+[persisted-format matrix](docs/storage-format-compatibility.md). Current
+adjacent N/N+1 compatibility is not implemented.
+
 ## Runtime Profiles and Deployment
 
 SQL remains the default. Build an isolated SQL, Graph, or KV image and set the
