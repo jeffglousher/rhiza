@@ -30,6 +30,7 @@ rhiza-sql = { version = "0.3.0", path = "../rhiza-sql", optional = true }
 rhiza-tuner = { version = "0.1.0", path = "../rhiza-tuner", optional = true }
 axum.workspace = true
 http-body.workspace = true
+libc = "0.2"
 postcard.workspace = true
 postcard-rpc = { workspace = true, optional = true }
 reqwest.workspace = true

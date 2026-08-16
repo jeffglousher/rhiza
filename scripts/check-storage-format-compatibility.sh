@@ -107,6 +107,10 @@ source_contains() {
     grep -F -- "$2" "$repo_root/$1" >/dev/null 2>&1 || fail "source anchor changed: $1:$2"
 }
 
+source_absent() {
+    ! grep -F -- "$2" "$repo_root/$1" >/dev/null 2>&1 || fail "obsolete source token remains: $1:$2"
+}
+
 require_matching_successor_restore_versions() {
     [ "$1" = "$2" ] || fail "successor restore version drift: node v$1, HA v$2"
 }
@@ -138,13 +142,14 @@ validate() {
     require_row "$file" 'Restore QEFX and recovery ownership' 'rhiza-node' "$(code 'consensus/pending-qefx-gc.json')" 'aggregate limits' 'digest-bound owner identity' 'fail closed'
     require_row "$file" 'Successor/prestage activation' 'rhiza-node' "$(code '.successor-prestage.{lock,intent,ready,published,finalized}')" "successor restore receipt v$successor_restore_version" "prestage identity v$successor_prestage_version" 'membership digests' 'not activated'
     require_row "$file" 'Completion markers' 'rhiza-node' "$(code '<data-dir>/<portable-marker-name>')" 'caller-supplied validated portable relative name' 'receipt hash bind marker'
-    require_row "$file" 'Admin operation ledger' 'rhiza-node' "$(code '<data>/admin-operations-v1.json')" 'deny_unknown_fields' '503 unavailable'
+    require_row "$file" 'Admin operation ledger' 'rhiza-node' "$(code '<data>/admin-operations-v2.json')" "version $admin_ledger_version" "$(code 'ADMIN_OPERATION_LEDGER_MAX_BYTES') = $admin_ledger_max_bytes" "$(code 'ADMIN_OPERATION_LEDGER_MAX_RECORDS') = $admin_ledger_max_records" "$(code 'ADMIN_OPERATION_RESULT_MAX_BYTES') = $admin_result_max_bytes" "$(code 'ADMIN_OPERATION_RETENTION_SECS') = $admin_retention_secs" 'SHA-256 request fingerprint' '503 unavailable'
 
     source_contains crates/rhiza-log/src/lib.rs 'pub const QLOG_FORMAT_VERSION'
     source_contains crates/rhiza-quepaxa/src/lib.rs 'const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";'
     source_contains crates/rhiza-archive/src/lib.rs 'pub const CHECKPOINT_FORMAT_VERSION'
     source_contains crates/rhiza-node/src/durability.rs 'const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";'
-    source_contains crates/rhiza-node/src/admin.rs 'join("admin-operations-v1.json")'
+    source_contains crates/rhiza-node/src/admin.rs 'const ADMIN_OPERATION_LEDGER_FILE: &str = "admin-operations-v2.json";'
+    source_absent crates/rhiza-node/src/admin.rs 'admin-operations-v1'
 }
 
 qlog_version=$(const_version crates/rhiza-log/src/lib.rs QLOG_FORMAT_VERSION)
@@ -185,6 +190,11 @@ successor_restore_ha_version=$(const_version crates/rhiza/src/ha.rs SUCCESSOR_RE
 require_matching_successor_restore_versions "$successor_restore_node_version" "$successor_restore_ha_version"
 successor_restore_version=$successor_restore_node_version
 local_marker_version=$(const_version crates/rhiza/src/ha.rs LOCAL_CHECKPOINT_IDENTITY_FORMAT_VERSION)
+admin_ledger_version=$(const_version crates/rhiza-node/src/admin.rs ADMIN_OPERATION_LEDGER_VERSION)
+admin_ledger_max_bytes=$(const_product crates/rhiza-node/src/admin.rs ADMIN_OPERATION_LEDGER_MAX_BYTES)
+admin_ledger_max_records=$(const_version crates/rhiza-node/src/admin.rs ADMIN_OPERATION_LEDGER_MAX_RECORDS)
+admin_result_max_bytes=$(const_product crates/rhiza-node/src/admin.rs ADMIN_OPERATION_RESULT_MAX_BYTES)
+admin_retention_secs=$(const_product crates/rhiza-node/src/admin.rs ADMIN_OPERATION_RETENTION_SECS)
 
 validate "$contract_file"
 
@@ -231,6 +241,11 @@ negative_token restore-install "install receipt v$restore_install_version"
 negative_token successor-prestage "prestage identity v$successor_prestage_version"
 negative_token successor-restore "successor restore receipt v$successor_restore_version"
 negative_token local-marker "local marker v$local_marker_version"
+negative_token admin-ledger-version "version $admin_ledger_version"
+negative_token admin-ledger-bytes "$(code 'ADMIN_OPERATION_LEDGER_MAX_BYTES') = $admin_ledger_max_bytes"
+negative_token admin-ledger-records "$(code 'ADMIN_OPERATION_LEDGER_MAX_RECORDS') = $admin_ledger_max_records"
+negative_token admin-result-bytes "$(code 'ADMIN_OPERATION_RESULT_MAX_BYTES') = $admin_result_max_bytes"
+negative_token admin-retention "$(code 'ADMIN_OPERATION_RETENTION_SECS') = $admin_retention_secs"
 
 if (require_matching_successor_restore_versions "$((successor_restore_node_version + 1))" "$successor_restore_ha_version") >/dev/null 2>&1; then
     fail 'negative test accepted node-side successor restore version drift'
