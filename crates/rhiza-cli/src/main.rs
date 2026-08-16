@@ -7267,7 +7267,8 @@ mod tests {
             match request_write(&write).await {
                 Ok(committed) => break committed,
                 Err(error)
-                    if error.contains("code=write_outcome_unknown")
+                    if (error.contains("code=write_outcome_unknown")
+                        || error.contains("code=ambiguous_mutation"))
                         && tokio::time::Instant::now() < write_deadline =>
                 {
                     tokio::time::sleep(Duration::from_millis(25)).await;
