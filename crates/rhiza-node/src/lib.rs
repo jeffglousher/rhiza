@@ -15513,10 +15513,9 @@ mod tests {
         .unwrap();
         let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
 
-        // A's proof reaches every recorder, but both the proof installation
-        // acknowledgement and its immediate inspection are made ambiguous.
-        // The following distinct request must first install A's recovered
-        // command and only then re-propose its own effect at the next slot.
+        // A's proof reaches every recorder, but its installation
+        // acknowledgement is lost. Inspection ambiguity may be consumed by
+        // recovery and is disarmed before the later distinct request.
         remaining_unknown_installs.store(3, Ordering::Release);
         remaining_unknown_inspections.store(3, Ordering::Release);
         let original = SqlCommand {
