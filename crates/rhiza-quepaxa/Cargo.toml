@@ -17,14 +17,12 @@ test-hooks = []
 
 [dependencies]
 getrandom.workspace = true
+libc = "0.2"
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
-rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 serde.workspace = true
 
 [dev-dependencies]
 proptest = "1"
-rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql" }
 serde_json.workspace = true
 tempfile.workspace = true
-tokio.workspace = true

@@ -1764,7 +1764,7 @@ impl CheckpointCoordinator {
                 // generation immediately afterward; that must not invalidate
                 // this immutable receipt or turn a durable write into 503.
                 let publication_receipt = published.publication_receipt()?;
-                let certificate = publication_receipt.certificate();
+                let anchor = publication_receipt.gc_anchor()?;
                 let configuration = runtime
                     .configuration_state()
                     .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
@@ -1774,13 +1774,13 @@ impl CheckpointCoordinator {
                 persist_pending_qefx_gc(
                     runtime.config.data_dir(),
                     &PendingQefxGc {
-                        cluster_id: certificate.identity().cluster_id().to_owned(),
-                        epoch: certificate.identity().epoch(),
+                        cluster_id: anchor.cluster_id().to_owned(),
+                        epoch: anchor.epoch(),
                         config_id: configuration.config_id(),
                         config_digest: configuration.digest().to_hex(),
-                        through_slot: certificate.tip().index(),
-                        checkpoint_hash: certificate.tip().hash().to_hex(),
-                        manifest_digest: certificate.manifest_digest().to_hex(),
+                        through_slot: anchor.tip().index(),
+                        checkpoint_hash: anchor.tip().hash().to_hex(),
+                        manifest_digest: anchor.manifest_digest().to_hex(),
                         receipt_holder: self.publisher.receipt_holder().to_owned(),
                         publication_receipt: Some(publication_receipt.encode()?),
                     },
@@ -1885,7 +1885,7 @@ impl CheckpointCoordinator {
                 .store
                 .load_checkpoint_receipt(
                     &pending.receipt_holder,
-                    local.certificate().manifest_digest(),
+                    local.gc_anchor()?.manifest_digest(),
                 )
                 .await?;
             if remote != local {
@@ -1904,14 +1904,14 @@ impl CheckpointCoordinator {
                 .await?
                 .ok_or(DurabilityError::MissingCheckpoint)?;
             let receipt = loaded.publication_receipt()?;
-            let certificate = receipt.certificate();
-            if certificate.identity().cluster_id() != pending.cluster_id
-                || certificate.identity().epoch() != pending.epoch
-                || certificate.identity().config_id() != pending.config_id
-                || certificate.identity().config_digest().to_hex() != pending.config_digest
-                || certificate.tip().index() != pending.through_slot
-                || certificate.tip().hash().to_hex() != pending.checkpoint_hash
-                || certificate.manifest_digest().to_hex() != pending.manifest_digest
+            let anchor = receipt.gc_anchor()?;
+            if anchor.cluster_id() != pending.cluster_id
+                || anchor.epoch() != pending.epoch
+                || anchor.config_id() != pending.config_id
+                || anchor.config_digest().to_hex() != pending.config_digest
+                || anchor.tip().index() != pending.through_slot
+                || anchor.tip().hash().to_hex() != pending.checkpoint_hash
+                || anchor.manifest_digest().to_hex() != pending.manifest_digest
             {
                 return Err(DurabilityError::SnapshotVerification(
                     "legacy pending QEFX GC evidence no longer exactly matches the visible checkpoint"
@@ -1927,14 +1927,14 @@ impl CheckpointCoordinator {
             pending = upgraded;
             receipt
         };
-        let certificate = receipt.certificate();
-        let identity_mismatch = certificate.identity().cluster_id() != pending.cluster_id
-            || certificate.identity().epoch() != pending.epoch;
-        let receipt_mismatch = certificate.identity().config_id() != pending.config_id
-            || certificate.identity().config_digest().to_hex() != pending.config_digest
-            || certificate.tip().index() != pending.through_slot
-            || certificate.tip().hash().to_hex() != pending.checkpoint_hash
-            || certificate.manifest_digest().to_hex() != pending.manifest_digest;
+        let anchor = receipt.gc_anchor()?;
+        let identity_mismatch =
+            anchor.cluster_id() != pending.cluster_id || anchor.epoch() != pending.epoch;
+        let receipt_mismatch = anchor.config_id() != pending.config_id
+            || anchor.config_digest().to_hex() != pending.config_digest
+            || anchor.tip().index() != pending.through_slot
+            || anchor.tip().hash().to_hex() != pending.checkpoint_hash
+            || anchor.manifest_digest().to_hex() != pending.manifest_digest;
         if identity_mismatch || receipt_mismatch {
             return Err(DurabilityError::SnapshotVerification(
                 "pending QEFX GC record does not match its publication receipt".into(),
@@ -1953,7 +1953,7 @@ impl CheckpointCoordinator {
         }
         let outcome = tokio::task::spawn_blocking(move || {
             recorder.advance_effect_bundle_gc_anchor_bounded(
-                &certificate,
+                &anchor,
                 &[],
                 ONLINE_QEFX_GC_REMOVAL_BUDGET,
             )
@@ -6617,7 +6617,7 @@ mod tests {
         let pending = super::load_pending_qefx_gc(&data_dir).unwrap().unwrap();
         let before = archive.load_checkpoint().await.unwrap().unwrap();
         let before_certificate = archive
-            .checkpoint_readback_certificate(&before)
+            .checkpoint_readback_gc_anchor(&before)
             .await
             .unwrap();
         assert_eq!(
@@ -6688,7 +6688,7 @@ mod tests {
         runtime.checkpoint_compact(&coordinator).await.unwrap();
         let locally_compacted = archive.load_checkpoint().await.unwrap().unwrap();
         let locally_compacted_certificate = archive
-            .checkpoint_readback_certificate(&locally_compacted)
+            .checkpoint_readback_gc_anchor(&locally_compacted)
             .await
             .unwrap();
         assert_ne!(
@@ -6708,7 +6708,7 @@ mod tests {
         );
         assert_eq!(
             archive
-                .checkpoint_readback_certificate(&archive.load_checkpoint().await.unwrap().unwrap())
+                .checkpoint_readback_gc_anchor(&archive.load_checkpoint().await.unwrap().unwrap())
                 .await
                 .unwrap()
                 .manifest_digest(),
@@ -6737,7 +6737,7 @@ mod tests {
             .unwrap();
         let compacted = archive.load_checkpoint().await.unwrap().unwrap();
         let compacted_certificate = archive
-            .checkpoint_readback_certificate(&compacted)
+            .checkpoint_readback_gc_anchor(&compacted)
             .await
             .unwrap();
         assert_ne!(
@@ -6791,16 +6791,16 @@ mod tests {
             .publish_committed(std::slice::from_ref(&entry))
             .await
             .unwrap();
-        let certificate = published.publication_certificate().unwrap();
+        let anchor = published.publication_gc_anchor().unwrap();
         let data_dir = root.path().join("node");
         let legacy = serde_json::json!({
-            "cluster_id": certificate.identity().cluster_id(),
-            "epoch": certificate.identity().epoch(),
-            "config_id": certificate.identity().config_id(),
-            "config_digest": certificate.identity().config_digest().to_hex(),
-            "through_slot": certificate.tip().index(),
-            "checkpoint_hash": certificate.tip().hash().to_hex(),
-            "manifest_digest": certificate.manifest_digest().to_hex()
+            "cluster_id": anchor.cluster_id(),
+            "epoch": anchor.epoch(),
+            "config_id": anchor.config_id(),
+            "config_digest": anchor.config_digest().to_hex(),
+            "through_slot": anchor.tip().index(),
+            "checkpoint_hash": anchor.tip().hash().to_hex(),
+            "manifest_digest": anchor.manifest_digest().to_hex()
         });
         std::fs::create_dir_all(data_dir.join("consensus")).unwrap();
         std::fs::write(

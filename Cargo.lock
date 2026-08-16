@@ -2138,15 +2138,13 @@ name = "rhiza-quepaxa"
 version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
+ "libc",
  "proptest",
- "rhiza-archive",
  "rhiza-core",
- "rhiza-obj-store",
  "rhiza-sql",
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
