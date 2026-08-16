@@ -84,6 +84,10 @@ source_contains() {
     grep -F -- "$2" "$repo_root/$1" >/dev/null 2>&1 || fail "source anchor changed: $1:$2"
 }
 
+require_matching_successor_restore_versions() {
+    [ "$1" = "$2" ] || fail "successor restore version drift: node v$1, HA v$2"
+}
+
 validate() {
     file=$1
     [ -f "$file" ] || fail "missing contract: $file"
@@ -104,12 +108,12 @@ validate() {
     require_row "$file" 'KV materialization' 'rhiza-kv' "$(code '<data>/kv/data.redb')" "$kv_snapshot_token" 'replay continuity'
     require_row "$file" 'Graph materialization' 'rhiza-graph' "$(code '<data>/ladybug/graph.lbug')" "$graph_snapshot_token" 'checked before use'
     require_row "$file" 'Archive history' 'rhiza-archive' "$(code 'rhiza/{cluster}/archive/manifest.json')" "Archive v$archive_version" 'CAS publication'
-    require_row "$file" 'Checkpoint generation' 'rhiza-archive' "$(code 'rhiza/{cluster}/checkpoints/epoch-{e}/config-{c}/generation-{g}/manifest.json')" "Checkpoint v$checkpoint_version" 'before install'
+    require_row "$file" 'Checkpoint generation' 'rhiza-archive' "$(code 'rhiza/{cluster}/checkpoints/epoch-{e}/config-{c}-digest-{digest}/generation-{g}/manifest.json')" "Checkpoint v$checkpoint_version" 'configuration digest' 'before install'
     require_row "$file" 'Checkpoint publication receipts' 'rhiza-archive' "$(code 'receipts/{holder-hash}/{manifest-digest}.json')" 'same-slot evidence conflicts'
     require_row "$file" 'Archive control and leases' 'rhiza-archive' "$(code 'gc/control.json')" "GC v$gc_version" 'fence deletion'
-    require_row "$file" 'Restore/install state' 'rhiza-node' "$(code '.rhiza-checkpoint-install.json')" 'exact expected path identity' 'partial activation'
-    require_row "$file" 'Restore QEFX and recovery ownership' 'rhiza-node' "$(code 'consensus/pending-qefx-gc.json')" 'aggregate limits' 'fail closed'
-    require_row "$file" 'Successor/prestage activation' 'rhiza-node' "$(code '.successor-prestage.{lock,intent,ready,published,finalized}')" 'state-transition checks' 'not activated'
+    require_row "$file" 'Restore/install state' 'rhiza-node' "$(code '.rhiza-checkpoint-install.json')" "restore intent v$restore_intent_version" "install receipt v$restore_install_version" "local marker v$local_marker_version" 'configuration-digest-bound' 'partial activation'
+    require_row "$file" 'Restore QEFX and recovery ownership' 'rhiza-node' "$(code 'consensus/pending-qefx-gc.json')" 'aggregate limits' 'digest-bound owner identity' 'fail closed'
+    require_row "$file" 'Successor/prestage activation' 'rhiza-node' "$(code '.successor-prestage.{lock,intent,ready,published,finalized}')" "successor restore receipt v$successor_restore_version" "prestage identity v$successor_prestage_version" 'membership digests' 'not activated'
     require_row "$file" 'Completion markers' 'rhiza-node' "$(code '<data-dir>/<portable-marker-name>')" 'caller-supplied validated portable relative name' 'receipt hash bind marker'
     require_row "$file" 'Admin operation ledger' 'rhiza-node' "$(code '<data>/admin-operations-v1.json')" 'deny_unknown_fields' '503 unavailable'
 
@@ -149,6 +153,14 @@ graph_snapshot_token=$(version_token "$graph_snapshot_magic" "$graph_snapshot_ve
 archive_version=$(const_version crates/rhiza-archive/src/lib.rs ARCHIVE_FORMAT_VERSION)
 checkpoint_version=$(const_version crates/rhiza-archive/src/lib.rs CHECKPOINT_FORMAT_VERSION)
 gc_version=$(const_version crates/rhiza-archive/src/lib.rs GC_FORMAT_VERSION)
+restore_intent_version=$(const_version crates/rhiza-node/src/durability.rs RESTORE_INTENT_FORMAT_VERSION)
+restore_install_version=$(const_version crates/rhiza-node/src/durability.rs RESTORE_INSTALL_FORMAT_VERSION)
+successor_prestage_version=$(const_version crates/rhiza-node/src/durability.rs SUCCESSOR_PRESTAGE_FORMAT_VERSION)
+successor_restore_node_version=$(const_version crates/rhiza-node/src/durability.rs SUCCESSOR_RESTORE_FORMAT_VERSION)
+successor_restore_ha_version=$(const_version crates/rhiza/src/ha.rs SUCCESSOR_RESTORE_RECEIPT_FORMAT_VERSION)
+require_matching_successor_restore_versions "$successor_restore_node_version" "$successor_restore_ha_version"
+successor_restore_version=$successor_restore_node_version
+local_marker_version=$(const_version crates/rhiza/src/ha.rs LOCAL_CHECKPOINT_IDENTITY_FORMAT_VERSION)
 
 validate "$contract_file"
 
@@ -188,5 +200,18 @@ negative_token qefx "$qefx_token"
 negative_token qegc "$qegc_token"
 negative_token kv-snapshot "$kv_snapshot_token"
 negative_token graph-snapshot "$graph_snapshot_token"
+negative_token checkpoint "Checkpoint v$checkpoint_version"
+negative_token restore-intent "restore intent v$restore_intent_version"
+negative_token restore-install "install receipt v$restore_install_version"
+negative_token successor-prestage "prestage identity v$successor_prestage_version"
+negative_token successor-restore "successor restore receipt v$successor_restore_version"
+negative_token local-marker "local marker v$local_marker_version"
+
+if (require_matching_successor_restore_versions "$((successor_restore_node_version + 1))" "$successor_restore_ha_version") >/dev/null 2>&1; then
+    fail 'negative test accepted node-side successor restore version drift'
+fi
+if (require_matching_successor_restore_versions "$successor_restore_node_version" "$((successor_restore_ha_version + 1))") >/dev/null 2>&1; then
+    fail 'negative test accepted HA-side successor restore version drift'
+fi
 
 printf '%s\n' 'storage-format compatibility contract: ok (missing-row and source-token negative tests passed)'

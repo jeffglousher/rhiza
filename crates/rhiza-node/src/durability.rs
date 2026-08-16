@@ -70,6 +70,10 @@ const QEFX_GC_PHASE_DONE: u8 = 3;
 const MAX_CHECKPOINT_QEFX_AGGREGATE_BYTES: usize = 128 * 1024 * 1024;
 const RESTORE_INTENT_FILE: &str = ".rhiza-restore.json";
 const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";
+const RESTORE_INTENT_FORMAT_VERSION: u8 = 2;
+const RESTORE_INSTALL_FORMAT_VERSION: u8 = 2;
+const SUCCESSOR_RESTORE_FORMAT_VERSION: u8 = 2;
+const SUCCESSOR_PRESTAGE_FORMAT_VERSION: u8 = 2;
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 #[cfg(feature = "sql")]
 pub(crate) const QEFX_RESTORE_HANDOFF_DIR: &str = "consensus/qefx-restore";
@@ -382,11 +386,13 @@ fn test_restore_lock_before_path_revalidation(data_dir: &Path) {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreIntentIdentity {
+    format_version: u8,
     cluster_id: String,
     node_id: String,
     execution_profile: ExecutionProfile,
     epoch: u64,
     config_id: u64,
+    config_digest: String,
     recovery_generation: u64,
     checkpoint_index: LogIndex,
     checkpoint_hash: String,
@@ -416,6 +422,7 @@ struct RepairArtifactOwnership {
 
 #[derive(Serialize)]
 struct SuccessorRestoreIdentity<'a> {
+    format_version: u8,
     cluster_id: &'a str,
     epoch: u64,
     target_config_id: u64,
@@ -423,6 +430,7 @@ struct SuccessorRestoreIdentity<'a> {
     node_id: &'a str,
     membership_digest: String,
     predecessor_config_id: u64,
+    predecessor_membership_digest: String,
     stop_index: LogIndex,
     stop_hash: String,
 }
@@ -430,6 +438,7 @@ struct SuccessorRestoreIdentity<'a> {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SuccessorRestoreReceipt {
+    format_version: u8,
     cluster_id: String,
     epoch: u64,
     target_config_id: u64,
@@ -437,6 +446,7 @@ struct SuccessorRestoreReceipt {
     node_id: String,
     membership_digest: String,
     predecessor_config_id: u64,
+    predecessor_membership_digest: String,
     stop_index: LogIndex,
     stop_hash: String,
 }
@@ -444,6 +454,7 @@ struct SuccessorRestoreReceipt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuccessorPrestageIdentity {
+    format_version: u8,
     cluster_id: String,
     epoch: u64,
     predecessor_config_id: u64,
@@ -2850,11 +2861,13 @@ fn restore_intent_identity(
     checkpoint_root: LogAnchor,
 ) -> RestoreIntentIdentity {
     RestoreIntentIdentity {
+        format_version: RESTORE_INTENT_FORMAT_VERSION,
         cluster_id: identity.cluster_id().to_owned(),
         node_id: node_id.to_owned(),
         execution_profile,
         epoch: identity.epoch(),
         config_id: identity.config_id(),
+        config_digest: identity.config_digest().to_hex(),
         recovery_generation: identity.recovery_generation(),
         checkpoint_index: checkpoint_root.index(),
         checkpoint_hash: checkpoint_root.hash().to_hex(),
@@ -2883,8 +2896,10 @@ pub fn checkpoint_restore_intent_bytes(
 
 fn parse_restore_intent_identity(bytes: &[u8]) -> Option<RestoreIntentIdentity> {
     let intent = serde_json::from_slice::<RestoreIntentIdentity>(bytes).ok()?;
-    (!intent.cluster_id.is_empty()
+    (intent.format_version == RESTORE_INTENT_FORMAT_VERSION
+        && !intent.cluster_id.is_empty()
         && !intent.node_id.is_empty()
+        && is_nonzero_log_hash(&intent.config_digest)
         && LogHash::from_hex(&intent.checkpoint_hash).is_some())
     .then_some(intent)
 }
@@ -2919,10 +2934,12 @@ pub fn checkpoint_restore_in_progress(
     })?;
     let expected = restore_intent_identity(identity, node_id, execution_profile, checkpoint_root);
     if actual.cluster_id != expected.cluster_id
+        || actual.format_version != expected.format_version
         || actual.node_id != expected.node_id
         || actual.execution_profile != expected.execution_profile
         || actual.epoch != expected.epoch
         || actual.config_id != expected.config_id
+        || actual.config_digest != expected.config_digest
         || actual.recovery_generation != expected.recovery_generation
         || actual.checkpoint_index != expected.checkpoint_index
         || actual.checkpoint_hash != expected.checkpoint_hash
@@ -3365,7 +3382,7 @@ fn restore_install_receipt(
     completion_marker: Option<(&str, &[u8])>,
 ) -> RestoreInstallReceipt {
     RestoreInstallReceipt {
-        format_version: 1,
+        format_version: RESTORE_INSTALL_FORMAT_VERSION,
         mode,
         identity: restore_intent_identity(
             prepared.identity(),
@@ -3957,6 +3974,7 @@ pub async fn prestage_successor_checkpoint(
     let identity = store.checkpoint_identity()?.clone();
     if !predecessor_configuration.is_active()
         || predecessor_configuration.config_id() != identity.config_id()
+        || predecessor_configuration.digest() != identity.config_digest()
     {
         return Err(DurabilityError::SnapshotVerification(
             "successor prestage predecessor configuration does not match the checkpoint".into(),
@@ -3996,6 +4014,7 @@ pub async fn prestage_successor_checkpoint(
     )
     .await?;
     let expected = SuccessorPrestageIdentity {
+        format_version: SUCCESSOR_PRESTAGE_FORMAT_VERSION,
         cluster_id: identity.cluster_id().to_owned(),
         epoch: identity.epoch(),
         predecessor_config_id: identity.config_id(),
@@ -4282,6 +4301,7 @@ pub fn adopt_finalized_successor_prestage(
     }
 
     let receipt = serde_json::to_vec(&SuccessorRestoreIdentity {
+        format_version: SUCCESSOR_RESTORE_FORMAT_VERSION,
         cluster_id: config.cluster_id(),
         epoch: config.epoch(),
         target_config_id: prestage.identity.target_config_id(),
@@ -4289,6 +4309,7 @@ pub fn adopt_finalized_successor_prestage(
         node_id: config.node_id(),
         membership_digest: config.membership().digest().to_hex(),
         predecessor_config_id: prestage.identity.predecessor_config_id(),
+        predecessor_membership_digest: predecessor_digest.to_hex(),
         stop_index: stop.entry.index,
         stop_hash: stop.entry.hash.to_hex(),
     })
@@ -4535,9 +4556,11 @@ fn is_valid_restore_install_receipt(path: &Path) -> Result<bool, DurabilityError
     };
     Ok(
         serde_json::from_slice::<RestoreInstallReceipt>(&bytes).is_ok_and(|receipt| {
-            receipt.format_version == 1
+            receipt.format_version == RESTORE_INSTALL_FORMAT_VERSION
+                && receipt.identity.format_version == RESTORE_INTENT_FORMAT_VERSION
                 && !receipt.identity.cluster_id.is_empty()
                 && !receipt.identity.node_id.is_empty()
+                && is_nonzero_log_hash(&receipt.identity.config_digest)
                 && LogHash::from_hex(&receipt.identity.checkpoint_hash).is_some()
                 && LogHash::from_hex(&receipt.checkpoint_hash).is_some()
         }),
@@ -4712,10 +4735,12 @@ fn recovery_artifact_cleanup_identity_matches(
             RecoveryArtifactIdentity::Restore(expected),
         ) => {
             actual.cluster_id == expected.cluster_id
+                && actual.format_version == expected.format_version
                 && actual.node_id == expected.node_id
                 && actual.execution_profile == expected.execution_profile
                 && actual.epoch == expected.epoch
                 && actual.config_id == expected.config_id
+                && actual.config_digest == expected.config_digest
                 && actual.recovery_generation == expected.recovery_generation
             // checkpoint_index/checkpoint_hash deliberately differ across a
             // later verified checkpoint for the same recovery generation.
@@ -4860,11 +4885,21 @@ fn read_regular_successor_control_file(path: &Path) -> Result<Option<Vec<u8>>, D
 
 fn parse_successor_restore_receipt(bytes: &[u8]) -> Option<SuccessorRestoreReceipt> {
     let receipt = serde_json::from_slice::<SuccessorRestoreReceipt>(bytes).ok()?;
-    (!receipt.cluster_id.is_empty()
+    (receipt.format_version == SUCCESSOR_RESTORE_FORMAT_VERSION
+        && !receipt.cluster_id.is_empty()
         && !receipt.node_id.is_empty()
-        && LogHash::from_hex(&receipt.membership_digest).is_some()
-        && LogHash::from_hex(&receipt.stop_hash).is_some())
+        && receipt
+            .predecessor_config_id
+            .checked_add(1)
+            .is_some_and(|next| next == receipt.target_config_id)
+        && is_nonzero_log_hash(&receipt.membership_digest)
+        && is_nonzero_log_hash(&receipt.predecessor_membership_digest)
+        && is_nonzero_log_hash(&receipt.stop_hash))
     .then_some(receipt)
+}
+
+fn is_nonzero_log_hash(value: &str) -> bool {
+    LogHash::from_hex(value).is_some_and(|hash| hash != LogHash::ZERO)
 }
 
 fn successor_receipt_matches_finalized_prestage(
@@ -4872,12 +4907,14 @@ fn successor_receipt_matches_finalized_prestage(
     identity: &SuccessorPrestageIdentity,
 ) -> bool {
     receipt.cluster_id == identity.cluster_id
+        && receipt.format_version == SUCCESSOR_RESTORE_FORMAT_VERSION
         && receipt.epoch == identity.epoch
         && receipt.target_config_id == identity.target_config_id
         && receipt.recovery_generation == identity.predecessor_recovery_generation
         && receipt.node_id == identity.node_id
         && receipt.membership_digest == identity.target_membership_digest
         && receipt.predecessor_config_id == identity.predecessor_config_id
+        && receipt.predecessor_membership_digest == identity.predecessor_membership_digest
 }
 
 fn parse_successor_prestage_identity(bytes: &[u8]) -> Option<SuccessorPrestageIdentity> {
@@ -4891,14 +4928,15 @@ fn validate_successor_prestage_identity(
     identity: &SuccessorPrestageIdentity,
 ) -> Result<(), DurabilityError> {
     let valid = !identity.cluster_id.is_empty()
+        && identity.format_version == SUCCESSOR_PRESTAGE_FORMAT_VERSION
         && !identity.node_id.is_empty()
         && snapshot_profile(&identity.cluster_id)? == identity.execution_profile
         && identity
             .predecessor_config_id
             .checked_add(1)
             .is_some_and(|next| next == identity.target_config_id)
-        && LogHash::from_hex(&identity.predecessor_membership_digest).is_some()
-        && LogHash::from_hex(&identity.target_membership_digest).is_some()
+        && is_nonzero_log_hash(&identity.predecessor_membership_digest)
+        && is_nonzero_log_hash(&identity.target_membership_digest)
         && LogHash::from_hex(&identity.seed_hash).is_some();
     if !valid {
         return Err(DurabilityError::SnapshotVerification(
@@ -6958,14 +6996,207 @@ mod tests {
     }
 
     #[test]
-    fn rejoin_artifact_cleanup_rejects_a_different_config_without_mutation() {
+    fn restore_intent_v2_requires_config_digest() {
+        let checkpoint = CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            LogHash::digest(&[b"node-test-config"]),
+            7,
+        );
+        let bytes = super::checkpoint_restore_intent_bytes(
+            &checkpoint,
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(9, LogHash::digest(&[b"checkpoint"])),
+        )
+        .unwrap();
+        let parsed = super::parse_restore_intent_identity(&bytes).unwrap();
+        assert_eq!(parsed.format_version, 2);
+        assert_eq!(parsed.config_digest, checkpoint.config_digest().to_hex());
+
+        let mut legacy = serde_json::to_value(&parsed).unwrap();
+        legacy.as_object_mut().unwrap().remove("config_digest");
+        assert!(
+            super::parse_restore_intent_identity(&serde_json::to_vec(&legacy).unwrap()).is_none()
+        );
+
+        let mut zero = serde_json::to_value(parsed).unwrap();
+        zero["config_digest"] = serde_json::json!(LogHash::ZERO.to_hex());
+        assert!(
+            super::parse_restore_intent_identity(&serde_json::to_vec(&zero).unwrap()).is_none()
+        );
+    }
+
+    #[test]
+    fn install_receipt_rejects_old_version_and_zero_config_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::RESTORE_RECEIPT_FILE);
+        let mut receipt = serde_json::json!({
+            "format_version": 2,
+            "mode": "fresh",
+            "identity": {
+                "format_version": 2,
+                "cluster_id": "rhiza:sql:cluster-a",
+                "node_id": "node-1",
+                "execution_profile": "sql",
+                "epoch": 1,
+                "config_id": 1,
+                "config_digest": LogHash::digest(&[b"config"]).to_hex(),
+                "recovery_generation": 1,
+                "checkpoint_index": 0,
+                "checkpoint_hash": LogHash::ZERO.to_hex()
+            },
+            "checkpoint_index": 0,
+            "checkpoint_hash": LogHash::ZERO.to_hex(),
+            "completion_marker_name": null,
+            "completion_marker_hash": null
+        });
+        std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(super::is_valid_restore_install_receipt(&path).unwrap());
+
+        receipt["format_version"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(!super::is_valid_restore_install_receipt(&path).unwrap());
+        receipt["format_version"] = serde_json::json!(2);
+        receipt["identity"]["config_digest"] = serde_json::json!(LogHash::ZERO.to_hex());
+        std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(!super::is_valid_restore_install_receipt(&path).unwrap());
+    }
+
+    #[test]
+    fn successor_receipt_and_prestage_reject_legacy_or_unbound_digests() {
+        let predecessor = LogHash::digest(&[b"predecessor"]);
+        let target = LogHash::digest(&[b"target"]);
+        let mut prestage = serde_json::json!({
+            "format_version": 2,
+            "cluster_id": "rhiza:sql:cluster-a",
+            "epoch": 1,
+            "predecessor_config_id": 1,
+            "predecessor_membership_digest": predecessor.to_hex(),
+            "predecessor_recovery_generation": 1,
+            "node_id": "node-1",
+            "execution_profile": "sql",
+            "target_config_id": 2,
+            "target_membership_digest": target.to_hex(),
+            "seed_index": 0,
+            "seed_hash": LogHash::ZERO.to_hex()
+        });
+        let expected =
+            super::parse_successor_prestage_identity(&serde_json::to_vec(&prestage).unwrap())
+                .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join(".restore-stage-4242-1");
+        std::fs::create_dir(&stage).unwrap();
+        let expected_owner = RecoveryArtifactIdentity::Prestage(expected.clone());
+        let mut owner = serde_json::to_value(super::RepairArtifactOwnership {
+            role: RepairArtifactRole::Staging,
+            name: ".restore-stage-4242-1".into(),
+            identity: expected_owner.clone(),
+        })
+        .unwrap();
+        std::fs::write(
+            stage.join(super::REPAIR_ARTIFACT_OWNER_FILE),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(super::is_owned_recovery_directory(
+            &stage,
+            &[],
+            RepairArtifactRole::Staging,
+            &expected_owner,
+        )
+        .unwrap());
+        owner["identity"]["identity"]["format_version"] = serde_json::json!(1);
+        std::fs::write(
+            stage.join(super::REPAIR_ARTIFACT_OWNER_FILE),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(!super::is_owned_recovery_directory(
+            &stage,
+            &[],
+            RepairArtifactRole::Staging,
+            &expected_owner,
+        )
+        .unwrap());
+        owner["identity"]["identity"]["format_version"] = serde_json::json!(2);
+        owner["identity"]["identity"]["target_membership_digest"] =
+            serde_json::json!(LogHash::ZERO.to_hex());
+        std::fs::write(
+            stage.join(super::REPAIR_ARTIFACT_OWNER_FILE),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(!super::is_owned_recovery_directory(
+            &stage,
+            &[],
+            RepairArtifactRole::Staging,
+            &expected_owner,
+        )
+        .unwrap());
+        prestage["format_version"] = serde_json::json!(1);
+        assert!(
+            super::parse_successor_prestage_identity(&serde_json::to_vec(&prestage).unwrap())
+                .is_none()
+        );
+        prestage["format_version"] = serde_json::json!(2);
+        prestage["target_membership_digest"] = serde_json::json!(LogHash::ZERO.to_hex());
+        assert!(
+            super::parse_successor_prestage_identity(&serde_json::to_vec(&prestage).unwrap())
+                .is_none()
+        );
+
+        let mut receipt = serde_json::json!({
+            "format_version": 2,
+            "cluster_id": "rhiza:sql:cluster-a",
+            "epoch": 1,
+            "target_config_id": 2,
+            "recovery_generation": 1,
+            "node_id": "node-1",
+            "membership_digest": target.to_hex(),
+            "predecessor_config_id": 1,
+            "predecessor_membership_digest": predecessor.to_hex(),
+            "stop_index": 1,
+            "stop_hash": LogHash::digest(&[b"stop"]).to_hex()
+        });
+        let parsed =
+            super::parse_successor_restore_receipt(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(super::successor_receipt_matches_finalized_prestage(
+            &parsed, &expected
+        ));
+        receipt["format_version"] = serde_json::json!(1);
+        assert!(
+            super::parse_successor_restore_receipt(&serde_json::to_vec(&receipt).unwrap())
+                .is_none()
+        );
+        receipt["format_version"] = serde_json::json!(2);
+        receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("predecessor_membership_digest");
+        assert!(
+            super::parse_successor_restore_receipt(&serde_json::to_vec(&receipt).unwrap())
+                .is_none()
+        );
+        receipt["predecessor_membership_digest"] =
+            serde_json::json!(LogHash::digest(&[b"wrong"]).to_hex());
+        let wrong =
+            super::parse_successor_restore_receipt(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(!super::successor_receipt_matches_finalized_prestage(
+            &wrong, &expected
+        ));
+    }
+
+    #[test]
+    fn rejoin_artifact_cleanup_rejects_a_different_config_digest_without_mutation() {
         let root = tempfile::tempdir().unwrap();
         let current_checkpoint = LogAnchor::new(9, LogHash::digest(&[b"current-checkpoint"]));
         let foreign = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
             &CheckpointIdentity::new(
                 "rhiza:sql:cluster-a",
                 1,
-                2,
+                1,
                 LogHash::digest(&[b"foreign-config"]),
                 7,
             ),
@@ -7031,7 +7262,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
-        let receipt = br#"{"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let receipt = br#"{"format_version":2,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"1111111111111111111111111111111111111111111111111111111111111111","predecessor_config_id":1,"predecessor_membership_digest":"2222222222222222222222222222222222222222222222222222222222222222","stop_index":1,"stop_hash":"3333333333333333333333333333333333333333333333333333333333333333"}"#;
         let intent = root.path().join(SUCCESSOR_RESTORE_INTENT_FILE);
         std::fs::write(&intent, receipt).unwrap();
         let target = root.path().join("target");

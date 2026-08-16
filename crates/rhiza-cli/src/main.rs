@@ -6889,7 +6889,7 @@ mod tests {
                     1,
                     ConfigurationState::active(
                         1,
-                        LogHash::digest(&[b"cli-roll-checkpoint-test-config"]),
+                        source.checkpoint_identity().unwrap().config_digest(),
                     ),
                     1,
                     LogAnchor::new(2, committed[1].hash),
