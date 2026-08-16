@@ -680,6 +680,15 @@ scripts/replace-k8s-config.sh config-c1.json config-c2-draft.json
 The live-admin routes share the client listener but have a distinct bearer
 token and operation contract. Defaults are under `/v1/admin`; path variables on
 the script allow a staged API rename without weakening response validation.
+Every mutating request must carry a globally unique operation ID that is never
+reused, even after node rebuild or the bounded local replay record expires or
+is evicted. An exact retry is safe while that record remains present; reuse
+after eviction is undetectable. Callers must therefore retain the original ID
+and payload across an ambiguous response, and must satisfy each route's
+configuration, generation, and root preconditions before retrying. A process
+crash may leave a durably completed mutation whose local replay result was not
+committed, so the caller must resolve that ambiguity from authoritative status
+before issuing a different operation.
 Every Job has an active deadline and `backoffLimit: 0`. Poll loops are bounded;
 elapsed time and sleeps never establish correctness. Only observed node,
 checkpoint, StatefulSet, and object-store state advances the workflow. Any

@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashSet},
     fmt, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
@@ -38,6 +38,12 @@ pub const ADMIN_COMPACT_PATH: &str = "/v1/admin/checkpoint/compact";
 pub const ADMIN_TUNER_METRICS_PATH: &str = "/v1/admin/tuner/metrics";
 const ADMIN_STATUS_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const ADMIN_STATUS_SNAPSHOT_MAX_IN_FLIGHT: usize = 1;
+const ADMIN_OPERATION_LEDGER_VERSION: u32 = 2;
+const ADMIN_OPERATION_LEDGER_FILE: &str = "admin-operations-v2.json";
+const ADMIN_OPERATION_LEDGER_MAX_BYTES: usize = 1024 * 1024;
+const ADMIN_OPERATION_LEDGER_MAX_RECORDS: usize = 1024;
+const ADMIN_OPERATION_RESULT_MAX_BYTES: usize = 64 * 1024;
+const ADMIN_OPERATION_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[cfg(test)]
 type StatusRefreshHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -399,21 +405,36 @@ struct AdminRouteState {
     before_refresh_durable_tip_hook: Option<StatusRefreshHook>,
     #[cfg(test)]
     status_snapshot_timeout: std::time::Duration,
-    operations: Arc<tokio::sync::Mutex<Option<HashMap<String, OperationRecord>>>>,
+    operations: Arc<tokio::sync::Mutex<Option<OperationLedger>>>,
     ledger_path: PathBuf,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OperationRecord {
-    fingerprint: Vec<u8>,
+    fingerprint: LogHash,
     status: u16,
     body: Value,
+    sequence: u64,
+    completed_at_unix_seconds: u64,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperationLedger {
-    operations: HashMap<String, OperationRecord>,
+    version: u32,
+    next_sequence: u64,
+    operations: BTreeMap<String, OperationRecord>,
+}
+
+impl Default for OperationLedger {
+    fn default() -> Self {
+        Self {
+            version: ADMIN_OPERATION_LEDGER_VERSION,
+            next_sequence: 1,
+            operations: BTreeMap::new(),
+        }
+    }
 }
 
 pub fn node_router_with_admin(
@@ -485,7 +506,10 @@ fn admin_router(
     coordinator: Option<Arc<CheckpointCoordinator>>,
     admin: AdminConfig,
 ) -> (Router, AdminTaskTracker) {
-    let ledger_path = runtime.config().data_dir().join("admin-operations-v1.json");
+    let ledger_path = runtime
+        .config()
+        .data_dir()
+        .join(ADMIN_OPERATION_LEDGER_FILE);
     let operations = load_operations(&ledger_path)
         .map(Some)
         .unwrap_or_else(|error| {
@@ -746,7 +770,7 @@ where
         let Some(operations) = operations.as_ref() else {
             return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
         };
-        if let Some(response) = replay(operations, &operation_id, &fingerprint) {
+        if let Some(response) = replay(operations, &operation_id, fingerprint) {
             return response;
         }
     }
@@ -755,16 +779,20 @@ where
     }
     let detached_state = state.clone();
     let detached_operation_id = operation_id.clone();
-    let detached_fingerprint = fingerprint.clone();
+    let detached_fingerprint = fingerprint;
     let (completed, mut completion) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let result = operation.await;
         let mut operations = detached_state.operations.lock().await;
-        if let Some(records) = operations.as_mut() {
-            let _ = store_result(records, detached_operation_id, detached_fingerprint, result);
-            if let Err(error) = persist_operations(&detached_state.ledger_path, records) {
+        if operations.is_some() {
+            if let Err(error) = commit_operation_result(
+                &mut operations,
+                &detached_state.ledger_path,
+                detached_operation_id,
+                detached_fingerprint,
+                result,
+            ) {
                 eprintln!("admin operation ledger persistence failed: {error}");
-                *operations = None;
             }
         }
         drop(operations);
@@ -787,20 +815,18 @@ where
     let Some(operations) = operations.as_ref() else {
         return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
     };
-    replay(operations, &operation_id, &fingerprint)
+    replay(operations, &operation_id, fingerprint)
         .unwrap_or_else(|| admin_error(StatusCode::INTERNAL_SERVER_ERROR, AdminErrorCode::Internal))
 }
 
-fn operation_fingerprint(kind: &str, request: &impl Serialize) -> Result<Vec<u8>, ()> {
-    serde_json::to_vec(&(kind, request)).map_err(|_| ())
+fn operation_fingerprint(kind: &str, request: &impl Serialize) -> Result<LogHash, ()> {
+    serde_json::to_vec(&(kind, request))
+        .map(|bytes| LogHash::digest(&[&bytes]))
+        .map_err(|_| ())
 }
 
-fn replay(
-    operations: &HashMap<String, OperationRecord>,
-    operation_id: &str,
-    fingerprint: &[u8],
-) -> Option<Response> {
-    operations.get(operation_id).map(|record| {
+fn replay(ledger: &OperationLedger, operation_id: &str, fingerprint: LogHash) -> Option<Response> {
+    ledger.operations.get(operation_id).map(|record| {
         if record.fingerprint == fingerprint {
             (
                 StatusCode::from_u16(record.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -814,16 +840,72 @@ fn replay(
 }
 
 fn validate_operation_id(operation_id: &str) -> Option<Response> {
-    (operation_id.trim().is_empty() || operation_id.len() > 256)
+    validate_operation_id_text(operation_id)
+        .is_err()
         .then(|| admin_error(StatusCode::BAD_REQUEST, AdminErrorCode::InvalidRequest))
 }
 
-fn store_result<R: Serialize>(
-    operations: &mut HashMap<String, OperationRecord>,
+fn validate_operation_id_text(operation_id: &str) -> Result<(), ()> {
+    (!operation_id.trim().is_empty() && operation_id.len() <= 256)
+        .then_some(())
+        .ok_or(())
+}
+
+fn update_operations<R: Serialize>(
+    ledger: &OperationLedger,
     operation_id: String,
-    fingerprint: Vec<u8>,
+    fingerprint: LogHash,
     result: Result<R, OperationError>,
-) -> Response {
+) -> Result<OperationLedger, std::io::Error> {
+    update_operations_at(
+        ledger,
+        operation_id,
+        fingerprint,
+        result,
+        current_unix_seconds()?,
+    )
+}
+
+fn commit_operation_result<R: Serialize>(
+    state: &mut Option<OperationLedger>,
+    path: &Path,
+    operation_id: String,
+    fingerprint: LogHash,
+    result: Result<R, OperationError>,
+) -> Result<(), std::io::Error> {
+    let committed = (|| {
+        let ledger = state
+            .as_ref()
+            .ok_or_else(|| invalid_operation_ledger("ledger is unavailable"))?;
+        let updated = update_operations(ledger, operation_id, fingerprint, result)?;
+        let bytes = encode_operation_ledger(&updated)?;
+        persist_operations(path, &bytes)?;
+        Ok(updated)
+    })();
+    match committed {
+        Ok(updated) => {
+            *state = Some(updated);
+            Ok(())
+        }
+        Err(error) => {
+            *state = None;
+            Err(error)
+        }
+    }
+}
+
+fn update_operations_at<R: Serialize>(
+    ledger: &OperationLedger,
+    operation_id: String,
+    fingerprint: LogHash,
+    result: Result<R, OperationError>,
+    completed_at_unix_seconds: u64,
+) -> Result<OperationLedger, std::io::Error> {
+    if ledger.operations.contains_key(&operation_id) {
+        return Err(invalid_operation_ledger(
+            "operation identifier was already used",
+        ));
+    }
     let (status, body) = match result {
         Ok(response) => match serde_json::to_value(response) {
             Ok(body) => (StatusCode::OK, body),
@@ -834,15 +916,26 @@ fn store_result<R: Serialize>(
         },
         Err(error) => operation_error_value(error),
     };
-    operations.insert(
+    let next_sequence = ledger.next_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "admin operation sequence overflow",
+        )
+    })?;
+    let mut updated = ledger.clone();
+    updated.next_sequence = next_sequence;
+    updated.operations.insert(
         operation_id,
         OperationRecord {
             fingerprint,
             status: status.as_u16(),
-            body: body.clone(),
+            body,
+            sequence: ledger.next_sequence,
+            completed_at_unix_seconds,
         },
     );
-    (status, Json(body)).into_response()
+    evict_operations(&mut updated, completed_at_unix_seconds)?;
+    Ok(updated)
 }
 
 async fn status_response(
@@ -1023,35 +1116,153 @@ fn validate_successor(
     Ok(membership)
 }
 
-fn load_operations(path: &Path) -> Result<HashMap<String, OperationRecord>, std::io::Error> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+fn load_operations(path: &Path) -> Result<OperationLedger, std::io::Error> {
+    let mut file = match open_operation_ledger(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OperationLedger::default());
+        }
         Err(error) => return Err(error),
     };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > ADMIN_OPERATION_LEDGER_MAX_BYTES as u64 {
+        return Err(invalid_operation_ledger(
+            "ledger is not a bounded regular file",
+        ));
+    }
+    let identity = crate::node_data_path_identity(&file).map_err(operation_ledger_path_error)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take((ADMIN_OPERATION_LEDGER_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > ADMIN_OPERATION_LEDGER_MAX_BYTES || bytes.len() as u64 != metadata.len() {
+        return Err(invalid_operation_ledger(
+            "ledger bounded read is incomplete",
+        ));
+    }
+    let after = file.metadata()?;
+    let path_identity =
+        crate::capture_node_data_path_identity(path, false).map_err(operation_ledger_path_error)?;
+    if metadata.len() != after.len() || identity != path_identity {
+        return Err(invalid_operation_ledger("ledger changed while being read"));
+    }
     let ledger: OperationLedger = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    Ok(ledger.operations)
+    validate_operation_ledger(&ledger, current_unix_seconds()?)?;
+    Ok(ledger)
 }
 
-fn persist_operations(
-    path: &Path,
-    operations: &HashMap<String, OperationRecord>,
-) -> Result<(), std::io::Error> {
+#[cfg(unix)]
+fn open_operation_ledger(path: &Path) -> Result<fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_operation_ledger(path: &Path) -> Result<fs::File, std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("admin operation ledger requires no-follow filesystem support");
+
+fn persist_operations(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "ledger has no parent")
     })?;
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec(&OperationLedger {
-        operations: operations.clone(),
-    })
-    .map_err(std::io::Error::other)?;
     let mut file = fs::File::create(&temporary)?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
     fs::File::open(parent)?.sync_all()
+}
+
+fn encode_operation_ledger(ledger: &OperationLedger) -> Result<Vec<u8>, std::io::Error> {
+    let bytes = serde_json::to_vec(ledger).map_err(std::io::Error::other)?;
+    if bytes.len() > ADMIN_OPERATION_LEDGER_MAX_BYTES {
+        return Err(invalid_operation_ledger("ledger exceeds byte limit"));
+    }
+    Ok(bytes)
+}
+
+fn validate_operation_ledger(ledger: &OperationLedger, now: u64) -> Result<(), std::io::Error> {
+    if ledger.version != ADMIN_OPERATION_LEDGER_VERSION
+        || ledger.next_sequence == 0
+        || ledger.operations.len() > ADMIN_OPERATION_LEDGER_MAX_RECORDS
+    {
+        return Err(invalid_operation_ledger("ledger envelope is invalid"));
+    }
+    let mut sequences = HashSet::with_capacity(ledger.operations.len());
+    for (operation_id, record) in &ledger.operations {
+        if validate_operation_id_text(operation_id).is_err()
+            || record.fingerprint == LogHash::ZERO
+            || StatusCode::from_u16(record.status).is_err()
+            || record.sequence == 0
+            || record.sequence >= ledger.next_sequence
+            || !sequences.insert(record.sequence)
+            || record.completed_at_unix_seconds == 0
+            || record.completed_at_unix_seconds > now
+            || serde_json::to_vec(&record.body)
+                .map_err(std::io::Error::other)?
+                .len()
+                > ADMIN_OPERATION_RESULT_MAX_BYTES
+        {
+            return Err(invalid_operation_ledger("ledger record is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn evict_operations(ledger: &mut OperationLedger, now: u64) -> Result<(), std::io::Error> {
+    let protected_sequence = ledger.next_sequence - 1;
+    let cutoff = now.saturating_sub(ADMIN_OPERATION_RETENTION_SECS);
+    ledger.operations.retain(|_, record| {
+        record.sequence == protected_sequence || record.completed_at_unix_seconds >= cutoff
+    });
+    while ledger.operations.len() > ADMIN_OPERATION_LEDGER_MAX_RECORDS
+        || encode_operation_ledger(ledger).is_err()
+    {
+        let oldest = ledger
+            .operations
+            .iter()
+            .filter(|(_, record)| record.sequence != protected_sequence)
+            .min_by_key(|(operation_id, record)| (record.sequence, operation_id.as_str()))
+            .map(|(operation_id, _)| operation_id.clone())
+            .ok_or_else(|| invalid_operation_ledger("new operation exceeds ledger bounds"))?;
+        ledger.operations.remove(&oldest);
+    }
+    validate_operation_ledger(ledger, now)
+}
+
+fn current_unix_seconds() -> Result<u64, std::io::Error> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| invalid_operation_ledger("system time precedes Unix epoch"))
+}
+
+fn invalid_operation_ledger(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn operation_ledger_path_error(error: crate::NodeDataRootLockError) -> std::io::Error {
+    match error {
+        crate::NodeDataRootLockError::Io(error) => error,
+        crate::NodeDataRootLockError::Locked | crate::NodeDataRootLockError::Invalid(_) => {
+            invalid_operation_ledger("ledger path identity is invalid")
+        }
+    }
 }
 
 fn install_successor(
@@ -1212,21 +1423,26 @@ mod tests {
         Arc, Barrier, Condvar, Mutex,
     };
     use std::time::Duration;
-    use std::{collections::HashMap, path::Path, thread::JoinHandle};
+    use std::{path::Path, thread::JoinHandle};
 
     use axum::{body::Body, http::Request, middleware, routing::get, Extension, Router};
     use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
     use rhiza_quepaxa::{Membership, RecorderFileStore, ThreeNodeConsensus};
+    use serde_json::Value;
     use tower::ServiceExt;
 
     use crate::{CheckpointCoordinator, DurabilityMode, NodeConfig, NodeRuntime};
 
     use super::{
-        admin_gate, admit_status_snapshot, handle_status, node_admin_status, run_status_snapshot,
-        run_status_snapshot_until, status_snapshot_join_error, AdminErrorCode, AdminGateState,
-        AdminPermit, AdminRouteState, AdminTaskTracker, NodeError, OperationLedger,
-        StatusRefreshHook, ADMIN_ACTIVE_MASK, ADMIN_ADMISSION_OPEN, ADMIN_STATUS_PATH,
+        admin_gate, admit_status_snapshot, commit_operation_result, encode_operation_ledger,
+        handle_status, load_operations, node_admin_status, run_status_snapshot,
+        run_status_snapshot_until, status_snapshot_join_error, update_operations_at,
+        validate_operation_ledger, AdminErrorCode, AdminGateState, AdminPermit, AdminRouteState,
+        AdminTaskTracker, NodeError, OperationLedger, OperationRecord, StatusRefreshHook,
+        ADMIN_ACTIVE_MASK, ADMIN_ADMISSION_OPEN, ADMIN_OPERATION_LEDGER_FILE,
+        ADMIN_OPERATION_LEDGER_MAX_BYTES, ADMIN_OPERATION_LEDGER_MAX_RECORDS,
+        ADMIN_OPERATION_RESULT_MAX_BYTES, ADMIN_OPERATION_RETENTION_SECS, ADMIN_STATUS_PATH,
         ADMIN_STATUS_SNAPSHOT_TIMEOUT,
     };
 
@@ -1377,7 +1593,7 @@ mod tests {
                 .unwrap(),
             _task: tasks.try_start().unwrap(),
         });
-        let ledger_path = root.path().join("admin-operations-v1.json");
+        let ledger_path = root.path().join(ADMIN_OPERATION_LEDGER_FILE);
         (
             root,
             AdminRouteState {
@@ -1388,7 +1604,7 @@ mod tests {
                 status_snapshot_hook: Some(hook),
                 before_refresh_durable_tip_hook,
                 status_snapshot_timeout,
-                operations: Arc::new(tokio::sync::Mutex::new(Some(HashMap::new()))),
+                operations: Arc::new(tokio::sync::Mutex::new(Some(OperationLedger::default()))),
                 ledger_path,
             },
             permit,
@@ -1464,11 +1680,197 @@ mod tests {
     #[test]
     fn operation_ledger_has_one_strict_canonical_shape() {
         let canonical = serde_json::to_value(OperationLedger::default()).unwrap();
-        assert_eq!(canonical, serde_json::json!({"operations": {}}));
-        assert!(serde_json::from_value::<OperationLedger>(
-            serde_json::json!({"version": 1, "operations": {}})
+        assert_eq!(
+            canonical,
+            serde_json::json!({"version": 2, "next_sequence": 1, "operations": {}})
+        );
+        let old: OperationLedger = serde_json::from_value(
+            serde_json::json!({"version": 1, "next_sequence": 1, "operations": {}}),
+        )
+        .unwrap();
+        assert!(validate_operation_ledger(&old, 1).is_err());
+        assert!(
+            serde_json::from_value::<OperationLedger>(serde_json::json!({
+                "version": 2,
+                "next_sequence": 1,
+                "operations": {},
+                "unknown": true
+            }))
+            .is_err()
+        );
+
+        let mut invalid = OperationLedger {
+            next_sequence: 2,
+            ..OperationLedger::default()
+        };
+        invalid.operations.insert(
+            "zero".into(),
+            OperationRecord {
+                fingerprint: LogHash::ZERO,
+                status: 200,
+                body: Value::Null,
+                sequence: 1,
+                completed_at_unix_seconds: 2,
+            },
+        );
+        assert!(validate_operation_ledger(&invalid, 2).is_err());
+        invalid.operations.get_mut("zero").unwrap().fingerprint = LogHash::digest(&[b"valid"]);
+        invalid
+            .operations
+            .get_mut("zero")
+            .unwrap()
+            .completed_at_unix_seconds = 3;
+        assert!(validate_operation_ledger(&invalid, 2).is_err());
+    }
+
+    fn operation_record(sequence: u64, completed_at_unix_seconds: u64) -> OperationRecord {
+        OperationRecord {
+            fingerprint: LogHash::digest(&[&sequence.to_be_bytes()]),
+            status: 200,
+            body: serde_json::json!({"sequence": sequence}),
+            sequence,
+            completed_at_unix_seconds,
+        }
+    }
+
+    #[test]
+    fn operation_ledger_evicts_expired_and_oldest_records_but_keeps_the_new_id() {
+        let now = ADMIN_OPERATION_RETENTION_SECS + 100;
+        let mut expired = OperationLedger {
+            next_sequence: 2,
+            ..OperationLedger::default()
+        };
+        expired
+            .operations
+            .insert("old".into(), operation_record(1, 1));
+        let expired = update_operations_at(
+            &expired,
+            "new".into(),
+            LogHash::digest(&[b"new"]),
+            Ok(serde_json::json!({"ok": true})),
+            now,
+        )
+        .unwrap();
+        assert_eq!(expired.operations.keys().collect::<Vec<_>>(), [&"new"]);
+
+        let mut full = OperationLedger {
+            next_sequence: ADMIN_OPERATION_LEDGER_MAX_RECORDS as u64 + 1,
+            ..OperationLedger::default()
+        };
+        for sequence in 1..=ADMIN_OPERATION_LEDGER_MAX_RECORDS as u64 {
+            full.operations
+                .insert(format!("op-{sequence:04}"), operation_record(sequence, now));
+        }
+        let full = update_operations_at(
+            &full,
+            "protected-new".into(),
+            LogHash::digest(&[b"protected"]),
+            Ok(serde_json::json!({"ok": true})),
+            now,
+        )
+        .unwrap();
+        assert_eq!(full.operations.len(), ADMIN_OPERATION_LEDGER_MAX_RECORDS);
+        assert!(!full.operations.contains_key("op-0001"));
+        assert!(full.operations.contains_key("protected-new"));
+
+        let mut byte_full = OperationLedger {
+            next_sequence: 17,
+            ..OperationLedger::default()
+        };
+        for sequence in 1..=16 {
+            let mut record = operation_record(sequence, now);
+            record.body = Value::String("x".repeat(62_000));
+            byte_full
+                .operations
+                .insert(format!("large-{sequence:02}"), record);
+        }
+        assert!(
+            encode_operation_ledger(&byte_full).unwrap().len() < ADMIN_OPERATION_LEDGER_MAX_BYTES
+        );
+        let byte_full = update_operations_at(
+            &byte_full,
+            "protected-large".into(),
+            LogHash::digest(&[b"protected-large"]),
+            Ok(Value::String("y".repeat(62_000))),
+            now,
+        )
+        .unwrap();
+        assert!(!byte_full.operations.contains_key("large-01"));
+        assert!(byte_full.operations.contains_key("protected-large"));
+
+        let exact = update_operations_at(
+            &OperationLedger::default(),
+            "exact-result".into(),
+            LogHash::digest(&[b"exact-result"]),
+            Ok(Value::String(
+                "z".repeat(ADMIN_OPERATION_RESULT_MAX_BYTES - 2),
+            )),
+            now,
+        )
+        .unwrap();
+        assert!(exact.operations.contains_key("exact-result"));
+        assert!(update_operations_at(
+            &OperationLedger::default(),
+            "oversized-result".into(),
+            LogHash::digest(&[b"oversized-result"]),
+            Ok(Value::String(
+                "z".repeat(ADMIN_OPERATION_RESULT_MAX_BYTES - 1)
+            )),
+            now,
         )
         .is_err());
+    }
+
+    #[test]
+    fn operation_ledger_persists_exact_bytes_and_disables_state_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(ADMIN_OPERATION_LEDGER_FILE);
+        let mut state = Some(OperationLedger::default());
+        commit_operation_result(
+            &mut state,
+            &path,
+            "first".into(),
+            LogHash::digest(&[b"first"]),
+            Ok(serde_json::json!({"ok": true})),
+        )
+        .unwrap();
+        let expected = encode_operation_ledger(state.as_ref().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(load_operations(&path).unwrap().operations.len(), 1);
+
+        let blocked_parent = root.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"blocked").unwrap();
+        let failure = commit_operation_result(
+            &mut state,
+            &blocked_parent.join(ADMIN_OPERATION_LEDGER_FILE),
+            "second".into(),
+            LogHash::digest(&[b"second"]),
+            Ok(serde_json::json!({"ok": true})),
+        );
+        assert!(failure.is_err());
+        assert!(state.is_none(), "a failed durable commit disables replay");
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operation_ledger_load_rejects_symlinks_and_oversized_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().join("canonical.json");
+        std::fs::write(
+            &canonical,
+            encode_operation_ledger(&OperationLedger::default()).unwrap(),
+        )
+        .unwrap();
+        let link = root.path().join(ADMIN_OPERATION_LEDGER_FILE);
+        symlink(&canonical, &link).unwrap();
+        assert!(load_operations(&link).is_err());
+
+        let oversized = root.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; ADMIN_OPERATION_LEDGER_MAX_BYTES + 1]).unwrap();
+        assert!(load_operations(&oversized).is_err());
     }
 
     #[tokio::test]
