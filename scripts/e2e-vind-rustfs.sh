@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 repo_root="$(git rev-parse --show-toplevel)"
 profile="${RHIZA_EXECUTION_PROFILE-}"
@@ -37,7 +38,8 @@ context=""
 previous_context=""
 resolved_image=""
 expected_rhiza_image_ids='[]'
-matched_rhiza_image_id=""
+expected_rhiza_config_id=""
+matched_rhiza_config_id=""
 created_cluster=false
 created_namespace=false
 namespace_uid=""
@@ -53,11 +55,40 @@ diagnostic_secrets=()
 
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
+require_one_gib_free() {
+  local target_root="${1-}" candidate parent available_kib
+  [ -n "$target_root" ] || die "target path must not be empty"
+  case "$target_root" in
+    /) die "target path must not be filesystem root" ;;
+    /*) candidate="$target_root" ;;
+    *) candidate="$repo_root/$target_root" ;;
+  esac
+  case "/$candidate/" in */./*|*/../*) die "target path must not contain . or .. components";; esac
+  while :; do
+    [ ! -L "$candidate" ] || die "target filesystem ancestor must not be a symlink"
+    if [ -e "$candidate" ]; then
+      [ -d "$candidate" ] || die "target filesystem ancestor must be a directory"
+      [ "$candidate" != / ] || die "target filesystem ancestor must not be root"
+      break
+    fi
+    parent="$(dirname "$candidate")"
+    [ "$parent" != "$candidate" ] || die "target filesystem ancestor is missing"
+    candidate="$parent"
+  done
+  available_kib="$(df -Pk "$candidate" | awk '
+    NR == 2 { available = $4 }
+    END {
+      if (NR != 2 || available !~ /^[0-9]+$/) exit 1
+      print available
+    }
+  ')" || die "cannot determine free space for target filesystem"
+  [ "$available_kib" -ge 1048576 ] || die "requires at least 1 GiB free on target filesystem; found ${available_kib} KiB"
+}
 case "$profile" in
   sql|graph|kv) ;;
   *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
-for tool in docker kubectl jq yq openssl; do require "$tool"; done
+for tool in docker kubectl jq yq openssl tar df; do require "$tool"; done
 [ "$direct_cluster" = 1 ] || require vcluster
 case "$cleanup" in 0|1) ;; *) die "RHIZA_VIND_CLEANUP must be 0 or 1";; esac
 case "$deploy_only" in 0|1) ;; *) die "RHIZA_E2E_DEPLOY_ONLY must be 0 or 1";; esac
@@ -88,16 +119,57 @@ for failed in "${recovery_failures[@]}"; do
   case "$failed" in 1|2|3) ;; *) die "invalid RHIZA_RECOVERY_FAIL_PEERS cell: $failed";; esac
 done
 if [ "$recovery_require_fresh_vcluster" = 1 ]; then
-  [ "$recovery_matrix" = 1 ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_E2E_RECOVERY_MATRIX=1"
-  [ "$recovery_matrix_only" = 1 ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_E2E_RECOVERY_MATRIX_ONLY=1"
   [ "$direct_cluster" = 0 ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_VIND_DIRECT_CLUSTER=0"
   [ "${RHIZA_VIND_REUSE_EXISTING:-0}" = 0 ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_VIND_REUSE_EXISTING=0"
-  [ "${#recovery_failures[@]}" = 1 ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires exactly one failure cell"
-  [ "${#recovery_holds[@]}" = 1 ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires exactly one hold cell"
   [ -n "$recovery_forbidden_sentinel" ] || die "RHIZA_RECOVERY_REQUIRE_FRESH_VCLUSTER=1 requires RHIZA_RECOVERY_FORBIDDEN_SENTINEL"
+  if [ "$recovery_matrix" = 1 ]; then
+    [ "$recovery_matrix_only" = 1 ] || die "fresh recovery matrix must be matrix-only"
+    [ "${#recovery_failures[@]}" = 1 ] || die "fresh recovery matrix requires exactly one failure cell"
+    [ "${#recovery_holds[@]}" = 1 ] || die "fresh recovery matrix requires exactly one hold cell"
+  fi
 fi
 
 k() { kubectl --context "$context" -n "$namespace" "$@"; }
+validate_local_docker_context() {
+  local selected endpoint
+  selected="$(docker context show)" || die "cannot determine Docker context"
+  [ -n "$selected" ] || die "Docker context must not be empty"
+  endpoint="$(docker context inspect "$selected" --format '{{ .Endpoints.docker.Host }}')" \
+    || die "cannot inspect Docker context $selected"
+  case "$(uname -s)" in
+    Darwin)
+      case "$endpoint" in unix:///*) ;; *) die "Docker context $selected is not a local Unix socket";; esac
+      ;;
+    *)
+      case "$endpoint" in unix:///*|npipe:////./pipe/*) ;; *) die "Docker context $selected is not local";; esac
+      ;;
+  esac
+}
+validate_local_vcluster_context() {
+  local endpoint
+  [ "$context" = "vcluster-docker_$cluster" ] || {
+    printf 'local-context-preflight: unexpected-context context=%s\n' "$context" >&2
+    return 1
+  }
+  endpoint="$(kubectl config view -o json 2>/dev/null | jq -er --arg context "$context" '
+    [.contexts[]? | select(.name == $context) | .context.cluster] as $clusters |
+    if ($clusters | length) != 1 or ($clusters[0] | type) != "string" then empty
+    else [.clusters[]? | select(.name == $clusters[0]) | .cluster.server] as $servers |
+      if ($servers | length) == 1 and ($servers[0] | type) == "string" and
+         ($servers[0] | length) > 0 then $servers[0] else empty end
+    end
+  ' 2>/dev/null)" || {
+    printf 'local-context-preflight: mapping-missing-or-ambiguous context=%s\n' "$context" >&2
+    return 1
+  }
+  case "$endpoint" in
+    https://127.0.0.1:*|https://localhost:*|https://[::1]:*) ;;
+    *)
+      printf 'local-context-preflight: endpoint-not-loopback context=%s\n' "$context" >&2
+      return 1
+      ;;
+  esac
+}
 format_epoch_utc() {
   date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
 }
@@ -108,6 +180,18 @@ normalize_image_id() {
   value="${value#docker-pullable://}"
   case "$value" in *@sha256:*) value="sha256:${value##*@sha256:}";; esac
   printf '%s\n' "$value"
+}
+docker_save_config_digest() {
+  docker image save "$image" | tar -xOf - manifest.json | jq -er '
+    if type != "array" or length != 1 or (.[0].Config | type) != "string" then
+      error("expected exactly one Docker save manifest config")
+    else .[0].Config end |
+    if test("^blobs/sha256/[0-9a-f]{64}$") then
+      "sha256:" + ltrimstr("blobs/sha256/")
+    elif test("^[0-9a-f]{64}[.]json$") then
+      "sha256:" + rtrimstr(".json")
+    else error("invalid Docker save manifest config") end
+  '
 }
 decode_base64() {
   base64 --decode 2>/dev/null || base64 -D
@@ -124,11 +208,10 @@ fresh_capture_live_image_provenance() {
     normalize_image_id "$image_id"
   done | sort -u)"
   normalized_live_json="$(printf '%s\n' "$normalized_live" | jq -R . | jq -sc 'unique')"
-  jq -e --argjson live "$normalized_live_json" --argjson expected "$expected_rhiza_image_ids" '
-    ($live | length == 1) and
-    ($live[0] as $id | $expected | index($id) != null)' >/dev/null \
-    || die "fresh isolation live voter image IDs do not match built Docker image ID"
-  matched_rhiza_image_id="$(jq -r '.[0]' <<< "$normalized_live_json")"
+  jq -n -e --argjson live "$normalized_live_json" --arg expected "$expected_rhiza_config_id" '
+    ($live | length == 1) and ($live[0] == $expected)' >/dev/null \
+    || die "fresh isolation live voter image ID does not match built Docker config ID"
+  matched_rhiza_config_id="$(jq -r '.[0]' <<< "$normalized_live_json")"
 }
 fresh_capture_empty_bucket_inventory() {
   local inventory_job access_key secret_key
@@ -142,7 +225,7 @@ fresh_capture_empty_bucket_inventory() {
     --env="AWS_ACCESS_KEY_ID=$access_key" --env="AWS_SECRET_ACCESS_KEY=$secret_key" \
     --env=AWS_DEFAULT_REGION=us-east-1 --command -- sh -ec \
     'aws --endpoint-url http://rustfs:9000 s3api list-objects-v2 --bucket rhiza --output json' >/dev/null
-  k wait --for=condition=complete "pod/$inventory_job" --timeout=120s >/dev/null \
+  k wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$inventory_job" --timeout=120s >/dev/null \
     || die "fresh isolation bucket inventory job failed"
   bucket_inventory_path="$target/fresh-rustfs-bucket-inventory.json"
   k logs "$inventory_job" > "$bucket_inventory_path"
@@ -221,7 +304,9 @@ fresh_capture_cell_isolation() {
   jq -cn --arg mode fresh-vcluster --arg cluster "$cluster" --arg context "$context" \
     --arg namespace "$namespace" --arg namespace_uid "$namespace_uid" \
     --arg statefulset_uid "$statefulset_uid" --arg rustfs_uid "$rustfs_uid" --arg node_uid "$node_uid" \
-    --argjson expected_image_ids "$expected_rhiza_image_ids" --arg matched_image_id "$matched_rhiza_image_id" \
+    --argjson expected_manifest_ids "$expected_rhiza_image_ids" \
+    --arg expected_config_id "$expected_rhiza_config_id" \
+    --arg matched_live_config_id "$matched_rhiza_config_id" \
     --arg bucket_inventory_path "$bucket_inventory_path" \
     --argjson live_rhiza_image_ids "$live_rhiza_image_ids" \
     --arg identity_artifact_path "$artifact" \
@@ -238,7 +323,8 @@ fresh_capture_cell_isolation() {
       vcluster:{name:$cluster,context:$context,created:true},
       namespace:{name:$namespace,uid:$namespace_uid,managed:true,created:true},
       statefulset_uid:$statefulset_uid,node_uid:$node_uid,rustfs_uid:$rustfs_uid,
-      expected_image_ids:$expected_image_ids,matched_image_id:$matched_image_id,live_rhiza_image_ids:$live_rhiza_image_ids,
+      expected_manifest_ids:$expected_manifest_ids,expected_config_id:$expected_config_id,
+      matched_live_config_id:$matched_live_config_id,live_rhiza_image_ids:$live_rhiza_image_ids,
       image_provenance_verified:true,bucket_inventory_path:$bucket_inventory_path,
       voter_pod_uids:$voter_pod_uids,pvc_count:0,hostpath_volume_count:0,
       prebootstrap_rhiza_workloads_absent:true,
@@ -301,7 +387,6 @@ redact_diagnostic_stream() {
 capture_failure_diagnostics() {
   local diagnostics="$target/failure-diagnostics" pod pod_name
   mkdir -p "$diagnostics"
-  chmod 700 "$diagnostics"
   k get pods -o wide 2>&1 |
     redact_diagnostic_stream > "$diagnostics/pods.txt" || true
   k get pods -l app.kubernetes.io/name=rhiza -o json 2>&1 |
@@ -320,7 +405,6 @@ capture_failure_diagnostics() {
   done < <(k get pods -l app.kubernetes.io/name=rhiza -o name 2>/dev/null || true)
 }
 capture_ready_context() {
-  [ -n "$context" ] || context="$(kubectl config current-context 2>/dev/null || true)"
   [ -n "$context" ] || die "no Kubernetes context selected"
   for ((attempt=1; attempt<=120; attempt++)); do
     if kubectl --context "$context" get --raw=/readyz >/dev/null 2>&1; then
@@ -338,7 +422,10 @@ cleanup_run() {
     k get events --sort-by=.metadata.creationTimestamp >&2 || true
   fi
   if [ "$cleanup" = 1 ] && "$created_cluster"; then
-    vcluster delete "$cluster" --driver docker >/dev/null 2>&1 || true
+    if ! vcluster delete "$cluster" --driver docker > "$target/cleanup-vcluster-delete.log" 2>&1; then
+      printf 'warning: local vcluster cleanup failed for %s; inspect %s\n' \
+        "$cluster" "$target/cleanup-vcluster-delete.log" >&2
+    fi
   fi
   if [ "$cleanup" = 1 ] && [ "$direct_cluster" = 1 ] && [ -n "$context" ]; then
     managed="$(kubectl --context "$context" get namespace "$namespace" \
@@ -356,15 +443,17 @@ cleanup_run() {
 trap 'status=$?; cleanup_run "$status"; exit "$status"' EXIT
 
 cd "$repo_root"
+require_one_gib_free "$target"
 mkdir -p "$target"
 chmod 700 "$target"
 previous_context="$(kubectl config current-context 2>/dev/null || true)"
+validate_local_docker_context
 
 if [ "$skip_build" = 1 ]; then
   docker image inspect "$image" >/dev/null 2>&1 \
     || die "RHIZA_VIND_SKIP_BUILD=1 requires existing local image: $image"
 else
-  docker build --build-arg "RHIZA_PROFILE=$profile" -t "$image" .
+  docker build --load --build-arg "RHIZA_PROFILE=$profile" -t "$image" .
 fi
 resolved_image="$(docker image inspect --format '{{.Id}}' "$image")"
 [ -n "$resolved_image" ] || die "cannot resolve Rhiza image ID: $image"
@@ -373,7 +462,9 @@ expected_rhiza_image_ids="$(docker image inspect "$image" | jq -r '.[0].Id, .[0]
   sort -u | jq -R . | jq -sc 'unique')"
 jq -e 'length > 0 and all(.[]; type == "string" and startswith("sha256:"))' \
   <<< "$expected_rhiza_image_ids" >/dev/null \
-  || die "cannot resolve expected Rhiza Docker config ID or RepoDigest"
+  || die "cannot resolve expected Rhiza Docker manifest IDs"
+expected_rhiza_config_id="$(docker_save_config_digest)" \
+  || die "cannot resolve expected Rhiza Docker config ID"
 if [ "$direct_cluster" = 1 ]; then
   context="${RHIZA_VIND_CONTEXT:-}"
   [ -n "$context" ] || die "RHIZA_VIND_DIRECT_CLUSTER=1 requires RHIZA_VIND_CONTEXT"
@@ -386,6 +477,13 @@ else
   else
     vcluster create "$cluster" --driver docker --kube-config-context-name "$cluster"
     created_cluster=true
+  fi
+  context="vcluster-docker_$cluster"
+  if ! context_preflight="$(validate_local_vcluster_context 2>&1)"; then
+    printf '%s\n' "$context_preflight" > "$target/local-context-preflight.log"
+    printf '%s\n' "$context_preflight" >&2
+    context=""
+    die "refusing non-local vcluster context"
   fi
 fi
 capture_ready_context
@@ -470,7 +568,6 @@ make_bundle() {
       recorder_tls_server_name:($name + "-" + ($n|tostring) + "." + $name)
     } else {} end)]}
   ' > "$output"
-  chmod 600 "$output"
 }
 make_bundle 1 "$target/config-c1.json"
 make_bundle 2 "$target/config-c2-draft.json"
@@ -662,7 +759,6 @@ matrix_run_no_quorum_safety_probe() {
   local write_classification read_classification local_stdout local_stderr local_rc
   sample_dir="$target/failure-safety-probes/${cell_id}/$(printf '%04d' "$sequence")"
   mkdir -p "$sample_dir"
-  chmod 700 "$sample_dir"
   if [ "$sequence" = 0 ]; then
     # Preserve the original no-quorum receipt so the post-recovery retry still
     # proves the idempotency boundary for the same request ID.
@@ -1045,7 +1141,6 @@ write_value() {
   deadline=$((SECONDS + write_retry_deadline_seconds))
   write_attempt_dir="$target/write-attempts"
   mkdir -p "$write_attempt_dir"
-  chmod 700 "$write_attempt_dir"
 
   for ((attempt=1; attempt<=60; attempt++)); do
     attempt_log="$(mktemp "$write_attempt_dir/write.XXXXXX")"
@@ -1737,7 +1832,6 @@ done
 if [ "$recovery_matrix" = 1 ]; then
   recovery_matrix_jsonl="$target/recovery-matrix.jsonl"
   : > "$recovery_matrix_jsonl"
-  chmod 600 "$recovery_matrix_jsonl"
   echo "== run config-1 emptyDir recovery matrix =="
   for hold in "${recovery_holds[@]}"; do
     for failed in "${recovery_failures[@]}"; do
