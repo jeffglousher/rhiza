@@ -4,7 +4,9 @@
 by rhiza. It provides the proposer, recorder state machine, decision proofs,
 fixed and stoppable membership transitions, and a file-backed recorder for
 embedding and tests. It does not depend on SQLite, HTTP, Tokio, object storage,
-or Kubernetes.
+or Kubernetes in its normal production dependency closure. Its test suite also
+checks SQL-produced QEFX payload interoperability through a test-only
+`rhiza-sql` dependency.
 
 The crate deliberately re-exports the `rhiza-core` model types used by its
 public API. Applications normally need only this crate to construct commands,
