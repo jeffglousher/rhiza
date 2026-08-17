@@ -1,10 +1,7 @@
-#![cfg(feature = "archive-gc")]
-use rhiza_archive::{CheckpointIdentity, CheckpointReadbackCertificate, ObjectArchiveStore};
 use rhiza_core::{
-    EntryType, ExternalEffectCommand, ExternalEffectProfile, LogEntry, LogHash, StoredCommand,
-    MAX_EXTERNAL_EFFECT_COMMAND_BYTES,
+    CheckpointGcAnchor, EntryType, ExternalEffectCommand, ExternalEffectProfile, LogAnchor,
+    LogHash, StoredCommand, MAX_EXTERNAL_EFFECT_COMMAND_BYTES,
 };
-use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
     AcceptedValue, DecisionProof, EffectBundleBinding, EffectBundleFinalizeRequest,
     EffectBundleGcPin, Error, Membership, Proposal, ProposalPriority, RecorderEffectBundle,
@@ -115,64 +112,23 @@ fn large_qefx(
     (bundle, request)
 }
 
-fn gc_certificate(
-    root: &std::path::Path,
+fn gc_anchor(
     cluster_id: &str,
     config_id: u64,
     config_digest: LogHash,
     through_slot: u64,
-    recovery_generation: u64,
-) -> CheckpointReadbackCertificate {
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async move {
-            let archive_root = root.join(format!(
-                "archive-{cluster_id}-{config_id}-{through_slot}-{recovery_generation}"
-            ));
-            let object_store = ObjStore::new(ObjStoreConfig::Local { root: archive_root }).unwrap();
-            let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
-                object_store,
-                CheckpointIdentity::new(
-                    cluster_id,
-                    EPOCH,
-                    config_id,
-                    config_digest,
-                    recovery_generation,
-                ),
-            );
-            let mut previous = LogHash::ZERO;
-            let entries = (1..=through_slot)
-                .map(|index| {
-                    let payload = format!("checkpoint-{index}").into_bytes();
-                    let hash = LogEntry::calculate_hash(
-                        cluster_id,
-                        index,
-                        EPOCH,
-                        config_id,
-                        EntryType::Command,
-                        previous,
-                        &payload,
-                    );
-                    let entry = LogEntry {
-                        cluster_id: cluster_id.into(),
-                        epoch: EPOCH,
-                        config_id,
-                        index,
-                        entry_type: EntryType::Command,
-                        payload,
-                        prev_hash: previous,
-                        hash,
-                    };
-                    previous = hash;
-                    entry
-                })
-                .collect::<Vec<_>>();
-            let loaded = archive.publish_committed(&entries).await.unwrap();
-            archive
-                .checkpoint_readback_certificate(&loaded)
-                .await
-                .unwrap()
-        })
+    manifest_evidence: &[u8],
+) -> CheckpointGcAnchor {
+    let slot = through_slot.to_be_bytes();
+    CheckpointGcAnchor::new(
+        cluster_id,
+        EPOCH,
+        config_id,
+        config_digest,
+        LogAnchor::new(through_slot, LogHash::digest(&[b"checkpoint tip", &slot])),
+        LogHash::digest(&[b"checkpoint manifest", manifest_evidence]),
+    )
+    .unwrap()
 }
 
 fn install_successor(store: &RecorderFileStore, current: &Membership, next: Membership) {
@@ -463,14 +419,7 @@ fn certified_gc_persists_monotonically_and_preserves_newer_effects_after_reopen(
     store.finalize_effect_bundle(&old_request).unwrap();
     store.finalize_effect_bundle(&new_request).unwrap();
 
-    let certificate = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        80,
-        1,
-    );
+    let certificate = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 80, b"monotonic");
     let outcome = store
         .advance_effect_bundle_gc_anchor(&certificate, &[])
         .unwrap();
@@ -515,14 +464,7 @@ fn certified_gc_bounded_sweep_requires_exact_retries_and_caps_each_slice() {
     let (second, second_request) = sql_qefx(&membership, vec![b"second-effect".to_vec()], 80);
     store.finalize_effect_bundle(&first_request).unwrap();
     store.finalize_effect_bundle(&second_request).unwrap();
-    let certificate = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        80,
-        1,
-    );
+    let certificate = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 80, b"bounded");
 
     let first_slice = store
         .advance_effect_bundle_gc_anchor_bounded(&certificate, &[], 1)
@@ -558,15 +500,16 @@ fn certified_gc_does_not_reap_chunks_between_stage_and_finalize() {
             &bundle.chunks()[0],
         )
         .unwrap();
+    store
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        )
+        .unwrap();
 
-    let certificate = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        80,
-        1,
-    );
+    let certificate = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 80, b"staged");
     store
         .advance_effect_bundle_gc_anchor(&certificate, &[])
         .unwrap();
@@ -581,42 +524,137 @@ fn certified_gc_does_not_reap_chunks_between_stage_and_finalize() {
 }
 
 #[test]
+fn staged_finalize_requires_every_chunk_to_be_restaged_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let (bundle, request) = sql_qefx(
+        &membership,
+        vec![
+            b"first-staged-chunk".to_vec(),
+            b"second-staged-chunk".to_vec(),
+        ],
+        82,
+    );
+    for (ordinal, chunk) in bundle.chunks().iter().enumerate() {
+        store
+            .stage_effect_bundle_chunk(
+                bundle.binding(),
+                &request.manifest_command,
+                ordinal as u16,
+                chunk,
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let (reopened, _) = open_store(root.path());
+    assert!(matches!(
+        reopened.finalize_staged_effect_bundle(
+            bundle.binding(),
+            request.manifest_command.clone()
+        ),
+        Err(Error::EffectBundleInvalid(message))
+            if message.contains("staged in the current process")
+    ));
+    reopened
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.finalize_staged_effect_bundle(
+            bundle.binding(),
+            request.manifest_command.clone()
+        ),
+        Err(Error::EffectBundleInvalid(message))
+            if message.contains("staged in the current process")
+    ));
+    reopened
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            1,
+            &bundle.chunks()[1],
+        )
+        .unwrap();
+    reopened
+        .finalize_staged_effect_bundle(bundle.binding(), request.manifest_command.clone())
+        .unwrap();
+    assert_eq!(
+        reopened.load_effect_bundle(bundle.binding()).unwrap(),
+        Some(bundle.clone())
+    );
+    drop(reopened);
+
+    let (finalized, _) = open_store(root.path());
+    finalized
+        .finalize_staged_effect_bundle(bundle.binding(), request.manifest_command)
+        .unwrap();
+    assert_eq!(
+        finalized.load_effect_bundle(bundle.binding()).unwrap(),
+        Some(bundle)
+    );
+}
+
+#[test]
+fn failed_chunk_stage_does_not_leave_a_gc_pin() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let (bundle, request) = sql_qefx(&membership, vec![b"conflicting-stage".to_vec()], 81);
+    let chunk_hash = ExternalEffectCommand::chunk_digest(&bundle.chunks()[0]);
+    let chunk_path = root
+        .path()
+        .join(format!("effect-chunk-{}.qefc", chunk_hash.to_hex()));
+    std::fs::write(&chunk_path, b"wrong-bytes").unwrap();
+
+    assert_eq!(
+        store.stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        ),
+        Err(Error::EffectBundleConflict)
+    );
+    let certificate = gc_anchor(
+        CLUSTER_ID,
+        CONFIG_ID,
+        membership.digest(),
+        80,
+        b"failed-stage",
+    );
+    let outcome = store
+        .advance_effect_bundle_gc_anchor(&certificate, &[])
+        .unwrap();
+    assert_eq!(outcome.removed_chunks, 1);
+    assert!(!chunk_path.exists());
+}
+
+#[test]
 fn certified_gc_rejects_uncertified_rollback_and_foreign_identity() {
     let root = tempfile::tempdir().unwrap();
     let (store, membership) = open_store(root.path());
     let (_bundle, request) = sql_qefx(&membership, vec![b"retain-on-error".to_vec()], 90);
     store.finalize_effect_bundle(&request).unwrap();
 
-    let certificate = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        90,
-        1,
-    );
+    let certificate = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 90, b"current");
     store
         .advance_effect_bundle_gc_anchor(&certificate, &[])
         .unwrap();
-    let rollback = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        89,
-        1,
-    );
+    let rollback = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 89, b"rollback");
     assert!(matches!(
         store.advance_effect_bundle_gc_anchor(&rollback, &[]),
         Err(Error::EffectBundleInvalid(_))
     ));
-    let foreign = gc_certificate(
-        root.path(),
+    let foreign = gc_anchor(
         "foreign-cluster",
         CONFIG_ID,
         membership.digest(),
         91,
-        1,
+        b"foreign",
     );
     assert!(matches!(
         store.advance_effect_bundle_gc_anchor(&foreign, &[]),
@@ -629,22 +667,14 @@ fn certified_gc_rejects_same_slot_conflicts_and_allows_real_configuration_transi
     let root = tempfile::tempdir().unwrap();
     let (store, membership) = open_store(root.path());
 
-    let first = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        102,
-        1,
-    );
+    let first = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 102, b"first");
     store.advance_effect_bundle_gc_anchor(&first, &[]).unwrap();
-    let conflicting = gc_certificate(
-        root.path(),
+    let conflicting = gc_anchor(
         CLUSTER_ID,
         CONFIG_ID,
         membership.digest(),
         102,
-        2,
+        b"conflicting",
     );
     assert!(matches!(
         store.advance_effect_bundle_gc_anchor(&conflicting, &[]),
@@ -657,14 +687,7 @@ fn certified_gc_rejects_same_slot_conflicts_and_allows_real_configuration_transi
     assert_eq!(configuration.config_id(), CONFIG_ID + 1);
     assert_eq!(configuration.config_digest(), next.digest());
 
-    let after_transition = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID + 1,
-        next.digest(),
-        103,
-        1,
-    );
+    let after_transition = gc_anchor(CLUSTER_ID, CONFIG_ID + 1, next.digest(), 103, b"transition");
     assert_eq!(
         store
             .advance_effect_bundle_gc_anchor(&after_transition, &[])
@@ -682,14 +705,7 @@ fn certified_gc_preserves_active_and_reconfiguration_pins_under_anchor() {
     let (swept, swept_request) = sql_qefx(&membership, vec![b"swept-effect".to_vec()], 101);
     store.finalize_effect_bundle(&active_request).unwrap();
     store.finalize_effect_bundle(&swept_request).unwrap();
-    let certificate = gc_certificate(
-        root.path(),
-        CLUSTER_ID,
-        CONFIG_ID,
-        membership.digest(),
-        101,
-        1,
-    );
+    let certificate = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 101, b"pins");
     let pins = vec![EffectBundleGcPin {
         binding: active.binding().clone(),
         manifest_command: active_request.manifest_command.clone(),

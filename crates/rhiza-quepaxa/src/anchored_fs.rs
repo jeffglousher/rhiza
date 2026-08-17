@@ -7,6 +7,10 @@
 ))]
 mod anchored {
     use crate::{Error, Result};
+    use libc::{
+        O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY,
+        SEEK_SET,
+    };
     use std::{
         ffi::{CStr, CString},
         os::{
@@ -23,34 +27,6 @@ mod anchored {
     };
 
     static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_DIRECTORY: c_int = 0o200000;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_CLOEXEC: c_int = 0o2000000;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_NOFOLLOW: c_int = 0o400000;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_APPEND: c_int = 0o2000;
-    #[cfg(target_os = "macos")]
-    const O_DIRECTORY: c_int = 0x0010_0000;
-    #[cfg(target_os = "macos")]
-    const O_CLOEXEC: c_int = 0x0100_0000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: c_int = 0x0000_0100;
-    #[cfg(target_os = "macos")]
-    const O_APPEND: c_int = 0x0000_0008;
-    const O_RDONLY: c_int = 0;
-    const O_WRONLY: c_int = 1;
-    const O_RDWR: c_int = 2;
-    const SEEK_SET: c_int = 0;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_CREAT: c_int = 0o100;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_EXCL: c_int = 0o200;
-    #[cfg(target_os = "macos")]
-    const O_CREAT: c_int = 0x0000_0200;
-    #[cfg(target_os = "macos")]
-    const O_EXCL: c_int = 0x0000_0800;
 
     unsafe extern "C" {
         fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
@@ -108,10 +84,10 @@ mod anchored {
                 .custom_flags(O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
             let directory = options
                 .open(path)
-                .map_err(|error| Error::Io(error.to_string()))?;
+                .map_err(|error| io_error("recorder root open", error))?;
             let metadata = directory
                 .metadata()
-                .map_err(|error| Error::Io(error.to_string()))?;
+                .map_err(|error| io_error("recorder root metadata", error))?;
             if !metadata.is_dir() {
                 return Err(Error::Decode(
                     "recorder root must be a real directory".into(),
@@ -126,8 +102,8 @@ mod anchored {
 
         pub(crate) fn verify_path(&self, path: &Path) -> Result<()> {
             self.verify()?;
-            let metadata =
-                fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| io_error("recorder root path metadata", error))?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_dir()
                 || metadata.dev() != self.device
@@ -200,8 +176,9 @@ mod anchored {
             let (temp, mut file) = self.create_temp_file(name)?;
             let result = (|| -> Result<()> {
                 file.write_all(bytes)
-                    .and_then(|_| file.sync_all())
-                    .map_err(|error| Error::Io(error.to_string()))?;
+                    .map_err(|error| io_error("recorder atomic file write", error))?;
+                file.sync_all()
+                    .map_err(|error| io_error("recorder atomic file fsync", error))?;
                 #[cfg(test)]
                 crate::record_file_sync();
                 drop(file);
@@ -316,7 +293,10 @@ mod anchored {
                 )
             };
             if status != 0 {
-                return Err(Error::Io(io::Error::last_os_error().to_string()));
+                return Err(io_error(
+                    "recorder atomic rename",
+                    io::Error::last_os_error(),
+                ));
             }
             self.sync()
         }
@@ -336,7 +316,7 @@ mod anchored {
             self.verify()?;
             self.directory
                 .sync_all()
-                .map_err(|error| Error::Io(error.to_string()))?;
+                .map_err(|error| io_error("recorder directory fsync", error))?;
             #[cfg(test)]
             crate::record_directory_sync();
             Ok(())
@@ -410,7 +390,12 @@ mod anchored {
                 ) {
                     Ok(file) => return Ok((temp, file)),
                     Err(Error::Io(message)) if is_already_exists_message(&message) => continue,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        return Err(error_context(
+                            "recorder atomic temporary-file create",
+                            error,
+                        ));
+                    }
                 }
             }
             Err(Error::Io(
@@ -425,7 +410,10 @@ mod anchored {
             let descriptor =
                 unsafe { openat(self.directory.as_raw_fd(), name.as_ptr(), flags, mode) };
             if descriptor < 0 {
-                return Err(Error::Io(io::Error::last_os_error().to_string()));
+                return Err(io_error(
+                    "recorder anchored openat",
+                    io::Error::last_os_error(),
+                ));
             }
             // SAFETY: openat returned a newly-owned descriptor.
             Ok(unsafe { fs::File::from_raw_fd(descriptor as RawFd) })
@@ -435,7 +423,7 @@ mod anchored {
             let metadata = self
                 .directory
                 .metadata()
-                .map_err(|error| Error::Io(error.to_string()))?;
+                .map_err(|error| io_error("recorder root anchor metadata", error))?;
             if !metadata.is_dir() || metadata.dev() != self.device || metadata.ino() != self.inode {
                 return Err(Error::Decode(
                     "recorder root directory anchor changed".into(),
@@ -451,6 +439,17 @@ mod anchored {
         }
         CString::new(name.as_bytes())
             .map_err(|_| Error::Decode("NUL in anchored path component".into()))
+    }
+
+    fn io_error(operation: &str, error: io::Error) -> Error {
+        Error::Io(format!("{operation}: {error}"))
+    }
+
+    fn error_context(operation: &str, error: Error) -> Error {
+        match error {
+            Error::Io(message) => Error::Io(format!("{operation}: {message}")),
+            error => error,
+        }
     }
 
     fn is_not_found_message(message: &str) -> bool {
@@ -501,8 +500,7 @@ pub(crate) use windows_anchored::AnchoredDir;
         target_pointer_width = "64"
     )
 )))]
-#[derive(Debug)]
-pub(crate) struct AnchoredDir;
+use crate::{Error, Result};
 
 #[cfg(not(any(
     target_os = "windows",
@@ -512,7 +510,8 @@ pub(crate) struct AnchoredDir;
         target_pointer_width = "64"
     )
 )))]
-use crate::{Error, Result};
+#[derive(Debug)]
+pub(crate) struct AnchoredDir;
 
 #[cfg(not(any(
     target_os = "windows",

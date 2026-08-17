@@ -8,7 +8,7 @@ use std::{
 };
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_core::{ConfigurationState, LogAnchor, LogHash};
+use rhiza_core::{ConfigurationState, LogAnchor};
 use rhiza_node::{
     durability::{finalize_successor_prestage_for_stop, inspect_successor_prestage},
     install_successor_recorder, NodeRuntime,
@@ -544,7 +544,9 @@ async fn finalized_successor_restart_handles_empty_target_archive_before_activat
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -851,7 +853,9 @@ async fn start_faulting_live_successor(
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -887,7 +891,9 @@ async fn start_faulting_live_successor(
             "rhiza:sql:cluster-a",
             1,
             2,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -967,7 +973,9 @@ async fn unavailable_tail_retry_is_interrupted_by_short_successor_shutdown_deadl
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -1004,7 +1012,9 @@ async fn unavailable_tail_retry_is_interrupted_by_short_successor_shutdown_deadl
             "rhiza:sql:cluster-a",
             1,
             2,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -1150,7 +1160,9 @@ async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );
@@ -1188,7 +1200,9 @@ async fn live_successor_keeps_one_owner_and_listener_from_prestop_ready_through_
             "rhiza:sql:cluster-a",
             1,
             2,
-            LogHash::digest(&[b"rhiza-test-config"]),
+            Membership::new(["node-4", "node-5", "node-6"])
+                .unwrap()
+                .digest(),
             1,
         ),
     );

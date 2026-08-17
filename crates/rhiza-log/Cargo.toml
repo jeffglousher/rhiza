@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Durable log primitives for rhiza"
 
 [dependencies]
+libc = "0.2"
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 
 [dev-dependencies]

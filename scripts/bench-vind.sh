@@ -1317,7 +1317,7 @@ fi
 bench_args=(--duration "$duration" --warmup "$warmup" --concurrency "$concurrency"
   --workload "$workload" --write-percent "$write_percent" --skip-setup)
 [ "$d1_exact_write" = 0 ] || [ "$d1_exact_write" = 1 ] || die "RHIZA_BENCH_D1_EXACT_WRITE must be 0 or 1"
-[ "$d1_exact_write" = 0 ] || bench_args+=(--d1-exact-write)
+[ "$d1_exact_write" = 0 ] || bench_args+=(--retry-ambiguous-writes --d1-exact-write)
 for endpoint_url in "${workload_endpoint_urls[@]}"; do bench_args+=(--endpoint "$endpoint_url"); done
 [ -z "$target_rate" ] || bench_args+=(--target-rate "$target_rate")
 case "$fault" in

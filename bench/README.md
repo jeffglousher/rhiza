@@ -30,6 +30,14 @@ cargo run --release --manifest-path bench/Cargo.toml -- \
 
 Durations accept `ms`, `s`, `m`, and `h` suffixes; a bare value means seconds. The default duration is `30s`, warmup is `5s`, concurrency is `1`, request timeout is `10s`, and fault-command timeout is `5m` (`--fault-timeout`).
 
+For single-Service chaos qualification, pass `--retry-ambiguous-writes
+--d1-exact-write`. Retryable 429/502/503/504 and transport outcomes then retry
+the exact SQL mutation body and request ID with bounded backoff, while D1
+verifies the final read-barrier ledger and rejects duplicate or missing rows.
+The logical retry budget defaults to 60 seconds and is configurable with
+`--ambiguous-write-retry-timeout`; each HTTP attempt remains capped by
+`--request-timeout` and the remaining logical budget.
+
 ## Workloads
 
 - `read`: sends `SELECT request_id, value FROM <table> WHERE request_id = ?` to `/v1/sql/query`.

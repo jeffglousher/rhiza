@@ -4,14 +4,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
+consumer_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 
 cd "$repo_root"
 rm -rf target/package
 cargo package \
   -p rhiza-core \
-  -p rhiza-log \
-  -p rhiza-obj-store \
-  -p rhiza-archive \
   -p rhiza-quepaxa \
   --no-verify "$@"
 
@@ -54,20 +52,11 @@ archive_root() {
 }
 
 core_archive="$(find_package_archive rhiza-core)"
-log_archive="$(find_package_archive rhiza-log)"
-obj_store_archive="$(find_package_archive rhiza-obj-store)"
-archive_archive="$(find_package_archive rhiza-archive)"
 quepaxa_archive="$(find_package_archive rhiza-quepaxa)"
 core_root="$(archive_root "$core_archive")"
-log_root="$(archive_root "$log_archive")"
-obj_store_root="$(archive_root "$obj_store_archive")"
-archive_root_dir="$(archive_root "$archive_archive")"
 quepaxa_root="$(archive_root "$quepaxa_archive")"
 
 tar -xzf "$core_archive" -C "$work_dir"
-tar -xzf "$log_archive" -C "$work_dir"
-tar -xzf "$obj_store_archive" -C "$work_dir"
-tar -xzf "$archive_archive" -C "$work_dir"
 tar -xzf "$quepaxa_archive" -C "$work_dir"
 
 mkdir -p "$work_dir/consumer/src"
@@ -82,9 +71,6 @@ rhiza-quepaxa = { path = "$work_dir/$quepaxa_root" }
 
 [patch.crates-io]
 rhiza-core = { path = "$work_dir/$core_root" }
-rhiza-log = { path = "$work_dir/$log_root" }
-rhiza-obj-store = { path = "$work_dir/$obj_store_root" }
-rhiza-archive = { path = "$work_dir/$archive_root_dir" }
 EOF
 
 cat >"$work_dir/consumer/src/main.rs" <<'EOF'
@@ -98,4 +84,9 @@ fn main() {
 }
 EOF
 
-cargo run --quiet --manifest-path "$work_dir/consumer/Cargo.toml"
+# The extracted package sources must remain outside the workspace, but their
+# build artifacts need not be duplicated in the system temporary volume. Reuse
+# the caller's Cargo target so the full local CI gate has one bounded build
+# cache instead of compiling the dependency graph into a second multi-GiB tree.
+CARGO_TARGET_DIR="$consumer_target_dir" \
+  cargo test --quiet --manifest-path "$work_dir/consumer/Cargo.toml" --all-targets

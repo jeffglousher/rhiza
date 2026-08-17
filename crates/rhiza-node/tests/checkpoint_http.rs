@@ -75,7 +75,7 @@ async fn sync_retry_returns_original_outcome_after_archive_recovers() {
     assert_client_error(
         first,
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "write_timeout",
+        "ambiguous_mutation",
         true,
         None,
     )
@@ -167,7 +167,7 @@ async fn disconnected_sync_write_finishes_checkpoint_after_archive_recovers() {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"checkpoint-http-test"]),
+            checkpoint_configuration_digest(&archive_root),
             1,
         ),
     );
@@ -802,12 +802,27 @@ async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"checkpoint-http-test"]),
+            checkpoint_configuration_digest(root),
             1,
         ),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive
+}
+
+fn checkpoint_configuration_digest(root: &Path) -> LogHash {
+    NodeConfig::new(
+        "rhiza:sql:cluster-a",
+        "node-1",
+        root.join("identity-only"),
+        1,
+        1,
+        peers(),
+        "client-token",
+    )
+    .unwrap()
+    .log_initial_configuration()
+    .digest()
 }
 
 fn runtime(data_dir: &Path) -> Arc<NodeRuntime> {

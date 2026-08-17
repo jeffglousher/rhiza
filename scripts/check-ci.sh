@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+required_commands=(cargo rustup yq)
+for command_name in "${required_commands[@]}"; do
+  command -v "$command_name" >/dev/null 2>&1 || {
+    echo "required CI tool is missing: $command_name" >&2
+    exit 69
+  }
+done
+
+packages=(
+  rhiza-core rhiza-log rhiza-obj-store rhiza-quepaxa rhiza-archive
+  rhiza-sql rhiza-graph rhiza-kv rhiza-node rhizadb rhiza-client
+  rhiza-cli rhiza-tuner
+)
+package_args=()
+for package in "${packages[@]}"; do
+  package_args+=(-p "$package")
+done
+
+run() {
+  printf '+ '
+  printf '%q ' "$@"
+  printf '\n'
+  "$@"
+}
+
+run cargo fmt --all -- --check
+run rustup target add --toolchain stable x86_64-pc-windows-msvc
+stable_rustc_path="$(rustup which --toolchain stable rustc)"
+run mkdir -p target
+run "$stable_rustc_path" --edition=2024 --crate-type=lib \
+  --target=x86_64-pc-windows-msvc scripts/check-anchored-fs-portable.rs \
+  -o target/check-anchored-fs-portable.rlib
+run cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc
+run scripts/e2e-fast.sh
+run cargo clippy --locked --all-targets "${package_args[@]}" -- -D warnings
+run cargo test --locked --all-targets "${package_args[@]}"
+run cargo test --locked -p rhiza-node --features graph --lib -- \
+  graph_write_retries_the_same_request_after_unknown_recorder_outcome \
+  materialize_recovers_a_transient_inspection_unknown_without_latching \
+  read_barrier_recovers_a_transient_inspection_unknown_without_latching \
+  background_materializer_survives_a_transient_unknown_and_applies_later
+run cargo test --locked -p rhiza-node --features graph --test graph_runtime \
+  http_read_barrier_recovers_after_a_transient_ambiguous_inspection
+
+for feature in shadow proposer-canary hedge-canary default-on; do
+  run cargo test --locked -p rhiza-tuner --no-default-features --features "$feature" \
+    rollout::tests::legacy_feature_default_is_preserved --lib
+done
+
+# Profile-only builds must compile without the SQL default. Feature-gated
+# variants (e.g. NodeError::RequestConflict) otherwise hide behind the SQL
+# feature and only fail in the graph/kv container profiles.
+for profile_feature in graph kv graph,kv; do
+  run cargo check --locked -p rhiza-node --no-default-features --features "$profile_feature"
+done
+for profile_feature in graph kv; do
+  run cargo check --locked -p rhiza-client --no-default-features --features "$profile_feature"
+  run cargo check --locked -p rhiza-cli --no-default-features --features "$profile_feature"
+done
+
+# Clippy with -D warnings must also pass per profile; cargo check alone misses
+# unreachable-pattern lint failures on profile-only builds.
+for profile_feature in graph kv graph,kv; do
+  run cargo clippy --locked -p rhiza-cli --all-targets \
+    --no-default-features --features "$profile_feature,recorder-postcard-rpc" \
+    -- -D warnings
+done
+
+run cargo test --locked -p rhiza-quepaxa --features test-hooks
+run cargo fmt --manifest-path bench/Cargo.toml -- --check
+run cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
+run cargo test --manifest-path bench/Cargo.toml --locked --all-targets
+run cargo fmt --manifest-path bench/hiqlite-recovery-client/Cargo.toml -- --check
+run cargo clippy --manifest-path bench/hiqlite-recovery-client/Cargo.toml --locked --all-targets -- -D warnings
+run cargo test --manifest-path bench/hiqlite-recovery-client/Cargo.toml --locked --all-targets
+
+run bash -n \
+  scripts/bench-vind.sh \
+  scripts/bench-rhiza-hiqlite.sh \
+  scripts/bench-rhiza-hiqlite-steady.sh \
+  scripts/bench-hiqlite-steady.sh \
+  scripts/bench-power-loss-durability.sh \
+  scripts/chaos-k8s.sh \
+  scripts/chaos-vm-loss.sh \
+  scripts/check-bench-rhiza-hiqlite-static.sh \
+  scripts/check-bench-rhiza-hiqlite-steady-static.sh \
+  scripts/check-power-loss-durability-static.sh \
+  scripts/check-chaos-static.sh \
+  scripts/check-e2e-recovery-matrix-static.sh \
+  scripts/tuner-monitor.sh \
+  scripts/check-tuner-monitor-static.sh \
+  scripts/e2e-fast.sh \
+  scripts/check-workspace-packages.sh \
+  scripts/check-quepaxa-package.sh \
+  scripts/check-ci.sh
+
+run scripts/check-bench-vind-static.sh
+run scripts/check-bench-rhiza-hiqlite-static.sh
+run scripts/check-bench-rhiza-hiqlite-steady-static.sh --fixture
+run scripts/check-power-loss-durability-static.sh
+run scripts/check-chaos-static.sh
+run scripts/check-storage-format-compatibility.sh
+run scripts/check-tuner-monitor-static.sh
+run scripts/check-deploy.sh
+run scripts/check-e2e-recovery-matrix-static.sh
+run scripts/check-workspace-packages.sh
+if git diff --quiet --ignore-submodules -- && git diff --cached --quiet --ignore-submodules --; then
+  run scripts/check-quepaxa-package.sh
+else
+  # Local pre-commit verification must package the exact working tree under test.
+  # CI remains clean and therefore exercises cargo package's normal clean-tree guard.
+  run scripts/check-quepaxa-package.sh --allow-dirty
+fi

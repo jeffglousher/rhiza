@@ -50,8 +50,10 @@ impl ErrorClassification {
             "unauthorized" => ErrorCategory::Authentication,
             "request_conflict" | "precondition_failed" => ErrorCategory::Conflict,
             "unavailable"
+            | "ambiguous_mutation"
             | "durability_unavailable"
             | "write_timeout"
+            | "write_outcome_unknown"
             | "writes_unavailable"
             | "configuration_transition"
             | "contention"
@@ -155,6 +157,73 @@ impl LogAnchor {
 
     pub const fn hash(&self) -> LogHash {
         self.hash
+    }
+}
+
+/// In-memory checkpoint evidence that authorizes Recorder effect-bundle GC.
+///
+/// This is deliberately not serialized: durable publication authority remains
+/// the archive's checkpoint-publication receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointGcAnchor {
+    cluster_id: ClusterId,
+    epoch: Epoch,
+    config_id: ConfigId,
+    config_digest: LogHash,
+    tip: LogAnchor,
+    manifest_digest: LogHash,
+}
+
+impl CheckpointGcAnchor {
+    pub fn new(
+        cluster_id: impl Into<ClusterId>,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        tip: LogAnchor,
+        manifest_digest: LogHash,
+    ) -> Option<Self> {
+        let cluster_id = cluster_id.into();
+        if cluster_id.is_empty()
+            || config_digest == LogHash::ZERO
+            || tip.index() == 0
+            || tip.hash() == LogHash::ZERO
+            || manifest_digest == LogHash::ZERO
+        {
+            return None;
+        }
+        Some(Self {
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            tip,
+            manifest_digest,
+        })
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    pub const fn config_id(&self) -> ConfigId {
+        self.config_id
+    }
+
+    pub const fn config_digest(&self) -> LogHash {
+        self.config_digest
+    }
+
+    pub const fn tip(&self) -> LogAnchor {
+        self.tip
+    }
+
+    pub const fn manifest_digest(&self) -> LogHash {
+        self.manifest_digest
     }
 }
 
@@ -1928,10 +1997,10 @@ impl Snapshot {
 mod tests {
     use super::{
         read_config_hash, read_config_hash_at, read_config_string, read_config_u16,
-        read_config_u64, read_config_u64_at, CommandEnvelopeError, ConfigChangeDecodeError,
-        ErrorCategory, ErrorClassification, ExecutionProfile, ExecutionProfileParseError,
-        ExternalEffectCommand, ExternalEffectCommandError, ReplicatedCommandEnvelope,
-        MAX_EXTERNAL_EFFECT_COMMAND_BYTES,
+        read_config_u64, read_config_u64_at, CheckpointGcAnchor, CommandEnvelopeError,
+        ConfigChangeDecodeError, ErrorCategory, ErrorClassification, ExecutionProfile,
+        ExecutionProfileParseError, ExternalEffectCommand, ExternalEffectCommandError, LogAnchor,
+        LogHash, ReplicatedCommandEnvelope, MAX_EXTERNAL_EFFECT_COMMAND_BYTES,
     };
 
     #[test]
@@ -1944,8 +2013,10 @@ mod tests {
             ("request_conflict", ErrorCategory::Conflict, false),
             ("precondition_failed", ErrorCategory::Conflict, false),
             ("unavailable", ErrorCategory::Unavailable, true),
+            ("ambiguous_mutation", ErrorCategory::Unavailable, true),
             ("durability_unavailable", ErrorCategory::Unavailable, true),
             ("write_timeout", ErrorCategory::Unavailable, true),
+            ("write_outcome_unknown", ErrorCategory::Unavailable, true),
             ("writes_unavailable", ErrorCategory::Unavailable, true),
             ("configuration_transition", ErrorCategory::Unavailable, true),
             ("contention", ErrorCategory::Unavailable, true),
@@ -1973,6 +2044,34 @@ mod tests {
             assert_eq!(classification.category(), category);
             assert_eq!(classification.retryable(), retryable);
         }
+    }
+
+    #[test]
+    fn checkpoint_gc_anchor_rejects_incomplete_evidence() {
+        let digest = LogHash::digest(&[b"digest"]);
+        let tip = LogAnchor::new(1, LogHash::digest(&[b"tip"]));
+        assert!(CheckpointGcAnchor::new("cluster", 1, 1, digest, tip, digest).is_some());
+        assert!(CheckpointGcAnchor::new("", 1, 1, digest, tip, digest).is_none());
+        assert!(CheckpointGcAnchor::new("cluster", 1, 1, LogHash::ZERO, tip, digest).is_none());
+        assert!(CheckpointGcAnchor::new(
+            "cluster",
+            1,
+            1,
+            digest,
+            LogAnchor::new(0, tip.hash()),
+            digest,
+        )
+        .is_none());
+        assert!(CheckpointGcAnchor::new(
+            "cluster",
+            1,
+            1,
+            digest,
+            LogAnchor::new(1, LogHash::ZERO),
+            digest,
+        )
+        .is_none());
+        assert!(CheckpointGcAnchor::new("cluster", 1, 1, digest, tip, LogHash::ZERO).is_none());
     }
 
     #[test]

@@ -2071,6 +2071,7 @@ dependencies = [
 name = "rhiza-log"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "rhiza-core",
 ]
 
@@ -2080,6 +2081,7 @@ version = "0.4.0"
 dependencies = [
  "axum",
  "http-body",
+ "libc",
  "postcard",
  "postcard-rpc",
  "reqwest",
@@ -2115,7 +2117,7 @@ name = "rhiza-quepaxa"
 version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
- "rhiza-archive",
+ "libc",
  "rhiza-core",
  "serde",
 ]

@@ -711,18 +711,17 @@ async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
         }),
     )
     .await;
-    assert_eq!(conflict.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        conflict.json::<ClientErrorResponse>().await.unwrap().code,
-        "invalid_request"
-    );
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    let conflict = conflict.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(conflict.code, "request_conflict");
+    assert!(!conflict.retryable);
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
     server.abort();
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_original_outcome() {
+async fn kv_sync_checkpoint_outage_reports_unknown_and_retries_original_outcome() {
     let _lock = kv_runtime_test_lock();
     let root = tempfile::tempdir().unwrap();
     let archive_root = root.path().join("archive");
@@ -746,10 +745,11 @@ async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_origi
             .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let server_runtime = Arc::clone(&runtime);
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            node_router_with_checkpoint_and_limits(runtime, recorder, coordinator, 1, 8),
+            node_router_with_checkpoint_and_limits(server_runtime, recorder, coordinator, 1, 8),
         )
         .await
         .unwrap();
@@ -766,10 +766,9 @@ async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_origi
     let first = post_kv_put(&client, addr, &body).await;
 
     assert_eq!(first.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        first.json::<ClientErrorResponse>().await.unwrap().code,
-        "write_timeout"
-    );
+    let first = first.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(first.code, "ambiguous_mutation");
+    assert!(first.retryable);
     let read = client
         .post(format!("http://{addr}{KV_GET_PATH}"))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
@@ -794,6 +793,28 @@ async fn kv_sync_checkpoint_outage_times_out_releases_capacity_and_retries_origi
     assert_eq!(
         retry.result,
         rhiza_node::KvMutationResultDto::Put { replaced: false }
+    );
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(retry.applied_index)
+    );
+    let conflict = post_kv_put(
+        &client,
+        addr,
+        &serde_json::json!({
+            "request_id": "request-1",
+            "key": "a2V5",
+            "value": "Y2hhbmdlZA=="
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    let conflict = conflict.json::<ClientErrorResponse>().await.unwrap();
+    assert_eq!(conflict.code, "request_conflict");
+    assert!(!conflict.retryable);
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(retry.applied_index)
     );
     server.abort();
 }

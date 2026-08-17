@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Barrier, Mutex,
+        mpsc, Arc, Barrier, Condvar, Mutex,
     },
     thread,
     time::Duration,
@@ -20,6 +20,8 @@ const EPOCH: u64 = 1;
 const CONFIG_ID: u64 = 1;
 const SLOT: u64 = 1;
 const REORDER_PROBE_SLOT: u64 = 2;
+const PROPOSER_A: &str = "n0";
+const PROPOSER_B: &str = "conflicting-proposer-b";
 
 #[derive(Debug)]
 struct SeededPriority(u64);
@@ -49,16 +51,69 @@ struct FaultCounts {
     reordered_stale: AtomicUsize,
 }
 
+struct CollisionGate {
+    expected: [&'static str; 2],
+    seen: Mutex<BTreeSet<String>>,
+    changed: Condvar,
+}
+
+impl CollisionGate {
+    fn new(expected: [&'static str; 2]) -> Self {
+        Self {
+            expected,
+            seen: Mutex::new(BTreeSet::new()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait_for_pair(&self, request: &RecordRequest) {
+        if request.slot != SLOT
+            || !self
+                .expected
+                .contains(&request.proposal.proposer_id.as_str())
+        {
+            return;
+        }
+        let mut seen = self.seen.lock().expect("collision gate lock poisoned");
+        seen.insert(request.proposal.proposer_id.clone());
+        if self.observed_pair(&seen) {
+            self.changed.notify_all();
+            return;
+        }
+        while !self.observed_pair(&seen) {
+            seen = self
+                .changed
+                .wait(seen)
+                .expect("collision gate wait poisoned");
+        }
+    }
+
+    fn observed(&self) -> bool {
+        self.observed_pair(&self.seen.lock().expect("collision gate lock poisoned"))
+    }
+
+    fn observed_pair(&self, seen: &BTreeSet<String>) -> bool {
+        self.expected
+            .iter()
+            .all(|proposer| seen.contains(*proposer))
+    }
+}
+
 #[derive(Clone)]
 struct AdversarialRecorder {
     store: RecorderFileStore,
     previous: Arc<Mutex<BTreeMap<u64, RecordRequest>>>,
     broadcast: Arc<Barrier>,
+    collision: Arc<CollisionGate>,
     counts: Arc<FaultCounts>,
 }
 
 impl AdversarialRecorder {
     fn deliver(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+        let mut previous = self
+            .previous
+            .lock()
+            .expect("adversarial schedule lock poisoned");
         let current = self.store.record(request.clone())?;
         let duplicate = self.store.record(request.clone())?;
         assert_eq!(
@@ -97,12 +152,10 @@ impl AdversarialRecorder {
         }
         self.counts.duplicated.fetch_add(1, Ordering::Relaxed);
 
-        let previous = self
-            .previous
-            .lock()
-            .expect("adversarial schedule lock poisoned")
-            .insert(request.slot, request.clone());
-        if let Some(stale) = previous.filter(|stale| stale.step < request.step) {
+        if let Some(stale) = previous
+            .insert(request.slot, request.clone())
+            .filter(|stale| stale.step < request.step)
+        {
             let replayed = self.store.record(stale)?;
             assert_eq!(
                 replayed.step, current.step,
@@ -157,6 +210,7 @@ impl RecorderRpc for AdversarialRecorder {
         _context: &rhiza_quepaxa::RecorderRpcContext,
         request: RecordRequest,
     ) -> Result<RecordSummary, Error> {
+        self.collision.wait_for_pair(&request);
         self.broadcast.wait();
         self.deliver(request)
     }
@@ -225,10 +279,19 @@ impl RecorderRpc for DroppedRecorder {
 
 #[test]
 fn seeded_fault_schedules_preserve_agreement_and_certified_recovery() {
+    run_membership_cases([PROPOSER_A, PROPOSER_B], false);
+}
+
+#[test]
+fn concurrent_nonpreferred_proposals_recover_phase2_proofs() {
+    run_membership_cases(["n1", PROPOSER_B], true);
+}
+
+fn run_membership_cases(proposers: [&'static str; 2], expect_phase2: bool) {
     for members in [3, 5, 7] {
         let (completed, watchdog) = mpsc::channel();
         let run = thread::spawn(move || {
-            run_membership_case(members);
+            run_membership_case(members, proposers, expect_phase2);
             completed.send(()).expect("watchdog receiver dropped");
         });
 
@@ -244,12 +307,18 @@ fn seeded_fault_schedules_preserve_agreement_and_certified_recovery() {
     }
 }
 
-fn run_membership_case(member_count: usize) {
+fn run_membership_case(member_count: usize, proposers: [&'static str; 2], expect_phase2: bool) {
     let root = tempfile::tempdir().expect("temporary recorder root");
     let ids: Vec<_> = (0..member_count).map(|index| format!("n{index}")).collect();
+    if expect_phase2 {
+        assert_ne!(proposers[0], ids[0]);
+        assert_ne!(proposers[1], ids[0]);
+        assert_ne!(proposers[0], proposers[1]);
+    }
     let membership = Membership::from_voters(ids.iter().cloned()).expect("valid membership");
     let quorum = membership.quorum_size();
     let broadcast = Arc::new(Barrier::new(member_count));
+    let collision = Arc::new(CollisionGate::new(proposers));
     let counts = Arc::new(FaultCounts::default());
     let stores: Vec<_> = ids
         .iter()
@@ -273,6 +342,7 @@ fn run_membership_case(member_count: usize) {
             store,
             previous: Arc::new(Mutex::new(BTreeMap::new())),
             broadcast: Arc::clone(&broadcast),
+            collision: Arc::clone(&collision),
             counts: Arc::clone(&counts),
         })
         .collect();
@@ -287,7 +357,7 @@ fn run_membership_case(member_count: usize) {
         quorum,
         Arc::clone(&broadcast),
         Arc::clone(&counts),
-        "n0",
+        proposers[0],
     );
     let proposer_b = consensus(
         &ids,
@@ -295,29 +365,50 @@ fn run_membership_case(member_count: usize) {
         quorum,
         Arc::clone(&broadcast),
         Arc::clone(&counts),
-        "conflicting-proposer-b",
+        proposers[1],
     );
 
-    let committed = proposer_a
-        .propose_at(
-            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
-            SLOT,
-            LogHash::ZERO,
-            Command::new(CommandKind::Deterministic, b"command-a".to_vec()),
-        )
-        .expect("proposer A commits");
-    let adopted = proposer_b
-        .propose_at(
-            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
-            SLOT,
-            LogHash::ZERO,
-            Command::new(
-                CommandKind::Deterministic,
-                b"conflicting-command-b".to_vec(),
-            ),
-        )
-        .expect("proposer B adopts the decided value");
-    assert_eq!(adopted, committed);
+    let proposer_a = Arc::new(proposer_a);
+    let proposer_b = Arc::new(proposer_b);
+    let start = Arc::new(Barrier::new(3));
+    let caller_a = {
+        let proposer = Arc::clone(&proposer_a);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            proposer.propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                SLOT,
+                LogHash::ZERO,
+                Command::new(CommandKind::Deterministic, b"command-a".to_vec()),
+            )
+        })
+    };
+    let caller_b = {
+        let proposer = Arc::clone(&proposer_b);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            proposer.propose_at(
+                rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                SLOT,
+                LogHash::ZERO,
+                Command::new(
+                    CommandKind::Deterministic,
+                    b"conflicting-command-b".to_vec(),
+                ),
+            )
+        })
+    };
+    start.wait();
+    let outcomes = [
+        caller_a.join().expect("proposer A caller panicked"),
+        caller_b.join().expect("proposer B caller panicked"),
+    ];
+    assert!(
+        collision.observed(),
+        "both conflicting proposers must reach Record before either may proceed"
+    );
 
     assert!(
         proposer_a.finish_pending_rpcs(Duration::from_secs(5)),
@@ -373,10 +464,24 @@ fn run_membership_case(member_count: usize) {
         )
         .expect("inspect reopened recorders")
     {
-        CertifiedDecisionInspection::Committed(certified) => certified.entry,
+        CertifiedDecisionInspection::Committed(certified) => {
+            if expect_phase2 {
+                assert!(matches!(
+                    certified.proof,
+                    DecisionProof::Phase2 { step, .. } if step % 4 == 2
+                ));
+            }
+            certified.entry
+        }
         other => panic!("expected certified recovery, got {other:?}"),
     };
-    assert_eq!(recovered, committed);
+    for outcome in outcomes {
+        match outcome {
+            Ok(entry) => assert_eq!(entry, recovered),
+            Err(Error::UnknownOutcome) => {}
+            Err(error) => panic!("concurrent conflicting proposal failed: {error:?}"),
+        }
+    }
 
     assert!(
         counts.duplicated.load(Ordering::Relaxed) >= quorum * 4,

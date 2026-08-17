@@ -41,6 +41,11 @@ The protected registry workflow publishes the engine dependency crates before
 `examples/basic-app-server` are not crates.io products; the CLI is distributed
 as profile-specific GitHub Release binaries and OCI images.
 
+The pre-publication boundary is documented in the
+[public API and wire baseline](docs/public-api-compatibility.md) and the single
+[persisted-format matrix](docs/storage-format-compatibility.md). Current
+adjacent N/N+1 compatibility is not implemented.
+
 ## Runtime Profiles and Deployment
 
 SQL remains the default. Build an isolated SQL, Graph, or KV image and set the
@@ -675,6 +680,15 @@ scripts/replace-k8s-config.sh config-c1.json config-c2-draft.json
 The live-admin routes share the client listener but have a distinct bearer
 token and operation contract. Defaults are under `/v1/admin`; path variables on
 the script allow a staged API rename without weakening response validation.
+Every mutating request must carry a globally unique operation ID that is never
+reused, even after node rebuild or the bounded local replay record expires or
+is evicted. An exact retry is safe while that record remains present; reuse
+after eviction is undetectable. Callers must therefore retain the original ID
+and payload across an ambiguous response, and must satisfy each route's
+configuration, generation, and root preconditions before retrying. A process
+crash may leave a durably completed mutation whose local replay result was not
+committed, so the caller must resolve that ambiguity from authoritative status
+before issuing a different operation.
 Every Job has an active deadline and `backoffLimit: 0`. Poll loops are bounded;
 elapsed time and sleeps never establish correctness. Only observed node,
 checkpoint, StatefulSet, and object-store state advances the workflow. Any
@@ -706,6 +720,20 @@ objects by prefix or bypass the plan evidence: manifests, snapshots, suffixes,
 and a concurrently referenced old generation can otherwise be lost.
 
 ## Vind E2E
+
+For the normal edit/test loop, run the process-level fast E2E first:
+
+```bash
+scripts/e2e-fast.sh
+```
+
+It runs three real local Recorder servers over postcard-rpc/TCP, performs an
+idempotent write through the public client path, checks retryable Recorder
+`UnknownOutcome`, and verifies that a voter behind a compacted shared
+checkpoint exits so orchestration can rejoin it from the verified snapshot.
+It has a 90-second cold-cache budget and normally completes much faster with a
+warm Cargo target. It intentionally does not build an image or claim
+Kubernetes, GCS, or Chaos Mesh qualification.
 
 The local harness requires Docker, `kubectl`, `vcluster` (vind), `jq`, `yq`, and
 OpenSSL:

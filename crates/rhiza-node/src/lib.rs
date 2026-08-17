@@ -78,9 +78,9 @@ use rhiza_quepaxa::{EffectBundleFinalizeRequest, RecorderEffectBundle};
 #[cfg(feature = "sql")]
 use rhiza_sql::{
     encode_put_request, encode_sql_command, restore_snapshot_file, QwalEffectManifestV4,
-    RecoverySnapshot, RequestConflict, RequestOutcome, SqlBatchMember, SqlCommand,
-    SqlCommandResult, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
-    VerifiedQwalEffectBundleV4, MAX_QWAL_V3_RECEIPTS, MAX_SQL_STATEMENTS,
+    RecoverySnapshot, RequestOutcome, SqlBatchMember, SqlCommand, SqlCommandResult, SqlQueryResult,
+    SqlStatement, SqlValue, SqliteStateMachine, VerifiedQwalEffectBundleV4, MAX_QWAL_V3_RECEIPTS,
+    MAX_SQL_STATEMENTS,
 };
 #[cfg(not(feature = "sql"))]
 type SqlCommandResult = ();
@@ -2613,12 +2613,17 @@ impl HttpRecorderClient {
         let outcome = loop {
             match context.check() {
                 Ok(()) => {}
-                Err(_) if mutating => return Err(rhiza_quepaxa::Error::UnknownOutcome),
+                Err(rhiza_quepaxa::Error::RpcCancelled) if mutating => {
+                    return Err(http_mutation_unknown("http_context_cancelled"));
+                }
+                Err(rhiza_quepaxa::Error::RpcDeadlineExceeded) if mutating => {
+                    return Err(http_mutation_unknown("http_context_deadline"));
+                }
                 Err(error) => return Err(error),
             }
             let Some(remaining) = context.remaining() else {
                 return Err(if mutating {
-                    rhiza_quepaxa::Error::UnknownOutcome
+                    http_mutation_unknown("http_context_deadline")
                 } else {
                     rhiza_quepaxa::Error::RpcDeadlineExceeded
                 });
@@ -2628,7 +2633,7 @@ impl HttpRecorderClient {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(if mutating {
-                        rhiza_quepaxa::Error::UnknownOutcome
+                        http_mutation_unknown("http_worker_disconnect")
                     } else {
                         rhiza_quepaxa::Error::Io("recorder HTTP worker closed".into())
                     });
@@ -2646,14 +2651,14 @@ impl HttpRecorderClient {
             }
             HttpCall::Transport(error) => {
                 return Err(if mutating {
-                    rhiza_quepaxa::Error::UnknownOutcome
+                    http_mutation_unknown("http_transport")
                 } else {
                     rhiza_quepaxa::Error::Io(error)
                 });
             }
             HttpCall::Decode(error) => {
                 return Err(if mutating {
-                    rhiza_quepaxa::Error::UnknownOutcome
+                    http_mutation_unknown("http_decode_or_envelope")
                 } else {
                     rhiza_quepaxa::Error::Decode(error)
                 });
@@ -2661,18 +2666,11 @@ impl HttpRecorderClient {
         };
         if wire.version != RECORDER_WIRE_VERSION {
             return Err(if mutating {
-                rhiza_quepaxa::Error::UnknownOutcome
+                http_mutation_unknown("http_decode_or_envelope")
             } else {
                 rhiza_quepaxa::Error::Decode("recorder wire version mismatch".into())
             });
         }
-        let envelope_mismatch = || {
-            if mutating {
-                rhiza_quepaxa::Error::UnknownOutcome
-            } else {
-                rhiza_quepaxa::Error::Decode("recorder HTTP status/envelope mismatch".into())
-            }
-        };
         let result = match wire.body {
             RecorderV2Result::Ok(value) if status == StatusCode::OK => Ok(value),
             RecorderV2Result::Rejected(reason) if status == StatusCode::CONFLICT => {
@@ -2690,14 +2688,29 @@ impl HttpRecorderClient {
             {
                 Err(recorder_error_from_wire(error))
             }
-            _ => Err(envelope_mismatch()),
+            _ if mutating => return Err(http_mutation_unknown("http_decode_or_envelope")),
+            _ => Err(rhiza_quepaxa::Error::Decode(
+                "recorder HTTP status/envelope mismatch".into(),
+            )),
         };
         if mutating {
-            result.map_err(preserve_mutation_outcome)
+            result.map_err(|error| {
+                let error = preserve_mutation_outcome(error);
+                if matches!(error, rhiza_quepaxa::Error::UnknownOutcome) {
+                    http_mutation_unknown("http_server_wire")
+                } else {
+                    error
+                }
+            })
         } else {
             result
         }
     }
+}
+
+fn http_mutation_unknown(source: &'static str) -> rhiza_quepaxa::Error {
+    eprintln!("node recorder unknown outcome source={source} mutating=true");
+    rhiza_quepaxa::Error::UnknownOutcome
 }
 
 impl RecorderRpc for HttpRecorderClient {
@@ -3654,9 +3667,24 @@ fn classify_pending_request(
     if members[canonical].payload == members[index].payload {
         Ok(Some(canonical))
     } else {
-        Err(NodeError::InvalidRequest(format!(
-            "request id {request_id:?} was reused with another command in the same writer batch"
-        )))
+        match &members[index].operation {
+            #[cfg(feature = "graph")]
+            QueuedOperation::Graph(_) => Err(NodeError::GraphRequestConflict {
+                request_id: request_id.to_owned(),
+                original: None,
+            }),
+            #[cfg(feature = "kv")]
+            QueuedOperation::Kv(_) => Err(NodeError::KvRequestConflict {
+                request_id: request_id.to_owned(),
+            }),
+            // SQL members cannot appear in the graph/kv batch paths; this
+            // arm exists only for SQL-enabled builds where the enum has more
+            // variants than the two profiled ones.
+            #[cfg(feature = "sql")]
+            _ => Err(NodeError::InvalidRequest(
+                "request id reused with another command in the same writer batch".into(),
+            )),
+        }
     }
 }
 
@@ -5212,13 +5240,11 @@ async fn coordinate_write(
             "durability confirmation is unavailable",
             None,
         ),
-        Err(_) => client_error_response(
+        Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "write_timeout",
-            true,
-            "write did not complete before the response deadline",
-            None,
-        ),
+            Json(ClientErrorResponse::ambiguous_mutation()),
+        )
+            .into_response(),
     }
 }
 
@@ -6171,9 +6197,15 @@ fn node_error_response(error: NodeError) -> Response {
         } => (StatusCode::BAD_REQUEST, Some(*statement_index)),
         #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, None),
+        #[cfg(feature = "graph")]
+        NodeError::GraphRequestConflict { .. } => (StatusCode::CONFLICT, None),
+        #[cfg(feature = "kv")]
+        NodeError::KvRequestConflict { .. } => (StatusCode::CONFLICT, None),
         NodeError::PreconditionFailed(_) => (StatusCode::CONFLICT, None),
-        NodeError::SnapshotRequired(_)
+        NodeError::AmbiguousMutation
+        | NodeError::SnapshotRequired(_)
         | NodeError::Unavailable(_)
+        | NodeError::OutcomeUnknown(_)
         | NodeError::StartupCancelled { .. }
         | NodeError::ResourceExhausted(_)
         | NodeError::ConfigurationTransition { .. }
@@ -6200,12 +6232,15 @@ fn node_error_response(error: NodeError) -> Response {
         status,
         classification.code(),
         classification.retryable(),
-        node_error_message(status),
+        node_error_message(&error, status),
         statement_index,
     )
 }
 
-fn node_error_message(status: StatusCode) -> &'static str {
+fn node_error_message(error: &NodeError, status: StatusCode) -> &'static str {
+    if matches!(error, NodeError::AmbiguousMutation) {
+        return AMBIGUOUS_MUTATION_MESSAGE;
+    }
     match status {
         StatusCode::BAD_REQUEST => "request could not be processed",
         StatusCode::CONFLICT => "request conflicts with current state",
@@ -7171,6 +7206,7 @@ pub enum NodeError {
     SnapshotRequired(Box<RecoveryAnchor>),
     Storage(String),
     Reconciliation(String),
+    OutcomeUnknown(String),
     Invariant(String),
     Unavailable(String),
     StartupCancelled {
@@ -7184,7 +7220,16 @@ pub enum NodeError {
     Contention(String),
     WinnerLimitExceeded,
     #[cfg(feature = "sql")]
-    RequestConflict(RequestConflict),
+    RequestConflict(rhiza_sql::RequestConflict),
+    #[cfg(feature = "graph")]
+    GraphRequestConflict {
+        request_id: String,
+        original: Option<LogAnchor>,
+    },
+    #[cfg(feature = "kv")]
+    KvRequestConflict {
+        request_id: String,
+    },
     InvalidRequest(String),
     #[cfg(feature = "sql")]
     InvalidSqlStatement {
@@ -7192,7 +7237,15 @@ pub enum NodeError {
         message: String,
     },
     PreconditionFailed(String),
+    AmbiguousMutation,
     Fatal(String),
+}
+
+const AMBIGUOUS_MUTATION_MESSAGE: &str =
+    "mutation outcome is ambiguous; retry only the identical request_id and payload";
+
+fn ambiguous_mutation_error() -> NodeError {
+    NodeError::AmbiguousMutation
 }
 
 impl fmt::Display for NodeError {
@@ -7218,6 +7271,7 @@ impl fmt::Display for NodeError {
             ),
             Self::Storage(message) => write!(f, "node storage failed: {message}"),
             Self::Reconciliation(message) => write!(f, "node reconciliation failed: {message}"),
+            Self::OutcomeUnknown(message) => write!(f, "write outcome is unknown: {message}"),
             Self::Invariant(message) => write!(f, "node invariant failed: {message}"),
             Self::Unavailable(message) => write!(f, "node unavailable: {message}"),
             Self::StartupCancelled { stage, .. } => {
@@ -7234,6 +7288,27 @@ impl fmt::Display for NodeError {
             Self::WinnerLimitExceeded => write!(f, "foreign winner retry limit exceeded"),
             #[cfg(feature = "sql")]
             Self::RequestConflict(conflict) => conflict.fmt(f),
+            #[cfg(feature = "graph")]
+            Self::GraphRequestConflict {
+                request_id,
+                original,
+            } => match original {
+                Some(anchor) => write!(
+                    f,
+                    "request id reused with a different graph command: {request_id} \
+                     (original qlog {}/{})",
+                    anchor.index(),
+                    anchor.hash().to_hex(),
+                ),
+                None => write!(
+                    f,
+                    "request id reused with a different graph command: {request_id}"
+                ),
+            },
+            #[cfg(feature = "kv")]
+            Self::KvRequestConflict { request_id } => {
+                write!(f, "request id reused with another kv command: {request_id}")
+            }
             Self::InvalidRequest(message) => write!(f, "invalid request: {message}"),
             #[cfg(feature = "sql")]
             Self::InvalidSqlStatement {
@@ -7244,6 +7319,7 @@ impl fmt::Display for NodeError {
                 "invalid SQL statement at index {statement_index}: {message}"
             ),
             Self::PreconditionFailed(message) => write!(f, "precondition failed: {message}"),
+            Self::AmbiguousMutation => write!(f, "{AMBIGUOUS_MUTATION_MESSAGE}"),
             Self::Fatal(message) => write!(f, "node is fatally unavailable: {message}"),
         }
     }
@@ -7259,9 +7335,15 @@ impl NodeError {
             Self::InvalidSqlStatement { .. } => ("invalid_request", false),
             #[cfg(feature = "sql")]
             Self::RequestConflict(_) => ("request_conflict", false),
+            #[cfg(feature = "graph")]
+            Self::GraphRequestConflict { .. } => ("request_conflict", false),
+            #[cfg(feature = "kv")]
+            Self::KvRequestConflict { .. } => ("request_conflict", false),
             Self::PreconditionFailed(_) => ("precondition_failed", false),
             Self::SnapshotRequired(_) => ("snapshot_required", false),
+            Self::AmbiguousMutation => ("ambiguous_mutation", true),
             Self::Unavailable(_) => ("unavailable", true),
+            Self::OutcomeUnknown(_) => ("write_outcome_unknown", true),
             Self::StartupCancelled { .. } => ("unavailable", true),
             Self::ResourceExhausted(_) => ("resource_exhausted", true),
             Self::ConfigurationTransition { .. } => ("configuration_transition", true),
@@ -7278,8 +7360,6 @@ impl NodeError {
         ErrorClassification::from_server_code(code, retryable)
     }
 }
-
-pub type RuntimeError = NodeError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -7330,6 +7410,17 @@ pub struct ClientErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+}
+
+impl ClientErrorResponse {
+    fn ambiguous_mutation() -> Self {
+        Self {
+            code: "ambiguous_mutation".into(),
+            retryable: true,
+            message: AMBIGUOUS_MUTATION_MESSAGE.into(),
+            statement_index: None,
+        }
+    }
 }
 
 #[cfg(feature = "sql")]
@@ -8902,6 +8993,35 @@ pub struct NodeRuntime {
     _data_root_lock: fs::File,
 }
 
+#[derive(Clone, Copy)]
+enum ConsensusDiagnostic {
+    ReceiptBackedMutation,
+    MaterializerInspect,
+    ReadBarrierInspect,
+    ReadBarrierPropose,
+    /// Call sites that do not classify their operation. New receipt-backed
+    /// mutation paths must use [`ConsensusDiagnostic::ReceiptBackedMutation`];
+    /// falling back to `Other` silently downgrades an admitted-mutation
+    /// unknown to `write_outcome_unknown` instead of `ambiguous_mutation`.
+    Other,
+}
+
+impl ConsensusDiagnostic {
+    const fn fields(self) -> (&'static str, &'static str, Option<bool>) {
+        match self {
+            Self::ReceiptBackedMutation => (
+                "receipt_backed_mutation_propose",
+                "mutating_propose",
+                Some(true),
+            ),
+            Self::MaterializerInspect => ("materializer_inspect", "read_inspect", Some(false)),
+            Self::ReadBarrierInspect => ("read_barrier", "read_inspect", Some(false)),
+            Self::ReadBarrierPropose => ("read_barrier", "mutating_propose", Some(true)),
+            Self::Other => ("other", "unknown", None),
+        }
+    }
+}
+
 #[cfg(feature = "sql")]
 struct PreparedExternalSqlBundleResolution {
     consensus: Arc<ThreeNodeConsensus>,
@@ -9334,6 +9454,7 @@ impl NodeRuntime {
             return Ok(GraphMutationOutcome::from_record(record));
         }
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -9346,7 +9467,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             self.persist_entry(&entry, slot, last_hash)?;
             if let Some(record) = self.check_graph_request(command.request_id(), &payload)? {
                 return Ok(GraphMutationOutcome::from_record(record));
@@ -9477,6 +9598,7 @@ impl NodeRuntime {
             return Ok(KvMutationOutcome::from_record(record));
         }
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -9489,7 +9611,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             self.persist_entry(&entry, slot, last_hash)?;
             if let Some(record) = self.check_kv_request(command.request_id(), &payload)? {
                 return Ok(KvMutationOutcome::from_record(record));
@@ -9716,7 +9838,10 @@ impl NodeRuntime {
             let grouped_results = match execution {
                 Ok(Ok(grouped_results)) => grouped_results,
                 Ok(Err(error)) => {
-                    let error = if matches!(error, NodeError::Unavailable(_)) {
+                    let error = if matches!(
+                        error,
+                        NodeError::Unavailable(_) | NodeError::OutcomeUnknown(_)
+                    ) {
                         error
                     } else {
                         self.latch(error)
@@ -9913,6 +10038,12 @@ impl NodeRuntime {
         profile.add_precheck_classification(classification_mark);
 
         'sql_batches: while !pending.is_empty() {
+            if let Err(error) = self.ensure_writes_active() {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
             let eligible = pending
                 .iter()
                 .copied()
@@ -10113,7 +10244,7 @@ impl NodeRuntime {
                         }
                         continue 'sql_batches;
                     }
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10147,7 +10278,7 @@ impl NodeRuntime {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10346,7 +10477,10 @@ impl NodeRuntime {
             let grouped_results = match execution {
                 Ok(Ok(grouped_results)) => grouped_results,
                 Ok(Err(error)) => {
-                    let error = if matches!(error, NodeError::Unavailable(_)) {
+                    let error = if matches!(
+                        error,
+                        NodeError::Unavailable(_) | NodeError::OutcomeUnknown(_)
+                    ) {
                         error
                     } else {
                         self.latch(error)
@@ -10513,6 +10647,12 @@ impl NodeRuntime {
         }
 
         while !pending.is_empty() {
+            if let Err(error) = self.ensure_writes_active() {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
             if pending.len() == 1 {
                 let index = pending[0];
                 results[index] = Some(self.execute_profile_member_locked(&members[index]));
@@ -10573,7 +10713,7 @@ impl NodeRuntime {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10709,6 +10849,12 @@ impl NodeRuntime {
         }
 
         while !pending.is_empty() {
+            if let Err(error) = self.ensure_writes_active() {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
             if pending.len() == 1 {
                 let index = pending[0];
                 results[index] = Some(self.execute_profile_member_locked(&members[index]));
@@ -10769,7 +10915,7 @@ impl NodeRuntime {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    let error = self.map_consensus_error(error);
+                    let error = self.map_receipt_backed_mutation_error(error, slot);
                     for index in pending.drain(..) {
                         results[index] = Some(Err(error.clone()));
                     }
@@ -10884,9 +11030,12 @@ impl NodeRuntime {
                 (command.request_id(), members[*index].payload.as_slice())
             })
             .collect::<Vec<_>>();
-        let lookups = kv
-            .check_requests(&requests)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+        let lookups = kv.check_requests(&requests).map_err(|error| match error {
+            rhiza_kv::Error::RequestConflict { request_id } => {
+                NodeError::KvRequestConflict { request_id }
+            }
+            other => NodeError::InvalidRequest(other.to_string()),
+        })?;
         if lookups.len() != indices.len() {
             return Err(self.latch(NodeError::Invariant(
                 "KV bulk receipt lookup returned a misaligned result vector".into(),
@@ -10895,11 +11044,14 @@ impl NodeRuntime {
         Ok(indices
             .iter()
             .copied()
-            .zip(
-                lookups.into_iter().map(|lookup| {
-                    lookup.map_err(|error| NodeError::InvalidRequest(error.to_string()))
-                }),
-            )
+            .zip(lookups.into_iter().map(|lookup| {
+                lookup.map_err(|error| match error {
+                    rhiza_kv::Error::RequestConflict { request_id } => {
+                        NodeError::KvRequestConflict { request_id }
+                    }
+                    other => NodeError::InvalidRequest(other.to_string()),
+                })
+            }))
             .collect())
     }
 
@@ -10972,6 +11124,7 @@ impl NodeRuntime {
         }
 
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -10991,7 +11144,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             let sql_result = self.persist_sql_entry_profiled(
                 &entry,
                 slot,
@@ -11106,7 +11259,7 @@ impl NodeRuntime {
             .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
         self.consensus
             .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
-            .map_err(|error| self.map_consensus_error(error))?;
+            .map_err(|error| self.map_receipt_backed_mutation_error(error, intended_slot))?;
         Ok(payload)
     }
 
@@ -11129,6 +11282,7 @@ impl NodeRuntime {
         }
 
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
@@ -11157,7 +11311,7 @@ impl NodeRuntime {
                 .map_err(|error| self.latch(NodeError::Invariant(error.to_string())))?;
             self.consensus
                 .finalize_effect_bundle_on_quorum(&self.consensus_context(), &request)
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             let entry = self
                 .consensus
                 .propose_at(
@@ -11166,7 +11320,7 @@ impl NodeRuntime {
                     last_hash,
                     Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                 )
-                .map_err(|error| self.map_consensus_error(error))?;
+                .map_err(|error| self.map_receipt_backed_mutation_error(error, slot))?;
             self.persist_sql_entry_profiled(
                 &entry,
                 slot,
@@ -11310,8 +11464,13 @@ impl NodeRuntime {
         match self
             .consensus
             .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-            .map_err(|error| self.map_consensus_error(error))?
-        {
+            .map_err(|error| {
+                self.map_consensus_error_at(
+                    error,
+                    ConsensusDiagnostic::MaterializerInspect,
+                    Some(slot),
+                )
+            })? {
             DecisionInspection::Committed(entry) => {
                 self.persist_entry(&entry, slot, last_hash)?;
                 Ok(true)
@@ -11445,6 +11604,7 @@ impl NodeRuntime {
         .map_err(|error| NodeError::Invariant(error.to_string()))?
         .to_stored_command();
         loop {
+            self.ensure_writes_active()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index
                 .checked_add(1)
@@ -12122,8 +12282,13 @@ impl NodeRuntime {
                 match self
                     .consensus
                     .inspect_context_read_fence_at(&self.consensus_context(), slot, last_hash)
-                    .map_err(|error| self.map_consensus_error(error))?
-                {
+                    .map_err(|error| {
+                        self.map_consensus_error_at(
+                            error,
+                            ConsensusDiagnostic::ReadBarrierInspect,
+                            Some(slot),
+                        )
+                    })? {
                     CertifiedDecisionInspection::Committed(certified) => {
                         DecisionInspection::Committed(certified.entry)
                     }
@@ -12134,7 +12299,13 @@ impl NodeRuntime {
             } else {
                 self.consensus
                     .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-                    .map_err(|error| self.map_consensus_error(error))?
+                    .map_err(|error| {
+                        self.map_consensus_error_at(
+                            error,
+                            ConsensusDiagnostic::ReadBarrierInspect,
+                            Some(slot),
+                        )
+                    })?
             };
             match inspection {
                 DecisionInspection::Committed(entry) => {
@@ -12161,8 +12332,13 @@ impl NodeRuntime {
                                 slot,
                                 last_hash,
                             )
-                            .map_err(|error| self.map_consensus_error(error))?
-                        {
+                            .map_err(|error| {
+                                self.map_consensus_error_at(
+                                    error,
+                                    ConsensusDiagnostic::ReadBarrierInspect,
+                                    Some(slot),
+                                )
+                            })? {
                             CertifiedDecisionInspection::Committed(certified) => {
                                 DecisionInspection::Committed(certified.entry)
                             }
@@ -12175,7 +12351,13 @@ impl NodeRuntime {
                     } else {
                         self.consensus
                             .inspect_decision_at(&self.consensus_context(), slot, last_hash)
-                            .map_err(|error| self.map_consensus_error(error))?
+                            .map_err(|error| {
+                                self.map_consensus_error_at(
+                                    error,
+                                    ConsensusDiagnostic::ReadBarrierInspect,
+                                    Some(slot),
+                                )
+                            })?
                     };
                     match re_inspection {
                         DecisionInspection::Committed(entry) => {
@@ -12197,7 +12379,13 @@ impl NodeRuntime {
                                     last_hash,
                                     Command::new(CommandKind::ReadBarrier, Vec::new()),
                                 )
-                                .map_err(|error| self.map_consensus_error(error))?;
+                                .map_err(|error| {
+                                    self.map_consensus_error_at(
+                                        error,
+                                        ConsensusDiagnostic::ReadBarrierPropose,
+                                        Some(slot),
+                                    )
+                                })?;
                             self.persist_entry(&entry, slot, last_hash)?;
                         }
                         DecisionInspection::Unavailable => {
@@ -12247,7 +12435,17 @@ impl NodeRuntime {
         };
         graph
             .check_request(request_id, payload)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))
+            .map_err(|error| match error {
+                rhiza_graph::Error::RequestConflict {
+                    request_id,
+                    original_log_index,
+                    original_log_hash,
+                } => NodeError::GraphRequestConflict {
+                    request_id,
+                    original: Some(LogAnchor::new(original_log_index, original_log_hash)),
+                },
+                other => NodeError::InvalidRequest(other.to_string()),
+            })
     }
 
     #[cfg(feature = "kv")]
@@ -12268,7 +12466,12 @@ impl NodeRuntime {
             });
         };
         kv.check_request(request_id, payload)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))
+            .map_err(|error| match error {
+                rhiza_kv::Error::RequestConflict { request_id } => {
+                    NodeError::KvRequestConflict { request_id }
+                }
+                other => NodeError::InvalidRequest(other.to_string()),
+            })
     }
 
     fn ensure_materialized_tip(&self) -> Result<(LogIndex, LogHash), NodeError> {
@@ -12656,7 +12859,51 @@ impl NodeRuntime {
     }
 
     fn map_consensus_error(&self, error: rhiza_quepaxa::Error) -> NodeError {
+        // This is the unclassified convenience path (read-only resolution,
+        // configuration transitions). Mutating proposal call sites must pass
+        // ConsensusDiagnostic::ReceiptBackedMutation explicitly so admitted
+        // unknowns surface as ambiguous_mutation rather than write_outcome_unknown.
+        self.map_consensus_error_at(error, ConsensusDiagnostic::Other, None)
+    }
+
+    /// Maps a consensus error for an admitted, receipt-backed user mutation
+    /// (SQL QEFX, graph, or KV write). The only path that must be used by
+    /// mutating proposal call sites so an admitted unknown is surfaced as a
+    /// retryable ambiguous_mutation instead of a generic write_outcome_unknown.
+    fn map_receipt_backed_mutation_error(
+        &self,
+        error: rhiza_quepaxa::Error,
+        slot: LogIndex,
+    ) -> NodeError {
+        self.map_consensus_error_at(
+            error,
+            ConsensusDiagnostic::ReceiptBackedMutation,
+            Some(slot),
+        )
+    }
+
+    fn map_consensus_error_at(
+        &self,
+        error: rhiza_quepaxa::Error,
+        diagnostic: ConsensusDiagnostic,
+        slot: Option<LogIndex>,
+    ) -> NodeError {
+        if matches!(&error, rhiza_quepaxa::Error::UnknownOutcome) {
+            let (origin, operation, mutation_started) = diagnostic.fields();
+            eprintln!(
+                "node consensus unknown outcome origin={} slot={} operation={} mutation_started={}",
+                origin,
+                slot.map_or_else(|| "unknown".to_owned(), |slot| slot.to_string()),
+                operation,
+                mutation_started.map_or("unknown".to_owned(), |started| started.to_string()),
+            );
+        }
         match error {
+            // Bare Cancelled and pre-admission RPC failures are definite
+            // pre-mutation outcomes: no recorder admitted the request, so a
+            // plain retry is safe. Once a mutating RPC is admitted, QuePaxa
+            // normalizes cancellation/deadline into UnknownOutcome, which the
+            // receipt-backed branch below classifies as ambiguous.
             rhiza_quepaxa::Error::NoQuorum
             | rhiza_quepaxa::Error::ProposeFailed
             | rhiza_quepaxa::Error::CommandUnavailable
@@ -12665,12 +12912,37 @@ impl NodeRuntime {
             | rhiza_quepaxa::Error::RpcCancelled
             | rhiza_quepaxa::Error::RpcDeadlineExceeded
             | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
+            // UnknownOutcome is the caller's observation of an admitted,
+            // idempotent Recorder mutation. The next operation revisits the
+            // same consensus slot and reconciles the durable result; a lost
+            // reply is not contradictory storage evidence and must not make
+            // the whole runtime permanently fatal. Receipt-backed mutations
+            // surface this as a retryable ambiguous mutation to the caller.
+            rhiza_quepaxa::Error::UnknownOutcome
+                if matches!(diagnostic, ConsensusDiagnostic::ReceiptBackedMutation) =>
+            {
+                ambiguous_mutation_error()
+            }
+            // Internal recovery inspection and read-barrier proposals revisit
+            // the exact same slot on the next poll/request and reconcile the
+            // durable result. A transient unknown must not latch the runtime
+            // into a permanent fatal state.
+            rhiza_quepaxa::Error::UnknownOutcome
+                if matches!(
+                    diagnostic,
+                    ConsensusDiagnostic::MaterializerInspect
+                        | ConsensusDiagnostic::ReadBarrierInspect
+                        | ConsensusDiagnostic::ReadBarrierPropose
+                ) =>
+            {
+                NodeError::Unavailable("consensus recovery pending".into())
+            }
+            rhiza_quepaxa::Error::UnknownOutcome => NodeError::OutcomeUnknown(error.to_string()),
             rhiza_quepaxa::Error::EffectBundleConflict
             | rhiza_quepaxa::Error::EffectBundleInvalid(_)
             | rhiza_quepaxa::Error::EffectBundleQuotaExceeded { .. }
             | rhiza_quepaxa::Error::ConflictingCertificates
-            | rhiza_quepaxa::Error::ChainConflict { .. }
-            | rhiza_quepaxa::Error::UnknownOutcome => {
+            | rhiza_quepaxa::Error::ChainConflict { .. } => {
                 self.latch(NodeError::Reconciliation(error.to_string()))
             }
             other => self.latch(NodeError::Invariant(other.to_string())),
@@ -12930,18 +13202,19 @@ mod tests {
     use axum::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
 
     use rhiza_core::{
-        Command, CommandKind, ConfigurationState, EntryType, ErrorCategory, ErrorClassification,
-        ExecutionProfile, ExternalEffectCommand, LogAnchor, LogEntry, LogHash, RecoveryAnchor,
-        SnapshotIdentity, StoredCommand,
+        ClusterId, Command, CommandKind, ConfigId, ConfigurationState, EntryType, Epoch,
+        ErrorCategory, ErrorClassification, ExecutionProfile, ExternalEffectCommand, LogAnchor,
+        LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
-    use rhiza_graph::{GraphCommandV1, GraphValueV1};
+    use rhiza_graph::{encode_replicated_graph_command, GraphCommandV1, GraphValueV1};
     #[cfg(feature = "kv")]
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
     use rhiza_quepaxa::{
-        AcceptedValue, DecisionProof, Membership, Proposal, ProposalPriority, RecordRequest,
-        RecordSummary, RecorderFileStore, RecorderRpc, RecorderSummary, ThreeNodeConsensus,
+        AcceptedValue, DecisionProof, EffectBundleBinding, Membership, Proposal, ProposalPriority,
+        ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
+        RecorderRpc, RecorderRpcContext, RecorderSummary, ThreeNodeConsensus,
     };
     #[cfg(all(feature = "sql", unix))]
     use std::os::unix::fs::PermissionsExt;
@@ -12964,8 +13237,8 @@ mod tests {
         install_test_startup_persistence_hook, persist_startup_entry, recorder_router,
         recorder_router_with_test_peer_concurrency, recorder_routes, test_http_decode_hook_lock,
         test_startup_effect_hook_lock, ConfigError, HttpRecorderClient, NodeConfig, NodeRuntime,
-        NodeService, PeerConfig, StartupCancellationAuthority, StartupCloseOutcome,
-        StartupIoContext, TestHttpDecodeHook, TestStartupLocalIoHook, TestStartupPersistenceHook,
+        PeerConfig, StartupCancellationAuthority, StartupCloseOutcome, StartupIoContext,
+        TestHttpDecodeHook, TestStartupLocalIoHook, TestStartupPersistenceHook,
         HTTP_RECORDER_MAX_CONCURRENT_WORKERS, MAX_HTTP_BODY_BYTES, RECORDER_FETCH_COMMAND_PATH,
         RECORDER_IDENTITY_PATH, RECORDER_INSPECT_PROOF_PATH, RECORDER_INSTALL_PROOF_PATH,
         RECORDER_PROTOCOL_VERSION, RECORDER_RECORD_PATH, RECORDER_WIRE_VERSION,
@@ -12973,11 +13246,15 @@ mod tests {
     use super::{
         client_authenticated, next_sync_flush_retry, post,
         retain_peer_permit_until_response_body_complete, retryable_sync_flush_error,
-        run_read_operation, sql_query_http_response, valid_recorder_record, Body, DurabilityError,
+        run_read_operation, valid_recorder_record, Body, ConsensusDiagnostic, DurabilityError,
         Duration, FileLogStore, HeaderMap, Instant, Json, NodeError, ReadConsistency, Request,
-        Response, Router, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler,
-        MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL,
-        VERSION_HEADER,
+        Response, Router, AMBIGUOUS_MUTATION_MESSAGE, MAX_COMMAND_BYTES, PROTOCOL_VERSION,
+        SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+    };
+    #[cfg(feature = "sql")]
+    use super::{
+        sql_query_http_response, NodeService, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue,
+        SqlWriteProfiler, MAX_SQL_RESPONSE_BYTES,
     };
 
     struct PendingThenDataBody {
@@ -13015,6 +13292,163 @@ mod tests {
         gate: Arc<(Mutex<bool>, Condvar)>,
     }
 
+    /// Test-only recorder wrapper for the receipt-boundary replay case: a
+    /// certified install becomes durable, but its acknowledgement is lost.
+    struct PersistThenUnknownInstallRecorder {
+        inner: RecorderFileStore,
+        remaining_unknown_installs: Arc<AtomicUsize>,
+        remaining_unknown_inspections: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for PersistThenUnknownInstallRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            context.check()?;
+            self.inner.record(request)
+        }
+
+        fn supports_context_read_fence(&self) -> bool {
+            true
+        }
+
+        fn observe_read_fence(
+            &self,
+            context: &RecorderRpcContext,
+            request: ReadFenceRequest,
+        ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+            context.check()?;
+            if self
+                .remaining_unknown_inspections
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            RecorderRpc::observe_read_fence(&self.inner, context, request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner.install_decision_proof(proof, membership)?;
+            if self
+                .remaining_unknown_installs
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            Ok(())
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            context.check()?;
+            if self
+                .remaining_unknown_inspections
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            self.inner.inspect_record_summary(slot)
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: ClusterId,
+            epoch: Epoch,
+            config_id: ConfigId,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            context.check()?;
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: ClusterId,
+            epoch: Epoch,
+            config_id: ConfigId,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner.store_command_for(
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner
+                .stage_effect_bundle_chunk(&binding, &manifest_command, ordinal, &chunk)
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            context.check()?;
+            self.inner
+                .finalize_staged_effect_bundle(&binding, manifest_command)
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            context.check()?;
+            self.inner.fetch_effect_bundle_manifest(&binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            context.check()?;
+            self.inner.fetch_effect_bundle_chunk(&binding, ordinal)
+        }
+    }
+
     #[derive(Clone)]
     struct HttpIdentityRecorder;
 
@@ -13022,6 +13456,438 @@ mod tests {
     struct GatedRecorder {
         enabled: Arc<AtomicBool>,
         inner: RecorderFileStore,
+    }
+
+    /// Coordinates the local-accept ordering in
+    /// `definite_remote_failures_preserve_local_accept_for_same_slot_retry`:
+    /// the local recorder durably signals after its first record completes,
+    /// and each remote recorder's first record waits for that signal before
+    /// failing definitively. Whichever order the worker queues run in, the
+    /// local accept is always durable before the remote failure is observed.
+    #[derive(Clone)]
+    struct RecordGateCoordinator {
+        local_recorded: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RecordGateCoordinator {
+        fn new() -> Self {
+            Self {
+                local_recorded: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn signal_local_recorded(&self) {
+            let (state, condvar) = &*self.local_recorded;
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            condvar.notify_all();
+        }
+
+        /// Waits until the local recorder durably accepted, returning false on
+        /// timeout so a test hang cannot outlive the caller deadline.
+        fn wait_for_local_record(&self, timeout: Duration) -> bool {
+            let (state, condvar) = &*self.local_recorded;
+            let mut recorded = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*recorded {
+                let (guard, result) = condvar
+                    .wait_timeout(recorded, timeout)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                recorded = guard;
+                if result.timed_out() {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct SignalingLocalRecorder {
+        coordinator: RecordGateCoordinator,
+        inner: RecorderFileStore,
+    }
+
+    impl RecorderRpc for SignalingLocalRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            let summary = RecorderRpc::record(&self.inner, context, request)?;
+            self.coordinator.signal_local_recorded();
+            Ok(summary)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(&self, context: &RecorderRpcContext) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::stage_effect_bundle_chunk(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            )
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::finalize_staged_effect_bundle(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+            )
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+        }
+    }
+
+    /// Fails the first record on this recorder after the local recorder has
+    /// durably accepted. Later records delegate to the inner store so the same
+    /// recorder can join a learned proposal. The failure is bound to the
+    /// recorder's first record call rather than to a wall-clock release, so it
+    /// is deterministic under any worker-queue interleaving.
+    #[derive(Clone)]
+    struct DeferredFailureRecorder {
+        coordinator: RecordGateCoordinator,
+        fail_first_record: Arc<AtomicBool>,
+        inner: RecorderFileStore,
+    }
+
+    impl RecorderRpc for DeferredFailureRecorder {
+        fn record(
+            &self,
+            context: &RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            context.check()?;
+            if self.fail_first_record.swap(false, Ordering::AcqRel) {
+                let remaining = context
+                    .remaining()
+                    .ok_or(rhiza_quepaxa::Error::RpcDeadlineExceeded)?;
+                if !self.coordinator.wait_for_local_record(remaining) {
+                    return Err(rhiza_quepaxa::Error::RpcDeadlineExceeded);
+                }
+                context.check()?;
+                return Err(rhiza_quepaxa::Error::ProposeFailed);
+            }
+            RecorderRpc::record(&self.inner, context, request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(&self, context: &RecorderRpcContext) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
+
+        fn stage_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+            ordinal: u16,
+            chunk: Vec<u8>,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::stage_effect_bundle_chunk(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+                ordinal,
+                chunk,
+            )
+        }
+
+        fn finalize_staged_effect_bundle(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            manifest_command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::finalize_staged_effect_bundle(
+                &self.inner,
+                context,
+                binding,
+                manifest_command,
+            )
+        }
+
+        fn fetch_effect_bundle_manifest(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_effect_bundle_manifest(&self.inner, context, binding)
+        }
+
+        fn fetch_effect_bundle_chunk(
+            &self,
+            context: &RecorderRpcContext,
+            binding: EffectBundleBinding,
+            ordinal: u16,
+        ) -> rhiza_quepaxa::Result<Option<Vec<u8>>> {
+            RecorderRpc::fetch_effect_bundle_chunk(&self.inner, context, binding, ordinal)
+        }
+    }
+
+    #[cfg(feature = "graph")]
+    #[derive(Clone)]
+    struct UnknownAfterFirstRecord {
+        first: Arc<AtomicBool>,
+        inner: RecorderFileStore,
+    }
+    #[cfg(feature = "graph")]
+    impl RecorderRpc for UnknownAfterFirstRecord {
+        fn record(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            request: RecordRequest,
+        ) -> rhiza_quepaxa::Result<RecordSummary> {
+            let summary = RecorderRpc::record(&self.inner, context, request)?;
+            if self.first.swap(false, Ordering::AcqRel) {
+                return Err(rhiza_quepaxa::Error::UnknownOutcome);
+            }
+            Ok(summary)
+        }
+
+        fn install_decision_proof(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::install_decision_proof(&self.inner, context, proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+            RecorderRpc::inspect_decision_proof(&self.inner, context, slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            slot: u64,
+        ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+            RecorderRpc::inspect_record_summary(&self.inner, context, slot)
+        }
+
+        fn recorder_id(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+        ) -> rhiza_quepaxa::Result<String> {
+            RecorderRpc::recorder_id(&self.inner, context)
+        }
+
+        fn store_command_for(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            RecorderRpc::store_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            context: &rhiza_quepaxa::RecorderRpcContext,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            RecorderRpc::fetch_command_for(
+                &self.inner,
+                context,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            )
+        }
     }
 
     impl RecorderRpc for GatedRecorder {
@@ -14128,6 +14994,12 @@ mod tests {
                 true,
             ),
             (
+                NodeError::AmbiguousMutation,
+                "ambiguous_mutation",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+            (
                 NodeError::ResourceExhausted("result too large".into()),
                 "resource_exhausted",
                 ErrorCategory::ResourceExhausted,
@@ -14148,6 +15020,552 @@ mod tests {
             assert_eq!(classification.category(), category);
             assert_eq!(classification.retryable(), retryable);
         }
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn materialize_recovers_a_transient_inspection_unknown_without_latching() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:graph:materialize-recovery",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:materialize-recovery",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "materialize-recovery",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        // Commit one decision with a definite proof, then make the next
+        // inspection ambiguous exactly once on every recorder. The materializer
+        // must treat that as transient and recover on the following poll.
+        let command = GraphCommandV1::put_document(
+            "materialize-1",
+            "document-1",
+            GraphValueV1::String("first".into()),
+        )
+        .unwrap();
+        runtime.mutate_graph(command).unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        // Seed a second decided slot directly on the consensus so the local
+        // materializer tip (1) lags the recorder quorum (2), then make the
+        // first inspection of that slot ambiguous on every voter.
+        let seeded = GraphCommandV1::put_document(
+            "materialize-2",
+            "document-2",
+            GraphValueV1::String("second".into()),
+        )
+        .unwrap();
+        let payload = encode_replicated_graph_command(&seeded).unwrap();
+        let last_hash = runtime
+            .log_store()
+            .read(1)
+            .unwrap()
+            .map(|entry| entry.hash)
+            .unwrap();
+        runtime
+            .consensus()
+            .propose_at(
+                runtime.consensus_context(),
+                2,
+                last_hash,
+                Command::new(CommandKind::Deterministic, payload),
+            )
+            .unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+        remaining_unknown_inspections.store(3, Ordering::Release);
+        let transient = runtime.materialize_next_decision().unwrap_err();
+        // The first poll may not consume every injected ambiguity (quorum
+        // inspection can stop after enough voters replied). Disarm before the
+        // retry so the second poll is guaranteed to observe the seeded
+        // decision without residual injected unknowns.
+        remaining_unknown_inspections.store(0, Ordering::Release);
+        assert!(matches!(transient, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready(), "transient inspect must not latch");
+        assert!(!runtime.is_fatal(), "transient inspect must not latch");
+
+        // The next poll must recover and apply the seeded decision exactly
+        // once, advancing the local tip to the recorder quorum tip.
+        assert!(runtime.materialize_next_decision().unwrap());
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+        let materializer = runtime.lock_materializer().unwrap();
+        assert_eq!(materializer.applied_tip().unwrap().index(), 2);
+        drop(materializer);
+
+        // A third poll finds nothing further to apply.
+        assert!(!runtime.materialize_next_decision().unwrap());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn read_barrier_recovers_a_transient_inspection_unknown_without_latching() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:graph:read-barrier-recovery",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:read-barrier-recovery",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "read-barrier-recovery",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        runtime
+            .mutate_graph(
+                GraphCommandV1::put_document(
+                    "rb-request-1",
+                    "rb-document",
+                    GraphValueV1::String("committed".into()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        // The first read barrier inspection is ambiguous on every voter. The
+        // read must fail transiently (503-equivalent Unavailable, no latch)
+        // and the caller must be able to retry the same read.
+        remaining_unknown_inspections.store(3, Ordering::Release);
+        let transient = runtime
+            .get_graph_document("rb-document", ReadConsistency::ReadBarrier)
+            .unwrap_err();
+        assert!(matches!(transient, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready(), "transient barrier must not latch");
+        assert!(!runtime.is_fatal(), "transient barrier must not latch");
+        // Disarm before the retry: the first barrier may not consume every
+        // injected ambiguity, and the retry must observe the committed value.
+        remaining_unknown_inspections.store(0, Ordering::Release);
+
+        let retried = runtime
+            .get_graph_document("rb-document", ReadConsistency::ReadBarrier)
+            .unwrap();
+        assert_eq!(
+            retried.value,
+            Some(GraphValueV1::String("committed".into()))
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_materializer_survives_a_transient_unknown_and_applies_later() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:graph:materializer-supervisor",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:materializer-supervisor",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "materializer-supervisor",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
+
+        runtime
+            .mutate_graph(
+                GraphCommandV1::put_document(
+                    "supervisor-request-1",
+                    "supervisor-document",
+                    GraphValueV1::String("first".into()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Seed a second decided slot so the local tip lags the quorum, then
+        // make the first inspection ambiguous on every voter. The supervisor
+        // must survive the transient error and apply the seeded decision on a
+        // later poll without terminating.
+        let seeded = GraphCommandV1::put_document(
+            "supervisor-request-2",
+            "supervisor-document",
+            GraphValueV1::String("second".into()),
+        )
+        .unwrap();
+        let payload = encode_replicated_graph_command(&seeded).unwrap();
+        let last_hash = runtime
+            .log_store()
+            .read(1)
+            .unwrap()
+            .map(|entry| entry.hash)
+            .unwrap();
+        runtime
+            .consensus()
+            .propose_at(
+                runtime.consensus_context(),
+                2,
+                last_hash,
+                Command::new(CommandKind::Deterministic, payload),
+            )
+            .unwrap();
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+        remaining_unknown_inspections.store(3, Ordering::Release);
+
+        let supervisor = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .run_background_materializer(Duration::from_millis(10), async {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    })
+                    .await
+            })
+        };
+
+        // Disarm after the first (transient) poll; the supervisor keeps
+        // polling and the remaining polls must observe the seeded decision.
+        let disarm = {
+            let remaining_unknown_inspections = Arc::clone(&remaining_unknown_inspections);
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                remaining_unknown_inspections.store(0, Ordering::Release);
+                drop(runtime);
+            })
+        };
+
+        // The supervisor must keep polling through the transient unknown and
+        // apply the seeded decision well within the shutdown horizon.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if runtime.log_store().last_index().unwrap() == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            runtime.log_store().last_index().unwrap(),
+            Some(2),
+            "supervisor must survive the transient unknown and apply the seeded decision"
+        );
+        let materializer = runtime.lock_materializer().unwrap();
+        assert_eq!(materializer.applied_tip().unwrap().index(), 2);
+        drop(materializer);
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let result = supervisor.await.unwrap();
+        assert!(matches!(result, Ok(())));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn only_external_mutation_unknown_outcomes_are_ambiguous_and_nonfatal() {
+        let (_dir, runtime) = sql_test_runtime();
+        let external = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::ReceiptBackedMutation,
+            Some(1),
+        );
+        assert_eq!(external.classification().code(), "ambiguous_mutation");
+        assert_eq!(
+            external.classification().category(),
+            ErrorCategory::Unavailable
+        );
+        assert!(external.classification().retryable());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let (_dir, runtime) = sql_test_runtime();
+        let internal = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::MaterializerInspect,
+            Some(1),
+        );
+        assert!(matches!(internal, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let (_dir, runtime) = sql_test_runtime();
+        let read_barrier = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::ReadBarrierInspect,
+            Some(1),
+        );
+        assert!(matches!(read_barrier, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let (_dir, runtime) = sql_test_runtime();
+        let read_barrier_propose = runtime.map_consensus_error_at(
+            rhiza_quepaxa::Error::UnknownOutcome,
+            ConsensusDiagnostic::ReadBarrierPropose,
+            Some(1),
+        );
+        assert!(matches!(read_barrier_propose, NodeError::Unavailable(_)));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn receipt_boundary_replays_the_recovered_command_before_reproposing_the_later_request() {
+        let root = tempfile::tempdir().unwrap();
+        let node_ids = ["n1", "n2", "n3"];
+        let membership = Membership::new(node_ids).unwrap();
+        let recorders = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    (*node_id).to_owned(),
+                    RecorderFileStore::new_with_membership(
+                        root.path().join("recorders").join(node_id),
+                        *node_id,
+                        "rhiza:sql:receipt-boundary-replay",
+                        1,
+                        1,
+                        membership.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let remaining_unknown_installs = Arc::new(AtomicUsize::new(0));
+        let remaining_unknown_inspections = Arc::new(AtomicUsize::new(0));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:sql:receipt-boundary-replay",
+                "n1",
+                1,
+                1,
+                recorders
+                    .iter()
+                    .map(|(id, recorder)| {
+                        (
+                            id.clone(),
+                            Box::new(PersistThenUnknownInstallRecorder {
+                                inner: recorder.clone(),
+                                remaining_unknown_installs: Arc::clone(&remaining_unknown_installs),
+                                remaining_unknown_inspections: Arc::clone(
+                                    &remaining_unknown_inspections,
+                                ),
+                            }) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "receipt-boundary-replay",
+            "n1",
+            root.path().join("node"),
+            1,
+            1,
+            node_ids,
+        )
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        // A's proof reaches every recorder, but its installation
+        // acknowledgement is lost. Inspection ambiguity may be consumed by
+        // recovery and is disarmed before the later distinct request.
+        remaining_unknown_installs.store(3, Ordering::Release);
+        remaining_unknown_inspections.store(3, Ordering::Release);
+        let original = SqlCommand {
+            request_id: "original".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE replay_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                    .into(),
+                parameters: vec![],
+            }],
+        };
+        let original_error = runtime.execute_sql(original.clone()).unwrap_err();
+        assert_eq!(original_error.classification().code(), "ambiguous_mutation");
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+        // A quorum inspection can stop before consuming every injected
+        // ambiguity. Disarm before the distinct request so it deterministically
+        // recovers A before proposing the later command.
+        remaining_unknown_installs.store(0, Ordering::Release);
+        remaining_unknown_inspections.store(0, Ordering::Release);
+
+        let later = SqlCommand {
+            request_id: "later".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE later_items(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        let later_response = runtime.execute_sql(later).unwrap();
+        assert_eq!(later_response.applied_index, 2);
+
+        let original_response = runtime.execute_sql(original.clone()).unwrap();
+        assert_eq!(original_response.applied_index, 1);
+        assert_ne!(original_response, later_response);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+
+        let reused_with_different_payload = SqlCommand {
+            request_id: original.request_id,
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE must_not_replace_original(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        assert!(matches!(
+            runtime.execute_sql(reused_with_different_payload),
+            Err(NodeError::RequestConflict(_))
+        ));
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
     }
 
     #[cfg(feature = "sql")]
@@ -14207,6 +15625,13 @@ mod tests {
                 None,
             ),
             (
+                NodeError::AmbiguousMutation,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "ambiguous_mutation",
+                true,
+                None,
+            ),
+            (
                 NodeError::Storage("disk failed".into()),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
@@ -14232,6 +15657,7 @@ mod tests {
                 "request could not be processed"
                     | "request conflicts with current state"
                     | "service is temporarily unavailable"
+                    | AMBIGUOUS_MUTATION_MESSAGE
                     | "internal server error"
             ));
         }
@@ -15256,7 +16682,7 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
         assert!(matches!(
             results[2],
-            Err(super::NodeError::InvalidRequest(_))
+            Err(super::NodeError::GraphRequestConflict { .. })
         ));
         assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -15278,7 +16704,7 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
         assert!(matches!(
             results[2],
-            Err(super::NodeError::InvalidRequest(_))
+            Err(super::NodeError::KvRequestConflict { .. })
         ));
         assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
         assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
@@ -15482,8 +16908,12 @@ mod tests {
         );
         assert!(matches!(
             retry_results[1],
-            Err(NodeError::InvalidRequest(_))
+            Err(NodeError::KvRequestConflict { .. })
         ));
+        let conflict = retry_results[1].as_ref().unwrap_err().classification();
+        assert_eq!(conflict.code(), "request_conflict");
+        assert_eq!(conflict.category(), ErrorCategory::Conflict);
+        assert!(!conflict.retryable());
         let new_anchors = new_results
             .iter()
             .map(|result| {
@@ -16920,6 +18350,104 @@ mod tests {
         assert!(runtime.is_fatal());
     }
 
+    #[test]
+    fn recorder_unknown_outcome_is_retryable_without_killing_runtime() {
+        let (_dir, runtime) = sql_test_runtime();
+
+        let error = runtime.map_consensus_error(rhiza_quepaxa::Error::UnknownOutcome);
+
+        assert!(matches!(error, NodeError::OutcomeUnknown(_)));
+        assert!(error.classification().retryable());
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let conflict = runtime.map_consensus_error(rhiza_quepaxa::Error::ConflictingCertificates);
+        assert!(matches!(conflict, NodeError::Reconciliation(_)));
+        assert!(!runtime.is_ready());
+        assert!(runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_write_retries_the_same_request_after_unknown_recorder_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let mut recorders = Vec::<(String, Box<dyn RecorderRpc>)>::new();
+        let first = Arc::new(AtomicBool::new(true));
+        for node_id in ["n1", "n2"] {
+            let recorder = RecorderFileStore::new_with_membership(
+                dir.path().join("recorders").join(node_id),
+                node_id,
+                "rhiza:graph:unknown-outcome",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            recorders.push((
+                node_id.into(),
+                Box::new(UnknownAfterFirstRecord {
+                    first: Arc::clone(&first),
+                    inner: recorder,
+                }),
+            ));
+        }
+        let unavailable = RecorderFileStore::new_with_membership(
+            dir.path().join("recorders/n3"),
+            "n3",
+            "rhiza:graph:unknown-outcome",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        recorders.push((
+            "n3".into(),
+            Box::new(GatedRecorder {
+                enabled: Arc::new(AtomicBool::new(false)),
+                inner: unavailable,
+            }),
+        ));
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:graph:unknown-outcome",
+                "n1",
+                1,
+                1,
+                recorders,
+            )
+            .unwrap(),
+        );
+        let config = NodeConfig::new_embedded(
+            "unknown-outcome",
+            "n1",
+            dir.path().join("node"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Graph)
+        .unwrap();
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+        let command = GraphCommandV1::put_document(
+            "stable-request",
+            "document",
+            GraphValueV1::String("value".into()),
+        )
+        .unwrap();
+
+        let first = runtime.mutate_graph(command.clone()).unwrap_err();
+        assert_eq!(first.classification().code(), "ambiguous_mutation");
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+
+        let retried = runtime.mutate_graph(command).unwrap();
+        assert_eq!(retried.applied_index(), 1);
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
     fn sql_test_runtime() -> (tempfile::TempDir, NodeRuntime) {
         sql_test_runtime_configured(None, None)
     }
@@ -17324,7 +18852,7 @@ mod tests {
             membership.clone(),
         )
         .unwrap();
-        let remotes_enabled = Arc::new(AtomicBool::new(false));
+        let coordinator = RecordGateCoordinator::new();
         let n2 = RecorderFileStore::new_with_membership(
             dir.path().join("n2"),
             "n2",
@@ -17350,18 +18878,26 @@ mod tests {
                 1,
                 1,
                 vec![
-                    ("n1".into(), Box::new(local.clone()) as Box<dyn RecorderRpc>),
+                    (
+                        "n1".into(),
+                        Box::new(SignalingLocalRecorder {
+                            coordinator: coordinator.clone(),
+                            inner: local.clone(),
+                        }) as Box<dyn RecorderRpc>,
+                    ),
                     (
                         "n2".into(),
-                        Box::new(GatedRecorder {
-                            enabled: Arc::clone(&remotes_enabled),
+                        Box::new(DeferredFailureRecorder {
+                            coordinator: coordinator.clone(),
+                            fail_first_record: Arc::new(AtomicBool::new(true)),
                             inner: n2.clone(),
                         }),
                     ),
                     (
                         "n3".into(),
-                        Box::new(GatedRecorder {
-                            enabled: Arc::clone(&remotes_enabled),
+                        Box::new(DeferredFailureRecorder {
+                            coordinator: coordinator.clone(),
+                            fail_first_record: Arc::new(AtomicBool::new(true)),
                             inner: n3.clone(),
                         }),
                     ),
@@ -17370,8 +18906,13 @@ mod tests {
             .unwrap(),
         );
         let offered = Command::new(CommandKind::Deterministic, b"original".to_vec());
+        // Every remote recorder's first record waits for the local durable
+        // accept before failing, so quorum impossibility is only observed
+        // after the local worker finished. Deterministic under any worker
+        // queue interleaving: whichever order n1/n2/n3 run in, the local
+        // summary exists before the failure is reported.
         let first = consensus.propose_at(
-            rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(2)),
+            rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),
             1,
             LogHash::ZERO,
             offered.clone(),
@@ -17415,7 +18956,6 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_winner.payload, b"foreign");
 
-        remotes_enabled.store(true, Ordering::Release);
         let learned = consensus
             .propose_at(
                 rhiza_quepaxa::RecorderRpcContext::with_timeout(Duration::from_secs(5)),

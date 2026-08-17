@@ -44,8 +44,9 @@ use rhiza_node::{
 };
 #[cfg(feature = "graph")]
 use rhiza_node::{
-    GraphDeleteDocumentRequest, GraphMutationResponse, GraphPutDocumentRequest, GraphQueryRequest,
-    GraphQueryResponse, GraphQueryStatementDto, GraphValueDto,
+    GraphDeleteDocumentRequest, GraphGetDocumentRequest, GraphGetDocumentResponse,
+    GraphMutationResponse, GraphPutDocumentRequest, GraphQueryRequest, GraphQueryResponse,
+    GraphQueryStatementDto, GraphValueDto,
 };
 #[cfg(feature = "kv")]
 use rhiza_node::{
@@ -68,6 +69,8 @@ use rhizadb::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 type RecorderClients = Vec<(String, Box<dyn RecorderRpc>)>;
+
+const MIN_GCS_CHECKPOINT_LEASE_MS: u64 = 60_000;
 
 #[tokio::main]
 async fn main() {
@@ -278,6 +281,17 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             },
             Err(error) => fail("graph delete-document", error),
         },
+        #[cfg(feature = "graph")]
+        Command::GraphGetDocument(args) => match request_graph_get_document(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("graph get-document", error.to_string()),
+            },
+            Err(error) => fail("graph get-document", error),
+        },
         #[cfg(feature = "kv")]
         Command::KvGet(args) => match request_kv_get(&args).await {
             Ok(response) => match serde_json::to_string(&response) {
@@ -375,6 +389,8 @@ enum Command {
     GraphPutDocument(GraphPutDocumentArgs),
     #[cfg(feature = "graph")]
     GraphDeleteDocument(GraphDeleteDocumentArgs),
+    #[cfg(feature = "graph")]
+    GraphGetDocument(GraphGetDocumentArgs),
     #[cfg(feature = "kv")]
     KvGet(KvGetArgs),
     #[cfg(feature = "kv")]
@@ -444,6 +460,13 @@ struct GraphDeleteDocumentArgs {
     urls: Vec<String>,
     token: String,
     request: GraphDeleteDocumentRequest,
+}
+
+#[cfg(feature = "graph")]
+struct GraphGetDocumentArgs {
+    urls: Vec<String>,
+    token: String,
+    request: GraphGetDocumentRequest,
 }
 
 #[cfg(feature = "kv")]
@@ -1041,6 +1064,13 @@ impl ServeConfig {
                 let lease_duration_ms =
                     optional_positive_env(&mut lookup, "RHIZA_CHECKPOINT_LEASE_MS")?
                         .unwrap_or(300_000);
+                if matches!(&object_store, ObjStoreConfig::Gcs { .. })
+                    && lease_duration_ms < MIN_GCS_CHECKPOINT_LEASE_MS
+                {
+                    return Err(format!(
+                        "RHIZA_CHECKPOINT_LEASE_MS must be at least {MIN_GCS_CHECKPOINT_LEASE_MS} for gcs"
+                    ));
+                }
                 (
                     recovery_generation,
                     Some(RemoteCheckpointConfig {
@@ -1431,8 +1461,12 @@ fn parse_graph_command(args: impl IntoIterator<Item = String>) -> Result<Command
             .map(Command::GraphPutDocument),
         Some("delete-document") => parse_graph_delete_document(args, |name| env::var(name).ok())
             .map(Command::GraphDeleteDocument),
+        Some("get-document") => parse_graph_get_document(args, |name| env::var(name).ok())
+            .map(Command::GraphGetDocument),
         Some(other) => Err(format!("unknown graph command: {other}")),
-        None => Err("missing graph command: query|put-document|delete-document".into()),
+        None => {
+            Err("missing graph command: query|put-document|delete-document|get-document".into())
+        }
     }
 }
 
@@ -1545,6 +1579,40 @@ fn parse_graph_delete_document(
         request: GraphDeleteDocumentRequest {
             request_id: required_arg(request_id, "--request-id")?,
             id: required_arg(id, "--id")?,
+        },
+    })
+}
+
+#[cfg(feature = "graph")]
+fn parse_graph_get_document(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<GraphGetDocumentArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut id = None;
+    let mut consistency = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--id" => id = Some(next_value(&mut args, "--id")?),
+            "--consistency" => {
+                consistency = Some(parse_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(GraphGetDocumentArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: GraphGetDocumentRequest {
+            id: required_arg(id, "--id")?,
+            consistency,
         },
     })
 }
@@ -4466,6 +4534,16 @@ async fn request_graph_delete_document(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "graph")]
+async fn request_graph_get_document(
+    args: &GraphGetDocumentArgs,
+) -> Result<GraphGetDocumentResponse, String> {
+    remote_client(&args.urls, &args.token)?
+        .graph_get_document(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "kv")]
 async fn request_kv_get(args: &KvGetArgs) -> Result<KvGetResponse, String> {
     remote_client(&args.urls, &args.token)?
@@ -6283,6 +6361,15 @@ mod tests {
             config.remote.as_ref().unwrap().object_store,
             ObjStoreConfig::S3 { .. }
         ));
+        s3.insert("RHIZA_CHECKPOINT_LEASE_MS", "5000");
+        assert_eq!(
+            parse_serve_env(&s3)
+                .unwrap()
+                .remote
+                .unwrap()
+                .lease_duration_ms,
+            5_000
+        );
 
         let mut gcs = base_serve_env();
         gcs.extend([
@@ -6298,6 +6385,21 @@ mod tests {
             parse_serve_env(&gcs).unwrap().remote.unwrap().object_store,
             ObjStoreConfig::Gcs { .. }
         ));
+
+        gcs.insert("RHIZA_CHECKPOINT_LEASE_MS", "59999");
+        assert_eq!(
+            parse_serve_env(&gcs).unwrap_err(),
+            "RHIZA_CHECKPOINT_LEASE_MS must be at least 60000 for gcs"
+        );
+        gcs.insert("RHIZA_CHECKPOINT_LEASE_MS", "60000");
+        assert_eq!(
+            parse_serve_env(&gcs)
+                .unwrap()
+                .remote
+                .unwrap()
+                .lease_duration_ms,
+            60_000
+        );
 
         let mut azure = base_serve_env();
         azure.extend([
@@ -6787,7 +6889,7 @@ mod tests {
                     1,
                     ConfigurationState::active(
                         1,
-                        LogHash::digest(&[b"cli-roll-checkpoint-test-config"]),
+                        source.checkpoint_identity().unwrap().config_digest(),
                     ),
                     1,
                     LogAnchor::new(2, committed[1].hash),
@@ -7150,7 +7252,7 @@ mod tests {
             wait_until_ready(address).await;
         }
         wait_until_ready(&client_addresses[2]).await;
-        let committed = request_write(&WriteArgs {
+        let write = WriteArgs {
             urls: client_addresses
                 .iter()
                 .map(|address| format!("http://{address}"))
@@ -7159,9 +7261,21 @@ mod tests {
             request_id: format!("integration-{recorder_transport:?}"),
             key: "transport".into(),
             value: "committed".into(),
-        })
-        .await
-        .unwrap();
+        };
+        let write_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let committed = loop {
+            match request_write(&write).await {
+                Ok(committed) => break committed,
+                Err(error)
+                    if (error.contains("code=write_outcome_unknown")
+                        || error.contains("code=ambiguous_mutation"))
+                        && tokio::time::Instant::now() < write_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("same-request write retry did not converge: {error}"),
+            }
+        };
         assert!(committed.applied_index > 0);
 
         let _ = first_shutdown.send(());

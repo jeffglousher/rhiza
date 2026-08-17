@@ -14,21 +14,15 @@ categories = ["algorithms", "database"]
 # Instrumentation available only to downstream test harnesses. It is not part
 # of the consensus runtime's normal feature set.
 test-hooks = []
-# Checkpoint-archive GC APIs pull rhiza-archive -> object_store (native aws-lc).
-# Disabled by default so consensus consumers can depend on the engine without
-# that stack. Taldra keeps this off (see TALDRA.md).
-archive-gc = ["dep:rhiza-archive"]
 
 [dependencies]
 getrandom.workspace = true
+libc = "0.2"
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
-rhiza-archive = { version = "0.3.0", path = "../rhiza-archive", optional = true }
 serde.workspace = true
 
 [dev-dependencies]
 proptest = "1"
-rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
 rhiza-sql = { version = "0.3.0", path = "../rhiza-sql" }
 serde_json.workspace = true
 tempfile.workspace = true
-tokio.workspace = true

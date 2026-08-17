@@ -3688,6 +3688,8 @@ fn validate_live_successor_draft(
         || target.epoch() != startup.node_config.epoch()
         || source.config_id().checked_add(1) != Some(target.config_id())
         || target.config_id() != startup.node_config.config_id()
+        || source.config_digest() != prestage.predecessor_membership.digest()
+        || target.config_digest() != startup.node_config.membership().digest()
         || source.recovery_generation() != target.recovery_generation()
         || target.recovery_generation() != startup.node_config.recovery_generation()
         || prestage.target_node_id != startup.node_config.node_id()
@@ -6807,6 +6809,7 @@ fn validate_archive_identity(
     if identity.cluster_id() != config.cluster_id()
         || identity.epoch() != config.epoch()
         || identity.config_id() != target_config_id
+        || identity.config_digest() != config.membership().digest()
         || identity.recovery_generation() != config.recovery_generation()
     {
         return Err(fail(
@@ -7112,7 +7115,7 @@ async fn prepare_standard(
                     .check("rejoin recovery-view restore")
                     .map_err(startup_error)?;
                 eprintln!(
-                    "local recovery view is not trustworthy ({view_error}); quarantining rebuildable state and restoring the verified checkpoint"
+                    "local recovery view is not trustworthy ({view_error}); attempting an identity-bound quarantine and verified checkpoint restore"
                 );
                 let expected = capture_checkpoint_restore_state_for_ha(
                     config,
@@ -7144,7 +7147,7 @@ async fn prepare_standard(
                     )
                     .map_err(|restore_error| {
                         fail(format!(
-                            "rebuildable local recovery view was quarantined but verified checkpoint restore failed: {restore_error}"
+                            "rebuildable local recovery view could not be quarantined and restored from the verified checkpoint: {restore_error}"
                         ))
                     })?;
                     #[cfg(test)]
@@ -8122,13 +8125,17 @@ fn verify_local_rejoin_checkpoint(
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalCheckpointIdentityMarker {
+    format_version: u8,
     cluster_id: String,
     node_id: String,
     execution_profile: ExecutionProfile,
     epoch: u64,
     config_id: u64,
+    config_digest: String,
     recovery_generation: u64,
 }
+
+const LOCAL_CHECKPOINT_IDENTITY_FORMAT_VERSION: u8 = 2;
 
 fn marker_from_identity(
     execution_profile: ExecutionProfile,
@@ -8136,11 +8143,13 @@ fn marker_from_identity(
     node_id: &str,
 ) -> LocalCheckpointIdentityMarker {
     LocalCheckpointIdentityMarker {
+        format_version: LOCAL_CHECKPOINT_IDENTITY_FORMAT_VERSION,
         cluster_id: identity.cluster_id().to_owned(),
         node_id: node_id.to_owned(),
         execution_profile,
         epoch: identity.epoch(),
         config_id: identity.config_id(),
+        config_digest: identity.config_digest().to_hex(),
         recovery_generation: identity.recovery_generation(),
     }
 }
@@ -8165,11 +8174,13 @@ fn validate_local_checkpoint_identity_marker(
     identity: &CheckpointIdentity,
     node_id: &str,
 ) -> Result<(), HaStartupError> {
-    if marker.cluster_id != identity.cluster_id()
+    if marker.format_version != LOCAL_CHECKPOINT_IDENTITY_FORMAT_VERSION
+        || marker.cluster_id != identity.cluster_id()
         || marker.node_id != node_id
         || marker.execution_profile != execution_profile
         || marker.epoch != identity.epoch()
         || marker.config_id != identity.config_id()
+        || marker.config_digest != identity.config_digest().to_hex()
         || marker.recovery_generation != identity.recovery_generation()
     {
         return Err(fail(
@@ -8327,6 +8338,7 @@ static LOCAL_MARKER_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize)]
 struct SuccessorRestoreReceipt<'a> {
+    format_version: u8,
     cluster_id: &'a str,
     epoch: u64,
     target_config_id: u64,
@@ -8334,9 +8346,12 @@ struct SuccessorRestoreReceipt<'a> {
     node_id: &'a str,
     membership_digest: String,
     predecessor_config_id: u64,
+    predecessor_membership_digest: String,
     stop_index: u64,
     stop_hash: String,
 }
+
+const SUCCESSOR_RESTORE_RECEIPT_FORMAT_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SuccessorRestoreControlState {
@@ -8352,6 +8367,7 @@ fn expected_successor_restore_receipt(
 ) -> Result<Vec<u8>, HaStartupError> {
     validate_predecessor_binding(config, target_config_id, predecessor)?;
     serde_json::to_vec(&SuccessorRestoreReceipt {
+        format_version: SUCCESSOR_RESTORE_RECEIPT_FORMAT_VERSION,
         cluster_id: config.cluster_id(),
         epoch: config.epoch(),
         target_config_id,
@@ -8359,6 +8375,7 @@ fn expected_successor_restore_receipt(
         node_id: config.node_id(),
         membership_digest: config.membership().digest().to_hex(),
         predecessor_config_id: predecessor.stop.entry.config_id,
+        predecessor_membership_digest: predecessor.membership.digest().to_hex(),
         stop_index: predecessor.stop.entry.index,
         stop_hash: predecessor.stop.entry.hash.to_hex(),
     })
@@ -8642,6 +8659,29 @@ mod tests {
         assert!(
             matches!(error, HaStartupError::Source(message) if message.contains("admission closed"))
         );
+    }
+
+    #[test]
+    fn local_checkpoint_marker_requires_v2_and_exact_config_digest() {
+        let identity = startup_fence_test_identity();
+        let mut marker = marker_from_identity(ExecutionProfile::Sqlite, &identity, "node-1");
+        assert_eq!(marker.format_version, 2);
+        validate_local_checkpoint_identity_marker(
+            &marker,
+            ExecutionProfile::Sqlite,
+            &identity,
+            "node-1",
+        )
+        .unwrap();
+
+        marker.config_digest = LogHash::digest(&[b"different-membership"]).to_hex();
+        assert!(validate_local_checkpoint_identity_marker(
+            &marker,
+            ExecutionProfile::Sqlite,
+            &identity,
+            "node-1",
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -9191,25 +9231,25 @@ mod tests {
     }
 
     fn actual_child_test_archive(root: &std::path::Path) -> ObjectArchiveStore {
-        actual_child_test_archive_for_cluster(root, "rhiza:sql:cluster-a")
+        let config = actual_child_test_node_config(&root.join("identity-only"));
+        actual_child_test_archive_for_cluster(
+            root,
+            config.cluster_id(),
+            config.log_initial_configuration().digest(),
+        )
     }
 
     fn actual_child_test_archive_for_cluster(
         root: &std::path::Path,
         cluster_id: impl Into<String>,
+        config_digest: LogHash,
     ) -> ObjectArchiveStore {
         ObjectArchiveStore::new_checkpoint_for_single_process(
             rhiza_obj_store::ObjStore::new(rhiza_obj_store::ObjStoreConfig::Local {
                 root: root.to_path_buf(),
             })
             .unwrap(),
-            CheckpointIdentity::new(
-                cluster_id,
-                1,
-                1,
-                rhiza_core::LogHash::digest(&[b"ha-test-config"]),
-                1,
-            ),
+            CheckpointIdentity::new(cluster_id, 1, 1, config_digest, 1),
         )
     }
 
@@ -9298,6 +9338,7 @@ mod tests {
         let archive = actual_child_test_archive_for_cluster(
             &root.join("archive"),
             config.cluster_id().to_owned(),
+            config.log_initial_configuration().digest(),
         );
         archive.initialize_checkpoint().await.unwrap();
 
@@ -9655,13 +9696,12 @@ mod tests {
             .await
             .expect("opened owner cleanup must finish before the original deadline");
         let snapshot = state.borrow().clone();
-        let recorder_rebound = tokio::net::TcpListener::bind(recorder_address)
+        assert!(tokio::net::TcpStream::connect(recorder_address)
             .await
-            .unwrap();
-        let service_rebound = tokio::net::TcpListener::bind(service_address)
+            .is_err());
+        assert!(tokio::net::TcpStream::connect(service_address)
             .await
-            .unwrap();
-        drop((recorder_rebound, service_rebound));
+            .is_err());
         (result, snapshot)
     }
 
@@ -11901,29 +11941,17 @@ mod tests {
                 root: root.path().join("archive"),
             })
             .unwrap();
+            let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+            let successor = Membership::new(["node-4", "node-5", "node-6"]).unwrap();
             let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                 store.clone(),
-                CheckpointIdentity::new(
-                    "rhiza:sql:cluster-a",
-                    1,
-                    1,
-                    LogHash::digest(&[b"ha-test-config"]),
-                    1,
-                ),
+                CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, predecessor.digest(), 1),
             );
             source_archive.initialize_checkpoint().await.unwrap();
             let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                 store,
-                CheckpointIdentity::new(
-                    "rhiza:sql:cluster-a",
-                    1,
-                    2,
-                    LogHash::digest(&[b"ha-test-config"]),
-                    1,
-                ),
+                CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, successor.digest(), 1),
             );
-            let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-            let successor = Membership::new(["node-4", "node-5", "node-6"]).unwrap();
             let data_dir = root.path().join("successor");
             std::fs::create_dir_all(data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE)).unwrap();
             let peers = successor
@@ -14734,24 +14762,18 @@ mod tests {
                         root: root_path.join("archive"),
                     })
                     .expect("archive store must open");
+                let predecessor = Membership::new(["node-1", "node-2", "node-3"])
+                    .expect("predecessor membership must be valid");
+                let successor = Membership::new(["node-4", "node-5", "node-6"])
+                    .expect("successor membership must be valid");
                 let source_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                     store.clone(),
-                    CheckpointIdentity::new(
-                        "rhiza:sql:cluster-a",
-                        1,
-                        1,
-                        LogHash::digest(&[b"ha-test-config"]),
-                        1,
-                    ),
+                    CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, predecessor.digest(), 1),
                 );
                 source_archive
                     .initialize_checkpoint()
                     .await
                     .expect("source checkpoint must initialize");
-                let predecessor = Membership::new(["node-1", "node-2", "node-3"])
-                    .expect("predecessor membership must be valid");
-                let successor = Membership::new(["node-4", "node-5", "node-6"])
-                    .expect("successor membership must be valid");
                 let source_recorders = predecessor
                     .members()
                     .iter()
@@ -14826,13 +14848,7 @@ mod tests {
                 drop(source);
                 let target_archive = ObjectArchiveStore::new_checkpoint_for_single_process(
                     store,
-                    CheckpointIdentity::new(
-                        "rhiza:sql:cluster-a",
-                        1,
-                        2,
-                        LogHash::digest(&[b"ha-test-config"]),
-                        1,
-                    ),
+                    CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 2, successor.digest(), 1),
                 );
                 let peers = successor
                     .members()

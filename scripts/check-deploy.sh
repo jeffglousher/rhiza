@@ -1444,7 +1444,49 @@ if grep -Fq 'wait-k8s-statefulset-ready.sh "$new_name"' \
   echo "successor learner flow must not wait for client readiness before activation" >&2
   exit 1
 fi
-grep -Fq "context=\"\$(kubectl config current-context" scripts/e2e-vind-rustfs.sh
+vind_e2e=scripts/e2e-vind-rustfs.sh
+grep -Fq "docker build --load --build-arg \"RHIZA_PROFILE=\$profile\" -t \"\$image\" ." "$vind_e2e"
+if grep -Fq "docker build --build-arg \"RHIZA_PROFILE=\$profile\" -t \"\$image\" ." "$vind_e2e"; then
+  echo "vind E2E must load the just-built local image before inspecting or loading it" >&2
+  exit 1
+fi
+vind_build_line="$(grep -nF "docker build --load --build-arg \"RHIZA_PROFILE=\$profile\" -t \"\$image\" ." "$vind_e2e" | cut -d: -f1)"
+vind_image_inspect_line="$(grep -nF "resolved_image=\"\$(docker image inspect --format" "$vind_e2e" | cut -d: -f1)"
+[ -n "$vind_build_line" ] && [ -n "$vind_image_inspect_line" ]
+[ "$vind_build_line" -lt "$vind_image_inspect_line" ]
+grep -Fq "k wait --for=jsonpath='{.status.phase}'=Succeeded \"pod/\$inventory_job\" --timeout=120s" "$vind_e2e"
+if grep -Fq 'k wait --for=condition=complete "pod/$inventory_job"' "$vind_e2e"; then
+  echo "fresh inventory must wait for the Pod Succeeded phase, not a Job condition" >&2
+  exit 1
+fi
+grep -Fq 'k wait --for=condition=complete job/rustfs-create-bucket --timeout=240s' "$vind_e2e"
+grep -Fq 'validate_local_vcluster_context' "$vind_e2e"
+grep -Fq 'context="vcluster-docker_$cluster"' "$vind_e2e"
+grep -Fq 'vcluster connect "$cluster" --driver docker >/dev/null' "$vind_e2e"
+grep -Fq 'kubectl config view -o json 2>/dev/null | jq -er --arg context "$context"' "$vind_e2e"
+grep -Fq 'select(.name == $context) | .context.cluster' "$vind_e2e"
+grep -Fq 'select(.name == $clusters[0]) | .cluster.server' "$vind_e2e"
+grep -Fq 'https://127.0.0.1:*|https://localhost:*|https://[::1]:*' "$vind_e2e"
+grep -Fq 'local-context-preflight.log' "$vind_e2e"
+grep -Fq 'local-context-preflight: mapping-missing-or-ambiguous' "$vind_e2e"
+grep -Fq 'local-context-preflight: endpoint-not-loopback' "$vind_e2e"
+if grep -Eq '^[[:space:]]*context="\$\(kubectl config current-context' "$vind_e2e"; then
+  echo "vind E2E must not select the ambient kubectl context" >&2
+  exit 1
+fi
+if grep -Fq 'vcluster connect "$cluster" --driver docker --print' "$vind_e2e"; then
+  echo "vind E2E must not parse a printed kubeconfig as a context" >&2
+  exit 1
+fi
+vind_context_set_line="$(grep -nF '  context="vcluster-docker_$cluster"' "$vind_e2e" | cut -d: -f1)"
+vind_context_validate_line="$(grep -nF '  if ! context_preflight="$(validate_local_vcluster_context 2>&1)"; then' "$vind_e2e" | cut -d: -f1)"
+vind_context_reject_line="$(grep -nF '    context=""' "$vind_e2e" | cut -d: -f1)"
+vind_ready_line="$(grep -nF 'capture_ready_context' "$vind_e2e" | tail -n1 | cut -d: -f1)"
+[ -n "$vind_context_set_line" ] && [ -n "$vind_context_validate_line" ] && \
+  [ -n "$vind_context_reject_line" ] && [ -n "$vind_ready_line" ]
+[ "$vind_context_set_line" -lt "$vind_context_validate_line" ]
+[ "$vind_context_validate_line" -lt "$vind_context_reject_line" ]
+[ "$vind_context_validate_line" -lt "$vind_ready_line" ]
 grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
 grep -Fq 'export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials' \
   scripts/e2e-vind-rustfs.sh
@@ -1539,8 +1581,8 @@ if grep -Fq "wait --for=jsonpath='{.status.phase}'=Running" scripts/replace-k8s-
   echo "configuration replacement must wait for Ready pods, not merely Running pods" >&2
   exit 1
 fi
-if grep -Eq 'vcluster-docker_|for candidate in' scripts/e2e-vind-rustfs.sh; then
-  echo "vind E2E must use the actual selected context" >&2
+if grep -Fq 'for candidate in' scripts/e2e-vind-rustfs.sh; then
+  echo "vind E2E must not guess among Kubernetes contexts" >&2
   exit 1
 fi
 

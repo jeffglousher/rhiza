@@ -181,7 +181,7 @@ async fn corrupt_operation_ledger_blocks_admin_operations() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime(root.path(), "node", 1, peers(), None);
     std::fs::write(
-        runtime.config().data_dir().join("admin-operations-v1.json"),
+        runtime.config().data_dir().join("admin-operations-v2.json"),
         b"not json",
     )
     .unwrap();
@@ -219,7 +219,7 @@ async fn operation_ledger_persist_failure_is_not_reported_as_success() {
         AdminConfig::new(ADMIN_TOKEN).unwrap(),
     )
     .unwrap();
-    std::fs::create_dir(runtime.config().data_dir().join("admin-operations-v1.json")).unwrap();
+    std::fs::create_dir(runtime.config().data_dir().join("admin-operations-v2.json")).unwrap();
     let (addr, server) = serve(router).await;
 
     let response = admin_post(
@@ -422,10 +422,11 @@ async fn stop_success_and_changed_body_conflict_survive_router_and_runtime_resta
     assert_eq!(first.status(), reqwest::StatusCode::OK);
     let first = response_json::<AdminStopResponse>(first).await;
     let ledger: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.path().join("node/admin-operations-v1.json")).unwrap(),
+        &std::fs::read(root.path().join("node/admin-operations-v2.json")).unwrap(),
     )
     .unwrap();
-    assert!(ledger.get("version").is_none());
+    assert_eq!(ledger.get("version"), Some(&serde_json::json!(2)));
+    assert!(ledger.get("next_sequence").is_some());
     drop(first_runtime);
 
     let runtime = runtime_with_consensus_recorders(
@@ -719,6 +720,16 @@ async fn serve(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
 }
 
 async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
+    let config = NodeConfig::new(
+        "rhiza:sql:cluster-a",
+        "node-1",
+        root.join("identity-only"),
+        1,
+        1,
+        peers(),
+        "client-token",
+    )
+    .unwrap();
     let store = ObjStore::new(ObjStoreConfig::Local {
         root: root.to_path_buf(),
     })
@@ -729,7 +740,7 @@ async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
             "rhiza:sql:cluster-a",
             1,
             1,
-            LogHash::digest(&[b"admin-http-test"]),
+            config.log_initial_configuration().digest(),
             1,
         ),
     );

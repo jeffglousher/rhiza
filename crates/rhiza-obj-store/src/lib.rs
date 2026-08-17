@@ -8,13 +8,23 @@ use object_store::{
     gcp::GoogleCloudStorageBuilder,
     local::LocalFileSystem,
     path::Path as ObjPath,
-    ObjectStore, ObjectStoreExt, PutMode,
+    ObjectStore, ObjectStoreExt, PutMode, RetryConfig,
 };
 use serde::{Deserialize, Serialize};
 
 pub use object_store::UpdateVersion;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+fn gcs_control_retry_config() -> RetryConfig {
+    RetryConfig {
+        // The archive owns the bounded retry budget for its shared GC-control
+        // CAS. Retrying that one operation again in the SDK could hide a
+        // request for the SDK's default three-minute window.
+        max_retries: 0,
+        ..RetryConfig::default()
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -149,6 +159,7 @@ impl fmt::Debug for ObjStoreConfig {
 #[derive(Clone)]
 pub struct ObjStore {
     inner: Arc<dyn ObjectStore>,
+    conditional_once_inner: Option<Arc<dyn ObjectStore>>,
     local_update_lock: Option<Arc<Mutex<()>>>,
 }
 
@@ -230,14 +241,39 @@ impl VersionedObject {
     }
 }
 
+fn build_gcs_store(
+    bucket: &str,
+    service_account_path: Option<&str>,
+    service_account_key: Option<&str>,
+    retry: Option<RetryConfig>,
+) -> Result<object_store::gcp::GoogleCloudStorage> {
+    let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
+    if let Some(retry) = retry {
+        builder = builder.with_retry(retry);
+    }
+    if let Some(path) = service_account_path {
+        builder = builder.with_service_account_path(path);
+    }
+    if let Some(key) = service_account_key {
+        builder = builder.with_service_account_key(key);
+    }
+    builder
+        .build()
+        .map_err(|err| Error::Configuration(err.to_string()))
+}
+
 impl ObjStore {
     pub fn new(config: ObjStoreConfig) -> Result<Self> {
-        let (inner, local_update_lock): (Arc<dyn ObjectStore>, _) = match config {
+        let (inner, conditional_once_inner, local_update_lock): (
+            Arc<dyn ObjectStore>,
+            Option<Arc<dyn ObjectStore>>,
+            _,
+        ) = match config {
             ObjStoreConfig::Local { root } => {
                 fs::create_dir_all(&root).map_err(|err| Error::Configuration(err.to_string()))?;
                 let store = LocalFileSystem::new_with_prefix(root)
                     .map_err(|err| Error::Configuration(err.to_string()))?;
-                (Arc::new(store), Some(Arc::new(Mutex::new(()))))
+                (Arc::new(store), None, Some(Arc::new(Mutex::new(()))))
             }
             ObjStoreConfig::S3 {
                 endpoint,
@@ -275,7 +311,7 @@ impl ObjStore {
                     .with_conditional_put(S3ConditionalPut::ETagMatch)
                     .build()
                     .map_err(|err| Error::Configuration(err.to_string()))?;
-                (Arc::new(store), None)
+                (Arc::new(store), None, None)
             }
             ObjStoreConfig::Gcs {
                 bucket,
@@ -291,17 +327,23 @@ impl ObjStore {
                     ));
                 }
 
-                let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
-                if let Some(path) = service_account_path {
-                    builder = builder.with_service_account_path(path);
-                }
-                if let Some(key) = service_account_key {
-                    builder = builder.with_service_account_key(key);
-                }
-                let store = builder
-                    .build()
-                    .map_err(|err| Error::Configuration(err.to_string()))?;
-                (Arc::new(store), None)
+                let store = build_gcs_store(
+                    &bucket,
+                    service_account_path.as_deref(),
+                    service_account_key.as_deref(),
+                    None,
+                )?;
+                let conditional_once_store = build_gcs_store(
+                    &bucket,
+                    service_account_path.as_deref(),
+                    service_account_key.as_deref(),
+                    Some(gcs_control_retry_config()),
+                )?;
+                (
+                    Arc::new(store),
+                    Some(Arc::new(conditional_once_store)),
+                    None,
+                )
             }
             ObjStoreConfig::AzureBlob {
                 account,
@@ -321,12 +363,13 @@ impl ObjStore {
                 let store = builder
                     .build()
                     .map_err(|err| Error::Configuration(err.to_string()))?;
-                (Arc::new(store), None)
+                (Arc::new(store), None, None)
             }
         };
 
         Ok(Self {
             inner,
+            conditional_once_inner,
             local_update_lock,
         })
     }
@@ -354,6 +397,19 @@ impl ObjStore {
         }
     }
 
+    /// Performs exactly one provider request for a conditional create when a
+    /// backend-specific one-shot client is configured. The caller owns any
+    /// retry and idempotency policy.
+    pub async fn create_conditional_once(
+        &self,
+        key: &str,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<UpdateVersion> {
+        let store = self.conditional_once_inner.as_ref().unwrap_or(&self.inner);
+        self.put_with_store_mode(store, key, bytes.as_ref(), PutMode::Create)
+            .await
+    }
+
     pub async fn update(
         &self,
         key: &str,
@@ -361,6 +417,21 @@ impl ObjStore {
         version: UpdateVersion,
     ) -> Result<UpdateVersion> {
         self.put_with_mode(key, bytes.as_ref(), PutMode::Update(version))
+            .await
+    }
+
+    /// Performs exactly one provider request for a conditional update when a
+    /// backend-specific one-shot client is configured. Normal object I/O keeps
+    /// the provider SDK's retry policy. This is intended for callers that own
+    /// a separate, bounded CAS retry loop.
+    pub async fn update_conditional_once(
+        &self,
+        key: &str,
+        bytes: impl AsRef<[u8]>,
+        version: UpdateVersion,
+    ) -> Result<UpdateVersion> {
+        let store = self.conditional_once_inner.as_ref().unwrap_or(&self.inner);
+        self.put_with_store_mode(store, key, bytes.as_ref(), PutMode::Update(version))
             .await
     }
 
@@ -481,18 +552,28 @@ impl ObjStore {
     }
 
     async fn put_with_mode(&self, key: &str, bytes: &[u8], mode: PutMode) -> Result<UpdateVersion> {
+        self.put_with_store_mode(&self.inner, key, bytes, mode)
+            .await
+    }
+
+    async fn put_with_store_mode(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        key: &str,
+        bytes: &[u8],
+        mode: PutMode,
+    ) -> Result<UpdateVersion> {
         let path = ObjPath::from(key);
         let payload: object_store::PutPayload = Bytes::copy_from_slice(bytes).into();
 
         if let (PutMode::Update(expected), Some(lock)) = (&mode, &self.local_update_lock) {
             let _guard = lock.lock().await;
-            let native = self
-                .inner
+            let native = store
                 .put_opts(&path, payload.clone(), mode.clone().into())
                 .await;
             let result = match native {
                 Err(object_store::Error::NotImplemented { .. }) => {
-                    let meta = match self.inner.head(&path).await {
+                    let meta = match store.head(&path).await {
                         Ok(meta) => meta,
                         Err(object_store::Error::NotFound { .. }) => {
                             return Err(Error::Precondition {
@@ -510,7 +591,7 @@ impl ObjStore {
                             key: key.to_string(),
                         });
                     }
-                    self.inner
+                    store
                         .put_opts(&path, payload, PutMode::Overwrite.into())
                         .await
                 }
@@ -521,7 +602,7 @@ impl ObjStore {
                 .map_err(|err| map_store_error(key, err));
         }
 
-        self.inner
+        store
             .put_opts(&path, payload, mode.into())
             .await
             .map(UpdateVersion::from)
@@ -616,6 +697,15 @@ fn map_store_error(key: &str, error: object_store::Error) -> Error {
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[test]
+    fn only_gcs_control_cas_disables_sdk_retries() {
+        let normal = RetryConfig::default();
+        let control = gcs_control_retry_config();
+        assert!(normal.max_retries > 0);
+        assert_eq!(control.max_retries, 0);
+        assert_eq!(control.retry_timeout, normal.retry_timeout);
+    }
 
     #[tokio::test]
     async fn bounded_get_accepts_exact_boundary_and_rejects_metadata_before_read() {

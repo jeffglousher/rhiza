@@ -1,7 +1,7 @@
 use rhiza_core::{
-    ConfigId, Epoch, ExternalEffectCommand, LogEntry, LogHash, LogIndex, RecoveryAnchor, Snapshot,
-    SnapshotManifest, MAX_EXTERNAL_EFFECT_BYTES, MAX_EXTERNAL_EFFECT_CHUNKS,
-    RECOVERY_ANCHOR_FORMAT_VERSION,
+    CheckpointGcAnchor, ConfigId, Epoch, ExternalEffectCommand, LogAnchor, LogEntry, LogHash,
+    LogIndex, RecoveryAnchor, Snapshot, SnapshotManifest, MAX_EXTERNAL_EFFECT_BYTES,
+    MAX_EXTERNAL_EFFECT_CHUNKS, RECOVERY_ANCHOR_FORMAT_VERSION,
 };
 use rhiza_log::{
     decode_segment_for_cluster_bounded, encode_segment, SegmentFile,
@@ -22,11 +22,13 @@ use rhiza_obj_store::{
 use serde::{Deserialize, Serialize};
 
 pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_SEGMENT_FORMAT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_CAS_ATTEMPTS: usize = 16;
 const CHECKPOINT_RESTORE_LIMITS: CheckpointRestoreLimits = CheckpointRestoreLimits {
-    manifest_encoded_bytes: 1024 * 1024,
+    // Compact QEFX manifests can exceed 1 MiB at the default compaction
+    // boundary, so keep a bounded 2 MiB manifest ceiling.
+    manifest_encoded_bytes: 2 * 1024 * 1024,
     segment_count: 256,
     object_count: 257,
     object_encoded_bytes: 256 * 1024 * 1024,
@@ -42,6 +44,12 @@ const _: () = assert!(
     std::mem::size_of::<LogEntry>() <= CHECKPOINT_RESTORED_ENTRY_OVERHEAD_BUDGET_BYTES as usize
 );
 const MAX_GC_CONTROL_CAS_ATTEMPTS: usize = 128;
+// Seven total attempts plus equal-jitter sleeps remain below the GCS minimum
+// 60s GCS Publisher lease while spanning multiple one-second mutation windows for
+// a simultaneous three-peer startup.
+const MAX_GC_CONTROL_THROTTLE_RETRIES: usize = 6;
+const GC_CONTROL_THROTTLE_BACKOFF_BASE_MS: u64 = 100;
+const GC_CONTROL_THROTTLE_BACKOFF_MAX_MS: u64 = 1_600;
 const GC_FORMAT_VERSION: u32 = 1;
 const GC_CONTROL_ENCODED_BYTES: u64 = 1024 * 1024;
 const DEFAULT_LEASE_MS: u64 = 60_000;
@@ -49,6 +57,7 @@ const DEFAULT_LEASE_MS: u64 = 60_000;
 // Renew well before the lease expires so that a live fetch remains fenced from
 // GC, while leaving enough room for a transient control-plane retry.
 const READER_LEASE_RENEW_DIVISOR: u64 = 3;
+const PUBLISHER_LEASE_RENEW_DIVISOR: u64 = 3;
 pub const DEFAULT_CHECKPOINT_COMPACTION_SEGMENTS: usize = 64;
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
@@ -473,6 +482,36 @@ struct GcLease {
     expires_at_ms: u64,
 }
 
+// Publisher operations may prove the same still-fresh lease several times per
+// checkpoint append.  Avoid rewriting the shared GC-control CAS object until
+// the last third of the lease, while still forcing a write after a fence change
+// or during an active GC barrier.
+fn publisher_lease_has_renewal_margin(lease: &GcLease, now_ms: u64, duration_ms: u64) -> bool {
+    let renewal_margin_ms = (duration_ms / PUBLISHER_LEASE_RENEW_DIVISOR).max(1);
+    lease.expires_at_ms.saturating_sub(now_ms) > renewal_margin_ms
+}
+
+fn gc_control_throttled(error: &ObjStoreError) -> bool {
+    matches!(
+        error,
+        ObjStoreError::Transport { message, .. }
+            if message.contains("429 Too Many Requests")
+                || message.contains("<Code>SlowDown</Code>")
+    )
+}
+
+fn gc_control_throttle_backoff(seed: &[u8], retry: usize) -> Duration {
+    let exponent = u32::try_from(retry).unwrap_or(u32::MAX).min(16);
+    let cap_ms = GC_CONTROL_THROTTLE_BACKOFF_BASE_MS
+        .saturating_mul(1_u64.checked_shl(exponent).unwrap_or(u64::MAX))
+        .min(GC_CONTROL_THROTTLE_BACKOFF_MAX_MS);
+    let floor_ms = (cap_ms / 2).max(1);
+    let retry_bytes = u64::try_from(retry).unwrap_or(u64::MAX).to_be_bytes();
+    let digest = LogHash::digest(&[b"rhiza-gc-control-throttle-v1", seed, &retry_bytes]);
+    let jitter = u64::from_be_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes"));
+    Duration::from_millis(floor_ms.saturating_add(jitter % (cap_ms - floor_ms + 1)))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ActiveGc {
@@ -771,8 +810,11 @@ pub struct CheckpointEffectRecord {
     manifest_object_key: String,
     manifest_sha256: String,
     manifest_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_object_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_sha256: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_size_bytes: Vec<u64>,
 }
 
@@ -1100,32 +1142,70 @@ pub struct LoadedCheckpointManifest {
     version: UpdateVersion,
 }
 
-/// Evidence returned only after a checkpoint manifest has been read back from
-/// object storage. `manifest_digest` is the hash of the canonical manifest
-/// bytes; no parallel certificate codec is introduced.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointReadbackCertificate {
+const MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES: usize = 16 * 1024;
+
+/// A bounded, durable encoding of the immutable result of one successful
+/// checkpoint-manifest conditional write. Its fields stay private so callers
+/// cannot assemble GC authority independently of an archive publication.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointPublicationReceipt {
     identity: CheckpointIdentity,
     tip: CheckpointTip,
     manifest_digest: LogHash,
-    object_generation: UpdateVersion,
+    object_version: ObjectVersion,
 }
 
-impl CheckpointReadbackCertificate {
-    pub const fn identity(&self) -> &CheckpointIdentity {
-        &self.identity
+impl CheckpointPublicationReceipt {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| Error::Serialization(error.to_string()))?;
+        if bytes.len() > MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES {
+            return Err(Error::Serialization(
+                "checkpoint publication receipt exceeds its size limit".into(),
+            ));
+        }
+        Ok(bytes)
     }
 
-    pub const fn tip(&self) -> &CheckpointTip {
-        &self.tip
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES {
+            return Err(Error::Serialization(
+                "checkpoint publication receipt exceeds its size limit".into(),
+            ));
+        }
+        let receipt: Self = serde_json::from_slice(bytes)
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        let canonical = receipt.encode()?;
+        if canonical != bytes {
+            return Err(Error::Serialization(
+                "checkpoint publication receipt is not canonical".into(),
+            ));
+        }
+        if receipt.identity.cluster_id().is_empty()
+            || receipt.tip.index() == 0
+            || receipt.tip.hash() == LogHash::ZERO
+            || receipt.manifest_digest == LogHash::ZERO
+        {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint publication receipt is incomplete".into(),
+            ));
+        }
+        Ok(receipt)
     }
 
-    pub const fn manifest_digest(&self) -> LogHash {
-        self.manifest_digest
-    }
-
-    pub const fn object_generation(&self) -> &UpdateVersion {
-        &self.object_generation
+    pub fn gc_anchor(&self) -> Result<CheckpointGcAnchor> {
+        CheckpointGcAnchor::new(
+            self.identity.cluster_id(),
+            self.identity.epoch(),
+            self.identity.config_id(),
+            self.identity.config_digest(),
+            LogAnchor::new(self.tip.index(), self.tip.hash()),
+            self.manifest_digest,
+        )
+        .ok_or_else(|| {
+            Error::InvalidCheckpoint("checkpoint publication receipt is incomplete".into())
+        })
     }
 }
 
@@ -1136,6 +1216,23 @@ impl LoadedCheckpointManifest {
 
     pub const fn version(&self) -> &UpdateVersion {
         &self.version
+    }
+
+    /// Returns immutable evidence for the exact manifest generation whose
+    /// conditional create/update completed. A later valid manifest generation
+    /// cannot invalidate this successful CAS receipt.
+    pub fn publication_gc_anchor(&self) -> Result<CheckpointGcAnchor> {
+        self.publication_receipt()?.gc_anchor()
+    }
+
+    pub fn publication_receipt(&self) -> Result<CheckpointPublicationReceipt> {
+        let bytes = serialize_checkpoint_manifest(self.manifest())?;
+        Ok(CheckpointPublicationReceipt {
+            identity: self.manifest.identity().clone(),
+            tip: *self.manifest.tip(),
+            manifest_digest: LogHash::digest(&[&bytes]),
+            object_version: self.version.clone().into(),
+        })
     }
 }
 
@@ -1215,6 +1312,7 @@ struct CheckpointPublisherState {
 
 pub struct CheckpointPublisher {
     store: ObjectArchiveStore,
+    holder: String,
     lease_id: String,
     options: CheckpointPublisherOptions,
     operation: tokio::sync::Mutex<()>,
@@ -1222,6 +1320,21 @@ pub struct CheckpointPublisher {
 }
 
 impl CheckpointPublisher {
+    pub fn receipt_holder(&self) -> &str {
+        &self.holder
+    }
+
+    pub async fn publish_receipt_for_loaded(
+        &self,
+        published: &LoadedCheckpointManifest,
+    ) -> Result<CheckpointPublicationReceipt> {
+        self.store
+            .validate_checkpoint_manifest(published.manifest())?;
+        self.store
+            .publish_checkpoint_receipt(&self.holder, published)
+            .await
+    }
+
     pub async fn renew(&self) -> Result<()> {
         self.renew_at(now_ms()).await
     }
@@ -1312,7 +1425,6 @@ impl CheckpointPublisher {
             self.renew().await?;
             return Ok(self.cached_checkpoint().await);
         }
-
         let (result, receiver) = tokio::sync::oneshot::channel();
         {
             let mut state = self.state.lock().await;
@@ -1322,7 +1434,7 @@ impl CheckpointPublisher {
             });
         }
         tokio::task::yield_now().await;
-        self.drive_flushes().await;
+        self.drive_flushes_with_public_renewal().await;
 
         receiver.await.unwrap_or_else(|_| {
             Err(Error::InvalidCheckpoint(
@@ -1341,6 +1453,7 @@ impl CheckpointPublisher {
         effects: &[CheckpointEffectRecord],
     ) -> Result<LoadedCheckpointManifest> {
         let _operation = self.operation.lock().await;
+        self.renew().await?;
         let loaded = self.state.lock().await.loaded.clone();
         let published = self
             .store
@@ -1363,6 +1476,7 @@ impl CheckpointPublisher {
         snapshot_bytes: &[u8],
     ) -> Result<LoadedCheckpointManifest> {
         let _operation = self.operation.lock().await;
+        self.renew().await?;
         let loaded = self.state.lock().await.loaded.clone();
         let published = self
             .store
@@ -1387,6 +1501,7 @@ impl CheckpointPublisher {
         snapshot_bytes: &[u8],
     ) -> Result<LoadedCheckpointManifest> {
         let _operation = self.operation.lock().await;
+        self.renew().await?;
         let loaded = self.state.lock().await.loaded.clone();
         let published = self
             .store
@@ -1408,8 +1523,22 @@ impl CheckpointPublisher {
         self.store.release_gc_lease(&self.lease_id).await
     }
 
+    #[cfg(test)]
     async fn drive_flushes(&self) {
+        self.drive_flushes_inner(false).await;
+    }
+
+    async fn drive_flushes_with_public_renewal(&self) {
+        self.drive_flushes_inner(true).await;
+    }
+
+    async fn drive_flushes_inner(&self, renew_missing_lease: bool) {
         let _operation = self.operation.lock().await;
+        let renewal = if renew_missing_lease {
+            self.renew().await
+        } else {
+            Ok(())
+        };
         let (pending, loaded) = {
             let mut state = self.state.lock().await;
             if state.pending.is_empty() {
@@ -1418,20 +1547,21 @@ impl CheckpointPublisher {
             (std::mem::take(&mut state.pending), state.loaded.clone())
         };
         let published_index = loaded.manifest().tip().index();
-        let published = match coalesce_pending_entries(&pending, published_index) {
-            Ok(entries) if entries.is_empty() => Ok(loaded),
-            Ok(entries) => {
-                self.store
-                    .publish_committed_from_loaded_unleased(
-                        &entries,
-                        &self.lease_id,
-                        self.options.lease_duration_ms,
-                        loaded,
-                    )
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+        let published =
+            match renewal.and_then(|()| coalesce_pending_entries(&pending, published_index)) {
+                Ok(entries) if entries.is_empty() => Ok(loaded),
+                Ok(entries) => {
+                    self.store
+                        .publish_committed_from_loaded_unleased(
+                            &entries,
+                            &self.lease_id,
+                            self.options.lease_duration_ms,
+                            loaded,
+                        )
+                        .await
+                }
+                Err(error) => Err(error),
+            };
 
         if let Ok(loaded) = &published {
             self.state.lock().await.loaded = loaded.clone();
@@ -1825,7 +1955,7 @@ async fn test_checkpoint_manifest_gate(store_identity: u64) {
 enum TestGcControlOperation {
     Load,
     Update,
-    UpdateError,
+    MutationError,
 }
 
 /// A test-only pause inside one exact GC-control operation. The gate is
@@ -1837,6 +1967,9 @@ struct TestGcControlGate {
     store_identity: u64,
     operation: TestGcControlOperation,
     injected_error: Option<ObjStoreError>,
+    injected_failures_remaining: Option<Arc<AtomicU64>>,
+    minimum_update_interval: Option<Duration>,
+    last_allowed_update: Option<Arc<Mutex<Option<std::time::Instant>>>>,
     entered: std::sync::mpsc::SyncSender<()>,
     released: Arc<std::sync::atomic::AtomicBool>,
     release_notification: Arc<tokio::sync::Notify>,
@@ -1854,6 +1987,9 @@ impl TestGcControlGate {
                 store_identity,
                 operation,
                 injected_error: None,
+                injected_failures_remaining: None,
+                minimum_update_interval: None,
+                last_allowed_update: None,
                 entered,
                 released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 release_notification: Arc::new(tokio::sync::Notify::new()),
@@ -1866,8 +2002,35 @@ impl TestGcControlGate {
         store_identity: u64,
         error: ObjStoreError,
     ) -> (Self, std::sync::mpsc::Receiver<()>) {
-        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::UpdateError);
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::MutationError);
         gate.injected_error = Some(error);
+        (gate, entered)
+    }
+
+    fn throttled_mutations(
+        store_identity: u64,
+        failures: u64,
+    ) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::MutationError);
+        gate.injected_error = Some(ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "429 Too Many Requests: <Code>SlowDown</Code>".into(),
+        });
+        gate.injected_failures_remaining = Some(Arc::new(AtomicU64::new(failures)));
+        (gate, entered)
+    }
+
+    fn rate_limited_mutations(
+        store_identity: u64,
+        interval: Duration,
+    ) -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (mut gate, entered) = Self::new(store_identity, TestGcControlOperation::MutationError);
+        gate.injected_error = Some(ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "429 Too Many Requests: <Code>SlowDown</Code>".into(),
+        });
+        gate.minimum_update_interval = Some(interval);
+        gate.last_allowed_update = Some(Arc::new(Mutex::new(None)));
         (gate, entered)
     }
 
@@ -1887,14 +2050,43 @@ impl TestGcControlGate {
         }
         loop {
             if self.released.load(Ordering::Acquire) {
-                return self.injected_error.clone();
+                return self.next_error();
             }
             let notified = self.release_notification.notified();
             if self.released.load(Ordering::Acquire) {
-                return self.injected_error.clone();
+                return self.next_error();
             }
             notified.await;
         }
+    }
+
+    fn next_error(&self) -> Option<ObjStoreError> {
+        if let (Some(interval), Some(last_allowed)) =
+            (self.minimum_update_interval, &self.last_allowed_update)
+        {
+            let now = std::time::Instant::now();
+            let mut last_allowed = last_allowed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let window_open = match *last_allowed {
+                Some(last) => now.duration_since(last) >= interval,
+                None => true,
+            };
+            if window_open {
+                *last_allowed = Some(now);
+                return None;
+            }
+            return self.injected_error.clone();
+        }
+        let Some(remaining) = &self.injected_failures_remaining else {
+            return self.injected_error.clone();
+        };
+        remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .ok()
+            .and_then(|_| self.injected_error.clone())
     }
 }
 
@@ -1964,10 +2156,10 @@ async fn test_gc_control_gate(
 }
 
 impl ObjectArchiveStore {
-    pub async fn checkpoint_readback_certificate(
+    pub async fn checkpoint_readback_gc_anchor(
         &self,
         expected: &LoadedCheckpointManifest,
-    ) -> Result<CheckpointReadbackCertificate> {
+    ) -> Result<CheckpointGcAnchor> {
         let actual = self.load_checkpoint().await?.ok_or_else(|| {
             Error::InvalidCheckpoint("checkpoint disappeared before GC certificate readback".into())
         })?;
@@ -1976,13 +2168,7 @@ impl ObjectArchiveStore {
                 "checkpoint changed before GC certificate readback".into(),
             ));
         }
-        let bytes = serialize_checkpoint_manifest(actual.manifest())?;
-        Ok(CheckpointReadbackCertificate {
-            identity: actual.manifest.identity().clone(),
-            tip: *actual.manifest.tip(),
-            manifest_digest: LogHash::digest(&[&bytes]),
-            object_generation: actual.version,
-        })
+        actual.publication_gc_anchor()
     }
     pub fn new(store: ObjStore, cluster_id: impl Into<String>) -> Result<Self> {
         if !store.supports_strong_cross_process_cas() {
@@ -2042,6 +2228,7 @@ impl ObjectArchiveStore {
         if command.cluster_id() != identity.cluster_id
             || command.epoch() != identity.epoch
             || command.config_id() != identity.config_id
+            || command.config_digest() != identity.config_digest
             || command.intended_slot() != entry.index
             || command.prev_hash() != entry.prev_hash
             || chunks.len() != command.chunks().len()
@@ -2063,9 +2250,6 @@ impl ObjectArchiveStore {
             ));
         }
         let prefix = checkpoint_effect_prefix(identity, entry.index, command.effect_digest_value());
-        let mut chunk_object_keys = Vec::with_capacity(chunks.len());
-        let mut chunk_sha256 = Vec::with_capacity(chunks.len());
-        let mut chunk_size_bytes = Vec::with_capacity(chunks.len());
         for (ordinal, (chunk, expected)) in chunks.iter().zip(command.chunks()).enumerate() {
             if chunk.len() != expected.encoded_len() as usize
                 || ExternalEffectCommand::chunk_digest(chunk) != expected.digest()
@@ -2085,9 +2269,6 @@ impl ObjectArchiveStore {
             let sha256 = sha256_hex(chunk);
             self.download_verified(&key, chunk.len() as u64, &sha256)
                 .await?;
-            chunk_object_keys.push(key);
-            chunk_sha256.push(sha256);
-            chunk_size_bytes.push(chunk.len() as u64);
         }
         let manifest_object_key = format!("{prefix}/binding.qefx");
         match self
@@ -2119,9 +2300,13 @@ impl ObjectArchiveStore {
             manifest_object_key,
             manifest_sha256,
             manifest_size_bytes: entry.payload.len() as u64,
-            chunk_object_keys,
-            chunk_sha256,
-            chunk_size_bytes,
+            // The canonical QEFX binding already commits the ordered chunk
+            // lengths and digests, and the archive keys are deterministic.
+            // Keep accepting the three legacy arrays on restore, but do not
+            // repeat them in every root checkpoint manifest record.
+            chunk_object_keys: Vec::new(),
+            chunk_sha256: Vec::new(),
+            chunk_size_bytes: Vec::new(),
         })
     }
 
@@ -2139,24 +2324,50 @@ impl ObjectArchiveStore {
         let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
             Error::InvalidCheckpoint(format!("invalid archived QEFX binding: {error}"))
         })?;
-        if command.intended_slot() != effect.entry_index
-            || command.chunks().len() != effect.chunk_object_keys.len()
-            || effect.chunk_object_keys.len() != effect.chunk_sha256.len()
-            || effect.chunk_object_keys.len() != effect.chunk_size_bytes.len()
+        let identity = self.checkpoint_identity()?;
+        let prefix =
+            checkpoint_effect_prefix(identity, effect.entry_index, command.effect_digest_value());
+        let expected_manifest_key = format!("{prefix}/binding.qefx");
+        let compact = effect.chunk_object_keys.is_empty()
+            && effect.chunk_sha256.is_empty()
+            && effect.chunk_size_bytes.is_empty();
+        let legacy = effect.chunk_object_keys.len() == command.chunks().len()
+            && effect.chunk_sha256.len() == command.chunks().len()
+            && effect.chunk_size_bytes.len() == command.chunks().len();
+        if command.cluster_id() != identity.cluster_id()
+            || command.epoch() != identity.epoch()
+            || command.config_id() != identity.config_id()
+            || command.config_digest() != identity.config_digest()
+            || command.intended_slot() != effect.entry_index
+            || effect.manifest_object_key != expected_manifest_key
+            || (!compact && !legacy)
         {
             return Err(Error::InvalidCheckpoint(
                 "archived QEFX reference shape mismatch".into(),
             ));
         }
         let mut chunks = Vec::with_capacity(command.chunks().len());
-        for (((key, sha256), size), expected) in effect
-            .chunk_object_keys
-            .iter()
-            .zip(&effect.chunk_sha256)
-            .zip(&effect.chunk_size_bytes)
-            .zip(command.chunks())
-        {
-            let chunk = self.download_verified(key, *size, sha256).await?;
+        for (ordinal, expected) in command.chunks().iter().enumerate() {
+            let expected_key = format!(
+                "{prefix}/chunks/{ordinal:03}-{}.qefc",
+                expected.digest().to_hex()
+            );
+            let chunk = if compact {
+                self.store
+                    .get_bounded(&expected_key, u64::from(expected.encoded_len()))
+                    .await
+                    .map_err(|error| map_restore_object_error(error, "object encoded bytes"))?
+            } else {
+                let key = &effect.chunk_object_keys[ordinal];
+                let size = effect.chunk_size_bytes[ordinal];
+                if key != &expected_key || size != u64::from(expected.encoded_len()) {
+                    return Err(Error::InvalidCheckpoint(
+                        "archived QEFX chunk reference differs from binding".into(),
+                    ));
+                }
+                self.download_verified(key, size, &effect.chunk_sha256[ordinal])
+                    .await?
+            };
             if chunk.len() != expected.encoded_len() as usize
                 || ExternalEffectCommand::chunk_digest(&chunk) != expected.digest()
             {
@@ -2171,6 +2382,101 @@ impl ObjectArchiveStore {
 
     pub fn checkpoint_manifest_key(&self) -> Result<String> {
         Ok(checkpoint_namespace(self.checkpoint_identity()?) + "/manifest.json")
+    }
+
+    async fn publish_checkpoint_receipt(
+        &self,
+        holder: &str,
+        published: &LoadedCheckpointManifest,
+    ) -> Result<CheckpointPublicationReceipt> {
+        let receipt = published.publication_receipt()?;
+        let identity = self.checkpoint_identity()?;
+        if receipt.identity != *identity {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint receipt identity differs from this archive".into(),
+            ));
+        }
+        let bytes = receipt.encode()?;
+        let key = checkpoint_publication_receipt_key(identity, holder, receipt.manifest_digest)?;
+        match self.store.create(&key, &bytes).await {
+            Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let readback = self
+            .store
+            .get_bounded(
+                &key,
+                u64::try_from(MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES)
+                    .expect("receipt bound fits u64"),
+            )
+            .await?;
+        if readback != bytes || CheckpointPublicationReceipt::decode(&readback)? != receipt {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint publication receipt readback differs".into(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    pub async fn load_checkpoint_receipt(
+        &self,
+        holder: &str,
+        manifest_digest: LogHash,
+    ) -> Result<CheckpointPublicationReceipt> {
+        let identity = self.checkpoint_identity()?;
+        let key = checkpoint_publication_receipt_key(identity, holder, manifest_digest)?;
+        let bytes = self
+            .store
+            .get_bounded(
+                &key,
+                u64::try_from(MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES)
+                    .expect("receipt bound fits u64"),
+            )
+            .await?;
+        let receipt = CheckpointPublicationReceipt::decode(&bytes)?;
+        if receipt.identity != *identity || receipt.manifest_digest != manifest_digest {
+            return Err(Error::InvalidCheckpoint(
+                "checkpoint publication receipt binding differs".into(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    pub async fn prune_checkpoint_receipts_through(
+        &self,
+        holder: &str,
+        through_slot: LogIndex,
+    ) -> Result<()> {
+        let identity = self.checkpoint_identity()?;
+        let holder_hash =
+            LogHash::digest(&[b"rhiza-checkpoint-receipt-holder-v1\0", holder.as_bytes()]);
+        let prefix = format!(
+            "{}/receipts/{}/",
+            checkpoint_namespace(identity),
+            holder_hash.to_hex()
+        );
+        for metadata in self.store.list_metadata(&prefix).await? {
+            let bytes = self
+                .store
+                .get_bounded(
+                    metadata.key(),
+                    u64::try_from(MAX_CHECKPOINT_PUBLICATION_RECEIPT_BYTES)
+                        .expect("receipt bound fits u64"),
+                )
+                .await?;
+            let receipt = CheckpointPublicationReceipt::decode(&bytes)?;
+            if receipt.identity != *identity {
+                return Err(Error::InvalidCheckpoint(
+                    "checkpoint receipt cleanup found a foreign identity".into(),
+                ));
+            }
+            if receipt.tip.index() <= through_slot {
+                self.store
+                    .delete_exact(metadata.key(), metadata.version())
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn open_checkpoint_publisher(
@@ -2212,6 +2518,7 @@ impl ObjectArchiveStore {
         };
         Ok(CheckpointPublisher {
             store: self.clone(),
+            holder,
             lease_id: lease.lease_id,
             options,
             operation: tokio::sync::Mutex::new(()),
@@ -2892,11 +3199,12 @@ impl ObjectArchiveStore {
         if source_identity.cluster_id != target_identity.cluster_id
             || source_identity.epoch != target_identity.epoch
             || source_identity.config_id != target_identity.config_id
+            || source_identity.config_digest != target_identity.config_digest
             || source_identity.recovery_generation.checked_add(1)
                 != Some(target_identity.recovery_generation)
         {
             return Err(Error::InvalidCheckpoint(
-                "recovery-generation roll requires the same cluster/epoch/config and generation + 1"
+                "recovery-generation roll requires the same cluster/epoch/config identity and generation + 1"
                     .into(),
             ));
         }
@@ -3039,56 +3347,48 @@ impl ObjectArchiveStore {
             tip: source.manifest.tip,
         };
         target.validate_checkpoint_manifest(&manifest)?;
-        target
-            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
-            .await?;
-        if let Some(existing) = target.load_checkpoint_unleased().await? {
-            return if existing.manifest == manifest {
-                target.register_generation(now_ms()).await?;
-                Ok(existing)
-            } else {
-                Err(Error::CheckpointTargetConflict)
-            };
-        }
-        let target_manifest_key = target.checkpoint_manifest_key()?;
-        let version = match target
-            .store
-            .create(
-                &target_manifest_key,
-                serialize_checkpoint_manifest(&manifest)?,
-            )
-            .await
-        {
-            Ok(version) => version,
-            Err(ObjStoreError::AlreadyExists { .. }) => {
-                let existing = target.load_checkpoint_unleased().await?.ok_or_else(|| {
-                    Error::InvalidCheckpoint("target manifest disappeared after create".into())
-                })?;
-                return if existing.manifest == manifest {
-                    target.register_generation(now_ms()).await?;
-                    Ok(existing)
-                } else {
-                    Err(Error::CheckpointTargetConflict)
-                };
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let source_after = self.load_checkpoint_unleased().await?;
-        if source_after.as_ref() != Some(&source) {
-            let published_version: ObjectVersion = version.clone().into();
-            if !target
-                .store
-                .delete_exact(&target_manifest_key, &published_version)
-                .await?
-            {
-                return Err(Error::CheckpointTargetConflict);
-            }
+        let source_at_publish = self.load_checkpoint_unleased().await?;
+        if source_at_publish.as_ref() != Some(&source) {
             return Err(Error::InvalidCheckpoint(
                 "source checkpoint changed during copy".into(),
             ));
         }
+        target
+            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+            .await?;
+        let published = if let Some(existing) = target.load_checkpoint_unleased().await? {
+            if existing.manifest != manifest {
+                return Err(Error::CheckpointTargetConflict);
+            }
+            existing
+        } else {
+            let target_manifest_key = target.checkpoint_manifest_key()?;
+            match target
+                .store
+                .create(
+                    &target_manifest_key,
+                    serialize_checkpoint_manifest(&manifest)?,
+                )
+                .await
+            {
+                Ok(version) => LoadedCheckpointManifest { manifest, version },
+                Err(ObjStoreError::AlreadyExists { .. }) => {
+                    let existing = target.load_checkpoint_unleased().await?.ok_or_else(|| {
+                        Error::InvalidCheckpoint("target manifest disappeared after create".into())
+                    })?;
+                    if existing.manifest != manifest {
+                        return Err(Error::CheckpointTargetConflict);
+                    }
+                    existing
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        target
+            .renew_active_publisher_gc_lease(target_lease_id, DEFAULT_LEASE_MS)
+            .await?;
         target.register_generation(now_ms()).await?;
-        Ok(LoadedCheckpointManifest { manifest, version })
+        Ok(published)
     }
 
     async fn create_verified_checkpoint_object(
@@ -3657,7 +3957,9 @@ impl ObjectArchiveStore {
                 .list_metadata(&prefix)
                 .await?
                 .into_iter()
-                .filter(|metadata| is_known_checkpoint_object(&generation.identity, metadata.key()))
+                .filter(|metadata| {
+                    is_known_retired_checkpoint_object(&generation.identity, metadata.key())
+                })
                 .collect::<Vec<_>>();
             if metadata.iter().any(|metadata| {
                 now_ms.saturating_sub(metadata.last_modified_ms()) < policy.min_age_ms
@@ -3701,9 +4003,7 @@ impl ObjectArchiveStore {
     }
 
     pub async fn execute_gc(&self, plan_hash: &str, now_ms: u64) -> Result<GcExecutionReport> {
-        if let Some(report) = self.load_gc_report(plan_hash).await? {
-            return Ok(report);
-        }
+        let existing_report = self.load_gc_report(plan_hash).await?;
         let plan_bytes = self.store.get(&self.gc_plan_key(plan_hash)).await?;
         let plan: GcPlan = deserialize_json(&plan_bytes)?;
         let actual_hash = hash_gc_plan(&plan)?;
@@ -3713,30 +4013,43 @@ impl ObjectArchiveStore {
                 actual: actual_hash,
             });
         }
+        if let Some(report) = existing_report {
+            self.validate_gc_report(&plan, &report)?;
+            self.clear_gc_barrier(&plan).await?;
+            return Ok(report);
+        }
         if now_ms < plan.not_before_ms {
             return Err(Error::GcBarrierBusy {
                 until_ms: plan.not_before_ms,
             });
         }
         if let Err(error) = self.acquire_gc_barrier(&plan, now_ms).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
         if let Err(error) = self.enter_delete_phase(&plan, now_ms).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
         if let Err(error) = self.fence_gc_root(&plan).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
         if let Err(error) = self.retire_plan_generations(&plan, now_ms).await {
-            return self.gc_report_after_stale(plan_hash, error).await;
+            return self.gc_report_after_stale(&plan, error).await;
         }
 
         let mut results = Vec::with_capacity(plan.candidates.len());
         for candidate in &plan.candidates {
             if let Err(error) = self.validate_gc_fence(&plan, now_ms).await {
-                return self.gc_report_after_stale(plan_hash, error).await;
+                return self.gc_report_after_stale(&plan, error).await;
             }
-            if !is_known_checkpoint_object(&candidate.generation, &candidate.key) {
+            let known = match candidate.reason {
+                GcCandidateReason::SupersededRecoveryGeneration => {
+                    is_known_retired_checkpoint_object(&candidate.generation, &candidate.key)
+                }
+                GcCandidateReason::UnreferencedCheckpointObject => {
+                    is_known_checkpoint_object(&candidate.generation, &candidate.key)
+                }
+            };
+            if !known {
                 return Err(Error::InvalidGc(format!(
                     "candidate is outside a known checkpoint layout: {}",
                     candidate.key
@@ -3798,21 +4111,59 @@ impl ObjectArchiveStore {
                 .ok_or_else(|| Error::InvalidGc("execution report disappeared".into()))?,
             Err(error) => return Err(error.into()),
         };
+        self.validate_gc_report(&plan, &report)?;
         self.clear_gc_barrier(&plan).await?;
         Ok(report)
     }
 
     async fn gc_report_after_stale(
         &self,
-        plan_hash: &str,
+        plan: &GcPlan,
         error: Error,
     ) -> Result<GcExecutionReport> {
         if matches!(error, Error::GcPlanStale { .. }) {
-            if let Some(report) = self.load_gc_report(plan_hash).await? {
+            if let Some(report) = self.load_gc_report(plan.plan_hash()).await? {
+                self.validate_gc_report(plan, &report)?;
                 return Ok(report);
             }
         }
         Err(error)
+    }
+
+    fn validate_gc_report(&self, plan: &GcPlan, report: &GcExecutionReport) -> Result<()> {
+        if report.format_version != GC_FORMAT_VERSION {
+            return Err(Error::InvalidGc(
+                "execution report format version mismatch".into(),
+            ));
+        }
+        if report.plan_hash != plan.plan_hash {
+            return Err(Error::GcPlanHashMismatch {
+                expected: plan.plan_hash.clone(),
+                actual: report.plan_hash.clone(),
+            });
+        }
+        if report.fence != execution_fence(plan) {
+            return Err(Error::InvalidGc(
+                "execution report fence does not match the plan".into(),
+            ));
+        }
+        if report.results.len() != plan.candidates.len() {
+            return Err(Error::InvalidGc(
+                "execution report candidates do not match the plan".into(),
+            ));
+        }
+        for (candidate, evidence) in plan.candidates.iter().zip(&report.results) {
+            if evidence.format_version != GC_FORMAT_VERSION
+                || evidence.plan_hash != plan.plan_hash
+                || evidence.key != candidate.key
+                || evidence.version != candidate.version
+            {
+                return Err(Error::InvalidGc(
+                    "execution report candidates do not match the plan".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn gc_plan_key(&self, plan_hash: &str) -> String {
@@ -3934,6 +4285,17 @@ impl ObjectArchiveStore {
                     });
                 }
             }
+            if kind == GcLeaseKind::Publisher
+                && loaded.control.active_gc.is_none()
+                && loaded.control.leases.iter().any(|lease| {
+                    lease.lease_id == lease_id
+                        && lease.kind == kind
+                        && lease.fence == loaded.control.fence
+                        && publisher_lease_has_renewal_margin(lease, now_ms, duration_ms)
+                })
+            {
+                return Ok(());
+            }
             let expires_at_ms = now_ms.saturating_add(duration_ms);
             if let Some(lease) = loaded
                 .control
@@ -4026,7 +4388,7 @@ impl ObjectArchiveStore {
             let Some(lease) = loaded
                 .control
                 .leases
-                .iter_mut()
+                .iter()
                 .find(|lease| lease.lease_id == lease_id)
             else {
                 return Err(Error::GcLeaseMissing {
@@ -4037,6 +4399,12 @@ impl ObjectArchiveStore {
                 return Err(Error::InvalidGc(
                     "publisher proof renewal lease kind changed".into(),
                 ));
+            }
+            if loaded.control.active_gc.is_none()
+                && lease.fence == loaded.control.fence
+                && publisher_lease_has_renewal_margin(lease, loaded_at_ms, duration_ms)
+            {
+                return Ok(());
             }
             if prior_hard_deadline.is_none() {
                 let remaining_ms =
@@ -4055,6 +4423,12 @@ impl ObjectArchiveStore {
                 );
                 prior_expires_at_ms = Some(lease.expires_at_ms);
             }
+            let lease = loaded
+                .control
+                .leases
+                .iter_mut()
+                .find(|lease| lease.lease_id == lease_id)
+                .expect("validated Publisher lease remains present");
             let expires_at_ms = loaded_at_ms.saturating_add(duration_ms);
             let next_hard_deadline = loaded_at
                 .checked_add(Duration::from_millis(duration_ms))
@@ -4506,6 +4880,7 @@ impl ObjectArchiveStore {
             if active.operation_id != plan.operation_id
                 || active.plan_hash != plan.plan_hash
                 || active.fence != execution_fence(plan)
+                || active.root != plan.root
             {
                 return Err(Error::GcPlanStale {
                     message: "GC barrier changed before completion".into(),
@@ -4581,14 +4956,35 @@ impl ObjectArchiveStore {
             leases: Vec::new(),
             active_gc: None,
         };
-        match self
-            .store
-            .create(&self.gc_control_key(), serialize_gc_control(&control)?)
-            .await
-        {
-            Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
+        let bytes = serialize_gc_control(&control)?;
+        for retry in 0..=MAX_GC_CONTROL_THROTTLE_RETRIES {
+            #[cfg(test)]
+            let injected = test_gc_control_gate(
+                self.test_store_identity,
+                TestGcControlOperation::MutationError,
+            )
+            .await;
+            #[cfg(not(test))]
+            let injected: Option<ObjStoreError> = None;
+            let result = match injected {
+                Some(error) => Err(error),
+                None => {
+                    self.store
+                        .create_conditional_once(&self.gc_control_key(), &bytes)
+                        .await
+                }
+            };
+            match result {
+                Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => return Ok(()),
+                Err(error)
+                    if retry < MAX_GC_CONTROL_THROTTLE_RETRIES && gc_control_throttled(&error) =>
+                {
+                    tokio::time::sleep(gc_control_throttle_backoff(&bytes, retry)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
+        unreachable!("bounded GC-control throttle loop always returns")
     }
 
     async fn load_gc_control(&self) -> Result<LoadedGcControl> {
@@ -4611,28 +5007,46 @@ impl ObjectArchiveStore {
     }
 
     async fn update_gc_control(&self, loaded: &LoadedGcControl) -> Result<UpdateVersion> {
-        #[cfg(test)]
-        if let Some(error) = test_gc_control_gate(
-            self.test_store_identity,
-            TestGcControlOperation::UpdateError,
-        )
-        .await
-        {
-            return Err(error.into());
-        }
-        let result = self
-            .store
-            .update(
-                &self.gc_control_key(),
-                serialize_gc_control(&loaded.control)?,
-                loaded.version.clone(),
+        let bytes = serialize_gc_control(&loaded.control)?;
+        for retry in 0..=MAX_GC_CONTROL_THROTTLE_RETRIES {
+            #[cfg(test)]
+            let injected = test_gc_control_gate(
+                self.test_store_identity,
+                TestGcControlOperation::MutationError,
             )
-            .await
-            .map_err(Into::into);
-        #[cfg(test)]
-        let _ =
-            test_gc_control_gate(self.test_store_identity, TestGcControlOperation::Update).await;
-        result
+            .await;
+            #[cfg(not(test))]
+            let injected: Option<ObjStoreError> = None;
+            let result = match injected {
+                Some(error) => Err(error),
+                None => {
+                    self.store
+                        .update_conditional_once(
+                            &self.gc_control_key(),
+                            &bytes,
+                            loaded.version.clone(),
+                        )
+                        .await
+                }
+            };
+            match result {
+                Err(error)
+                    if retry < MAX_GC_CONTROL_THROTTLE_RETRIES && gc_control_throttled(&error) =>
+                {
+                    tokio::time::sleep(gc_control_throttle_backoff(&bytes, retry)).await;
+                }
+                result => {
+                    #[cfg(test)]
+                    let _ = test_gc_control_gate(
+                        self.test_store_identity,
+                        TestGcControlOperation::Update,
+                    )
+                    .await;
+                    return result.map_err(Into::into);
+                }
+            }
+        }
+        unreachable!("bounded GC-control throttle loop always returns")
     }
 
     fn expire_gc_state(&self, control: &mut GcControl, now_ms: u64) {
@@ -5027,39 +5441,7 @@ impl ObjectArchiveStore {
             ));
         }
         for effect in effects {
-            if effect.chunk_object_keys.len() != effect.chunk_sha256.len()
-                || effect.chunk_object_keys.len() != effect.chunk_size_bytes.len()
-                || effect.chunk_object_keys.len() > MAX_EXTERNAL_EFFECT_CHUNKS
-            {
-                return Err(Error::InvalidCheckpoint(
-                    "invalid QEFX checkpoint ref shape".into(),
-                ));
-            }
-            let manifest = self
-                .download_verified(
-                    &effect.manifest_object_key,
-                    effect.manifest_size_bytes,
-                    &effect.manifest_sha256,
-                )
-                .await?;
-            let command = ExternalEffectCommand::decode(&manifest).map_err(|error| {
-                Error::InvalidCheckpoint(format!("invalid QEFX checkpoint ref: {error}"))
-            })?;
-            if command.intended_slot() != effect.entry_index
-                || command.chunks().len() != effect.chunk_object_keys.len()
-            {
-                return Err(Error::InvalidCheckpoint(
-                    "QEFX checkpoint ref binding mismatch".into(),
-                ));
-            }
-            for ((key, sha256), size) in effect
-                .chunk_object_keys
-                .iter()
-                .zip(&effect.chunk_sha256)
-                .zip(&effect.chunk_size_bytes)
-            {
-                self.download_verified(key, *size, sha256).await?;
-            }
+            self.restore_checkpoint_effect(effect).await?;
         }
         Ok(())
     }
@@ -5377,6 +5759,13 @@ impl ObjectArchiveStore {
                 anchor.config_id(),
             ));
         }
+        if anchor.configuration_state().digest() != identity.config_digest() {
+            return Err(checkpoint_identity_mismatch(
+                "config_digest",
+                identity.config_digest().to_hex(),
+                anchor.configuration_state().digest().to_hex(),
+            ));
+        }
         if anchor.recovery_generation() != identity.recovery_generation() {
             return Err(checkpoint_identity_mismatch(
                 "recovery_generation",
@@ -5630,6 +6019,13 @@ fn validate_checkpoint_identity(
             "config_id",
             expected.config_id,
             actual.config_id,
+        ));
+    }
+    if expected.config_digest != actual.config_digest {
+        return Err(checkpoint_identity_mismatch(
+            "config_digest",
+            expected.config_digest.to_hex(),
+            actual.config_digest.to_hex(),
         ));
     }
     if expected.recovery_generation != actual.recovery_generation {
@@ -5887,8 +6283,12 @@ fn checkpoint_effect_refs_for_suffix(
 
 fn checkpoint_namespace(identity: &CheckpointIdentity) -> String {
     format!(
-        "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}/generation-{:020}",
-        identity.cluster_id, identity.epoch, identity.config_id, identity.recovery_generation
+        "rhiza/{}/checkpoints/epoch-{:020}/config-{:020}-digest-{}/generation-{:020}",
+        identity.cluster_id,
+        identity.epoch,
+        identity.config_id,
+        identity.config_digest.to_hex(),
+        identity.recovery_generation
     )
 }
 
@@ -5927,6 +6327,26 @@ fn checkpoint_snapshot_key(identity: &CheckpointIdentity, anchor: &RecoveryAncho
         "{prefix}-{}.snapshot",
         anchor.executor_fingerprint().to_hex()
     )
+}
+
+fn checkpoint_publication_receipt_key(
+    identity: &CheckpointIdentity,
+    holder: &str,
+    manifest_digest: LogHash,
+) -> Result<String> {
+    if holder.is_empty() || holder.len() > 1024 {
+        return Err(Error::InvalidCheckpoint(
+            "checkpoint receipt holder is not a portable identifier".into(),
+        ));
+    }
+    let holder_hash =
+        LogHash::digest(&[b"rhiza-checkpoint-receipt-holder-v1\0", holder.as_bytes()]);
+    Ok(format!(
+        "{}/receipts/{}/{}.json",
+        checkpoint_namespace(identity),
+        holder_hash.to_hex(),
+        manifest_digest.to_hex()
+    ))
 }
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>> {
@@ -6029,6 +6449,25 @@ fn is_known_checkpoint_snapshot(identity: &CheckpointIdentity, key: &str) -> boo
 
 fn is_known_checkpoint_object(identity: &CheckpointIdentity, key: &str) -> bool {
     is_known_checkpoint_segment(identity, key) || is_known_checkpoint_snapshot(identity, key)
+}
+
+fn is_known_retired_checkpoint_object(identity: &CheckpointIdentity, key: &str) -> bool {
+    if is_known_checkpoint_object(identity, key) {
+        return true;
+    }
+    let prefix = checkpoint_namespace(identity) + "/receipts/";
+    let Some(relative) = key.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some((holder, file_name)) = relative.split_once('/') else {
+        return false;
+    };
+    holder.len() == 64
+        && holder.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !file_name.contains('/')
+        && file_name.len() == 69
+        && file_name.ends_with(".json")
+        && file_name[..64].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn hash_gc_plan(plan: &GcPlan) -> Result<String> {
@@ -6185,6 +6624,152 @@ mod tests {
 
         let loaded = publisher.publish_committed(&[entry()]).await.unwrap();
         assert_eq!(loaded.manifest().tip().index(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_publisher_lease_renewals_do_not_rewrite_gc_control() {
+        let (_dir, _store, archive) = fixture();
+        let duration_ms = 60_000;
+        let now = now_ms();
+        let publisher = archive
+            .open_checkpoint_publisher(
+                "coalesced-renewal",
+                CheckpointPublisherOptions::new(duration_ms),
+            )
+            .await
+            .unwrap();
+
+        let before = archive.load_gc_control().await.unwrap();
+        publisher.renew_at(now).await.unwrap();
+        archive
+            .renew_active_publisher_gc_lease(&publisher.lease_id, duration_ms)
+            .await
+            .unwrap();
+        let after_fresh_renewals = archive.load_gc_control().await.unwrap();
+        assert_eq!(after_fresh_renewals.control, before.control);
+        assert_eq!(after_fresh_renewals.version, before.version);
+
+        let published = publisher.publish_committed(&[entry()]).await.unwrap();
+        assert_eq!(published.manifest().tip().index(), 1);
+        let after_publish = archive.load_gc_control().await.unwrap();
+        assert_eq!(after_publish.control, before.control);
+        assert_eq!(after_publish.version, before.version);
+
+        let mut expiring = after_publish;
+        let lease = expiring
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.lease_id == publisher.lease_id)
+            .unwrap();
+        lease.expires_at_ms = now.saturating_add(duration_ms / PUBLISHER_LEASE_RENEW_DIVISOR);
+        archive.update_gc_control(&expiring).await.unwrap();
+        let before_required_renewal = archive.load_gc_control().await.unwrap();
+
+        publisher.renew_at(now).await.unwrap();
+        let after_required_renewal = archive.load_gc_control().await.unwrap();
+        assert_ne!(
+            after_required_renewal.version,
+            before_required_renewal.version
+        );
+        let renewed = after_required_renewal
+            .control
+            .leases
+            .iter()
+            .find(|lease| lease.lease_id == publisher.lease_id)
+            .unwrap();
+        assert_eq!(renewed.expires_at_ms, now.saturating_add(duration_ms));
+    }
+
+    #[tokio::test]
+    async fn publisher_lease_acquisition_retries_bounded_gc_control_throttling() {
+        let (_dir, _store, archive) = fixture();
+        archive.ensure_gc_control().await.unwrap();
+        let (gate, _entered) =
+            TestGcControlGate::throttled_mutations(archive.test_store_identity, 2);
+        let release = gate.release_guard();
+        let _installed = install_test_gc_control_gate(gate);
+        drop(release);
+
+        let lease = archive
+            .acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-1".into(),
+                now_ms(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|stored| stored.lease_id == lease.lease_id));
+    }
+
+    #[tokio::test]
+    async fn three_publishers_acquire_through_one_shared_mutation_window() {
+        let (_dir, _store, archive) = fixture();
+        let (gate, _entered) = TestGcControlGate::rate_limited_mutations(
+            archive.test_store_identity,
+            Duration::from_millis(50),
+        );
+        let release = gate.release_guard();
+        let _installed = install_test_gc_control_gate(gate);
+        drop(release);
+
+        let first = archive.clone();
+        let second = archive.clone();
+        let third = archive.clone();
+        let (first, second, third) = tokio::join!(
+            first.acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-1".into(),
+                now_ms(),
+                30_000,
+            ),
+            second.acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-2".into(),
+                now_ms(),
+                30_000,
+            ),
+            third.acquire_named_lease(
+                GcLeaseKind::Publisher,
+                "startup-node-3".into(),
+                now_ms(),
+                30_000,
+            ),
+        );
+        let leases = [first.unwrap(), second.unwrap(), third.unwrap()];
+        let loaded = archive.load_gc_control().await.unwrap();
+        assert!(leases.iter().all(|expected| loaded
+            .control
+            .leases
+            .iter()
+            .any(|actual| actual.lease_id == expected.lease_id)));
+    }
+
+    #[test]
+    fn gc_control_throttle_classifier_is_narrow() {
+        assert!(gc_control_throttled(&ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "429 Too Many Requests".into(),
+        }));
+        assert!(gc_control_throttled(&ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "<Code>SlowDown</Code>".into(),
+        }));
+        assert!(!gc_control_throttled(&ObjStoreError::Transport {
+            key: "gc/control.json".into(),
+            message: "connection reset".into(),
+        }));
+        assert!(!gc_control_throttled(&ObjStoreError::Precondition {
+            key: "gc/control.json".into(),
+        }));
     }
 
     #[tokio::test]
@@ -6855,6 +7440,333 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn reader_restore_blocks_then_reuses_the_same_gc_plan_after_release() {
+        let (_dir, store, archive) = fixture();
+        let root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            3,
+        );
+        let root = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            root_identity.clone(),
+        );
+        archive.publish_committed(&[entry()]).await.unwrap();
+        root.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        root.set_gc_root(root_identity.clone(), now.saturating_sub(1))
+            .await
+            .unwrap();
+        let plan = root
+            .plan_gc(
+                GcPolicy::new("reader-load-blocks-gc", root_identity.clone(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let alternate = root
+            .plan_gc(
+                GcPolicy::new(
+                    "reader-load-blocks-gc-alternate",
+                    root_identity.clone(),
+                    0,
+                    0,
+                    0,
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(plan.swept_generations.contains(&identity()));
+        assert!(!plan.candidates.is_empty());
+
+        let object_key = archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .segments()[0]
+            .object_key()
+            .to_owned();
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::new(archive.test_store_identity, object_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let restore_archive = archive.clone();
+        let restore = tokio::spawn(async move {
+            restore_archive
+                .load_checkpoint_restore_with_reader_lease_duration(TEST_READER_LEASE_MS)
+                .await
+        });
+        wait_for_test_gate(entered, "Reader restore did not reach the object gate").await;
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .iter()
+            .any(|lease| lease.kind == GcLeaseKind::Reader));
+
+        let blocked = root.execute_gc(plan.plan_hash(), now).await;
+        let control = root.load_gc_control().await.unwrap();
+        let active = control
+            .control
+            .active_gc
+            .as_ref()
+            .expect("blocked GC must retain its draining barrier");
+        assert!(matches!(blocked, Err(Error::GcBarrierBusy { .. })));
+        assert_eq!(active.phase, GcBarrierPhase::Draining);
+        assert_eq!(active.fence, execution_fence(&plan));
+        assert_eq!(active.plan_hash, plan.plan_hash());
+        assert!(matches!(
+            archive
+                .acquire_gc_lease(
+                    GcLeaseKind::Reader,
+                    "late-reader",
+                    now,
+                    TEST_READER_LEASE_MS
+                )
+                .await,
+            Err(Error::GcBarrierActive { .. })
+        ));
+        assert!(matches!(
+            root.execute_gc(alternate.plan_hash(), now).await,
+            Err(Error::GcBarrierActive { .. })
+        ));
+        assert!(root
+            .load_gc_report(plan.plan_hash())
+            .await
+            .unwrap()
+            .is_none());
+        for candidate in &plan.candidates {
+            assert!(store.get(&candidate.key).await.is_ok());
+        }
+
+        drop(release);
+        let restored = restore.await.unwrap().unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&entry()));
+        assert!(archive
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .leases
+            .is_empty());
+
+        let report = root.execute_gc(plan.plan_hash(), now).await.unwrap();
+        assert_eq!(report.results().len(), plan.candidates.len());
+        assert!(report
+            .results()
+            .iter()
+            .all(|evidence| evidence.outcome == GcDeleteOutcome::Deleted));
+        assert_eq!(
+            root.load_gc_report(plan.plan_hash()).await.unwrap(),
+            Some(report)
+        );
+        assert!(root
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_none());
+        for candidate in &plan.candidates {
+            assert!(matches!(
+                store.get(&candidate.key).await,
+                Err(ObjStoreError::NotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            archive.load_checkpoint_restore().await,
+            Err(Error::GenerationRetired { .. })
+        ));
+        assert_eq!(
+            root.load_checkpoint_restore()
+                .await
+                .unwrap()
+                .unwrap()
+                .restored()
+                .suffix(),
+            std::slice::from_ref(&entry())
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_gc_retry_from_reopened_archive_clears_matching_barrier() {
+        let (_dir, store, archive) = fixture();
+        let root_identity = CheckpointIdentity::new(
+            "cluster-a",
+            7,
+            3,
+            LogHash::digest(&[b"archive-test-config"]),
+            3,
+        );
+        let root = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            root_identity.clone(),
+        );
+        archive.publish_committed(&[entry()]).await.unwrap();
+        root.publish_committed(&[entry()]).await.unwrap();
+        let now = now_ms();
+        root.set_gc_root(root_identity.clone(), now.saturating_sub(1))
+            .await
+            .unwrap();
+        let plan = root
+            .plan_gc(
+                GcPolicy::new("reported-gc-retry", root_identity.clone(), 0, 0, 0),
+                now,
+            )
+            .await
+            .unwrap();
+        let alternate = root
+            .plan_gc(
+                GcPolicy::new(
+                    "reported-gc-retry-alternate",
+                    root_identity.clone(),
+                    0,
+                    0,
+                    0,
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+
+        root.acquire_gc_barrier(&plan, now).await.unwrap();
+        root.enter_delete_phase(&plan, now).await.unwrap();
+        root.fence_gc_root(&plan).await.unwrap();
+        root.retire_plan_generations(&plan, now).await.unwrap();
+        let (gate, _entered) = TestGcControlGate::failing_update(
+            root.test_store_identity,
+            ObjStoreError::Transport {
+                key: "gc/control.json".into(),
+                message: "injected report-clear failure".into(),
+            },
+        );
+        let release = gate.release_guard();
+        let installed = install_test_gc_control_gate(gate);
+        drop(release);
+        assert!(matches!(
+            root.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::ObjectStore(ObjStoreError::Transport { .. }))
+        ));
+        let report = root
+            .load_gc_report(plan.plan_hash())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.results().len(), plan.candidates.len());
+        assert!(root
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_some());
+        drop(installed);
+
+        let reopened =
+            ObjectArchiveStore::new_checkpoint_for_single_process(store.clone(), root_identity);
+        let report_key = root.gc_report_key(plan.plan_hash());
+        let mut invalid_format = report.clone();
+        invalid_format.format_version += 1;
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&invalid_format).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::InvalidGc(message)) if message == "execution report format version mismatch"
+        ));
+        assert!(reopened
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_some());
+
+        let mut mismatched_candidate = report.clone();
+        mismatched_candidate.results[0].key.push('x');
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&mismatched_candidate).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::InvalidGc(message)) if message == "execution report candidates do not match the plan"
+        ));
+
+        let mut duplicated_candidate = report.clone();
+        duplicated_candidate
+            .results
+            .push(duplicated_candidate.results[0].clone());
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&duplicated_candidate).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(plan.plan_hash(), now).await,
+            Err(Error::InvalidGc(message)) if message == "execution report candidates do not match the plan"
+        ));
+
+        let object = store.get_versioned(&report_key).await.unwrap();
+        store
+            .update(
+                &report_key,
+                serialize_json(&report).unwrap(),
+                object.version().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.execute_gc(alternate.plan_hash(), now).await,
+            Err(Error::GcBarrierActive { .. })
+        ));
+        assert_eq!(
+            reopened.execute_gc(plan.plan_hash(), now).await.unwrap(),
+            report
+        );
+        assert!(reopened
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .active_gc
+            .is_none());
+        for candidate in &plan.candidates {
+            assert!(matches!(
+                store.get(&candidate.key).await,
+                Err(ObjStoreError::NotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            archive.load_checkpoint_restore().await,
+            Err(Error::GenerationRetired { .. })
+        ));
+        assert!(reopened.load_checkpoint_restore().await.unwrap().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retired_generation_cancels_a_delayed_manifest_fetch_without_reinserting_its_lease() {
         let (_dir, store, archive) = fixture();
         let root_identity = CheckpointIdentity::new(
@@ -7047,7 +7959,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"target-membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             compacted,
             SnapshotIdentity::new(
@@ -7326,6 +8238,65 @@ mod tests {
                 actual: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn successful_publication_receipt_survives_a_later_manifest_generation() {
+        let (_dir, _store, archive) = fixture();
+        let first = entry();
+        let published = archive
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let encoded = published.publication_receipt().unwrap().encode().unwrap();
+        let publication_receipt = CheckpointPublicationReceipt::decode(&encoded).unwrap();
+        assert_eq!(publication_receipt.encode().unwrap(), encoded);
+        let publisher = archive
+            .open_checkpoint_publisher("receipt-test", CheckpointPublisherOptions::default())
+            .await
+            .unwrap();
+        publisher
+            .publish_receipt_for_loaded(&published)
+            .await
+            .unwrap();
+        let receipt = archive
+            .load_checkpoint_receipt(
+                publisher.receipt_holder(),
+                publication_receipt.gc_anchor().unwrap().manifest_digest(),
+            )
+            .await
+            .unwrap()
+            .gc_anchor()
+            .unwrap();
+
+        let second = next_entry(&first);
+        let later = archive
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receipt.cluster_id(),
+            published.manifest().identity().cluster_id()
+        );
+        assert_eq!(receipt.epoch(), published.manifest().identity().epoch());
+        assert_eq!(
+            receipt.config_id(),
+            published.manifest().identity().config_id()
+        );
+        assert_eq!(
+            receipt.config_digest(),
+            published.manifest().identity().config_digest()
+        );
+        assert_eq!(receipt.tip().index(), published.manifest().tip().index());
+        assert_eq!(receipt.tip().hash(), published.manifest().tip().hash());
+        assert_ne!(receipt.tip().index(), later.manifest().tip().index());
+        assert_ne!(published.version(), later.version());
+        assert!(matches!(
+            archive.checkpoint_readback_gc_anchor(&published).await,
+            Err(Error::InvalidCheckpoint(message))
+                if message == "checkpoint changed before GC certificate readback"
+        ));
     }
 
     #[tokio::test]
@@ -7812,7 +8783,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             LogAnchor::new(3, LogHash::digest(&[b"tip"])),
             SnapshotIdentity::new(
@@ -7957,7 +8928,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             LogAnchor::new(first.index, first.hash),
             SnapshotIdentity::new(
@@ -8165,7 +9136,7 @@ mod tests {
         let anchor = RecoveryAnchor::new(
             "cluster-a",
             7,
-            ConfigurationState::active(3, LogHash::digest(&[b"membership"])),
+            ConfigurationState::active(3, identity().config_digest()),
             1,
             LogAnchor::new(first.index, first.hash),
             SnapshotIdentity::new(
@@ -8600,6 +9571,207 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn recovery_roll_rejects_a_source_change_before_its_publish_boundary() {
+        let (_source_directory, _source_store, source) = fixture();
+        let first = entry();
+        let second = next_entry(&first);
+        let source_checkpoint = source
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let copied_key = checkpoint_segment_key(
+            target.checkpoint_identity().unwrap(),
+            source_checkpoint.manifest().segments()[0].start_index(),
+            source_checkpoint.manifest().segments()[0].end_index(),
+        );
+        let (gate, entered, _cancelled) =
+            TestCheckpointDownloadGate::after_create(target.test_store_identity, copied_key);
+        let _installed = install_test_checkpoint_download_gate(gate.clone());
+        let release = gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(entered, "recovery roll did not copy its immutable object").await;
+
+        source
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        drop(release);
+        assert!(matches!(
+            copy.await.unwrap(),
+            Err(Error::InvalidCheckpoint(message))
+                if message == "source checkpoint changed during copy"
+        ));
+        assert!(target.load_checkpoint_unleased().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_source_reread_is_the_manifest_publish_boundary() {
+        let (_source_directory, _source_store, source) = fixture();
+        let first = entry();
+        let second = next_entry(&first);
+        let source_checkpoint = source
+            .publish_committed(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let copied_key = checkpoint_segment_key(
+            target.checkpoint_identity().unwrap(),
+            source_checkpoint.manifest().segments()[0].start_index(),
+            source_checkpoint.manifest().segments()[0].end_index(),
+        );
+        let (object_gate, object_entered, _object_cancelled) =
+            TestCheckpointDownloadGate::after_create(target.test_store_identity, copied_key);
+        let _installed_object = install_test_checkpoint_download_gate(object_gate.clone());
+        let object_release = object_gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(
+            object_entered,
+            "recovery roll did not copy its immutable object",
+        )
+        .await;
+
+        let (manifest_gate, manifest_entered, _manifest_cancelled) =
+            TestCheckpointManifestGate::new(target.test_store_identity);
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let manifest_release = manifest_gate.release_guard();
+        drop(object_release);
+        wait_for_test_gate(
+            manifest_entered,
+            "recovery roll did not reach the target manifest CAS",
+        )
+        .await;
+        source
+            .publish_committed(std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        drop(manifest_release);
+
+        let copied = copy.await.unwrap().unwrap();
+        assert_eq!(copied.manifest().tip(), source_checkpoint.manifest().tip());
+        let restored = target.load_checkpoint_restore().await.unwrap().unwrap();
+        assert_eq!(restored.restored().suffix(), std::slice::from_ref(&first));
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_is_idempotent_for_the_same_target_manifest() {
+        let (_source_directory, _source_store, source) = fixture();
+        source.publish_committed(&[entry()]).await.unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+
+        let first = source.roll_recovery_generation(&target).await.unwrap();
+        let repeated = source.roll_recovery_generation(&target).await.unwrap();
+        assert_eq!(repeated, first);
+        assert_eq!(
+            target
+                .load_gc_control()
+                .await
+                .unwrap()
+                .control
+                .generations
+                .iter()
+                .filter(|entry| entry.identity == *target.checkpoint_identity().unwrap())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_retries_an_unregistered_manifest_after_lease_loss() {
+        let (_source_directory, _source_store, source) = fixture();
+        let source_checkpoint = source.publish_committed(&[entry()]).await.unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let source_segment = &source_checkpoint.manifest().segments()[0];
+        let copied_key = checkpoint_segment_key(
+            target.checkpoint_identity().unwrap(),
+            source_segment.start_index(),
+            source_segment.end_index(),
+        );
+        let (object_gate, object_entered, _object_cancelled) =
+            TestCheckpointDownloadGate::after_create(target.test_store_identity, copied_key);
+        let _installed_object = install_test_checkpoint_download_gate(object_gate.clone());
+        let object_release = object_gate.release_guard();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy =
+            tokio::spawn(async move { copy_source.roll_recovery_generation(&copy_target).await });
+        wait_for_test_gate(
+            object_entered,
+            "recovery roll did not copy its immutable object",
+        )
+        .await;
+
+        let (manifest_gate, manifest_entered, _manifest_cancelled) =
+            TestCheckpointManifestGate::new(target.test_store_identity);
+        let _installed_manifest = install_test_checkpoint_manifest_gate(manifest_gate.clone());
+        let manifest_release = manifest_gate.release_guard();
+        drop(object_release);
+        wait_for_test_gate(
+            manifest_entered,
+            "recovery roll did not reach the target manifest CAS",
+        )
+        .await;
+        let mut control = target.load_gc_control().await.unwrap();
+        let publisher = control
+            .control
+            .leases
+            .iter_mut()
+            .find(|lease| lease.kind == GcLeaseKind::Publisher)
+            .expect("paused recovery roll must hold its target Publisher lease");
+        publisher.expires_at_ms = 0;
+        control.control.fence += 1;
+        target.update_gc_control(&control).await.unwrap();
+        drop(manifest_release);
+        assert!(matches!(
+            copy.await.unwrap(),
+            Err(Error::GcLeaseMissing { .. })
+        ));
+
+        let published = target.load_checkpoint_unleased().await.unwrap().unwrap();
+        assert!(!target
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .generations
+            .iter()
+            .any(|entry| entry.identity == *target.checkpoint_identity().unwrap()));
+        let retried = source.roll_recovery_generation(&target).await.unwrap();
+        assert_eq!(retried, published);
+        assert!(target
+            .load_gc_control()
+            .await
+            .unwrap()
+            .control
+            .generations
+            .iter()
+            .any(|entry| entry.identity == *target.checkpoint_identity().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_rejects_a_different_target_manifest_without_overwrite() {
+        let (_source_directory, _source_store, source) = fixture();
+        source.publish_committed(&[entry()]).await.unwrap();
+        let (_target_directory, _target_store, target) = recovery_roll_target();
+        let existing = target.initialize_checkpoint().await.unwrap();
+
+        assert!(matches!(
+            source.roll_recovery_generation(&target).await,
+            Err(Error::CheckpointTargetConflict)
+        ));
+        assert_eq!(
+            target.load_checkpoint_unleased().await.unwrap(),
+            Some(existing)
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, ObjStore, ObjectArchiveStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = ObjStore::new(ObjStoreConfig::Local {
@@ -8611,6 +9783,19 @@ mod tests {
         (dir, store, archive)
     }
 
+    fn recovery_roll_target() -> (tempfile::TempDir, ObjStore, ObjectArchiveStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjStore::new(ObjStoreConfig::Local {
+            root: directory.path().to_path_buf(),
+        })
+        .unwrap();
+        let target = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store.clone(),
+            CheckpointIdentity::new("cluster-a", 7, 3, identity().config_digest(), 2),
+        );
+        (directory, store, target)
+    }
+
     #[tokio::test]
     async fn overlapping_qefx_append_attaches_only_new_suffix_effects() {
         let (_directory, _store, archive) = fixture();
@@ -8619,6 +9804,39 @@ mod tests {
             .publish_verified_qefx_bundle(&first, &first_chunks)
             .await
             .unwrap();
+        assert!(first_effect.chunk_object_keys.is_empty());
+        assert!(first_effect.chunk_sha256.is_empty());
+        assert!(first_effect.chunk_size_bytes.is_empty());
+        let compact_json = serialize_json(&first_effect).unwrap();
+        assert!(!compact_json
+            .windows(b"chunk_object_keys".len())
+            .any(|window| window == b"chunk_object_keys"));
+
+        // Manifests already published by the first QEFX release carried
+        // redundant chunk arrays. They remain readable long enough for a
+        // current node to compact the checkpoint into the compact shape.
+        let first_command = ExternalEffectCommand::decode(&first.payload).unwrap();
+        let first_prefix = checkpoint_effect_prefix(
+            archive.checkpoint_identity().unwrap(),
+            first.index,
+            first_command.effect_digest_value(),
+        );
+        let mut legacy_effect = first_effect.clone();
+        for (ordinal, (chunk, expected)) in
+            first_chunks.iter().zip(first_command.chunks()).enumerate()
+        {
+            legacy_effect.chunk_object_keys.push(format!(
+                "{first_prefix}/chunks/{ordinal:03}-{}.qefc",
+                expected.digest().to_hex()
+            ));
+            legacy_effect.chunk_sha256.push(sha256_hex(chunk));
+            legacy_effect.chunk_size_bytes.push(chunk.len() as u64);
+        }
+        archive
+            .restore_checkpoint_effect(&legacy_effect)
+            .await
+            .unwrap();
+        assert!(serialize_json(&legacy_effect).unwrap().len() > compact_json.len());
         archive
             .publish_committed_with_effects(
                 std::slice::from_ref(&first),
@@ -8685,6 +9903,68 @@ mod tests {
         assert_eq!(replayed.version(), loaded.version());
     }
 
+    #[test]
+    fn legacy_qefx_manifest_has_bounded_transition_headroom() {
+        let mut manifest = CheckpointManifest::new(identity());
+        let mut previous_hash = LogHash::ZERO;
+        for start_index in (1_u64..=1_400).step_by(32) {
+            let end_index = start_index.saturating_add(31).min(1_400);
+            let last_hash = LogHash::digest(&[&end_index.to_le_bytes()]);
+            manifest.segments.push(CheckpointSegmentRecord {
+                format_version: CHECKPOINT_SEGMENT_FORMAT_VERSION,
+                start_index,
+                end_index,
+                first_prev_hash: previous_hash,
+                last_hash,
+                object_key: checkpoint_segment_key(&identity(), start_index, end_index),
+                sha256: "c".repeat(64),
+                size_bytes: 1,
+                effects: (start_index..=end_index)
+                    .map(|entry_index| CheckpointEffectRecord {
+                        entry_index,
+                        manifest_object_key: format!(
+                            "{}/effects/{entry_index}/{}",
+                            "m".repeat(220),
+                            "binding.qefx"
+                        ),
+                        manifest_sha256: "a".repeat(64),
+                        manifest_size_bytes: 512,
+                        chunk_object_keys: vec![format!(
+                            "{}/effects/{entry_index}/chunks/000-{}.qefc",
+                            "c".repeat(180),
+                            "d".repeat(64)
+                        )],
+                        chunk_sha256: vec!["b".repeat(64)],
+                        chunk_size_bytes: vec![256 * 1024],
+                    })
+                    .collect(),
+            });
+            previous_hash = last_hash;
+        }
+        manifest.tip = CheckpointTip::new(1_400, previous_hash);
+
+        let bytes = serialize_json(&manifest).unwrap();
+        assert!(bytes.len() > 1024 * 1024);
+        assert!(bytes.len() < CHECKPOINT_RESTORE_LIMITS.manifest_encoded_bytes as usize);
+        assert_eq!(serialize_checkpoint_manifest(&manifest).unwrap(), bytes);
+        let (_directory, _store, archive) = fixture();
+        archive.validate_checkpoint_manifest(&manifest).unwrap();
+
+        let mut compact = manifest;
+        for effect in compact
+            .segments
+            .iter_mut()
+            .flat_map(|segment| &mut segment.effects)
+        {
+            effect.chunk_object_keys.clear();
+            effect.chunk_sha256.clear();
+            effect.chunk_size_bytes.clear();
+        }
+        let compact_bytes = serialize_checkpoint_manifest(&compact).unwrap();
+        assert!(compact_bytes.len() < 1024 * 1024);
+        assert!(compact_bytes.len() + 256 * 1024 < bytes.len());
+    }
+
     fn identity() -> CheckpointIdentity {
         CheckpointIdentity::new(
             "cluster-a",
@@ -8693,6 +9973,90 @@ mod tests {
             LogHash::digest(&[b"archive-test-config"]),
             1,
         )
+    }
+
+    #[test]
+    fn checkpoint_digest_qualifies_namespace_and_manifest_identity() {
+        let expected = identity();
+        let different = CheckpointIdentity::new(
+            expected.cluster_id(),
+            expected.epoch(),
+            expected.config_id(),
+            LogHash::digest(&[b"different-membership"]),
+            expected.recovery_generation(),
+        );
+        assert_ne!(
+            checkpoint_namespace(&expected),
+            checkpoint_namespace(&different)
+        );
+        assert!(checkpoint_namespace(&expected).contains(&expected.config_digest().to_hex()));
+
+        let (_directory, _store, archive) = fixture();
+        let manifest = CheckpointManifest::new(different);
+        assert_eq!(manifest.format_version(), 3);
+        assert!(matches!(
+            archive.validate_checkpoint_manifest(&manifest),
+            Err(Error::CheckpointIdentityMismatch {
+                field: "config_digest",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_v3_never_falls_back_to_the_legacy_namespace() {
+        let (_directory, store, archive) = fixture();
+        archive.initialize_checkpoint().await.unwrap();
+        let legacy = "rhiza/cluster-a/checkpoints/epoch-00000000000000000007/config-00000000000000000003/generation-00000000000000000001/manifest.json";
+        assert!(matches!(
+            store.get(legacy).await,
+            Err(ObjStoreError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_anchor_rejects_same_config_id_with_different_digest() {
+        let (_directory, _store, archive) = fixture();
+        let anchor = RecoveryAnchor::new(
+            "cluster-a",
+            7,
+            ConfigurationState::active(3, LogHash::digest(&[b"different-membership"])),
+            1,
+            LogAnchor::new(0, LogHash::ZERO),
+            SnapshotIdentity::new(
+                "snapshot",
+                LogHash::digest(&[b"snapshot"]),
+                8,
+                LogHash::digest(&[b"executor"]),
+            ),
+        );
+        assert!(matches!(
+            archive.validate_recovery_anchor(&anchor),
+            Err(Error::CheckpointIdentityMismatch {
+                field: "config_digest",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_roll_rejects_same_config_id_with_different_digest() {
+        let (_directory, store, source) = fixture();
+        let target = ObjectArchiveStore::new_checkpoint_for_single_process(
+            store,
+            CheckpointIdentity::new(
+                "cluster-a",
+                7,
+                3,
+                LogHash::digest(&[b"different-membership"]),
+                2,
+            ),
+        );
+        assert!(matches!(
+            source.roll_recovery_generation(&target).await,
+            Err(Error::InvalidCheckpoint(message))
+                if message.contains("same cluster/epoch/config identity")
+        ));
     }
 
     fn entry() -> LogEntry {

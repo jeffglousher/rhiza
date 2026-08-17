@@ -26,7 +26,7 @@ async fn initialized_archive(root: &std::path::Path) -> ObjectArchiveStore {
             "rhiza:sql:cluster-a",
             9,
             4,
-            LogHash::digest(&[b"prestage-test-config"]),
+            predecessor_configuration().digest(),
             7,
         ),
     );
@@ -41,6 +41,39 @@ fn predecessor_configuration() -> ConfigurationState {
             .unwrap()
             .digest(),
     )
+}
+
+#[tokio::test]
+async fn prestage_rejects_same_config_id_with_different_checkpoint_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+        ObjStore::new(ObjStoreConfig::Local {
+            root: root.path().join("archive"),
+        })
+        .unwrap(),
+        CheckpointIdentity::new(
+            "rhiza:sql:cluster-a",
+            9,
+            4,
+            LogHash::digest(&[b"different-membership"]),
+            7,
+        ),
+    );
+    archive.initialize_checkpoint().await.unwrap();
+    assert!(matches!(
+        prestage_successor_checkpoint(
+            archive,
+            root.path().join("prestage"),
+            predecessor_configuration(),
+            "node-2",
+            ExecutionProfile::Sqlite,
+            5,
+            LogHash::digest(&[b"successor-membership"]),
+        )
+        .await,
+        Err(DurabilityError::SnapshotVerification(message))
+            if message.contains("predecessor configuration")
+    ));
 }
 
 #[tokio::test]
@@ -558,6 +591,7 @@ async fn finalized_prestage_adopts_the_existing_successor_receipt_without_recopy
     .unwrap();
 
     let receipt = serde_json::to_vec(&super::SuccessorRestoreIdentity {
+        format_version: super::SUCCESSOR_RESTORE_FORMAT_VERSION,
         cluster_id: "rhiza:sql:cluster-a",
         epoch: 9,
         target_config_id: 5,
@@ -565,6 +599,7 @@ async fn finalized_prestage_adopts_the_existing_successor_receipt_without_recopy
         node_id: "node-2",
         membership_digest: successor.digest().to_hex(),
         predecessor_config_id: 4,
+        predecessor_membership_digest: predecessor_digest.to_hex(),
         stop_index: 1,
         stop_hash: hash.to_hex(),
     })

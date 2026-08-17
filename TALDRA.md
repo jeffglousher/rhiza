@@ -25,8 +25,9 @@ deadlines and cancellation via `RecorderRpcContext`.
 
 ## Current Taldra pin baseline
 
-At fork adoption, Taldra tracks tip of this fork after the `archive-gc`
-optionalization patch (see below). Exact revision is pinned in Taldra
+This fork tracks `mrchypark/rhiza` `main` merged through
+`62e2eaa358bfd3537852921c8a7c3a478447d865` (v0.7.1 plus PRs through #85),
+plus the Taldra patches below. Exact revision is pinned in Taldra
 `crates/taldra-consensus/Cargo.toml`.
 
 See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
@@ -34,10 +35,10 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
 
 ## Fork patches (Taldra)
 
-- `archive-gc` feature: `rhiza-quepaxa` no longer hard-depends on
-  `rhiza-archive` / `object_store` / `aws-lc-sys`. Enable `archive-gc` only when
-  checkpoint GC APIs are required. Taldra's dual-engine pin uses
-  `default-features = false` and does not enable `archive-gc`.
+- Upstream #69 already removed the `rhiza-quepaxa` hard dependency on
+  `rhiza-archive` / `object_store`. Checkpoint GC now takes
+  `rhiza_core::CheckpointGcAnchor`. The earlier Taldra `archive-gc` feature
+  is obsolete and was dropped on this merge.
 
 - Windows / non-unix64 `anchored_fs` stub: import `crate::{Error, Result}` so
   the unsupported platform path type-checks (upstream tip omitted the import).
@@ -46,9 +47,9 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
   single-component children after symlink refusal, and re-check the canonical
   path on each operation. Child opens are path-relative (not `NtCreateFile` /
   `openat`). Unix `openat` remains the stronger production path. This unblocks
-  Taldra's Windows comparative lab. Four upstream WAL torn-tail / rotation
-  tests still fail on Windows (`Access is denied` while rewriting a recently
-  truncated file); they are not the comparative propose/reopen path.
+  Taldra's Windows comparative lab. Five upstream WAL torn-tail / rotation /
+  preflight tests still fail on Windows (`Access is denied` while rewriting a
+  recently truncated file); they are not the comparative propose/reopen path.
 
 
 ## Fork patches (caller-owned drive)

@@ -4,7 +4,9 @@ use std::{
     time::Duration,
 };
 
-use rhiza_core::{Command, CommandKind, ConfigurationState, ExecutionProfile, LogHash};
+use rhiza_core::{
+    Command, CommandKind, ConfigChange, ConfigurationState, ExecutionProfile, LogHash,
+};
 use rhiza_node::{
     effective_cluster_id, install_successor_recorder, log_peer_router, AdminConfig, ConfigError,
     FetchLogRequest, InMemoryLogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig,
@@ -448,6 +450,53 @@ fn stop_advances_past_an_already_decided_normal_command() {
             .index(),
         2
     );
+}
+
+#[test]
+fn write_rechecks_stop_after_reconciling_a_foreign_slot() {
+    let root = TempDir::new().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let config = NodeConfig::new(
+        "rhiza:sql:cluster-a",
+        "n1",
+        root.path().join("node"),
+        1,
+        1,
+        peers(3),
+        "client-token",
+    )
+    .unwrap();
+    let consensus = Arc::new(membership_consensus(root.path(), membership.clone()));
+    let stop_command = ConfigChange::bound_stop(
+        "rhiza:sql:cluster-a",
+        1,
+        membership.digest(),
+        2,
+        membership.members().to_vec(),
+    )
+    .unwrap()
+    .to_stored_command();
+    let stop = consensus
+        .propose_stored_at(
+            rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+            1,
+            LogHash::ZERO,
+            stop_command,
+        )
+        .unwrap();
+    let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+    let error = runtime
+        .write("request-after-stop", "key", "value")
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        NodeError::ConfigurationTransition { ref state }
+            if state.stop().is_some_and(|anchor| anchor.index() == stop.index)
+    ));
+    assert!(!runtime.is_fatal());
+    assert_eq!(runtime.applied_index().unwrap(), stop.index);
 }
 
 #[test]

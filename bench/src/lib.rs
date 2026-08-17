@@ -36,6 +36,8 @@ pub struct Config {
     pub fault_timeout: Duration,
     pub skip_setup: bool,
     pub d1_exact_write: bool,
+    pub retry_ambiguous_writes: bool,
+    pub ambiguous_write_retry_timeout: Duration,
     pub fault: Option<FaultConfig>,
 }
 
@@ -58,6 +60,10 @@ impl Config {
             ("--warmup", self.warmup),
             ("--request-timeout", self.request_timeout),
             ("--fault-timeout", self.fault_timeout),
+            (
+                "--ambiguous-write-retry-timeout",
+                self.ambiguous_write_retry_timeout,
+            ),
         ] {
             if Instant::now().checked_add(duration).is_none() {
                 return Err(format!("{flag} exceeds the platform clock range"));
@@ -66,13 +72,20 @@ impl Config {
         if self.concurrency == 0 {
             return Err("--concurrency must be greater than zero".into());
         }
+        if self.retry_ambiguous_writes && self.ambiguous_write_retry_timeout.is_zero() {
+            return Err("--ambiguous-write-retry-timeout must be greater than zero".into());
+        }
         if self.d1_exact_write && self.workload != Workload::Write {
             return Err("--d1-exact-write requires --workload write".into());
         }
-        if self.d1_exact_write && self.endpoints.len() != 1 {
+        if self.d1_exact_write && !self.retry_ambiguous_writes {
             return Err(
-                "--d1-exact-write requires exactly one endpoint (no fallback retries)".into(),
+                "--d1-exact-write requires --retry-ambiguous-writes for fail-closed qualification"
+                    .into(),
             );
+        }
+        if self.d1_exact_write && self.endpoints.len() != 1 {
+            return Err("--d1-exact-write requires exactly one stable Service endpoint".into());
         }
         if self.table.is_empty()
             || !self
@@ -121,6 +134,8 @@ pub fn parse_config(
     let mut fault_timeout = None;
     let mut skip_setup = false;
     let mut d1_exact_write = false;
+    let mut retry_ambiguous_writes = false;
+    let mut ambiguous_write_retry_timeout = None;
     let mut fault = None;
     let values: Vec<_> = args.into_iter().collect();
     let mut index = 0;
@@ -193,6 +208,14 @@ pub fn parse_config(
                 d1_exact_write = true;
                 index += 1;
             }
+            "--retry-ambiguous-writes" => {
+                retry_ambiguous_writes = true;
+                index += 1;
+            }
+            "--ambiguous-write-retry-timeout" => {
+                ambiguous_write_retry_timeout = Some(parse_duration(&next(index)?)?);
+                index += 2;
+            }
             "--fault" => {
                 let offset = values
                     .get(index + 1)
@@ -245,6 +268,9 @@ pub fn parse_config(
         fault_timeout: fault_timeout.unwrap_or(Duration::from_secs(300)),
         skip_setup,
         d1_exact_write,
+        retry_ambiguous_writes,
+        ambiguous_write_retry_timeout: ambiguous_write_retry_timeout
+            .unwrap_or(Duration::from_secs(60)),
         fault,
     };
     if config.write_percent > 100 {
