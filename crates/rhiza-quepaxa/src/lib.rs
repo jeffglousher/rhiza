@@ -1923,7 +1923,7 @@ pub struct RecorderFileStore {
     seal_fault: Arc<Mutex<Option<SealFaultPoint>>>,
     _root_lock: Arc<fs::File>,
     effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
-    staged_effect_pins: Arc<Mutex<HashMap<LogHash, EffectBundleGcPin>>>,
+    staged_effect_pins: Arc<Mutex<HashMap<LogHash, StagedEffectBundle>>>,
     sync: Arc<Mutex<()>>,
 }
 
@@ -1978,6 +1978,8 @@ const EFFECT_BUNDLE_GC_ANCHOR_FILE: &str = ".effect-bundle-gc-anchor.rec";
 const EFFECT_BUNDLE_GC_ANCHOR_MAGIC: &[u8; 4] = b"QEGC";
 const EFFECT_BUNDLE_GC_ANCHOR_VERSION: u16 = 1;
 const MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES: usize = 4 * 1024;
+const STAGED_EFFECT_RESTAGE_REQUIRED: &str =
+    "every effect chunk must be staged in the current process before finalization";
 const STORAGE_GENERATION_FILE: &str = ".rhiza-storage-generation";
 const STORAGE_GENERATION_FINGERPRINT: &[u8] = b"rhiza:recorder:storage-generation:clean-v1\n";
 
@@ -2063,6 +2065,12 @@ fn effect_bundle_binding_digest(binding: &EffectBundleBinding) -> LogHash {
 pub struct EffectBundleGcPin {
     pub binding: EffectBundleBinding,
     pub manifest_command: StoredCommand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedEffectBundle {
+    pin: EffectBundleGcPin,
+    ordinals: BTreeSet<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -3607,6 +3615,14 @@ impl RecorderFileStore {
             .sync
             .lock()
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.finalize_effect_bundle_with_quota_unlocked(request, quota_bytes)
+    }
+
+    fn finalize_effect_bundle_with_quota_unlocked(
+        &self,
+        request: &EffectBundleFinalizeRequest,
+        quota_bytes: u64,
+    ) -> Result<()> {
         self.recover_intent()?;
         self.effect_root_anchor.verify_path(&self.root)?;
         let bundle = &request.bundle;
@@ -3724,16 +3740,35 @@ impl RecorderFileStore {
         self.recover_intent()?;
         self.effect_root_anchor.verify_path(&self.root)?;
         self.validate_effect_bundle_binding(binding)?;
-        self.staged_effect_pins
+        if self
+            .effect_root_anchor
+            .read_optional(
+                &self.effect_bundle_name(binding),
+                MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+                "effect bundle manifest",
+            )?
+            .is_some()
+        {
+            let bundle = self.load_effect_bundle_unlocked(binding)?;
+            return self.finalize_effect_bundle_with_quota_unlocked(
+                &EffectBundleFinalizeRequest::new(bundle, manifest_command.clone())?,
+                DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES,
+            );
+        }
+        let binding_digest = effect_bundle_binding_digest(binding);
+        let pin = EffectBundleGcPin {
+            binding: binding.clone(),
+            manifest_command: manifest_command.clone(),
+        };
+        if self
+            .staged_effect_pins
             .lock()
             .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
-            .insert(
-                effect_bundle_binding_digest(binding),
-                EffectBundleGcPin {
-                    binding: binding.clone(),
-                    manifest_command: manifest_command.clone(),
-                },
-            );
+            .get(&binding_digest)
+            .is_some_and(|staged| staged.pin != pin)
+        {
+            return Err(Error::EffectBundleConflict);
+        }
         let name = self.effect_chunk_name(expected.digest());
         if let Some(existing) = self.effect_root_anchor.read_optional(
             &name,
@@ -3743,10 +3778,25 @@ impl RecorderFileStore {
             if existing != chunk {
                 return Err(Error::EffectBundleConflict);
             }
-            return Ok(());
+        } else {
+            self.effect_root_anchor.atomic_write(&name, chunk)?;
+            self.effect_root_anchor.sync()?;
         }
-        self.effect_root_anchor.atomic_write(&name, chunk)?;
-        self.effect_root_anchor.sync()
+        let mut staged = self
+            .staged_effect_pins
+            .lock()
+            .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
+        let entry = staged
+            .entry(binding_digest)
+            .or_insert_with(|| StagedEffectBundle {
+                pin: pin.clone(),
+                ordinals: BTreeSet::new(),
+            });
+        if entry.pin != pin {
+            return Err(Error::EffectBundleConflict);
+        }
+        entry.ordinals.insert(ordinal);
+        Ok(())
     }
 
     /// Finalizes an exact QEFX bundle from its previously staged chunks.
@@ -3756,35 +3806,80 @@ impl RecorderFileStore {
         manifest_command: StoredCommand,
     ) -> Result<()> {
         let qefx = verified_effect_bundle_command(binding, &manifest_command)?;
-        let chunks = {
-            let _guard = self
-                .sync
-                .lock()
-                .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
-            self.recover_intent()?;
-            self.effect_root_anchor.verify_path(&self.root)?;
-            self.validate_effect_bundle_binding(binding)?;
-            qefx.chunks()
-                .iter()
-                .map(|expected| {
-                    let chunk = self.effect_root_anchor.read(
-                        &self.effect_chunk_name(expected.digest()),
-                        MAX_EFFECT_BUNDLE_CHUNK_BYTES,
-                        "effect chunk",
-                    )?;
-                    if chunk.len() != expected.encoded_len() as usize
-                        || effect_chunk_digest(&chunk) != expected.digest()
-                    {
-                        return Err(Error::EffectBundleInvalid(
-                            "staged effect chunk does not match QEFX".into(),
-                        ));
-                    }
-                    Ok(chunk)
-                })
-                .collect::<Result<Vec<_>>>()?
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        self.effect_root_anchor.verify_path(&self.root)?;
+        self.validate_effect_bundle_binding(binding)?;
+        if self
+            .effect_root_anchor
+            .read_optional(
+                &self.effect_bundle_name(binding),
+                MAX_EFFECT_BUNDLE_MANIFEST_BYTES,
+                "effect bundle manifest",
+            )?
+            .is_some()
+        {
+            let bundle = self.load_effect_bundle_unlocked(binding)?;
+            return self.finalize_effect_bundle_with_quota_unlocked(
+                &EffectBundleFinalizeRequest::new(bundle, manifest_command)?,
+                DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES,
+            );
+        }
+        let binding_digest = effect_bundle_binding_digest(binding);
+        let expected_pin = EffectBundleGcPin {
+            binding: binding.clone(),
+            manifest_command: manifest_command.clone(),
         };
+        {
+            let staged = self
+                .staged_effect_pins
+                .lock()
+                .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
+            let Some(staged) = staged.get(&binding_digest) else {
+                return Err(Error::EffectBundleInvalid(
+                    STAGED_EFFECT_RESTAGE_REQUIRED.into(),
+                ));
+            };
+            if staged.pin != expected_pin {
+                return Err(Error::EffectBundleConflict);
+            }
+            if !(0..qefx.chunks().len()).all(|ordinal| {
+                u16::try_from(ordinal)
+                    .ok()
+                    .is_some_and(|ordinal| staged.ordinals.contains(&ordinal))
+            }) {
+                return Err(Error::EffectBundleInvalid(
+                    STAGED_EFFECT_RESTAGE_REQUIRED.into(),
+                ));
+            }
+        }
+        let chunks = qefx
+            .chunks()
+            .iter()
+            .map(|expected| {
+                let chunk = self.effect_root_anchor.read(
+                    &self.effect_chunk_name(expected.digest()),
+                    MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                    "effect chunk",
+                )?;
+                if chunk.len() != expected.encoded_len() as usize
+                    || effect_chunk_digest(&chunk) != expected.digest()
+                {
+                    return Err(Error::EffectBundleInvalid(
+                        "staged effect chunk does not match QEFX".into(),
+                    ));
+                }
+                Ok(chunk)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let bundle = RecorderEffectBundle::new(binding.clone(), chunks)?;
-        self.finalize_effect_bundle(&EffectBundleFinalizeRequest::new(bundle, manifest_command)?)
+        self.finalize_effect_bundle_with_quota_unlocked(
+            &EffectBundleFinalizeRequest::new(bundle, manifest_command)?,
+            DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES,
+        )
     }
 
     /// Returns only the bounded QEFX command for a finalized bundle.
@@ -3924,8 +4019,8 @@ impl RecorderFileStore {
                 .lock()
                 .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
                 .values()
-                .filter(|pin| pin.binding.intended_slot > tip.index())
-                .cloned(),
+                .filter(|staged| staged.pin.binding.intended_slot > tip.index())
+                .map(|staged| staged.pin.clone()),
         );
         let protected = self.effect_bundle_gc_protected(&all_pins)?;
         let previous = self.load_effect_bundle_gc_anchor_unlocked()?;
