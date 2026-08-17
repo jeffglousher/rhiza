@@ -42,6 +42,14 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
 - Windows / non-unix64 `anchored_fs` stub: import `crate::{Error, Result}` so
   the unsupported platform path type-checks (upstream tip omitted the import).
 
+- Windows `AnchoredDir` lab path: canonicalize the recorder root, open
+  single-component children after symlink refusal, and re-check the canonical
+  path on each operation. Child opens are path-relative (not `NtCreateFile` /
+  `openat`). Unix `openat` remains the stronger production path. This unblocks
+  Taldra's Windows comparative lab. Four upstream WAL torn-tail / rotation
+  tests still fail on Windows (`Access is denied` while rewriting a recently
+  truncated file); they are not the comparative propose/reopen path.
+
 
 ## Fork patches (caller-owned drive)
 

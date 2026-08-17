@@ -487,7 +487,14 @@ mod anchored {
 ))]
 pub(crate) use anchored::AnchoredDir;
 
+#[cfg(target_os = "windows")]
+#[path = "anchored_fs_windows.rs"]
+mod windows_anchored;
+#[cfg(target_os = "windows")]
+pub(crate) use windows_anchored::AnchoredDir;
+
 #[cfg(not(any(
+    target_os = "windows",
     target_os = "macos",
     all(
         any(target_os = "linux", target_os = "android"),
@@ -498,6 +505,7 @@ pub(crate) use anchored::AnchoredDir;
 pub(crate) struct AnchoredDir;
 
 #[cfg(not(any(
+    target_os = "windows",
     target_os = "macos",
     all(
         any(target_os = "linux", target_os = "android"),
@@ -507,6 +515,7 @@ pub(crate) struct AnchoredDir;
 use crate::{Error, Result};
 
 #[cfg(not(any(
+    target_os = "windows",
     target_os = "macos",
     all(
         any(target_os = "linux", target_os = "android"),
@@ -581,6 +590,7 @@ impl AnchoredDir {
 }
 
 #[cfg(not(any(
+    target_os = "windows",
     target_os = "macos",
     all(
         any(target_os = "linux", target_os = "android"),
