@@ -500,6 +500,14 @@ fn certified_gc_does_not_reap_chunks_between_stage_and_finalize() {
             &bundle.chunks()[0],
         )
         .unwrap();
+    store
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        )
+        .unwrap();
 
     let certificate = gc_anchor(CLUSTER_ID, CONFIG_ID, membership.digest(), 80, b"staged");
     store
@@ -513,6 +521,116 @@ fn certified_gc_does_not_reap_chunks_between_stage_and_finalize() {
         store.load_effect_bundle(bundle.binding()).unwrap(),
         Some(bundle)
     );
+}
+
+#[test]
+fn staged_finalize_requires_every_chunk_to_be_restaged_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let (bundle, request) = sql_qefx(
+        &membership,
+        vec![
+            b"first-staged-chunk".to_vec(),
+            b"second-staged-chunk".to_vec(),
+        ],
+        82,
+    );
+    for (ordinal, chunk) in bundle.chunks().iter().enumerate() {
+        store
+            .stage_effect_bundle_chunk(
+                bundle.binding(),
+                &request.manifest_command,
+                ordinal as u16,
+                chunk,
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let (reopened, _) = open_store(root.path());
+    assert!(matches!(
+        reopened.finalize_staged_effect_bundle(
+            bundle.binding(),
+            request.manifest_command.clone()
+        ),
+        Err(Error::EffectBundleInvalid(message))
+            if message.contains("staged in the current process")
+    ));
+    reopened
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.finalize_staged_effect_bundle(
+            bundle.binding(),
+            request.manifest_command.clone()
+        ),
+        Err(Error::EffectBundleInvalid(message))
+            if message.contains("staged in the current process")
+    ));
+    reopened
+        .stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            1,
+            &bundle.chunks()[1],
+        )
+        .unwrap();
+    reopened
+        .finalize_staged_effect_bundle(bundle.binding(), request.manifest_command.clone())
+        .unwrap();
+    assert_eq!(
+        reopened.load_effect_bundle(bundle.binding()).unwrap(),
+        Some(bundle.clone())
+    );
+    drop(reopened);
+
+    let (finalized, _) = open_store(root.path());
+    finalized
+        .finalize_staged_effect_bundle(bundle.binding(), request.manifest_command)
+        .unwrap();
+    assert_eq!(
+        finalized.load_effect_bundle(bundle.binding()).unwrap(),
+        Some(bundle)
+    );
+}
+
+#[test]
+fn failed_chunk_stage_does_not_leave_a_gc_pin() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let (bundle, request) = sql_qefx(&membership, vec![b"conflicting-stage".to_vec()], 81);
+    let chunk_hash = ExternalEffectCommand::chunk_digest(&bundle.chunks()[0]);
+    let chunk_path = root
+        .path()
+        .join(format!("effect-chunk-{}.qefc", chunk_hash.to_hex()));
+    std::fs::write(&chunk_path, b"wrong-bytes").unwrap();
+
+    assert_eq!(
+        store.stage_effect_bundle_chunk(
+            bundle.binding(),
+            &request.manifest_command,
+            0,
+            &bundle.chunks()[0],
+        ),
+        Err(Error::EffectBundleConflict)
+    );
+    let certificate = gc_anchor(
+        CLUSTER_ID,
+        CONFIG_ID,
+        membership.digest(),
+        80,
+        b"failed-stage",
+    );
+    let outcome = store
+        .advance_effect_bundle_gc_anchor(&certificate, &[])
+        .unwrap();
+    assert_eq!(outcome.removed_chunks, 1);
+    assert!(!chunk_path.exists());
 }
 
 #[test]

@@ -130,7 +130,7 @@ validate() {
     require_row "$file" 'Recorder generation and lock' 'rhiza-quepaxa' "$(code '.rhiza-storage-generation')" 'clean-v1' 'reject open/install'
     require_row "$file" 'Recorder decision state' 'rhiza-quepaxa' "$(code 'recorder.wal')" "\`QWAL\` v$recorder_wal_version" 'conflict fails closed'
     require_row "$file" 'Recorder configuration/commands' 'rhiza-quepaxa' "$(code 'configuration.rec')" "\`QCON\` v$configuration_version" 'content-hash checks'
-    require_row "$file" 'Recorder effects and GC fence' 'rhiza-quepaxa' "$(code '.effect-bundle-gc-anchor.rec')" "$qegc_token" 'unsafe deletion fails closed'
+    require_row "$file" 'Recorder effects and GC fence' 'rhiza-quepaxa' "$(code '.effect-bundle-gc-anchor.rec')" "$qegc_token" 'staged chunk ACKs are process-local' 'restage every chunk after restart' 'unsafe deletion fails closed'
     require_row "$file" 'SQL materialization and control' 'rhiza-sql' "$(code '.rhiza-control.sqlite')" "\`QCTL\` schema v$sql_control_version" 'install snapshot rather than auto-migrate'
     require_row "$file" 'KV materialization' 'rhiza-kv' "$(code '<data>/kv/data.redb')" "$kv_snapshot_token" 'replay continuity'
     require_row "$file" 'Graph materialization' 'rhiza-graph' "$(code '<data>/ladybug/graph.lbug')" "$graph_snapshot_token" 'checked before use'
@@ -146,6 +146,7 @@ validate() {
 
     source_contains crates/rhiza-log/src/lib.rs 'pub const QLOG_FORMAT_VERSION'
     source_contains crates/rhiza-quepaxa/src/lib.rs 'const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";'
+    source_contains crates/rhiza-quepaxa/src/lib.rs 'const STAGED_EFFECT_RESTAGE_REQUIRED: &str ='
     source_contains crates/rhiza-archive/src/lib.rs 'pub const CHECKPOINT_FORMAT_VERSION'
     source_contains crates/rhiza-node/src/durability.rs 'const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";'
     source_contains crates/rhiza-node/src/admin.rs 'const ADMIN_OPERATION_LEDGER_FILE: &str = "admin-operations-v2.json";'
@@ -233,6 +234,8 @@ negative_token anchor "$anchor_token"
 negative_token control-intent-bound "$(code 'CONTROL_INTENT_MAX_BYTES') = $control_intent_max_bytes bytes (8 MiB)"
 negative_token qefx "$qefx_token"
 negative_token qegc "$qegc_token"
+negative_token staged-effect-process-local 'staged chunk ACKs are process-local'
+negative_token staged-effect-restage 'restage every chunk after restart'
 negative_token kv-snapshot "$kv_snapshot_token"
 negative_token graph-snapshot "$graph_snapshot_token"
 negative_token checkpoint "Checkpoint v$checkpoint_version"
