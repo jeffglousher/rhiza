@@ -35,7 +35,7 @@ does not pull `rhiza-node`, HTTP, journals, placement, or receipts.
 | Offer | Why it belongs in `rhiza-quepaxa` | Status |
 |---|---|---|
 | Windows WAL truncate / checkpoint while an append handle is live | Unix can `ftruncate`/`rename` an open WAL; Windows `SetEndOfFile` on `FILE_APPEND_DATA` or a second write handle returns `Access is denied`. This is recorder durability, not a Taldra feature. | This branch |
-| `CallerOwnedConsensus` as a **module** that shares drive logic with `ThreeNodeConsensus` | Caller-owned deadlines already exist on `RecorderRpcContext`. A second copy of `drive_inner` in `lib.rs` is not reviewable. | Not yet — extract before offering |
+| `CallerOwnedConsensus` as `caller_owned.rs` plus `proposer_drive` helpers | Caller-owned deadlines already exist on `RecorderRpcContext`. Error/predecessor helpers are shared. `drive_inner` still has two copies until a later drive-trait extract. | Module extracted; not offered until `drive_inner` is shared |
 | Windows `AnchoredDir` as a documented lab path | Useful, but weaker than `openat`. Do not offer it as Unix-equivalent. | Hold until WAL truncate is honest |
 
 Never offer: Taldra receipts, journals, virtual-bucket placement, oracle
@@ -76,10 +76,15 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
 
 **Caller-owned QuePaxa drive (ADR-0005 exit condition 1) -- landed:**
 
-- Public type: `CallerOwnedConsensus` (no `RecordWorker` / `ControlWorker` OS
-  threads).
+- Public type: `CallerOwnedConsensus` in `caller_owned.rs` (no
+  `RecordWorker` / `ControlWorker` OS threads).
+- Shared helpers in `proposer_drive.rs`: predecessor check and recorder
+  error classification used by both `ThreeNodeConsensus` and
+  `CallerOwnedConsensus`.
 - Record / install / fetch / inspect RPCs run synchronously on the calling
   thread via `RecorderRpc`, with quorum early-stop and `UnknownOutcome` after
   mutation-started cancel/deadline.
 - `ThreeNodeConsensus` worker runtime remains for Rhiza-native tests; Taldra
   should pin this revision and migrate labs onto `CallerOwnedConsensus`.
+- `drive_inner` is still duplicated. Do not offer this module upstream until
+  that loop is shared.
