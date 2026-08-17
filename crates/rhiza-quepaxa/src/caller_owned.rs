@@ -6,7 +6,6 @@
 //! and predecessor helpers live in [`crate::proposer_drive`].
 
 use std::{
-    collections::BTreeSet,
     fmt,
     path::PathBuf,
     sync::{
@@ -18,12 +17,11 @@ use std::{
 
 use crate::{
     check_operation_context, check_proposal_operation_context, proof_cluster_id, proof_context,
-    proposal_exact, proposer_drive, stored_command, AcceptedValue, ClusterId, Command, ConfigId,
-    Consensus, ControlCallBudget, DecisionProof, DriveOutcome, EntryType, Epoch, Error, LogEntry,
-    LogHash, LogIndex, Membership, NodeId, OsPrioritySource, PrioritySource, Proposal,
-    ProposalPriority, ProposerProgress, RecordRequest, RecordSummary, RecorderFileStore,
-    RecorderRpc, RecorderRpcContext, RecorderSummary, RejectReason, Result, RpcCallBudget,
-    SingleNodeState, Slot, StoredCommand,
+    proposer_drive, stored_command, AcceptedValue, ClusterId, Command, ConfigId, Consensus,
+    ControlCallBudget, DecisionProof, DriveOutcome, EntryType, Epoch, Error, LogEntry, LogHash,
+    LogIndex, Membership, NodeId, OsPrioritySource, PrioritySource, Proposal, ProposalPriority,
+    ProposerProgress, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
+    RecorderRpcContext, RejectReason, Result, RpcCallBudget, SingleNodeState, Slot, StoredCommand,
 };
 /// QuePaxa consensus driven entirely on the calling thread.
 ///
@@ -275,210 +273,11 @@ impl CallerOwnedConsensus {
 
     fn drive_inner(
         &self,
-        mut progress: ProposerProgress,
+        progress: ProposerProgress,
         context: &RecorderRpcContext,
         mutation_started: &AtomicBool,
     ) -> Result<DriveOutcome> {
-        check_operation_context(context, mutation_started)?;
-        self.ensure_progress_command(&mut progress, context, mutation_started)?;
-        let round = progress.step / 4;
-        let phase = progress.step % 4;
-        if phase == 0 {
-            progress
-                .phase_zero_priorities
-                .retain(|(cached_round, _), _| *cached_round == round);
-        } else {
-            progress.phase_zero_priorities.clear();
-        }
-        let command_targets: BTreeSet<_> = self
-            .membership
-            .members()
-            .iter()
-            .filter(|recorder_id| !progress.command_holders.contains(*recorder_id))
-            .cloned()
-            .collect();
-        let requests: Vec<_> = self
-            .membership
-            .members()
-            .iter()
-            .map(|recorder_id| -> Result<RecordRequest> {
-                let mut proposal = progress.proposal.clone();
-                if phase == 0 {
-                    proposal.priority =
-                        if progress.step == 4 && self.proposer_id == self.membership.members()[0] {
-                            ProposalPriority::MAX
-                        } else {
-                            match progress
-                                .phase_zero_priorities
-                                .entry((round, recorder_id.clone()))
-                            {
-                                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
-                                std::collections::btree_map::Entry::Vacant(entry) => {
-                                    *entry.insert(self.priority_source.sample(
-                                        progress.slot,
-                                        round,
-                                        &self.proposer_id,
-                                        recorder_id,
-                                    )?)
-                                }
-                            }
-                        };
-                }
-                Ok(RecordRequest {
-                    cluster_id: self.cluster_id.clone(),
-                    epoch: self.epoch,
-                    config_id: self.config_id,
-                    config_digest: self.config_digest,
-                    slot: progress.slot,
-                    step: progress.step,
-                    proposal,
-                    command: command_targets
-                        .contains(recorder_id)
-                        .then(|| progress.command.clone())
-                        .flatten(),
-                })
-            })
-            .collect::<Result<_>>()?;
-        let mut replies =
-            self.record_broadcast_with_context(requests, context.clone(), mutation_started)?;
-        progress.command_holders.extend(
-            replies
-                .iter()
-                .filter(|reply| command_targets.contains(&reply.recorder_id))
-                .map(|reply| reply.recorder_id.clone()),
-        );
-        for reply in &replies {
-            if let Some(proof) = &reply.decided {
-                if proof_cluster_id(proof) != self.cluster_id {
-                    return Err(Error::Rejected(RejectReason::WrongCluster));
-                }
-                proof
-                    .validate_for_cluster(
-                        &self.cluster_id,
-                        progress.slot,
-                        self.epoch,
-                        self.config_id,
-                        &self.membership,
-                    )
-                    .map_err(Error::Rejected)?;
-                return self.finish_decision_with_context(
-                    proof.clone(),
-                    progress.command.as_ref(),
-                    context,
-                    mutation_started,
-                );
-            }
-        }
-        if let Some(highest) = replies.iter().map(|reply| reply.step).max() {
-            if highest > progress.step {
-                let caught_up = replies
-                    .iter()
-                    .filter(|reply| reply.step == highest)
-                    .min_by(|left, right| left.recorder_id.cmp(&right.recorder_id))
-                    .expect("highest reply exists");
-                progress.step = highest;
-                if let Some(proposal) = &caught_up.first_current {
-                    progress.proposal = proposal.clone();
-                }
-                self.ensure_progress_command(&mut progress, context, mutation_started)?;
-                progress.phase_zero_priorities.clear();
-                return Ok(DriveOutcome::Progress(progress));
-            }
-        }
-        replies.retain(|reply| reply.step == progress.step);
-        replies.sort_by(|left, right| left.recorder_id.cmp(&right.recorder_id));
-        replies.dedup_by(|left, right| left.recorder_id == right.recorder_id);
-        if replies.len() < self.membership.quorum_size() {
-            return Ok(DriveOutcome::Pending(progress));
-        }
-        replies.truncate(self.membership.quorum_size());
-        let summaries: Vec<_> = replies
-            .iter()
-            .map(|reply| RecorderSummary {
-                recorder_id: reply.recorder_id.clone(),
-                slot: reply.slot,
-                step: reply.step,
-                first_current: reply.first_current.clone(),
-                aggregate_prior: reply.aggregate_prior.clone(),
-            })
-            .collect();
-        match phase {
-            0 => {
-                let fast_proposal = summaries
-                    .first()
-                    .and_then(|summary| summary.first_current.as_ref())
-                    .filter(|proposal| proposal.priority == ProposalPriority::MAX)
-                    .filter(|proposal| {
-                        progress.step == 4
-                            && summaries.iter().all(|summary| {
-                                summary
-                                    .first_current
-                                    .as_ref()
-                                    .is_some_and(|candidate| proposal_exact(candidate, proposal))
-                            })
-                    })
-                    .cloned();
-                if let Some(proposal) = fast_proposal {
-                    let proof = DecisionProof::FastPath {
-                        cluster_id: self.cluster_id.clone(),
-                        slot: progress.slot,
-                        epoch: self.epoch,
-                        config_id: self.config_id,
-                        config_digest: self.config_digest,
-                        proposal,
-                        summaries,
-                    };
-                    return self.finish_decision_with_context(
-                        proof,
-                        progress.command.as_ref(),
-                        context,
-                        mutation_started,
-                    );
-                }
-                progress.proposal = replies
-                    .iter()
-                    .filter_map(|reply| reply.first_current.clone())
-                    .max()
-                    .ok_or(Error::Rejected(RejectReason::InvalidRequest))?;
-            }
-            1 => {}
-            2 => {
-                let maximum = replies
-                    .iter()
-                    .filter_map(|reply| reply.aggregate_prior.clone())
-                    .max();
-                if maximum.as_ref() == Some(&progress.proposal) {
-                    let proof = DecisionProof::Phase2 {
-                        cluster_id: self.cluster_id.clone(),
-                        slot: progress.slot,
-                        epoch: self.epoch,
-                        config_id: self.config_id,
-                        config_digest: self.config_digest,
-                        step: progress.step,
-                        proposal: progress.proposal.clone(),
-                        summaries,
-                    };
-                    return self.finish_decision_with_context(
-                        proof,
-                        progress.command.as_ref(),
-                        context,
-                        mutation_started,
-                    );
-                }
-            }
-            3 => {
-                progress.proposal = replies
-                    .iter()
-                    .filter_map(|reply| reply.aggregate_prior.clone())
-                    .max()
-                    .ok_or(Error::Rejected(RejectReason::InvalidRequest))?;
-            }
-            _ => unreachable!("phase is step modulo four"),
-        }
-        self.ensure_progress_command(&mut progress, context, mutation_started)?;
-        progress.step = progress.step.checked_add(1).ok_or(Error::ProposeFailed)?;
-        progress.phase_zero_priorities.clear();
-        Ok(DriveOutcome::Progress(progress))
+        proposer_drive::drive_inner(self, progress, context, mutation_started)
     }
 
     fn finish_decision_with_context(
@@ -995,6 +794,64 @@ impl CallerOwnedConsensus {
 
     fn is_record_safety_error(error: &Error) -> bool {
         proposer_drive::is_record_safety_error(error)
+    }
+}
+
+impl proposer_drive::ProposerDriveHost for CallerOwnedConsensus {
+    fn drive_cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
+    }
+
+    fn drive_proposer_id(&self) -> &NodeId {
+        &self.proposer_id
+    }
+
+    fn drive_epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    fn drive_config_id(&self) -> ConfigId {
+        self.config_id
+    }
+
+    fn drive_config_digest(&self) -> LogHash {
+        self.config_digest
+    }
+
+    fn drive_membership(&self) -> &Membership {
+        &self.membership
+    }
+
+    fn drive_priority_source(&self) -> &dyn PrioritySource {
+        self.priority_source.as_ref()
+    }
+
+    fn drive_ensure_progress_command(
+        &self,
+        progress: &mut ProposerProgress,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<()> {
+        self.ensure_progress_command(progress, context, mutation_started)
+    }
+
+    fn drive_record_broadcast(
+        &self,
+        requests: Vec<RecordRequest>,
+        context: RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<Vec<RecordSummary>> {
+        self.record_broadcast_with_context(requests, context, mutation_started)
+    }
+
+    fn drive_finish_decision(
+        &self,
+        proof: DecisionProof,
+        known_command: Option<&StoredCommand>,
+        context: &RecorderRpcContext,
+        mutation_started: &AtomicBool,
+    ) -> Result<DriveOutcome> {
+        self.finish_decision_with_context(proof, known_command, context, mutation_started)
     }
 }
 
