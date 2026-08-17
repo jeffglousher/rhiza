@@ -22,6 +22,26 @@ deadlines and cancellation via `RecorderRpcContext`.
    pin. Prefer minimal, reviewable patches over silent rewrites.
 5. **Do not** publish a competing crates.io crate from this fork unless the
    owner Accepts a versioning/identity plan.
+6. **Keep `rhiza-quepaxa` focused.** The crate is protocol + recorder WAL +
+   typed `RecorderRpc`. Fork patches must be either (a) shaped as a later
+   upstream PR with no Taldra types, or (b) explicitly Taldra-only glue that
+   never becomes the crate's public product surface.
+
+## What we offer upstream
+
+Offer only when the patch is one concern, reviewable without Taldra, and
+does not pull `rhiza-node`, HTTP, journals, placement, or receipts.
+
+| Offer | Why it belongs in `rhiza-quepaxa` | Status |
+|---|---|---|
+| Windows WAL truncate / checkpoint while an append handle is live | Unix can `ftruncate`/`rename` an open WAL; Windows `SetEndOfFile` on `FILE_APPEND_DATA` or a second write handle returns `Access is denied`. This is recorder durability, not a Taldra feature. | This branch |
+| `CallerOwnedConsensus` as a **module** that shares drive logic with `ThreeNodeConsensus` | Caller-owned deadlines already exist on `RecorderRpcContext`. A second copy of `drive_inner` in `lib.rs` is not reviewable. | Not yet — extract before offering |
+| Windows `AnchoredDir` as a documented lab path | Useful, but weaker than `openat`. Do not offer it as Unix-equivalent. | Hold until WAL truncate is honest |
+
+Never offer: Taldra receipts, journals, virtual-bucket placement, oracle
+parity, Quinn/process proof, or anything from `rhiza-node` (admin ledger,
+TCP admission, HTTP 503 mapping). Those stay in Taldra or in Rhiza's node
+crate.
 
 ## Current Taldra pin baseline
 
@@ -47,9 +67,9 @@ See Taldra ADR-0005 / ADR-0015 and `deny.toml` `allow-git` for
   single-component children after symlink refusal, and re-check the canonical
   path on each operation. Child opens are path-relative (not `NtCreateFile` /
   `openat`). Unix `openat` remains the stronger production path. This unblocks
-  Taldra's Windows comparative lab. Five upstream WAL torn-tail / rotation /
-  preflight tests still fail on Windows (`Access is denied` while rewriting a
-  recently truncated file); they are not the comparative propose/reopen path.
+  Taldra's Windows comparative lab. WAL checkpoint/truncate now closes the
+  live append handle and uses a write handle for `set_len` so Windows can
+  rotate and recover a torn tail. Unix `openat` is unchanged.
 
 
 ## Fork patches (caller-owned drive)

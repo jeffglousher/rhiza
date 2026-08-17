@@ -132,12 +132,25 @@ impl AnchoredDir {
     }
 
     pub(crate) fn truncate(&self, name: &str, len: u64) -> Result<()> {
-        let file = self.open_append(name)?;
+        // Windows `SetEndOfFile` requires `FILE_WRITE_DATA`. An append-only
+        // handle (`FILE_APPEND_DATA`) returns Access Denied. Unix `ftruncate`
+        // on an `O_APPEND` fd does not have that restriction.
+        let file = self.open_file(name, Access::ReadWrite)?;
+        if !file
+            .metadata()
+            .map_err(|error| Error::Io(error.to_string()))?
+            .is_file()
+        {
+            return Err(Error::Decode(
+                "anchored truncate target must be a regular file".into(),
+            ));
+        }
         file.set_len(len)
             .and_then(|_| file.sync_all())
             .map_err(|error| Error::Io(error.to_string()))?;
         #[cfg(test)]
         crate::record_file_sync();
+        drop(file);
         self.sync()
     }
 
