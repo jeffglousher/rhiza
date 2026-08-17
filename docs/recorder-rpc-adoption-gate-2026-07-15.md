@@ -45,10 +45,24 @@ complete cluster security.
 - The listener still binds to `0.0.0.0:8082`; isolation therefore depends on a
   trusted cluster plus CNI/NetworkPolicy enforcement. The repository manifests
   check exposure but do not create a default-deny NetworkPolicy.
-- Server connection and admitted-operation counts are bounded. Completed tasks
-  are reaped, shutdown waits for admitted mutations, failed pooled connections
-  are discarded, and a request is never automatically replayed after a write
-  begins.
+- TCP admission is bounded before protocol work: at most 32 connections may be
+  pending HELLO, 96 may be authenticated globally, and each exact configured
+  peer node ID may own at most five sessions. A non-waiting RAII transition
+  replaces pending ownership with peer/global ownership only after HELLO
+  credentials and recovery generation validate, before recorder identity is
+  queried or `Accepted` is written. The authenticated lease remains held for
+  the full session and is released on normal close, shutdown, cancellation, or
+  panic.
+- Every asynchronous TCP frame read has one 20-second deadline covering both
+  its four-byte prefix and complete payload. A pool-owned timer closes classic
+  TCP entries at 10 seconds idle and releases exactly one open reservation,
+  without waiting for another checkout; generation matching prevents stale
+  timers from retiring active or rechecked connections.
+- Admitted-operation counts remain independently bounded. Completed tasks are
+  reaped, shutdown waits for admitted mutations, and failed pooled connections
+  are discarded. Postcard-RPC EOF closes that session; a later call reconnects,
+  but a mutation from the failed session is never replayed and remains an
+  `UnknownOutcome`.
 
 ## Validation completed
 

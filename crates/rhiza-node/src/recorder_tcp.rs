@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     fmt,
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -30,8 +31,12 @@ use crate::{
 const WIRE_VERSION: u16 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
+const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTIONS_PER_LANE: usize = 2;
-const MAX_SERVER_CONNECTIONS: usize = DEFAULT_PEER_CONCURRENCY * 4;
+const MAX_PENDING_CONNECTIONS: usize = 32;
+const MAX_AUTHENTICATED_CONNECTIONS: usize = 96;
+const MAX_CONNECTIONS_PER_PEER: usize = 5;
 const MAX_SERVER_DECODE_CONCURRENCY: usize = 32;
 const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/5";
 
@@ -80,6 +85,95 @@ pub struct RecorderIngressExit {
 struct RecorderListenerOwner {
     listener: Option<tokio::net::TcpListener>,
     listener_dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionAdmissionPolicy {
+    pending: usize,
+    authenticated: usize,
+    per_peer: usize,
+}
+
+const CONNECTION_ADMISSION_POLICY: ConnectionAdmissionPolicy = ConnectionAdmissionPolicy {
+    pending: MAX_PENDING_CONNECTIONS,
+    authenticated: MAX_AUTHENTICATED_CONNECTIONS,
+    per_peer: MAX_CONNECTIONS_PER_PEER,
+};
+
+#[derive(Default)]
+struct ConnectionAdmissionState {
+    pending: usize,
+    authenticated: usize,
+    peers: HashMap<String, usize>,
+}
+
+enum ConnectionAdmissionPhase {
+    Pending,
+    Authenticated(String),
+}
+
+/// Owns exactly one connection admission from accept through session teardown.
+/// Authentication atomically replaces pending ownership with peer/global
+/// ownership; every exit path releases the currently owned counters in Drop.
+struct ConnectionAdmission {
+    state: Arc<Mutex<ConnectionAdmissionState>>,
+    policy: ConnectionAdmissionPolicy,
+    phase: ConnectionAdmissionPhase,
+}
+
+impl ConnectionAdmission {
+    fn try_pending(
+        state: Arc<Mutex<ConnectionAdmissionState>>,
+        policy: ConnectionAdmissionPolicy,
+    ) -> Option<Self> {
+        let mut counts = state.lock().unwrap_or_else(|error| error.into_inner());
+        if counts.pending >= policy.pending {
+            return None;
+        }
+        counts.pending += 1;
+        drop(counts);
+        Some(Self {
+            state,
+            policy,
+            phase: ConnectionAdmissionPhase::Pending,
+        })
+    }
+
+    fn authenticate(&mut self, peer: &str) -> bool {
+        if !matches!(self.phase, ConnectionAdmissionPhase::Pending) {
+            return false;
+        }
+        let mut counts = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let peer_count = counts.peers.get(peer).copied().unwrap_or(0);
+        if peer_count >= self.policy.per_peer || counts.authenticated >= self.policy.authenticated {
+            return false;
+        }
+        counts.pending = counts.pending.saturating_sub(1);
+        counts.authenticated += 1;
+        *counts.peers.entry(peer.to_owned()).or_default() += 1;
+        self.phase = ConnectionAdmissionPhase::Authenticated(peer.to_owned());
+        true
+    }
+}
+
+impl Drop for ConnectionAdmission {
+    fn drop(&mut self) {
+        let mut counts = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match &self.phase {
+            ConnectionAdmissionPhase::Pending => {
+                counts.pending = counts.pending.saturating_sub(1);
+            }
+            ConnectionAdmissionPhase::Authenticated(peer) => {
+                counts.authenticated = counts.authenticated.saturating_sub(1);
+                if let Some(count) = counts.peers.get_mut(peer) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        counts.peers.remove(peer);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl RecorderListenerOwner {
@@ -426,9 +520,9 @@ where
         lifecycle,
         Arc::clone(&slots),
         DEFAULT_PEER_CONCURRENCY,
-        MAX_SERVER_CONNECTIONS,
+        CONNECTION_ADMISSION_POLICY,
         "recorder TCP accept failed",
-        move |stream, _peer_address, shutdown, force, connection| {
+        move |stream, _peer_address, shutdown, force, admission| {
             let recorder = recorder.clone();
             let peers = Arc::clone(&peers);
             let slots = Arc::clone(&slots);
@@ -436,13 +530,13 @@ where
             let tls = tls.clone();
             let reported_connection_error = Arc::clone(&reported_connection_error);
             async move {
-                let _connection = connection;
                 let signals = RecorderConnectionSignals { shutdown, force };
                 let context = RecorderConnectionContext {
                     peers,
                     recovery_generation,
                     slots,
                     decode_slots,
+                    admission,
                     signals: Some(signals),
                     #[cfg(test)]
                     response_write_test_server,
@@ -471,7 +565,7 @@ async fn run_recorder_ingress<H, Fut>(
     mut lifecycle: RecorderIngressLifecycle,
     work_slots: Arc<tokio::sync::Semaphore>,
     work_slot_count: usize,
-    connection_limit: usize,
+    admission_policy: ConnectionAdmissionPolicy,
     accept_error_prefix: &'static str,
     mut serve_connection: H,
 ) -> RecorderIngressExit
@@ -481,7 +575,7 @@ where
         SocketAddr,
         tokio::sync::watch::Receiver<bool>,
         tokio::sync::watch::Receiver<bool>,
-        tokio::sync::OwnedSemaphorePermit,
+        ConnectionAdmission,
     ) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
@@ -490,7 +584,7 @@ where
         .take()
         .expect("recorder lifecycle owns one listener-drop receipt");
     let mut listener = RecorderListenerOwner::new(listener, listener_dropped);
-    let connection_slots = Arc::new(tokio::sync::Semaphore::new(connection_limit));
+    let connection_admission = Arc::new(Mutex::new(ConnectionAdmissionState::default()));
     let (connection_shutdown, _) = tokio::sync::watch::channel(false);
     let (connection_force, _) = tokio::sync::watch::channel(false);
     let mut connections = tokio::task::JoinSet::new();
@@ -527,7 +621,10 @@ where
                         break;
                     }
                 };
-                let Ok(connection) = connection_slots.clone().try_acquire_owned() else {
+                let Some(admission) = ConnectionAdmission::try_pending(
+                    Arc::clone(&connection_admission),
+                    admission_policy,
+                ) else {
                     continue;
                 };
                 let _ = stream.set_nodelay(true);
@@ -536,7 +633,7 @@ where
                     peer_address,
                     connection_shutdown.subscribe(),
                     connection_force.subscribe(),
-                    connection,
+                    admission,
                 ));
             }
         }
@@ -605,6 +702,7 @@ struct RecorderConnectionContext {
     recovery_generation: u64,
     slots: Arc<tokio::sync::Semaphore>,
     decode_slots: Arc<tokio::sync::Semaphore>,
+    admission: ConnectionAdmission,
     signals: Option<RecorderConnectionSignals>,
     #[cfg(test)]
     response_write_test_server: Option<SocketAddr>,
@@ -660,11 +758,21 @@ where
             recovery_generation,
             slots,
             decode_slots: Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_DECODE_CONCURRENCY)),
+            admission: test_connection_admission(),
             signals: None,
             response_write_test_server: None,
         },
     )
     .await
+}
+
+#[cfg(test)]
+fn test_connection_admission() -> ConnectionAdmission {
+    ConnectionAdmission::try_pending(
+        Arc::new(Mutex::new(ConnectionAdmissionState::default())),
+        CONNECTION_ADMISSION_POLICY,
+    )
+    .expect("test connection admission")
 }
 
 async fn serve_connection_with_decode_slots<R, S>(
@@ -676,12 +784,9 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let hello_bytes = tokio::time::timeout(
-        CALL_TIMEOUT,
-        read_frame_with_signals(&mut stream, &mut context.signals),
-    )
-    .await
-    .map_err(|_| "recorder HELLO timed out".to_string())??;
+    let hello_bytes =
+        read_frame_with_signals_timeout(&mut stream, &mut context.signals, "recorder HELLO")
+            .await?;
     let Some(hello_bytes) = hello_bytes else {
         return Ok(());
     };
@@ -694,6 +799,15 @@ where
         );
         let _ = await_unless_forced(&mut context.signals, rejection).await;
         return Err("recorder HELLO rejected".into());
+    }
+    if !context.admission.authenticate(&hello.node_id) {
+        let rejection = write_value_async_with_timeout(
+            &mut stream,
+            &HelloReply::Rejected,
+            "recorder HELLO connection overload rejection",
+        );
+        let _ = await_unless_forced(&mut context.signals, rejection).await;
+        return Err("recorder HELLO connection overloaded".into());
     }
     let permit = match context.slots.clone().try_acquire_owned() {
         Ok(permit) => Arc::new(permit),
@@ -739,7 +853,13 @@ where
     drop(permit);
 
     loop {
-        let request = match read_frame_with_signals(&mut stream, &mut context.signals).await {
+        let request = match read_frame_with_signals_timeout(
+            &mut stream,
+            &mut context.signals,
+            "recorder request frame",
+        )
+        .await
+        {
             Ok(Some(bytes)) => {
                 decode_request_framed_with_gate(&bytes, &context.decode_slots).await?
             }
@@ -820,6 +940,31 @@ where
         },
         None => read_frame_async(reader).await.map(Some),
     }
+}
+
+async fn read_frame_with_signals_timeout<R>(
+    reader: &mut R,
+    signals: &mut Option<RecorderConnectionSignals>,
+    description: &str,
+) -> Result<Option<Vec<u8>>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    read_frame_with_signals_timeout_for(reader, signals, description, FRAME_TIMEOUT).await
+}
+
+async fn read_frame_with_signals_timeout_for<R>(
+    reader: &mut R,
+    signals: &mut Option<RecorderConnectionSignals>,
+    description: &str,
+    timeout: Duration,
+) -> Result<Option<Vec<u8>>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    tokio::time::timeout(timeout, read_frame_with_signals(reader, signals))
+        .await
+        .map_err(|_| format!("{description} timed out"))?
 }
 
 async fn await_unless_forced<T, F>(
@@ -1561,6 +1706,14 @@ fn frame_length_from_size(size: usize) -> Result<[u8; 4], String> {
 struct ConnectionPool {
     state: Mutex<PoolState>,
     available: Condvar,
+    idle_wake: mpsc::SyncSender<()>,
+    idle_timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct IdleExpiry {
+    generation: u64,
+    deadline: Instant,
 }
 
 /// Owns one `PoolState::open` reservation while a connector result is in
@@ -1598,8 +1751,82 @@ struct ConnectorCompletion {
 
 #[derive(Default)]
 struct PoolState {
-    idle: Vec<RecorderClientStream>,
+    idle: Vec<IdleConnection>,
     open: usize,
+    next_idle_generation: u64,
+}
+
+struct IdleConnection {
+    stream: RecorderClientStream,
+    expires_at: Instant,
+    generation: u64,
+}
+
+fn take_idle_connection(state: &mut PoolState, now: Instant) -> Option<RecorderClientStream> {
+    while let Some(idle) = state.idle.pop() {
+        if now < idle.expires_at {
+            return Some(idle.stream);
+        }
+        // The expired stream still represented exactly one open pool slot.
+        // Retire the wrapper and reservation together.
+        state.open = state.open.saturating_sub(1);
+    }
+    None
+}
+
+fn retire_idle_generation(pool: &ConnectionPool, generation: u64) {
+    let Ok(mut state) = pool.state.lock() else {
+        return;
+    };
+    let Some(index) = state
+        .idle
+        .iter()
+        .position(|idle| idle.generation == generation)
+    else {
+        return;
+    };
+    drop(state.idle.swap_remove(index));
+    state.open = state.open.saturating_sub(1);
+    pool.available.notify_all();
+}
+
+fn earliest_idle_expiry(pool: &ConnectionPool) -> Option<IdleExpiry> {
+    let state = pool.state.lock().ok()?;
+    state
+        .idle
+        .iter()
+        .min_by_key(|idle| idle.expires_at)
+        .map(|idle| IdleExpiry {
+            generation: idle.generation,
+            deadline: idle.expires_at,
+        })
+}
+
+fn run_idle_reaper(pool: std::sync::Weak<ConnectionPool>, receiver: mpsc::Receiver<()>) {
+    loop {
+        let Some(live_pool) = pool.upgrade() else {
+            return;
+        };
+        let expiry = earliest_idle_expiry(&live_pool);
+        drop(live_pool);
+        if let Some(expiry) = expiry {
+            match receiver.recv_timeout(expiry.deadline.saturating_duration_since(Instant::now())) {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let Some(pool) = pool.upgrade() else {
+                        return;
+                    };
+                    retire_idle_generation(&pool, expiry.generation);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            match receiver.recv() {
+                Ok(()) => {}
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 trait DeadlineClock {
@@ -1832,11 +2059,24 @@ enum ClientTransport {
 }
 
 impl ConnectionPool {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Arc<Self>, String> {
+        Self::new_with_idle_timeout(IDLE_CONNECTION_TIMEOUT)
+    }
+
+    fn new_with_idle_timeout(idle_timeout: Duration) -> Result<Arc<Self>, String> {
+        let (idle_wake, receiver) = mpsc::sync_channel(1);
+        let pool = Arc::new(Self {
             state: Mutex::new(PoolState::default()),
             available: Condvar::new(),
-        }
+            idle_wake,
+            idle_timeout,
+        });
+        let weak = Arc::downgrade(&pool);
+        thread::Builder::new()
+            .name("rhiza-recorder-idle-reaper".into())
+            .spawn(move || run_idle_reaper(weak, receiver))
+            .map_err(|error| format!("cannot start recorder idle reaper: {error}"))?;
+        Ok(pool)
     }
 }
 
@@ -1959,8 +2199,8 @@ impl TcpPostcardRecorderClient {
             recovery_generation,
             transport,
             call_timeout,
-            consensus: Arc::new(ConnectionPool::new()),
-            control: Arc::new(ConnectionPool::new()),
+            consensus: ConnectionPool::new()?,
+            control: ConnectionPool::new()?,
             next_request_id: AtomicU64::new(1),
         })
     }
@@ -2049,7 +2289,7 @@ impl TcpPostcardRecorderClient {
                     && response.request_id == request_id
                     && response_matches(operation, &response.body) =>
             {
-                self.checkin(pool, stream);
+                Self::checkin(pool, stream);
                 match context.check() {
                     Ok(()) => Ok(response.body),
                     Err(_) if mutating => Err(Error::UnknownOutcome),
@@ -2097,7 +2337,7 @@ impl TcpPostcardRecorderClient {
                 .state
                 .lock()
                 .map_err(|_| Error::Io("recorder connection pool lock poisoned".into()))?;
-            if let Some(stream) = state.idle.pop() {
+            if let Some(stream) = take_idle_connection(&mut state, Instant::now()) {
                 return Ok(stream);
             }
             if state.open < CONNECTIONS_PER_LANE {
@@ -2305,10 +2545,33 @@ impl TcpPostcardRecorderClient {
         }
     }
 
-    fn checkin(&self, pool: &ConnectionPool, stream: RecorderClientStream) {
-        if let Ok(mut state) = pool.state.lock() {
-            state.idle.push(stream);
+    fn checkin(pool: &Arc<ConnectionPool>, stream: RecorderClientStream) {
+        let expiry = if let Ok(mut state) = pool.state.lock() {
+            let Some(generation) = state.next_idle_generation.checked_add(1) else {
+                state.open = state.open.saturating_sub(1);
+                pool.available.notify_one();
+                return;
+            };
+            state.next_idle_generation = generation;
+            let expiry = IdleExpiry {
+                generation,
+                deadline: Instant::now() + pool.idle_timeout,
+            };
+            state.idle.push(IdleConnection {
+                stream,
+                expires_at: expiry.deadline,
+                generation,
+            });
             pool.available.notify_one();
+            expiry
+        } else {
+            return;
+        };
+        match pool.idle_wake.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                retire_idle_generation(pool, expiry.generation);
+            }
         }
     }
 
@@ -2834,6 +3097,218 @@ mod tests {
         },
         thread,
     };
+
+    #[test]
+    fn connection_admission_transitions_and_releases_exact_counters() {
+        let policy = ConnectionAdmissionPolicy {
+            pending: 2,
+            authenticated: 2,
+            per_peer: 1,
+        };
+        let state = Arc::new(Mutex::new(ConnectionAdmissionState::default()));
+        let mut first = ConnectionAdmission::try_pending(Arc::clone(&state), policy).unwrap();
+        let mut second = ConnectionAdmission::try_pending(Arc::clone(&state), policy).unwrap();
+        assert!(ConnectionAdmission::try_pending(Arc::clone(&state), policy).is_none());
+        assert!(first.authenticate("node-a"));
+        assert!(!second.authenticate("node-a"));
+        assert!(second.authenticate("node-b"));
+        {
+            let counts = state.lock().unwrap();
+            assert_eq!((counts.pending, counts.authenticated), (0, 2));
+            assert_eq!(counts.peers.get("node-a"), Some(&1));
+            assert_eq!(counts.peers.get("node-b"), Some(&1));
+        }
+        drop(first);
+        let mut replacement = ConnectionAdmission::try_pending(Arc::clone(&state), policy).unwrap();
+        assert!(replacement.authenticate("node-a"));
+        drop((replacement, second));
+        let counts = state.lock().unwrap();
+        assert_eq!((counts.pending, counts.authenticated), (0, 0));
+        assert!(counts.peers.is_empty());
+    }
+
+    #[test]
+    fn connection_admission_releases_on_panic_unwind() {
+        let state = Arc::new(Mutex::new(ConnectionAdmissionState::default()));
+        let policy = ConnectionAdmissionPolicy {
+            pending: 1,
+            authenticated: 1,
+            per_peer: 1,
+        };
+        let unwind_state = Arc::clone(&state);
+        let _ = std::panic::catch_unwind(move || {
+            let mut admission = ConnectionAdmission::try_pending(unwind_state, policy).unwrap();
+            assert!(admission.authenticate("node-a"));
+            panic!("injected admitted connection panic");
+        });
+        let counts = state.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!((counts.pending, counts.authenticated), (0, 0));
+        assert!(counts.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_admission_releases_when_session_is_aborted() {
+        let state = Arc::new(Mutex::new(ConnectionAdmissionState::default()));
+        let policy = ConnectionAdmissionPolicy {
+            pending: 1,
+            authenticated: 1,
+            per_peer: 1,
+        };
+        let task_state = Arc::clone(&state);
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut admission = ConnectionAdmission::try_pending(task_state, policy).unwrap();
+            assert!(admission.authenticate("node-a"));
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let counts = state.lock().unwrap();
+        assert_eq!((counts.pending, counts.authenticated), (0, 0));
+        assert!(counts.peers.is_empty());
+    }
+
+    fn test_pool_stream() -> RecorderClientStream {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        RecorderClientStream::Plain(DeadlineStream::new(
+            client,
+            Instant::now() + Duration::from_secs(1),
+        ))
+    }
+
+    #[test]
+    fn classic_idle_reaper_retires_without_checkout() {
+        let pool = ConnectionPool::new_with_idle_timeout(Duration::from_millis(10)).unwrap();
+        pool.state.lock().unwrap().open = 1;
+        TcpPostcardRecorderClient::checkin(&pool, test_pool_stream());
+        let state = pool.state.lock().unwrap();
+        let (state, wait) = pool
+            .available
+            .wait_timeout_while(state, Duration::from_secs(1), |state| state.open != 0)
+            .unwrap();
+        assert!(!wait.timed_out(), "idle reaper did not run");
+        assert_eq!(state.open, 0);
+        assert!(state.idle.is_empty());
+    }
+
+    #[test]
+    fn classic_idle_wakes_coalesce_under_repeated_checkout_and_checkin() {
+        let (idle_wake, receiver) = mpsc::sync_channel(1);
+        let pool = Arc::new(ConnectionPool {
+            state: Mutex::new(PoolState {
+                open: 1,
+                ..PoolState::default()
+            }),
+            available: Condvar::new(),
+            idle_wake,
+            idle_timeout: Duration::from_secs(60),
+        });
+        let mut stream = test_pool_stream();
+        for _ in 0..1_000 {
+            TcpPostcardRecorderClient::checkin(&pool, stream);
+            stream = take_idle_connection(&mut pool.state.lock().unwrap(), Instant::now()).unwrap();
+        }
+        TcpPostcardRecorderClient::checkin(&pool, stream);
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn classic_idle_reaper_recomputes_out_of_order_earliest_expiry() {
+        let (idle_wake, receiver) = mpsc::sync_channel(1);
+        let now = Instant::now();
+        let pool = Arc::new(ConnectionPool {
+            state: Mutex::new(PoolState {
+                idle: vec![
+                    IdleConnection {
+                        stream: test_pool_stream(),
+                        expires_at: now + Duration::from_secs(1),
+                        generation: 1,
+                    },
+                    IdleConnection {
+                        stream: test_pool_stream(),
+                        expires_at: now + Duration::from_millis(10),
+                        generation: 2,
+                    },
+                ],
+                open: 2,
+                next_idle_generation: 2,
+            }),
+            available: Condvar::new(),
+            idle_wake,
+            idle_timeout: Duration::from_secs(60),
+        });
+        let weak = Arc::downgrade(&pool);
+        let reaper = thread::spawn(move || run_idle_reaper(weak, receiver));
+        pool.idle_wake.try_send(()).unwrap();
+
+        let state = pool.state.lock().unwrap();
+        let (state, wait) = pool
+            .available
+            .wait_timeout_while(state, Duration::from_secs(1), |state| state.open != 1)
+            .unwrap();
+        assert!(
+            !wait.timed_out(),
+            "earliest out-of-order expiry was delayed"
+        );
+        assert_eq!(state.idle.len(), 1);
+        assert_eq!(state.idle[0].generation, 1);
+        drop(state);
+        drop(pool);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn classic_idle_generation_never_retires_active_or_replacement_twice() {
+        let pool = ConnectionPool::new_with_idle_timeout(Duration::from_secs(60)).unwrap();
+        pool.state.lock().unwrap().open = 1;
+        TcpPostcardRecorderClient::checkin(&pool, test_pool_stream());
+        let (active, old_generation) = {
+            let mut state = pool.state.lock().unwrap();
+            let generation = state.idle[0].generation;
+            (
+                take_idle_connection(&mut state, Instant::now()).unwrap(),
+                generation,
+            )
+        };
+        retire_idle_generation(&pool, old_generation);
+        assert_eq!(pool.state.lock().unwrap().open, 1);
+
+        TcpPostcardRecorderClient::checkin(&pool, active);
+        let replacement_generation = pool.state.lock().unwrap().idle[0].generation;
+        assert_ne!(old_generation, replacement_generation);
+        retire_idle_generation(&pool, old_generation);
+        assert_eq!(pool.state.lock().unwrap().open, 1);
+        retire_idle_generation(&pool, replacement_generation);
+        retire_idle_generation(&pool, replacement_generation);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.open, 0);
+        assert!(state.idle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn whole_frame_timeout_covers_partial_prefix_and_body() {
+        for partial in [vec![0, 0], vec![0, 0, 0, 4, 1, 2]] {
+            let (mut writer, mut reader) = tokio::io::duplex(16);
+            writer.write_all(&partial).await.unwrap();
+            let error = read_frame_with_signals_timeout_for(
+                &mut reader,
+                &mut None,
+                "test frame",
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, "test frame timed out");
+        }
+    }
 
     #[derive(Clone)]
     struct FakeClock {
@@ -3760,7 +4235,11 @@ mod tests {
     }
 
     fn peers() -> Vec<PeerConfig> {
-        (1..=3)
+        peer_configs(3)
+    }
+
+    fn peer_configs(count: usize) -> Vec<PeerConfig> {
+        (1..=count)
             .map(|index| {
                 PeerConfig::new(
                     format!("node-{index}"),
@@ -3770,6 +4249,10 @@ mod tests {
                 .unwrap()
             })
             .collect()
+    }
+
+    fn many_peers() -> Vec<PeerConfig> {
+        peer_configs(8)
     }
 
     struct TestIngressControl {
@@ -3811,16 +4294,24 @@ mod tests {
     where
         R: RecorderRpc + Clone + Send + Sync + 'static,
     {
+        start_actual_recorder_server_with_peers(recorder, peers()).await
+    }
+
+    async fn start_actual_recorder_server_with_peers<R>(
+        recorder: R,
+        peers: Vec<PeerConfig>,
+    ) -> (
+        SocketAddr,
+        TestRunningIngressControl,
+        tokio::task::JoinHandle<RecorderIngressExit>,
+    )
+    where
+        R: RecorderRpc + Clone + Send + Sync + 'static,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (control, lifecycle) = test_ingress_lifecycle();
-        let server = tokio::spawn(serve_recorder_tcp(
-            listener,
-            recorder,
-            peers(),
-            7,
-            lifecycle,
-        ));
+        let server = tokio::spawn(serve_recorder_tcp(listener, recorder, peers, 7, lifecycle));
         let TestIngressControl {
             shutdown,
             force,
@@ -3851,7 +4342,11 @@ mod tests {
             lifecycle,
             Arc::new(tokio::sync::Semaphore::new(1)),
             1,
-            1,
+            ConnectionAdmissionPolicy {
+                pending: 1,
+                authenticated: 1,
+                per_peer: 1,
+            },
             "test accept failed",
             move |_stream, _peer, _shutdown, _force, _connection| {
                 let entered = entered.take().expect("test admits exactly one connection");
@@ -3876,6 +4371,16 @@ mod tests {
     }
 
     async fn authenticated_tcp_hello(address: SocketAddr) -> tokio::net::TcpStream {
+        authenticated_tcp_hello_as(address, 2).await
+    }
+
+    async fn authenticated_tcp_hello_as(address: SocketAddr, peer: usize) -> tokio::net::TcpStream {
+        let (stream, reply) = tcp_hello_as(address, peer).await;
+        assert!(matches!(reply, HelloReply::Accepted { .. }));
+        stream
+    }
+
+    async fn tcp_hello_as(address: SocketAddr, peer: usize) -> (tokio::net::TcpStream, HelloReply) {
         let mut stream = tokio::time::timeout(
             Duration::from_secs(1),
             tokio::net::TcpStream::connect(address),
@@ -3887,6 +4392,38 @@ mod tests {
             &mut stream,
             &Hello {
                 version: WIRE_VERSION,
+                node_id: format!("node-{peer}"),
+                recovery_generation: 7,
+                token: format!("peer-token-{peer}"),
+            },
+        )
+        .await
+        .unwrap();
+        let reply = decode_exact::<HelloReply>(
+            &tokio::time::timeout(Duration::from_secs(1), read_frame_async(&mut stream))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        (stream, reply)
+    }
+
+    #[tokio::test]
+    async fn framed_per_peer_connection_cap_is_five_and_recovers_after_close() {
+        let (address, control, server) = start_actual_recorder_server(CountingIdentity {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .await;
+        let mut streams = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_PEER {
+            streams.push(authenticated_tcp_hello(address).await);
+        }
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        write_value_async(
+            &mut excess,
+            &Hello {
+                version: WIRE_VERSION,
                 node_id: "node-2".into(),
                 recovery_generation: 7,
                 token: "peer-token-2".into(),
@@ -3895,16 +4432,122 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            decode_exact::<HelloReply>(
-                &tokio::time::timeout(Duration::from_secs(1), read_frame_async(&mut stream))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap(),
-            HelloReply::Accepted { .. }
+            decode_exact::<HelloReply>(&read_frame_async(&mut excess).await.unwrap()).unwrap(),
+            HelloReply::Rejected
         ));
-        stream
+        drop(streams.pop());
+        streams.push(authenticated_tcp_hello(address).await);
+        drop(streams);
+        control.shutdown.send_replace(true);
+        assert!(server.await.unwrap().result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn actual_framed_ingress_caps_partial_hello_while_authenticated_session_serves() {
+        let (address, control, server) = start_actual_recorder_server(CountingIdentity {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .await;
+        let mut authenticated = authenticated_tcp_hello(address).await;
+        let mut partial = Vec::new();
+        for _ in 0..(MAX_PENDING_CONNECTIONS + 8) {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(&[0, 0]).await.unwrap();
+            partial.push(stream);
+        }
+        let mut rejected = 0;
+        for stream in &mut partial {
+            if matches!(
+                tokio::time::timeout(Duration::from_millis(25), stream.read_u8()).await,
+                Ok(Err(_))
+            ) {
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected >= 8,
+            "pending admission retained more than {MAX_PENDING_CONNECTIONS} partial HELLOs"
+        );
+
+        write_value_async(
+            &mut authenticated,
+            &RequestFrame {
+                version: WIRE_VERSION,
+                request_id: 92_001,
+                remaining_deadline_ms: 1_000,
+                body: RecorderRequestBody::Identity,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<ResponseFrame>(&read_frame_async(&mut authenticated).await.unwrap())
+                .unwrap()
+                .body,
+            RecorderResponseBody::Identity(RpcResult::Ok(_))
+        ));
+        drop((partial, authenticated));
+        control.shutdown.send_replace(true);
+        assert!(server.await.unwrap().result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn actual_framed_ingress_caps_96_authenticated_sessions_and_recovers() {
+        let (address, control, server) = start_actual_recorder_server_with_peers(
+            CountingIdentity {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            peer_configs(21),
+        )
+        .await;
+        let mut sessions = Vec::new();
+        for index in 0..MAX_AUTHENTICATED_CONNECTIONS {
+            sessions.push(authenticated_tcp_hello_as(address, 1 + index / 5).await);
+        }
+        let (excess, reply) = tcp_hello_as(address, 20).await;
+        assert!(matches!(reply, HelloReply::Rejected));
+        drop(excess);
+
+        drop(sessions.pop());
+        let mut recovered = None;
+        for _ in 0..MAX_PENDING_CONNECTIONS {
+            let (stream, reply) = tcp_hello_as(address, 20).await;
+            if matches!(reply, HelloReply::Accepted { .. }) {
+                recovered = Some(stream);
+                break;
+            }
+        }
+        assert!(
+            recovered.is_some(),
+            "global authenticated lease did not recover"
+        );
+        drop((recovered, sessions));
+        control.shutdown.send_replace(true);
+        assert!(server.await.unwrap().result.is_ok());
+    }
+
+    #[test]
+    fn recorder_adoption_doc_matches_private_connection_constants() {
+        let doc = include_str!("../../../docs/recorder-rpc-adoption-gate-2026-07-15.md");
+        assert_eq!(
+            (
+                MAX_PENDING_CONNECTIONS,
+                MAX_AUTHENTICATED_CONNECTIONS,
+                MAX_CONNECTIONS_PER_PEER,
+                FRAME_TIMEOUT,
+                IDLE_CONNECTION_TIMEOUT,
+            ),
+            (32, 96, 5, Duration::from_secs(20), Duration::from_secs(10))
+        );
+        assert!(doc.contains(
+            "at most 32 connections may be\n  pending HELLO, 96 may be authenticated globally, and each exact configured\n  peer node ID may own at most five sessions"
+        ));
+        assert!(doc.contains(
+            "one 20-second deadline covering both\n  its four-byte prefix and complete payload"
+        ));
+        assert!(doc.contains(
+            "closes classic\n  TCP entries at 10 seconds idle and releases exactly one open reservation,\n  without waiting for another checkout"
+        ));
     }
 
     async fn next_decode_event(
@@ -4020,6 +4663,7 @@ mod tests {
                 recovery_generation: 7,
                 slots: Arc::clone(&operation_slots),
                 decode_slots: Arc::clone(&decode_slots),
+                admission: test_connection_admission(),
                 signals: None,
                 response_write_test_server: None,
             },
@@ -4060,6 +4704,7 @@ mod tests {
                 recovery_generation: 7,
                 slots: operation_slots,
                 decode_slots: Arc::clone(&decode_slots),
+                admission: test_connection_admission(),
                 signals: None,
                 response_write_test_server: None,
             },
@@ -4216,13 +4861,16 @@ mod tests {
             events: events_tx,
             release: Some(Arc::clone(&release)),
         });
-        let (address, shutdown, server) = start_actual_recorder_server(CountingIdentity {
-            calls: Arc::clone(&calls),
-        })
+        let (address, shutdown, server) = start_actual_recorder_server_with_peers(
+            CountingIdentity {
+                calls: Arc::clone(&calls),
+            },
+            many_peers(),
+        )
         .await;
         let mut clients = Vec::new();
-        for _ in 0..33 {
-            clients.push(authenticated_tcp_hello(address).await);
+        for index in 0..33 {
+            clients.push(authenticated_tcp_hello_as(address, 2 + index / 5).await);
         }
         // HELLO authentication/identity is deliberately outside the scoped
         // request-decode test gate; measure only request backend dispatch.
@@ -4791,13 +5439,13 @@ mod tests {
                 command: Arc::clone(&payload),
                 calls: Arc::clone(&calls),
             },
-            peers(),
+            many_peers(),
             7,
             lifecycle,
         ));
         let mut slow_readers = Vec::new();
-        for request_id in request_ids.iter().copied() {
-            let mut stream = authenticated_tcp_hello(address).await;
+        for (index, request_id) in request_ids.iter().copied().enumerate() {
+            let mut stream = authenticated_tcp_hello_as(address, 2 + index / 5).await;
             write_value_async(
                 &mut stream,
                 &RequestFrame {

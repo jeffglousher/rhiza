@@ -9,9 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-
 use postcard_rpc::{
     endpoint,
     header::{VarHeader, VarKey, VarSeq, VarSeqKind},
@@ -26,13 +23,17 @@ use rhiza_quepaxa::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+
 use super::{
     await_unless_forced, bounded_postcard_size, frame_length, read_frame_async,
-    read_frame_with_signals, response_matches, response_operation, run_recorder_ingress,
-    write_value_async_with_timeout, Hello, HelloReply, Operation, RecorderConnectionSignals,
-    RecorderIngressExit, RecorderIngressLifecycle, RecorderRequestBody, RecorderResponseBody,
-    RecorderTlsClientConfig, RecorderTlsServerConfig, CALL_TIMEOUT, CONNECT_TIMEOUT,
-    MAX_SERVER_CONNECTIONS, MAX_SERVER_DECODE_CONCURRENCY, WIRE_VERSION,
+    read_frame_with_signals_timeout, response_matches, response_operation, run_recorder_ingress,
+    write_value_async_with_timeout, ConnectionAdmission, Hello, HelloReply, Operation,
+    RecorderConnectionSignals, RecorderIngressExit, RecorderIngressLifecycle, RecorderRequestBody,
+    RecorderResponseBody, RecorderTlsClientConfig, RecorderTlsServerConfig, CALL_TIMEOUT,
+    CONNECTION_ADMISSION_POLICY, CONNECT_TIMEOUT, FRAME_TIMEOUT, MAX_SERVER_DECODE_CONCURRENCY,
+    WIRE_VERSION,
 };
 use crate::{
     preserve_mutation_outcome,
@@ -106,24 +107,6 @@ static TEST_INNER_DECODE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
 #[cfg(test)]
 static TEST_GLOBAL_HOOK_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
-
-#[cfg(test)]
-static TEST_CONNECTION_LIMIT: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-struct TestConnectionLimitGuard(usize);
-
-#[cfg(test)]
-impl Drop for TestConnectionLimitGuard {
-    fn drop(&mut self) {
-        TEST_CONNECTION_LIMIT.store(self.0, Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-fn override_test_connection_limit(limit: usize) -> TestConnectionLimitGuard {
-    TestConnectionLimitGuard(TEST_CONNECTION_LIMIT.swap(limit, Ordering::SeqCst))
-}
 
 #[cfg(test)]
 fn test_inner_decode_hook_slot() -> &'static std::sync::Mutex<Option<Arc<TestInnerDecodeHook>>> {
@@ -408,36 +391,20 @@ where
     let peers: Arc<[PeerConfig]> = peers.into();
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
     let decode_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_DECODE_CONCURRENCY));
-    let connection_limit = {
-        #[cfg(test)]
-        {
-            let override_limit = TEST_CONNECTION_LIMIT.load(Ordering::SeqCst);
-            if override_limit != 0 {
-                override_limit
-            } else {
-                MAX_SERVER_CONNECTIONS
-            }
-        }
-        #[cfg(not(test))]
-        {
-            MAX_SERVER_CONNECTIONS
-        }
-    };
     run_recorder_ingress(
         listener,
         lifecycle,
         Arc::clone(&slots),
         DEFAULT_PEER_CONCURRENCY,
-        connection_limit,
+        CONNECTION_ADMISSION_POLICY,
         "recorder postcard-rpc TCP accept failed",
-        move |stream, peer_address, shutdown, force, connection| {
+        move |stream, peer_address, shutdown, force, admission| {
             let recorder = recorder.clone();
             let peers = Arc::clone(&peers);
             let slots = Arc::clone(&slots);
             let decode_slots = Arc::clone(&decode_slots);
             let tls = tls.clone();
             async move {
-                let _connection = connection;
                 let signals = RecorderConnectionSignals { shutdown, force };
                 let result = if let Some(config) = tls {
                     serve_postcard_rpc_tls_connection(
@@ -448,6 +415,7 @@ where
                         recovery_generation,
                         slots,
                         decode_slots,
+                        admission,
                         signals,
                     )
                     .await
@@ -459,6 +427,7 @@ where
                         recovery_generation,
                         slots,
                         decode_slots,
+                        admission,
                         Some(signals),
                     )
                     .await
@@ -486,6 +455,7 @@ async fn serve_postcard_rpc_tls_connection<R>(
     recovery_generation: u64,
     slots: Arc<tokio::sync::Semaphore>,
     decode_slots: Arc<tokio::sync::Semaphore>,
+    admission: ConnectionAdmission,
     mut signals: RecorderConnectionSignals,
 ) -> Result<(), String>
 where
@@ -514,6 +484,7 @@ where
         recovery_generation,
         slots,
         decode_slots,
+        admission,
         Some(signals),
     )
     .await
@@ -538,11 +509,13 @@ where
         recovery_generation,
         slots,
         Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_DECODE_CONCURRENCY)),
+        super::test_connection_admission(),
         None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_postcard_rpc_connection_with_decode_slots<R, S>(
     mut stream: S,
     recorder: R,
@@ -550,18 +523,16 @@ async fn serve_postcard_rpc_connection_with_decode_slots<R, S>(
     recovery_generation: u64,
     slots: Arc<tokio::sync::Semaphore>,
     decode_slots: Arc<tokio::sync::Semaphore>,
+    mut admission: ConnectionAdmission,
     mut signals: Option<RecorderConnectionSignals>,
 ) -> Result<(), String>
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let hello_bytes = tokio::time::timeout(
-        CALL_TIMEOUT,
-        read_frame_with_signals(&mut stream, &mut signals),
-    )
-    .await
-    .map_err(|_| "recorder postcard-rpc HELLO timed out".to_string())??;
+    let hello_bytes =
+        read_frame_with_signals_timeout(&mut stream, &mut signals, "recorder postcard-rpc HELLO")
+            .await?;
     let Some(hello_bytes) = hello_bytes else {
         return Ok(());
     };
@@ -581,6 +552,15 @@ where
         );
         let _ = await_unless_forced(&mut signals, rejection).await;
         return Err("recorder postcard-rpc HELLO rejected".into());
+    }
+    if !admission.authenticate(&hello.node_id) {
+        let rejection = write_value_async_with_timeout(
+            &mut stream,
+            &HelloReply::Rejected,
+            "recorder postcard-rpc HELLO connection overload rejection",
+        );
+        let _ = await_unless_forced(&mut signals, rejection).await;
+        return Err("recorder postcard-rpc HELLO connection overloaded".into());
     }
     let permit = match slots.clone().try_acquire_owned() {
         Ok(permit) => Arc::new(permit),
@@ -648,7 +628,13 @@ where
             // Shutdown may cancel a partial frame only because this socket is
             // immediately dropped and never resumed. Response completion still
             // cannot cancel the read and desynchronize a live session.
-            let bytes = match read_frame_with_signals(&mut reader, &mut signals).await {
+            let bytes = match read_frame_with_signals_timeout(
+                &mut reader,
+                &mut signals,
+                "recorder postcard-rpc request frame",
+            )
+            .await
+            {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => return Ok(()),
                 Err(error) if error == "connection closed" => {
@@ -1104,8 +1090,9 @@ impl WireRx for FrameRx {
     type Error = WireFailure;
 
     async fn receive(&mut self) -> Result<Vec<u8>, Self::Error> {
-        read_frame_async(&mut self.reader)
+        tokio::time::timeout(FRAME_TIMEOUT, read_frame_async(&mut self.reader))
             .await
+            .map_err(|_| WireFailure("recorder postcard-rpc frame receive timed out".into()))?
             .map_err(WireFailure)
     }
 }
@@ -2338,6 +2325,19 @@ mod tests {
             .collect()
     }
 
+    fn many_peers() -> Vec<PeerConfig> {
+        (1..=8)
+            .map(|index| {
+                PeerConfig::new(
+                    format!("node-{index}"),
+                    format!("http://node-{index}:8081"),
+                    format!("peer-token-{index}"),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
     struct TestIngressControl {
         shutdown: tokio::sync::watch::Sender<bool>,
         _force: tokio::sync::watch::Sender<bool>,
@@ -2393,6 +2393,13 @@ mod tests {
     }
 
     async fn authenticated_slow_reader(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+        authenticated_slow_reader_as(address, 2).await
+    }
+
+    async fn authenticated_slow_reader_as(
+        address: std::net::SocketAddr,
+        peer: usize,
+    ) -> tokio::net::TcpStream {
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let stream = stream.into_std().unwrap();
         let socket = Socket::from(stream);
@@ -2405,9 +2412,9 @@ mod tests {
             &mut stream,
             &Hello {
                 version: POSTCARD_RPC_WIRE_VERSION,
-                node_id: "node-2".into(),
+                node_id: format!("node-{peer}"),
                 recovery_generation: 7,
-                token: "peer-token-2".into(),
+                token: format!("peer-token-{peer}"),
             },
         )
         .await
@@ -2568,7 +2575,6 @@ mod tests {
     #[tokio::test]
     async fn prpc_shared_32_inner_decode_gate_admits_the_33rd_after_release() {
         let _lock = test_inner_decode_lock().lock().await;
-        let _connection_limit = override_test_connection_limit(40);
         let release = Arc::new(tokio::sync::Notify::new());
         let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         let _hook = install_test_inner_decode_hook(TestInnerDecodeHook {
@@ -2582,13 +2588,13 @@ mod tests {
         let server = tokio::spawn(serve_recorder_postcard_rpc(
             listener,
             IdentityRecorder,
-            peers(),
+            many_peers(),
             7,
             lifecycle,
         ));
         let mut streams = Vec::new();
-        for _ in 0..33 {
-            streams.push(authenticated_slow_reader(address).await);
+        for index in 0..33 {
+            streams.push(authenticated_slow_reader_as(address, 2 + index / 5).await);
         }
         for (index, stream) in streams.iter_mut().enumerate() {
             send_raw_request(
@@ -2616,16 +2622,17 @@ mod tests {
             TestInnerDecodeEvent::Entered
         );
         release.notify_waiters();
-        for (index, stream) in streams.iter_mut().enumerate() {
+        let mut responses = std::collections::BTreeSet::new();
+        for stream in &mut streams {
             let frame = tokio::time::timeout(Duration::from_secs(1), read_frame_async(stream))
                 .await
                 .unwrap()
                 .unwrap();
             let (header, payload) = VarHeader::take_from_slice(&frame).unwrap();
-            assert_eq!(
-                header.seq_no,
-                VarSeq::Seq4(71_000 + u32::try_from(index).unwrap())
-            );
+            let VarSeq::Seq4(sequence) = header.seq_no else {
+                panic!("expected Seq4 response")
+            };
+            responses.insert(sequence);
             assert!(matches!(
                 decode_exact::<RecorderResponseBody>(decode_opaque_response(payload).unwrap())
                     .unwrap(),
@@ -2636,13 +2643,14 @@ mod tests {
         // independent 32-operation-slot gate may return a terminal overload
         // response for a decoded request while the earlier response tasks
         // still own their permits.
+        assert_eq!(responses, (71_000..71_033).collect());
         drop(streams);
         control.shutdown.send_replace(true);
         assert!(server.await.unwrap().result.is_ok());
     }
 
     #[tokio::test]
-    async fn prpc_default_connection_cap_is_12_and_recovers_after_close() {
+    async fn prpc_per_peer_connection_cap_is_five_and_recovers_after_close() {
         let _lock = test_inner_decode_lock().lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2655,12 +2663,12 @@ mod tests {
             lifecycle,
         ));
         let mut streams = Vec::new();
-        for _ in 0..MAX_SERVER_CONNECTIONS {
+        for _ in 0..super::super::MAX_CONNECTIONS_PER_PEER {
             streams.push(authenticated_slow_reader(address).await);
         }
-        let mut thirteenth = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
         super::super::write_value_async(
-            &mut thirteenth,
+            &mut excess,
             &Hello {
                 version: POSTCARD_RPC_WIRE_VERSION,
                 node_id: "node-2".into(),
@@ -2670,22 +2678,67 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !matches!(
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    read_frame_async(&mut thirteenth)
-                )
-                .await,
-                Ok(Ok(_))
-            ),
-            "the thirteenth connection must not reach authenticated PRPC processing"
-        );
-        drop(thirteenth);
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut excess).await.unwrap()).unwrap(),
+            HelloReply::Rejected
+        ));
+        drop(excess);
         drop(streams.pop());
         let recovered = authenticated_slow_reader(address).await;
         drop(recovered);
         drop(streams);
+        control.shutdown.send_replace(true);
+        assert!(server.await.unwrap().result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn actual_prpc_ingress_caps_partial_hello_while_authenticated_session_serves() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (control, lifecycle) = test_ingress_lifecycle();
+        let server = tokio::spawn(serve_recorder_postcard_rpc(
+            listener,
+            IdentityRecorder,
+            peers(),
+            7,
+            lifecycle,
+        ));
+        let mut authenticated = authenticated_slow_reader(address).await;
+        let mut partial = Vec::new();
+        for _ in 0..(super::super::MAX_PENDING_CONNECTIONS + 8) {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(&[0, 0]).await.unwrap();
+            partial.push(stream);
+        }
+        let mut rejected = 0;
+        for stream in &mut partial {
+            if matches!(
+                tokio::time::timeout(Duration::from_millis(25), stream.read_u8()).await,
+                Ok(Err(_))
+            ) {
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected >= 8,
+            "PRPC pending admission retained more than {} partial HELLOs",
+            super::super::MAX_PENDING_CONNECTIONS
+        );
+
+        send_raw_request(
+            &mut authenticated,
+            72_001,
+            Operation::Identity,
+            &RecorderRequestBody::Identity,
+        )
+        .await;
+        let frame = read_frame_async(&mut authenticated).await.unwrap();
+        let (_, payload) = VarHeader::take_from_slice(&frame).unwrap();
+        assert!(matches!(
+            decode_exact::<RecorderResponseBody>(decode_opaque_response(payload).unwrap()).unwrap(),
+            RecorderResponseBody::Identity(RpcResult::Ok(_))
+        ));
+        drop((partial, authenticated));
         control.shutdown.send_replace(true);
         assert!(server.await.unwrap().result.is_ok());
     }
@@ -3098,15 +3151,19 @@ mod tests {
         let recovered =
             TcpPostcardRpcRecorderClient::new(address, "node-1", "node-2", "peer-token-2", 7)
                 .unwrap();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || {
-                recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
-            })
-            .await
-            .unwrap()
-            .unwrap(),
-            "node-1"
-        );
+        let recovered = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout()) {
+                    Ok(id) => return id,
+                    Err(_) if Instant::now() < deadline => thread::yield_now(),
+                    Err(error) => panic!("dispatch-gate connection did not recover: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered, "node-1");
         server.abort();
     }
 
@@ -3363,15 +3420,19 @@ mod tests {
         let recovered =
             TcpPostcardRpcRecorderClient::new(address, "node-1", "node-2", "peer-token-2", 7)
                 .unwrap();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || {
-                recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
-            })
-            .await
-            .unwrap()
-            .unwrap(),
-            "node-1"
-        );
+        let recovered = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout()) {
+                    Ok(id) => return id,
+                    Err(_) if Instant::now() < deadline => thread::yield_now(),
+                    Err(error) => panic!("panic-response permits did not recover: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered, "node-1");
         TEST_PERMIT_LIFECYCLE_HOOK.lock().unwrap().take();
         server.abort();
     }
@@ -3472,15 +3533,19 @@ mod tests {
         let recovered =
             TcpPostcardRpcRecorderClient::new(address, "node-1", "node-2", "peer-token-2", 7)
                 .unwrap();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || {
-                recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout())
-            })
-            .await
-            .unwrap()
-            .unwrap(),
-            "node-1"
-        );
+        let recovered = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match recovered.recorder_id(&rhiza_quepaxa::RecorderRpcContext::default_timeout()) {
+                    Ok(id) => return id,
+                    Err(_) if Instant::now() < deadline => thread::yield_now(),
+                    Err(error) => panic!("deadline-response permits did not recover: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered, "node-1");
         server.abort();
     }
 
@@ -3660,6 +3725,101 @@ mod tests {
             .unwrap();
         assert!(matches!(call.await.unwrap(), Err(Error::UnknownOutcome)));
         blackhole.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutation_eof_is_unknown_and_next_call_reconnects_without_replay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first = StoredCommand::new(rhiza_core::EntryType::Command, b"first".to_vec());
+        let second = StoredCommand::new(rhiza_core::EntryType::Command, b"second".to_vec());
+        let first_hash = first.hash();
+        let second_hash = second.hash();
+        let (release, mut release_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            for (expected_hash, answer) in [(first_hash, false), (second_hash, true)] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let hello: Hello =
+                    decode_exact(&read_frame_async(&mut stream).await.unwrap()).unwrap();
+                assert_eq!(hello.version, POSTCARD_RPC_WIRE_VERSION);
+                super::super::write_value_async(
+                    &mut stream,
+                    &HelloReply::Accepted {
+                        version: POSTCARD_RPC_WIRE_VERSION,
+                        recorder_id: "node-1".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let frame = read_frame_async(&mut stream).await.unwrap();
+                let (header, payload) = VarHeader::take_from_slice(&frame).unwrap();
+                let (_, body) = decode_opaque_request(payload).unwrap();
+                assert!(matches!(
+                    decode_exact::<RecorderRequestBody>(body).unwrap(),
+                    RecorderRequestBody::StoreCommand { command_hash, .. }
+                        if command_hash == expected_hash
+                ));
+                if answer {
+                    let response = build_opaque_bytes(
+                        Some(VarHeader {
+                            key: VarKey::Key8(response_key(Operation::StoreCommand)),
+                            seq_no: header.seq_no,
+                        }),
+                        None,
+                        &RecorderResponseBody::StoreCommand(RpcResult::Ok(())),
+                    )
+                    .unwrap();
+                    write_raw_frame(&mut stream, &response).await.unwrap();
+                    while !*release_rx.borrow() {
+                        release_rx.changed().await.unwrap();
+                    }
+                }
+            }
+        });
+        let client = Arc::new(
+            TcpPostcardRpcRecorderClient::new_with_transport_and_timeout(
+                address,
+                "node-1",
+                "node-2",
+                "peer-token-2",
+                7,
+                ClientTransport::Plain,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let first_client = Arc::clone(&client);
+        let first_result = tokio::task::spawn_blocking(move || {
+            first_client.store_command_for(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                "rhiza:sql:cluster-a".into(),
+                1,
+                1,
+                LogHash::ZERO,
+                first.hash(),
+                first,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(first_result, Err(Error::UnknownOutcome)));
+        let second_client = Arc::clone(&client);
+        let second_result = tokio::task::spawn_blocking(move || {
+            second_client.store_command_for(
+                &rhiza_quepaxa::RecorderRpcContext::default_timeout(),
+                "rhiza:sql:cluster-a".into(),
+                1,
+                1,
+                LogHash::ZERO,
+                second.hash(),
+                second,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(second_result.is_ok(), "{second_result:?}");
+        release.send_replace(true);
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
