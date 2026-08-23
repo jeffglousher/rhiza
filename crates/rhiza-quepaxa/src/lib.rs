@@ -4690,6 +4690,16 @@ impl RecorderFileStore {
             head = frame.head;
             offset = end;
         }
+        // Drop any live append handle before truncating a torn tail. Windows
+        // cannot SetEndOfFile while another handle still holds the WAL; Unix
+        // can. Closing first keeps the path portable.
+        {
+            let mut wal = self
+                .wal
+                .lock()
+                .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+            wal.file = None;
+        }
         if offset != bytes.len() {
             self.effect_root_anchor
                 .truncate(Self::WAL_FILE, offset as u64)?;
@@ -5396,6 +5406,15 @@ impl RecorderFileStore {
         })();
         match materialized {
             Ok(next_checkpoint) => {
+                // Close the live append handle before truncating. Windows cannot
+                // SetEndOfFile a WAL that another handle still holds; Unix can.
+                {
+                    let mut wal = self
+                        .wal
+                        .lock()
+                        .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+                    wal.file = None;
+                }
                 if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
                     if let Ok(mut wal) = self.wal.lock() {
                         wal.failed = true;
@@ -5406,6 +5425,7 @@ impl RecorderFileStore {
                     .wal
                     .lock()
                     .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+                wal.file = Some(self.effect_root_anchor.open_append(Self::WAL_FILE)?);
                 wal.checkpoint = next_checkpoint;
                 wal.last_digest = LogHash::ZERO;
                 wal.frame_count = 0;
